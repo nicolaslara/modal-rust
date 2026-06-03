@@ -41,8 +41,8 @@ modal-rust call   add --input '{"a":40,"b":2}'   # invoke the deployed function 
 **Local only** (offline — no Modal):
 
 ```bash
-cargo test                                                                       # default-members (skips the CUDA-only burn example)
-cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'   # -> {"ok":true,"value":{"sum":42}}
+cargo test                                                                                  # default-members (skips the CUDA-only burn example)
+cargo run -p example-add --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'   # -> {"ok":true,"value":{"sum":42}}
 ```
 
 **GPU** (validated on a T4; runs via the raw shim — `--gpu` wiring in the CLI is a follow-up):
