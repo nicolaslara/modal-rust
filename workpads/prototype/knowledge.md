@@ -469,3 +469,98 @@ The prototype gate is now **MET**. Both halves proven with real evidence:
 Human commands for the README:
 - Deploy:  `modal deploy /Users/nicolas/devel/modal-rust/workpads/prototype/deploy_app.py`
 - Call:    `modal run /Users/nicolas/devel/modal-rust/workpads/prototype/call_app.py::main`
+
+### Third loop — M9-build / M9b / M9a executed, modal-rust CLI proven (2026-06-03 PM)
+
+M9-build (CLI build + offline gates), M9b (`doctor`), and M9a (CLI wrapper
+byte-equivalence) all PASS with real evidence. The `modal-rust` CLI now exists as a
+pure wrapper over the prototype shims; Modal was up and responsive throughout the M9a
+live run (NOT blocked — no transient incident this loop). Git was edited then restored
+via `git checkout`; the working tree is clean.
+
+#### M9-build — modal-rust CLI builds; offline workspace green (pass)
+
+The `modal-rust` CLI is a **pure wrapper** exposing `doctor`/`run`/`deploy`/`call`, all
+with `--help`. It introduces NO new Modal capability — it generates the dev/deploy/call
+shims into `<workspace-root>/.modal-rust/generated/` (workspace root detected by walking
+up for `[workspace]`, mounted as `/src`), then execs the official `modal` CLI. Public
+`--input <json|@file>` lowers to `modal run <shim>::main --entrypoint <e> --input-json
+<json>`; `deploy` → `modal deploy <shim>`. The shims are embedded as templates with only
+the documented injected params (app name, RUST_VER, source path) substituted —
+byte-identical to the prototype shims. Errors surface as the runner-envelope-shaped
+structured error (`{"ok":false,"error":{kind,message,details,backtrace}}`) with a
+non-zero exit.
+- Workspace green: `cargo fmt --check` clean; `cargo clippy --all-targets
+  --all-features -- -D warnings` clean; `cargo test --workspace` 6/6 suites OK (16 CLI +
+  11 runtime tests, 27 total).
+- `cargo run -p modal-rust-cli -- doctor` exits 0 in this env (modal 1.3.2,
+  `~/.modal.toml`, rustc/cargo 1.96.0, release `panic=unwind`); all four subcommands
+  expose `--help`.
+- Generated shims are byte-equivalent to the prototype fixtures (empty `diff`, equal
+  sha256 on all three) and correctly gitignored under `.modal-rust/`. No `gpu=` path; no
+  Modal calls made.
+- **VERDICT: pass** — CLI builds, is a pure wrapper, workspace gates green, doctor exits
+  0 offline, shims byte-identical, no Modal calls.
+
+#### M9b — `doctor` preflight + `panic=abort` detection (pass)
+
+`doctor` is its own boundary (structured-error preflight + abort-profile detection in
+isolation), reusing the M0 5-kind error model.
+- OFFLINE accuracy: reports modal CLI 1.3.2, creds from `~/.modal.toml` (env-var
+  `MODAL_TOKEN_ID`+`MODAL_TOKEN_SECRET` also recognized); `--rust` adds cargo/rustc
+  1.96.0 and release `panic="unwind"`. The line-scan parser tracks `[profile.release]`
+  and ignores `[profile.dev]` (unit-tested).
+- **`panic=abort` detection present + correct:** workspace-root/standalone `panic =
+  "abort"` → `panic_abort_profile` FAIL exit 1; a member-abort under an unwind root →
+  unwind OK (resolved release profile). Default unwind profile passes.
+- Simulated missing prerequisite (exit 1): `env -i PATH=<empty> HOME=<no .modal.toml>`
+  → `[FAIL] modal CLI not found on $PATH`, with an actionable runner-envelope-shaped
+  error on stderr:
+  `{"ok":false,"error":{"kind":"missing_prerequisite","message":"...","details":{"prerequisite":"modal CLI","remediation":"Install the Modal CLI..."},"backtrace":""}}`.
+- Quality gates: `cargo test -p modal-rust-cli` → 16/16 pass (6 doctor tests); clippy
+  `-D warnings` exit 0; `cargo fmt --check` exit 0.
+- Minor (non-blocking) note: §8 mentions doctor should also surface pinned
+  python/image-builder versions; the bare `doctor` reports modal CLI version + creds
+  only (rust toolchain versions appear under `--rust`). A §8-completeness nicety, not in
+  the M9b acceptance bullets and not a correctness bug. Source:
+  `/Users/nicolas/devel/modal-rust/crates/modal-rust-cli/src/doctor.rs`.
+- **VERDICT: pass** — doctor OFFLINE accurate; abort-detection present + correct;
+  missing-prereq → `missing_prerequisite` runner-envelope error exit 1; 16/16 tests,
+  clippy + fmt clean.
+
+#### M9a — modal-rust CLI is a byte-equivalent wrapper (run/deploy/call) (pass)
+
+The public UX proven live against Modal — one `modal-rust` binary generates the shims
+and orchestrates the build stage; the user never touches Modal Python. Modal (client
+1.3.2, `~/.modal.toml`) was up and responsive — NO transient incident this loop. Every
+`modal run`/`deploy` was wrapped in `timeout`; no `gpu=` path used.
+- **(a) `modal-rust run add --input '{"a":40,"b":2}'`** → runtime function-body cargo
+  build + `{"ok":true,"value":{"sum":42}}` (reproduces M4/M5).
+- **(b) `modal-rust deploy add`** → `cargo build --release` ran at IMAGE-BUILD time
+  (Step 1 RUN), binary baked via `cp /app/src/target/release/modal_runner
+  /app/modal_runner` (Step 2); deployed under `modal-rust-add-poc` (reproduces M7).
+- **(c) `modal-rust call add --input '{"a":40,"b":2}'`** → `{"ok":true,"value":{"sum":42}}`
+  (inner value `{"sum":42}`), with NO cargo/compile lines anywhere in the call log
+  (reproduces M8, the deploy invariant).
+- **Shim equivalence (the anti-divergence guard):** generated
+  `.modal-rust/generated/{dev_app,deploy_app,call_app}.py` are byte-for-byte identical
+  to `workpads/prototype/{dev_app,deploy_app,call_app}.py` (all three `diff` exit 0;
+  matching sha256; CLI defaults match the prototype injected params). All three shims
+  are gitignored (private, per §8/§10).
+- Offline still stands: `cargo build -p modal-rust-cli` clean; `cargo test -p
+  modal-rust-cli` 16/16 green including the three byte-equivalence tests and the
+  `panic=abort`/unwind doctor tests (M9-build, M9b).
+- **VERDICT: pass** — CLI pure-wrapper reproduces shims: run→runtime build +
+  `{"sum":42}`, deploy→build-time bake (`modal-rust-add-poc`), call→`{"sum":42}` with no
+  cargo in the call log; all 3 generated shims diff-identical to prototype refs (exit 0)
+  and gitignored; offline build + 16/16 tests green.
+
+#### M9 milestone consequence — the modal-rust CLI now exists
+
+With M9-build and M9b (and M9a) all passing, the **`modal-rust` CLI now exists** as a
+real binary. The README's `modal-rust run/deploy/call` commands are therefore real for
+the `doctor` + offline (shim-generation / byte-equivalence) surfaces. The wrapper
+`run`/`deploy`/`call` against live Modal were also exercised and PASS this loop (M9a),
+so they are real end-to-end as well — Modal was healthy throughout; no Modal-blocked
+note applies. (README CLI commands left for the human to review before adding to the
+Try-it section.)

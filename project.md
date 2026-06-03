@@ -177,10 +177,10 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { ... }
 | --- | --- |
 | Authoring | Write normal Rust library functions; no required `main()` |
 | Dispatch | Named functions, typed JSON in/out, structured errors, panic capture |
-| Dev run | Mount source, compile remotely per run, execute; reflects local edits |
+| Dev run | Mount source, compile remotely when inputs changed, reuse a smart run cache when unchanged; reflects local edits |
 | Deploy | Build once at deploy time; persistent Modal Function; no runtime compile |
 | Invoke | Call deployed functions from the CLI (via modal-rs, generated python, or HTTPS) |
-| Caching | Cargo registry/git/target cache on a Modal Volume for tolerable dev iteration |
+| Caching | Source-fingerprint binary cache plus Cargo registry/git/target cache on a Modal Volume for tolerable dev iteration |
 | GPU | Run Rust in GPU-attached containers; CUDA driver access; real GPU compute |
 | Ergonomics | Proc-macros (`inventory` registry) and optional PyO3/maturin bridge — later |
 
@@ -257,6 +257,7 @@ validated **before** they are depended on:
 - Define the runner protocol and registry API (manual now, macro-compatible).
 - Prove runtime compile on a normal Modal Function.
 - Prove deploy-time build with no runtime compile.
-- Add a Cargo cache Volume for dev iteration.
+- Add a smart Cargo run cache for dev iteration: no-op runs reuse a cached
+  `modal_runner`; changed sources rebuild against a warm target cache.
 - Prove GPU placement and real Rust GPU compute, Burn-free first.
 - Add proc-macros and optional PyO3/maturin bridge once the manual path is solid.

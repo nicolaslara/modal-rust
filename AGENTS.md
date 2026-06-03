@@ -137,9 +137,15 @@ contract is the stable seam — guard it across every change. See
   workspace credentials.
 - Treat the generated Python shims under `.modal-rust/generated/` as
   disposable, regenerable artifacts; do not hand-edit them as a source of truth.
-- Real Modal spikes cost money and run remotely (outward-facing). Keep them
-  small, opt-in, and record what was run. Confirm before any deploy that creates
-  persistent apps.
+- Real Modal calls run remotely and cost a little. Ephemeral `modal run` and the
+  `modal-rust-add-poc` deploy are pre-authorized for the POC; give a heads-up only
+  before GPU runs or a brand-new public/persistent exposure.
+- **Modal flakiness is transient — retry, do not block.** Capacity blips show up
+  as a `modal` call hanging or `could not fetch task data … does not have
+  permission to execute`. On that: kill the call (always `timeout`-wrap it),
+  retry, and if it persists wait a few minutes and retry again. Keep going until
+  it goes through. Never mark a task "blocked on Modal" or blame our code for a
+  transient incident; only stop for a clear, reproducible code bug.
 - Prefer cheap/CPU validation before GPU; GPU runs incur higher cost.
 
 ## Research Rules

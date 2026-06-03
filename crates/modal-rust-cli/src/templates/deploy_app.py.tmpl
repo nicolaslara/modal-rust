@@ -1,0 +1,94 @@
+"""modal-rust prototype deploy shim (the `deploy` / prod path) — M7/M8.
+
+This is the deploy-side counterpart of `dev_app.py`. It proves the OTHER half of
+the build boundary (boundaries.md §4, §5; tasks.md M7/M8):
+
+  - `run`/dev  (dev_app.py): source MOUNTED at startup via add_local_dir(copy=False);
+    `cargo build` runs in the FUNCTION BODY at execution time.
+  - `deploy`/prod (this file): source COPIED into an image LAYER via
+    add_local_dir(copy=True); `cargo build --release` runs at IMAGE-BUILD time via
+    `run_commands(...)`; the freshly built `modal_runner` is `cp`'d to a fixed path
+    and BAKED into the image.
+
+Deployed-runtime invariant (boundaries.md §4, the hard non-negotiable one):
+  The deployed Function body execs ONLY the baked `/app/modal_runner`. It mounts no
+  source, mounts no cache Volume, and NEVER invokes `cargo`. The build boundary is
+  the product: at deploy/call time the runtime runs a prebuilt binary, full stop.
+
+Flag-mapping (tasks.md, authoritative):
+  `modal run`/`modal deploy` auto-bind CLI flags ONLY to a `@app.local_entrypoint()`
+  by parameter name; a bare `@app.function` does NOT bind flags. So the deployed work
+  function `call_entrypoint(entrypoint, input_json)` is a bare `@app.function`, and
+  the flag-bound driver is `main(entrypoint, input_json)` -> `.remote(...)`.
+
+Creates a PERSISTENT app named "modal-rust-add-poc" (authorized by the M7 task).
+"""
+
+import modal
+
+# Persistent app (authorized for M7): deploying registers it under this name so the
+# baked binary survives until an explicit redeploy.
+app = modal.App("{{APP_NAME}}")
+
+# Deploy image — the build boundary lives HERE, in image layers:
+#   - from_registry("rust:1-slim", add_python="3.12"): the Rust toolchain image with
+#     Modal's MANDATORY Python runtime (a bare rust: image is an invalid Function
+#     image — boundaries.md §5).
+#   - .entrypoint([]): neutralize the base ENTRYPOINT so Modal's Python runtime starts.
+#   - .env({"RUST_BACKTRACE": "1"}): the runner's `panic` envelope carries a backtrace.
+#   - .add_local_dir(..., copy=True): COPY the repo source into an image LAYER (NOT a
+#     startup mount). Ignore rules (boundaries.md §10) keep the upload minimal:
+#     build artifacts, git metadata, generated shims, stray rlibs.
+#   - first .run_commands(cargo build): compile `modal_runner` at IMAGE-BUILD time.
+#     This is the deploy-side build; the deployed runtime never repeats it.
+#   - second .run_commands(cp + chmod): BAKE the freshly built binary at the fixed
+#     path /app/modal_runner so the deployed body can exec it directly. The workspace
+#     leaves CARGO_TARGET_DIR at its default, so the binary lands at
+#     /app/src/target/release/modal_runner.
+image = (
+    modal.Image.from_registry("rust:{{RUST_VER}}-slim", add_python="3.12")
+    .entrypoint([])
+    .env({"RUST_BACKTRACE": "1"})
+    .add_local_dir(
+        "{{LOCAL_SRC}}",
+        "/app/src",
+        copy=True,
+        ignore=["target", ".git", ".modal-rust", "**/*.rlib"],
+    )
+    .run_commands(
+        "cd /app/src && cargo build --release --bin modal_runner",
+        "cp /app/src/target/release/modal_runner /app/modal_runner && chmod +x /app/modal_runner",
+    )
+)
+
+
+# Deployed work function — a BARE @app.function (does not bind CLI flags directly).
+# The deployed runtime invariant in action: NO cargo, NO source mount, NO cache
+# Volume. It writes the input to /tmp/in.json and execs ONLY the baked binary via the
+# M0 runner protocol (§2.2), returning the single stdout JSON envelope line.
+@app.function(image=image)
+def call_entrypoint(entrypoint: str, input_json: str) -> str:
+    import subprocess
+
+    # Feed the runner via --input-file (avoids argv-length limits / the gRPC payload
+    # ceiling; §2.2). stdout of the runner is exactly one JSON envelope.
+    with open("/tmp/in.json", "w") as f:
+        f.write(input_json)
+
+    proc = subprocess.run(
+        ["/app/modal_runner", "--entrypoint", entrypoint, "--input-file", "/tmp/in.json"],
+        capture_output=True,
+        text=True,
+    )
+    # Runner diagnostics (if any) -> stderr; stdout is the single envelope we return.
+    if proc.stderr:
+        import sys
+
+        print(proc.stderr, file=sys.stderr)
+    return proc.stdout.strip()
+
+
+# Flag-bound driver (REQUIRED: a bare @app.function does not bind `modal run` flags).
+@app.local_entrypoint()
+def main(entrypoint: str = "add", input_json: str = '{"a":40,"b":2}'):
+    print(call_entrypoint.remote(entrypoint, input_json))

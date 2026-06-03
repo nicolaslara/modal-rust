@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/modal-rust-runtime",
+    "crates/modal-rust-cli",
     "examples/add",
 ]
 

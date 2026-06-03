@@ -31,13 +31,17 @@ ways:** `cargo build` appears in the `run` function-body log and in the
 `deploy`/image-build log, and is **ABSENT from the `call` log**; the deployed
 result is stable until an explicit redeploy (edit local source → call still
 returns the old value; redeploy → new value, with the new cargo build only in the
-new deploy's build log). Best-effort items (the M6 cache speedup) do NOT block the
-gate; a null cache result is acceptable.
+new deploy's build log). The original M6 cache speedup does NOT block the
+prototype gate, but smart run-cache is now a dev-velocity requirement before the
+`run` UX is considered product-ready (M6b).
 
 DAG (verified acyclic, §3): `M0 → M1`; `M1 → {M2, M3}`; `{M0, M2, M3} → M4`;
-`M4 → {M5, M6, M7}`; `M7 → M8`; `{M5, M8} → M9a`; `M0 → M9b`. `M6` (cache) is
-best-effort and **not** a dependency of M7, M9a, or M9b. (M9 is split into M9a —
-the pure-wrapper claim — and M9b — `doctor` — so each fails for exactly one reason;
+`M4 → {M5, M6, M7}`; `M6 → M6b`; `M7 → M8`; `{M5, M8} → M9a`; `M0 → M9b`.
+`M6` is the first cache probe; `M6b` is the smart run-cache product requirement
+and a follow-up to the original core-path gate. `M6b` does not gate deploy/call
+correctness, but it must refresh the dev shim and rerun the relevant CLI/diff
+checks because dev velocity is part of the v0 UX. (M9 is split into M9a — the
+pure-wrapper claim — and M9b — `doctor` — so each fails for exactly one reason;
 see those tasks.)
 
 ### Flag mapping (authoritative — fixed once, used everywhere)
@@ -366,6 +370,67 @@ Evidence:
 - The recorded M2-branch decision and the `cp -a` wall-clock (read-only path).
 - `modal volume list` + the documented reset command.
 
+## M6b - Smart run compilation cache (required dev-velocity follow-up)
+
+Status: planned
+
+risk: high. depends_on: [M5, M6]
+
+Validates: `modal-rust run` can distinguish "source unchanged" from "source
+changed" and preserve development velocity without weakening the run-vs-deploy
+boundary. A no-op run should reuse the previously compiled runner and skip cargo;
+a changed-source run should rebuild in the Function body against warm cache state.
+
+Design target:
+- Compute a deterministic content fingerprint over the mounted source tree after
+  the normal ignore rules (`target`, `.git`, `.modal-rust`, generated shims), plus
+  `Cargo.lock`, Cargo manifests, rust image/toolchain, target triple, profile,
+  features, and the runner/generator version.
+- Store cache state under `modal-rust-cargo-cache`: exact-hit binaries at
+  `/cache/run/<fingerprint>/modal_runner`, registry/git state under `/cache/cargo`,
+  and compiled artifacts under a benchmarked target-cache strategy.
+- Benchmark two target-cache strategies before selecting the default:
+  `CARGO_TARGET_DIR` directly on the Volume versus restore `/cache/target-snapshot`
+  to `/tmp/target`, build on local disk, then sync back after a successful build.
+  The snapshot strategy is the conservative candidate because Cargo's hot path is
+  many small file/stat/lock operations.
+- Keep cache writes single-writer for v0 (`run` dev path, low concurrency). Do not
+  use `vol.reload()` on the build path; explicit commit is allowed only after cargo
+  exits and file handles are closed.
+- Deploy/call remains unchanged: deployed runtime mounts no source/cache and never
+  invokes cargo.
+
+Acceptance:
+- First run with an empty cache builds remotely and returns 42; logs include
+  `[run-cache] MISS` and cargo compilation.
+- Second run with identical source returns 42; logs include `[run-cache] HIT` and
+  contain no `cargo build`, `Compiling`, or crates.io download/update lines.
+- Editing `examples/add/src/lib.rs` to return `a+b+1` causes a miss, rebuilds in
+  the Function body, and returns 43 without `modal deploy`.
+- Reverting the edit either hits the previous 42 fingerprint or rebuilds safely;
+  in both cases it returns 42 and never serves a stale binary for the wrong
+  fingerprint.
+- Warm changed-source rebuild timing is recorded for the selected target-cache
+  strategy and compared against the M6 CARGO_HOME-only result.
+- `modal-rust run add --input '{"a":40,"b":2}'` uses the same smart-cache path as
+  the hand-authored shim: first invocation is a miss/build, second identical
+  invocation is an exact hit/no-cargo, and an edit causes a miss/rebuild.
+- The CLI-generated dev shim is normalized and diffed against the updated
+  smart-cache reference fixture; the diff is empty except for documented injected
+  params.
+- Cache reset is documented (`modal volume rm modal-rust-cargo-cache` or a new
+  cache namespace), and stale/corrupt cache fallback is recorded.
+
+Evidence:
+- Cold miss transcript, exact-hit transcript with no cargo lines, edit-miss
+  transcript returning 43, and revert transcript returning 42.
+- Benchmark table for Volume target-dir vs local `/tmp/target` snapshot sync, or
+  a recorded reason one strategy was rejected before full benchmarking.
+- `cargo run -p modal-rust-cli -- run add --input '{"a":40,"b":2}'` cold miss +
+  exact-hit rerun + edit miss transcripts.
+- The updated generated `dev_app.py` fixture and empty normalized diff against the
+  smart-cache reference.
+
 ## M7 - Deploy-time build (`copy=True` + `run_commands` cargo build, bake `/app/modal_runner`)
 
 Status: completed
@@ -465,7 +530,7 @@ Evidence (raw `modal run` against the `call_app.py` `main` local_entrypoint —
 
 ## M9a - modal-rust CLI is a byte-equivalent wrapper of the shims (run/deploy/call)
 
-Status: blocked (depends_on M5 and M8; M8 not yet executed, so the wrapper-equivalence claim cannot be validated yet)
+Status: completed (2026-06-03 — CLI pure-wrapper reproduces shims: run→runtime build+{"sum":42}, deploy→build-time bake (modal-rust-add-poc), call→{"sum":42} with no cargo in call log; all 3 generated shims diff-identical to prototype refs and gitignored; Modal up/responsive throughout — not blocked)
 
 risk: medium. depends_on: [M5, M8]
 
@@ -510,7 +575,7 @@ Evidence:
 
 ## M9b - `modal-rust doctor` preflight + `panic=abort` detection
 
-Status: in_progress (M0 dependency satisfied; doctor preflight + panic=abort detection not executed in the 2026-06-03 POC loop)
+Status: completed (2026-06-03 — doctor OFFLINE accurate (modal 1.3.2, creds ~/.modal.toml, cargo/rustc 1.96.0, release panic="unwind"); panic=abort detection present+correct; simulated missing-prereq → missing_prerequisite runner-envelope error exit 1; 16/16 tests, clippy+fmt clean)
 
 risk: low. depends_on: [M0]
 

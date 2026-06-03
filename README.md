@@ -9,47 +9,55 @@ problem is **Rust function discovery + remote dispatch + project packaging**,
 with a clean split between **build-at-run-time** (dev) and **build-at-deploy-time**
 (prod).
 
-> Status: **prototype gate met (M0–M8).** `examples/add` runs end-to-end on Modal:
-> the dev path compiles the mounted source *in the function body* and reflects local
-> edits, and the deploy path compiles *once at image-build time* with the deployed
-> runtime executing only the prebuilt binary (never `cargo`). The build boundary is
-> proven both ways. Remaining: M9 (the `modal-rust` CLI wrapper) and GPU. Built one
-> boundary at a time via a file-backed workpads workflow; see `workpads/prototype/`.
+> Status: **prototype complete (M0–M9).** `examples/add` runs end-to-end on Modal
+> via the `modal-rust` CLI: the dev path compiles the mounted source *in the
+> function body* and reflects local edits; the deploy path compiles *once at
+> image-build time* with the deployed runtime executing only the prebuilt binary
+> (never `cargo`). The build boundary is proven both ways. Remaining: GPU
+> (Stage 6, M10–M13). Built one boundary at a time via a file-backed workpads
+> workflow; see `workpads/prototype/`.
 
 ## Try it
-
-> The **`modal-rust` CLI doesn't exist yet** (that's milestone **M9**). Today you
-> drive what the prototype produced directly: the **`modal_runner`** binary (built
-> from `examples/add`) and the **generated Python shims** under
-> `workpads/prototype/`. The CLI will later generate those shims for you.
 
 **Prerequisites:** a Rust toolchain ([`rustup`](https://rustup.rs)) and the Modal
 CLI authenticated — `pip install modal && modal token new` (or an existing
 `~/.modal.toml`). Run everything from the repo root.
 
-**Test it locally** (offline — no Modal):
+**Install the `modal-rust` CLI** (M9 — built and validated):
+
+```bash
+cargo install --path crates/modal-rust-cli   # puts `modal-rust` on your PATH
+modal-rust doctor                            # offline preflight: modal CLI + credentials (--rust also checks cargo/rustc)
+```
+
+**Run / deploy / call** (defaults to the `add` entrypoint in `examples/add`):
+
+```bash
+modal-rust run    add --input '{"a":40,"b":2}'   # dev: mounts source, compiles IN the container -> {"ok":true,"value":{"sum":42}}
+modal-rust deploy add                            # prod: compiles once at image-build time, bakes the binary (app: modal-rust-add-poc)
+modal-rust call   add --input '{"a":40,"b":2}'   # invoke the deployed function -> {"ok":true,"value":{"sum":42}} (no recompile)
+```
+
+**Local only** (offline — no Modal):
 
 ```bash
 cargo test --workspace
-cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'
-# -> {"ok":true,"value":{"sum":42}}
+cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'   # -> {"ok":true,"value":{"sum":42}}
 ```
 
-**Run it on Modal** (source is mounted and compiled *inside* the container, then executed):
+<details><summary><b>Under the hood</b> — what the CLI generates</summary>
+
+`modal-rust` writes Python shims under `.modal-rust/generated/` and calls the
+official `modal` CLI. The same shims live (committed) under `workpads/prototype/`
+and can be driven directly without installing the CLI:
 
 ```bash
-modal run workpads/prototype/dev_app.py::main
-# builds examples/add in the container, prints {"ok":true,"value":{"sum":42}}
-# override the call (defaults to add + {"a":40,"b":2}):
-modal run workpads/prototype/dev_app.py::main --entrypoint add --input-json '{"a":2,"b":3}'
+modal run    workpads/prototype/dev_app.py::main      # == modal-rust run add
+modal deploy workpads/prototype/deploy_app.py         # == modal-rust deploy add
+modal run    workpads/prototype/call_app.py::main     # == modal-rust call add
 ```
 
-**Deploy & call** (compiles *once* at deploy time; the deployed runtime only runs the prebuilt binary, never `cargo`):
-
-```bash
-modal deploy workpads/prototype/deploy_app.py       # bakes /app/modal_runner into the image (app: modal-rust-add-poc)
-modal run    workpads/prototype/call_app.py::main    # -> {"ok":true,"value":{"sum":42}}
-```
+</details>
 
 ## The idea
 
@@ -61,13 +69,13 @@ generated runner binary     # links the user crate, dispatches by name
 remote Modal container      # runs the runner, calls the function by name
 ```
 
-The intended user experience — the `modal-rust` CLI (milestone **M9, not built
-yet**; until then use the **Current state** commands above):
+The user experience — the `modal-rust` CLI (milestone **M9, built** — see
+**Try it** above):
 
 ```bash
-modal-rust run add    --project examples/add --input-json '{"a":2,"b":40}'
-modal-rust deploy add --project examples/add --app modal-rust-add-poc
-modal-rust call   add --app modal-rust-add-poc --input-json '{"a":2,"b":40}'
+modal-rust run add    --input '{"a":2,"b":40}'
+modal-rust deploy add --app modal-rust-add-poc
+modal-rust call   add --app modal-rust-add-poc --input '{"a":2,"b":40}'
 ```
 
 The runner contract everything compiles down to:

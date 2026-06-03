@@ -325,21 +325,35 @@ NOT `panic = "abort"`.
 
 ---
 
-## 7. Cargo cache (run-path only; synthesis §2.4 cache, §1.3)
+## 7. Smart run cache (run-path only; synthesis §2.4 cache, §1.3)
 
-- `Volume.from_name("modal-rust-cargo-cache", create_if_missing=True)` at a
-  **stable** mount path; `CARGO_HOME` (index/downloads) may sit on the Volume;
-  `CARGO_TARGET_DIR` stays `/tmp/target` by default and is promoted to the Volume
-  **only** if it benchmarks net-positive and lock-safe.
-- **Correctness rule:** a cache miss only costs time, never a wrong result;
-  correctness never depends on cache state.
+Goal: `modal-rust run` should rebuild only when build inputs changed. The public
+dev-loop target is:
+
+- **Exact source-fingerprint hit:** compute a content fingerprint over the mounted
+  source after the normal ignore rules (`target`, `.git`, `.modal-rust`, generated
+  shims), plus the Rust image/toolchain, build profile, target triple, features,
+  lockfile, and runner/generator version. If
+  `/cache/run/<fingerprint>/modal_runner` exists, execute it directly and skip
+  `cargo build`.
+- **Fingerprint miss:** run `cargo build` in the Function body, but with warm
+  cache state. `CARGO_HOME` lives on the Volume. The compiled-artifact strategy
+  must be benchmarked before becoming default: either `CARGO_TARGET_DIR` directly
+  on a Volume path, or restore a cached target snapshot into `/tmp/target`, build
+  on local disk, then sync the target snapshot and freshly built `modal_runner`
+  back to the Volume after success.
+- **Correctness rule:** cache state is advisory. A hit is valid only when the
+  fingerprint manifest matches the current inputs; a miss only costs time, never a
+  wrong result.
 - Modal Volume semantics: automatic background commits "every few seconds" + a
-  final commit → explicit `vol.commit()` often unnecessary. `vol.reload()` fails
+  final commit exist, but an explicit commit after a successful build/cache-sync is
+  allowed once cargo has exited and file handles are closed. `vol.reload()` fails
   "volume busy" when files are open (cargo holds locks) — **never on the hot build
   path.**
-- **Best-effort and NOT a dependency of deploy.** Reset via `modal volume rm` / a
+- **Run-path only and NOT a dependency of deploy.** Reset via `modal volume rm` / a
   new name. Single-writer / low concurrency (v1 last-write-wins, avoid >~5
-  concurrent commits); parallel shared-cache writes out of scope for v0.
+  concurrent commits); parallel shared-cache writes out of scope for v0 unless the
+  implementation adds a proven cross-container lock or shard key.
 
 ---
 
