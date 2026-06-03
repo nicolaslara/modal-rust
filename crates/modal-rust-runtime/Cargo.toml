@@ -1,0 +1,16 @@
+[package]
+name = "modal-rust-runtime"
+version = "0.0.0"
+edition = "2021"
+description = "modal-rust runtime: Registry, typed!() macro, JSON Codec, HandlerFn, and the runner CLI protocol. Zero Modal/network/Python deps."
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

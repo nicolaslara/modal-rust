@@ -1,0 +1,20 @@
+[package]
+name = "example-add"
+version = "0.0.0"
+edition = "2021"
+description = "The modal-rust walking-skeleton example: add(a,b) plus test entrypoints exercising every runner error kind."
+publish = false
+
+[lib]
+name = "example_add"
+path = "src/lib.rs"
+
+[[bin]]
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+modal-rust-runtime = { path = "../../crates/modal-rust-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

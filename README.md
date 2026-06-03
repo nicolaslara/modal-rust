@@ -9,9 +9,11 @@ problem is **Rust function discovery + remote dispatch + project packaging**,
 with a clean split between **build-at-run-time** (dev) and **build-at-deploy-time**
 (prod).
 
-> Status: **planning / scaffolding.** This repository is operated through a
-> file-backed workpads workflow. Implementation is built one validated boundary at
-> a time. See `project.md` and `TASKS.md`.
+> Status: **early prototype.** The walking skeleton runs: `examples/add` compiles
+> and executes on Modal, and the central belief — *a normal Modal Function can
+> `cargo build` mounted Rust source at runtime* — is validated (prototype M0–M4).
+> Built one boundary at a time via a file-backed workpads workflow; see
+> `project.md`, `TASKS.md`, and `workpads/prototype/`.
 
 ## The idea
 
@@ -46,6 +48,39 @@ user error when its error type is `Serialize` (else `null`):
 ```text
 -> {"ok":false,"error":{"kind":"function_error","message":"...","details":null,"backtrace":"..."}}
 ```
+
+## Try it
+
+**Prerequisites:** a Rust toolchain ([`rustup`](https://rustup.rs)) and the Modal
+CLI authenticated — `pip install modal && modal token new` (or an existing
+`~/.modal.toml`). The Modal CLI reads your credentials itself; nothing to copy.
+
+**Test it locally** (offline — no Modal, no cost):
+
+```bash
+cargo test --workspace
+# run the function through the runner, locally:
+cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'
+# -> {"ok":true,"value":{"sum":42}}
+```
+
+**Run it on Modal** (the real thing — your source is mounted and compiled *inside*
+the container, then executed):
+
+```bash
+modal run workpads/prototype/dev_app.py::main
+# builds examples/add in the Modal container, prints {"ok":true,"value":{"sum":42}}
+```
+
+It defaults to `add` with `{"a":40,"b":2}`; override either:
+
+```bash
+modal run workpads/prototype/dev_app.py::main --entrypoint add --input-json '{"a":2,"b":3}'
+```
+
+> These are the raw generated shims under `workpads/prototype/`. The
+> `modal-rust run/deploy/call` CLI (prototype M9) will wrap them so you won't call
+> `modal` directly. Deploy/call commands are added here once M7–M8 land.
 
 ## Design stances
 

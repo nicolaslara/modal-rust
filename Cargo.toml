@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/modal-rust-runtime",
+    "examples/add",
+]
+
+# M0 build-profile constraint (boundaries.md §6): `catch_unwind` requires the
+# unwind panic strategy. A user's `panic = "abort"` would silently degrade the
+# `panic` error kind into a raw process abort. Pin unwind for the workspace so
+# the runner's panic capture is guaranteed to work.
+[profile.release]
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"

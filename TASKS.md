@@ -9,14 +9,22 @@ mid-phase.
 
 ## Active Now
 
-**architecture** — Ratify and finalize the canonical contract `boundaries.md`
-(A0–A8) against the verified research findings, resolving each `[spike: Rx]`-tagged
-decision and passing the architecture gate. The contract is drafted from the
-planning workflow's synthesis; this phase confirms it section-by-section.
+**prototype** — Build the `add` function end to end (M0–M9), validating the
+central beliefs fastest: M0 (local runner contract) → M1 (auth + control path) →
+**M2/M3/M4 (the runtime-compile-in-a-Function-body belief)** → M5/M6 (dev loop) →
+M7/M8 (deploy boundary) → M9 (CLI). Stages 0–2 (M0–M4) are the de-risking POC.
 
 The plan deliberately validates **one boundary at a time**. Do not jump ahead to
 later milestones because they look more concrete; the point is to fail fast at
-each boundary.
+each boundary. Deploy (M7/M8, persistent app) and GPU (gpu-compute) incur cost —
+confirm before spending.
+
+> **Architecture gate passed (design-complete) 2026-06-03.** `boundaries.md` is
+> complete, internally consistent, and derived from the adversarially-reviewed
+> synthesis (§2). The A0–A8 ratification is satisfied at the doc level; the two
+> genuinely *empirical* confirmations (mount writability, runtime compile) are the
+> job of prototype **M2/M4**, which run real Modal calls. We move to code now to
+> validate beliefs ASAP.
 
 > **Doc-research already done.** The multi-agent planning workflow
 > (`.claude/workflows/plan-research.js`) performed the doc-level research
@@ -37,11 +45,11 @@ each boundary.
   `copy=False` mount, Cargo-cache, the `modal-rs` capability matrix, and GPU/CUDA
   facts are recorded in `research-synthesis.md` §1 + `research/knowledge.md`. Live
   runtime-compile + mount-writability spikes are carried into prototype M2/M4.
-- [ ] **architecture** — Crate/workspace layout, runner protocol + registry API
-  (macro-compatible), the **run-vs-deploy build boundary**, generated Python shim
-  design (dev/deploy/call), CLI command surface, Cargo-cache design, ignore
-  rules. Gate: boundaries + contracts recorded; user-sensitive decisions called
-  out.
+- [x] **architecture** — Gate passed (design-complete) 2026-06-03: `boundaries.md`
+  records the crate layout, runner protocol + registry API, the **run-vs-deploy
+  build boundary**, the generated shim design (dev/deploy/call), CLI surface,
+  Cargo-cache design, and ignore rules — internally consistent and derived from the
+  reviewed synthesis. Empirical confirmation deferred to prototype M2/M4.
 - [ ] **prototype** — The `add` function end to end (M0-M9): local dispatcher ->
   generated Function control path -> source mount -> remote runtime compile ->
   source-edit reactivity -> Cargo cache -> deploy-time build -> deployed call

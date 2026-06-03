@@ -91,6 +91,14 @@ Every task needs evidence before completion. Match depth to scope:
 
 Record skipped verification in the task or `knowledge.md` with a reason.
 
+## README Currency
+
+Keep the README **Try it** section current. Whenever a milestone lands a new
+human-facing capability (run / deploy / call / GPU), update it with the exact,
+minimal test + run commands a human would type — sensible defaults, fewest flags
+required — verified against what actually works (not aspirational). The README is
+the human's entry point; agents work from `AGENTS.md`.
+
 ## Workpad Gates
 
 1. **Research gate:** `workpads/research/knowledge.md` records, with evidence,

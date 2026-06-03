@@ -68,7 +68,7 @@ on `modal-rust` wrapper lines (M9a). Probe/diagnostic targets selected with
 
 ## M0 - Local dispatcher + runner contract (no Modal) [scaffold]
 
-Status: pending
+Status: completed
 
 risk: low. depends_on: []
 
@@ -136,7 +136,7 @@ Evidence:
 
 ## M1 - Generated Modal Function runs a shell command (control path, no Rust)
 
-Status: pending
+Status: completed
 
 risk: low. depends_on: [M0]
 
@@ -167,7 +167,7 @@ Evidence:
 
 ## M2 - Source mount via `add_local_dir(copy=False)`
 
-Status: pending
+Status: completed
 
 risk: medium. depends_on: [M1]
 
@@ -200,7 +200,7 @@ Evidence:
 
 ## M3 - Rust toolchain image with Modal's Python requirement satisfied
 
-Status: pending
+Status: completed
 
 risk: medium. depends_on: [M1]
 
@@ -231,7 +231,7 @@ Evidence:
 
 ## M4 - RUNTIME COMPILE in a Function body (the key validation)
 
-Status: pending
+Status: completed
 
 risk: high. depends_on: [M0, M2, M3]
 
@@ -290,7 +290,7 @@ Evidence:
 
 ## M5 - Source-edit reactivity
 
-Status: pending
+Status: in_progress (M4 dependency satisfied; not executed in the 2026-06-03 POC loop, which stopped after M4)
 
 risk: low. depends_on: [M4]
 
@@ -315,7 +315,7 @@ Evidence (raw `modal run` against the `main` local_entrypoint — `--input-json`
 
 ## M6 - Cargo-cache Volume (best-effort dev-iteration speedup)
 
-Status: pending
+Status: in_progress (best-effort; M4 dependency satisfied with a 9.34s cold baseline recorded; cache benchmark not executed in the 2026-06-03 POC loop)
 
 risk: medium. depends_on: [M4]
 
@@ -368,7 +368,7 @@ Evidence:
 
 ## M7 - Deploy-time build (`copy=True` + `run_commands` cargo build, bake `/app/modal_runner`)
 
-Status: pending
+Status: in_progress (M4 dependency satisfied; deploy-time build not executed in the 2026-06-03 POC loop, which stopped after M4)
 
 risk: high. depends_on: [M4]
 
@@ -409,7 +409,7 @@ Evidence:
 
 ## M8 - Deployed runtime does NOT compile (the deploy invariant)
 
-Status: pending
+Status: blocked (depends_on M7, which has not been executed yet)
 
 risk: medium. depends_on: [M7]
 
@@ -465,7 +465,7 @@ Evidence (raw `modal run` against the `call_app.py` `main` local_entrypoint —
 
 ## M9a - modal-rust CLI is a byte-equivalent wrapper of the shims (run/deploy/call)
 
-Status: pending
+Status: blocked (depends_on M5 and M8; M8 not yet executed, so the wrapper-equivalence claim cannot be validated yet)
 
 risk: medium. depends_on: [M5, M8]
 
@@ -510,7 +510,7 @@ Evidence:
 
 ## M9b - `modal-rust doctor` preflight + `panic=abort` detection
 
-Status: pending
+Status: in_progress (M0 dependency satisfied; doctor preflight + panic=abort detection not executed in the 2026-06-03 POC loop)
 
 risk: low. depends_on: [M0]
 

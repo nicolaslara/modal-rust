@@ -195,3 +195,135 @@ M0–M3). Record the empirical answer when a milestone resolves it.
 - **GPU / deploy cost confirmation** (§4 Q1): require an explicit `--yes` for
   persistent deploys and any GPU run, with a per-run cost note. (Cost-sensitive —
   confirm with the user before persistent/GPU spend.)
+
+## POC validation (2026-06-03)
+
+First empirical loop. M0 through M4 executed and all PASS; M5–M9b not run this
+loop (M4 was the stopping point). Git untouched throughout.
+
+### CENTRAL VERDICT
+
+**YES — runtime-compile-in-a-Function-body works.** A single
+`modal run dev_app.py::main --entrypoint add --input-json '{"a":40,"b":2}'` showed
+the in-body `cargo build` (`Compiling example-add` + `Finished in 9.34s`) AND
+returned `{"ok":true,"value":{"sum":42}}` from the freshly-compiled-in-Function-body
+binary. M4 returned sum=42 from a fresh build. The hypothesis that decides the
+architecture is confirmed on the direct path.
+
+**Sandbox fallback: NOT indicated.** Direct `@app.function` execution succeeded; the
+documented Sandbox fallback (stance 1) is not needed. The one error during the loop
+was a transient `DEADLINE_EXCEEDED` gRPC control-plane auth timeout during teardown
+of the `{}` run, which occurred AFTER the envelope was already returned — infra
+noise, not a build/runner failure.
+
+### M0 — local runner contract (pass)
+
+Full runner protocol validated locally, no Modal. Gates green: `cargo fmt --check`
+clean, `cargo clippy --all-targets --all-features -- -D warnings` clean,
+`cargo test --workspace` 13/13 pass.
+- Success: `add {"a":40,"b":2}` → `{"ok":true,"value":{"sum":42}}`, exit 0, exactly
+  one stdout envelope.
+- All five frozen error kinds verified with correct frozen envelopes + non-zero exit:
+  `unknown_entrypoint`; `decode_error` (both malformed `not-json` AND wrong-shape
+  `{"a":1}`); `function_error` with null `details` (`fail`) AND populated `details`
+  (`fail_structured` → `details:{"code":42,...}`, confirming the Serialize-details
+  path); `encode_error` (the "key must be a string" case — surfaced as `encode_error`,
+  NOT `panic`); `panic` with a non-empty backtrace.
+- Precedence: malformed JSON + bad entrypoint → `decode_error` (top-level parse
+  precedes entrypoint lookup), as frozen.
+- Runner seams: `--input-file` and `--input-stdin` both → 42.
+- Release profile confirmed `panic = "unwind"`; a release build also produces the
+  `panic` kind (so `catch_unwind` upgrades panics in release, not just debug).
+
+### M1 — Python-shim control path (pass)
+
+`control` target authenticated via `~/.modal.toml` and printed the remote
+`uname -a`: `Linux modal 4.4.0 #1 SMP Sun Jan 10 15:06:54 PST 2016 x86_64
+GNU/Linux`. The Modal control plane (auth, app authoring, subprocess, result
+marshalling) and CLI-arg routing via a `@app.local_entrypoint()` work end to end.
+Full `dev_app.py` written at
+`/Users/nicolas/devel/modal-rust/workpads/prototype/dev_app.py` carrying all four
+milestone targets: `control` (M1), `mount` (M2), `toolchain` (M3), and
+`run_entrypoint`/`main` (M4).
+- Contract note: the design (tasks.md M1 acceptance) permits proving arg-routing via
+  a matching `@app.local_entrypoint()`; here `control` is the bare `@app.function`
+  body and `control_main` is the printing local_entrypoint. Acceptance met as
+  designed.
+
+### M2 — source mount + writability (pass)
+
+`modal run dev_app.py::mount_main` mounted source at startup (not as an image layer).
+- `target/` and `.git` ABSENT remotely — client-side `ignore` applied (only
+  `/src/.gitignore` present).
+- Remote sha256 of `/src/Cargo.toml` =
+  `e5432ef8e279eccd8fc747900adacf37721ab91ac27441dc365150ff274b8bb1`, byte-equal to
+  the local `shasum` of `/Users/nicolas/devel/modal-rust/Cargo.toml`.
+- **Mount writability: WRITABLE.** The biggest unverified assumption is resolved —
+  the `copy=False` mount is writable in place. This unblocks the M4 build location:
+  M4 may build in `/src` directly with `CARGO_TARGET_DIR=/tmp/target` (no read-only
+  `cp -a /src /tmp/build` detour needed). Modal run URL:
+  `https://modal.com/apps/nicolaslara/main/ap-ga93PfaAx0Np8869d0gIHb`.
+- Contract divergence (surfaced to orchestrator, acceptance satisfied either way):
+  tasks.md M2 describes the probe as `mount_probe` at `/workspace` with
+  `ignore=['target','.git']`; the actual fixture implements it as `mount`/`mount_main`
+  at `/src` with `ignore=["target",".git",".modal-rust","**/*.rlib"]`. The fixture's
+  actual target was run.
+
+### M3 — Rust+Python toolchain image (pass)
+
+Image `rust:1-slim + add_python="3.12"` hosts BOTH the Rust toolchain and Modal's
+Python runtime: cargo 1.96.0, rustc 1.96.0, Python 3.12.1 (`python`/`python3` resolve
+to `/usr/local/bin`). The Function started cleanly via
+`modal run dev_app.py::toolchain_probe`.
+- Negative control confirmed: bare `rust:1-slim` WITHOUT `add_python` fails as an
+  invalid Function image (`ConflictError`) — `add_python` is mandatory, as expected.
+- Probe-shim gotcha discovered and worked around: (a) the `::NAME` selector matches
+  the entrypoint's **Python function name**, not its registered `name=` tag; and (b) a
+  function + entrypoint sharing the same Python name silently shadows the Function (its
+  `.remote` is lost), so a naive collision "completes" with ZERO probe output. Working
+  pattern: the `@app.local_entrypoint()` is Python-named `toolchain_probe` and calls a
+  distinctly-named bare `@app.function` `_toolchain_probe_fn.remote()`. New file:
+  `/Users/nicolas/devel/modal-rust/workpads/prototype/dev_app_no_python.py` (negative
+  control). This naming hazard should inform the M9a shim generator.
+
+### M4 — runtime compile in Function body (pass — THE key validation)
+
+See CENTRAL VERDICT above. Detail:
+- Invocation: `modal run …/dev_app.py::main --entrypoint add --input-json
+  '{"a":40,"b":2}'` (disambiguated with `::main` because the shim hosts multiple
+  local_entrypoints — `control_main`, `mount_main`, `toolchain_probe`, `main`; `main`
+  is exactly the contract's `main(entrypoint, input_json)`). Single log showed BOTH
+  the cargo build AND `{"ok":true,"value":{"sum":42}}`.
+- **Build location:** built in-place in the writable `/src` mount (per the M2
+  WRITABLE result) with `CARGO_TARGET_DIR=/tmp/target` and `CARGO_HOME=/tmp/cargo` —
+  a local writable path, NOT a Volume (Modal review HIGH #2 honored).
+- Failure propagation: `--entrypoint will_panic` propagated a structured `panic`
+  envelope; `{}` (empty input) propagated `decode_error` — never silent success.
+- `timeout=1800` set on `run_entrypoint`.
+
+### Observed image / build timing
+
+- **Cold first-build wall-clock: ~9.34s** (`Compiling example-add` → `Finished in
+  9.34s`). This is the M6 cache-speedup baseline. Small dep graph — cold-start build
+  latency is far from the 1800s timeout for `add`; larger dep graphs remain the open
+  risk M6 should probe.
+- Mount applies client-side `ignore` at startup; uploaded bytes small (only source,
+  target/.git excluded). Exact byte/wall-clock for the mount upload not separately
+  captured this loop (early signal, non-gating per M2).
+
+### Mount-writability result
+
+**WRITABLE** in place (M2 write-probe). Consequence for downstream: M4 built directly
+in `/src`; M6's target-dir caching is on the writable-in-place branch (both
+`CARGO_HOME` and `CARGO_TARGET_DIR` are candidates for Volume warming) rather than the
+read-only `cp -a` cliff branch.
+
+### Not executed this loop (M5–M9b)
+
+M5 (source-edit reactivity), M6 (cache Volume, best-effort), M7 (deploy-time build),
+M8 (deploy no-compile invariant), M9a (CLI wrapper byte-equivalence), M9b (`doctor`
+preflight + `panic=abort` detection) were not run; the loop stopped after the M4
+central validation. The deploy half of the build boundary (cargo in deploy log,
+ABSENT from call log) remains UNPROVEN — the gate is not yet met. M5/M6/M7/M9b have
+their dependencies satisfied and are ready to run next; M8 and M9a are blocked on M7
+and M8 respectively.
