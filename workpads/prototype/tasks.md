@@ -372,7 +372,7 @@ Evidence:
 
 ## M6b - Smart run compilation cache (required dev-velocity follow-up)
 
-Status: planned
+Status: completed (2026-06-03 — sccache artifact-cache experiment ran + benchmarked with a recorded decision; the warm wall-clock speedup is null/negative on `add`'s tiny 16-crate graph — that modest/null result is still a completed experiment, not a failure: cache CORRECTNESS is perfect (cold 0/16 hits; warm-unchanged 16/0 = 100% hits, 0 recompiles; edit 15/16 = 93.75%, only edited crate rebuilt), and a miss only ever cost time. DECISION recorded in knowledge.md: wire sccache behind an opt-in `--cache` flag, OFF by default, paired with a local-SCCACHE_DIR + Volume-snapshot-sync strategy before promotion — see follow-up task M6b-wire below)
 
 risk: high. depends_on: [M5, M6]
 
@@ -430,6 +430,46 @@ Evidence:
   exact-hit rerun + edit miss transcripts.
 - The updated generated `dev_app.py` fixture and empty normalized diff against the
   smart-cache reference.
+
+## M6b-wire - Wire sccache into the CLI dev_app template behind `--cache` (follow-up)
+
+Status: planned
+
+risk: medium. depends_on: [M6b]
+
+Follow-up arising from the M6b DECISION (knowledge.md "M6b — sccache dev cache
+(2026-06-03)"): the sccache experiment proved cache correctness (warm-unchanged
+100% rustc cache-hit / 0 recompile; a miss only ever costs time, never a wrong
+result), so it is safe to expose — but the direct Volume-`SCCACHE_DIR` wiring is
+net-negative-warm on `add`'s tiny 16-crate graph and a dev-UX regression if
+defaulted on. It plausibly becomes a large win on dependency-heavy crates (per-crate
+compile >> per-object Volume fetch), which is exactly the audience an opt-in flag
+targets. DO NOT default sccache on. (Not implemented in M6b — recorded here as the
+explicit follow-up; do not implement under M6b.)
+
+Design target:
+- Add an explicit `--cache` (a.k.a. `--sccache`) flag to `modal-rust run` (and
+  consider `deploy`), OFF by default. When absent, the generated dev shim stays
+  byte-identical to the prototype `dev_app.py` reference (preserve the M9a
+  byte-equivalence invariant — the cache path differs from the no-cache shim ONLY by
+  the injected sccache wiring, mirroring how `--gpu` injects only a `gpu=` kwarg).
+- Pair sccache with the conservative strategy before promotion: point `SCCACHE_DIR`
+  at LOCAL disk and snapshot-restore the (small) cache dir to/from the Volume around
+  the build, instead of letting sccache read/write each object over the network FS
+  during compilation (the §7 snapshot-restore pattern). Benchmark this against the
+  direct Volume-`SCCACHE_DIR` path before defaulting either on.
+- Keep the run-vs-deploy boundary unchanged: deploy/call never invoke cargo or
+  mount the sccache Volume.
+
+Acceptance:
+- `modal-rust run add --input '{"a":40,"b":2}' --cache` uses the sccache path
+  (RUSTC_WRAPPER + SCCACHE_DIR), returns `{"sum":42}`, and prints sccache stats.
+- Without `--cache`, the generated dev shim diffs empty against the prototype
+  `dev_app.py` reference (M9a byte-equivalence holds).
+- A benchmark of local-SCCACHE_DIR + Volume-snapshot-sync vs direct
+  Volume-SCCACHE_DIR is recorded; the default-on/-off choice is justified by it.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  and `cargo test` clean for the CLI crate (new flag + shim-injection guards).
 
 ## M7 - Deploy-time build (`copy=True` + `run_commands` cargo build, bake `/app/modal_runner`)
 

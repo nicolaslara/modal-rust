@@ -639,3 +639,86 @@ invariant. Full GPU-side detail is mirrored in
   Tesla T4 (Driver 580.95.05, CUDA 13.0). First try, no git touched.
 - **Files:** `crates/modal-rust-cli/src/{templates.rs,workspace.rs,main.rs}`,
   `crates/modal-rust-cli/src/templates/{dev_app,deploy_app,call_app}.py.tmpl`.
+
+### M6b — sccache dev cache (2026-06-03)
+
+**Status: COMPLETED experiment** — the sccache artifact-cache spike ran, was
+cold/warm/edit-benchmarked, and ends with a recorded DECISION. The honest net
+speedup is null/negative on `add`'s tiny graph; that modest/null result is still a
+completed experiment (the mechanism is proven correct), not a failure.
+
+**Approach (vs M6's CARGO_HOME-only path):** M6 warmed only `CARGO_HOME`
+(crates.io index + downloads) on a Volume, so it saved download time but NEVER
+compile time — hence M6's accepted null. M6b instead caches COMPILED ARTIFACTS:
+`sccache` as `RUSTC_WRAPPER` with `SCCACHE_DIR` on a dedicated Modal Volume
+(`modal-rust-sccache`). sccache is content-addressable, so it sidesteps cargo's
+single-writer target-dir + network-FS locking that defeats a Volume-mounted
+`CARGO_TARGET_DIR`. `CARGO_TARGET_DIR` stays on local `/tmp`; only the
+content-addressed object cache lives on the Volume. sccache installed at
+image-build time via the prebuilt static musl binary (v0.15.0), NOT `cargo
+install`. Shim: `workpads/prototype/dev_app_sccache.py`.
+
+Goal (tasks.md M6b, boundaries.md §7): cache COMPILED ARTIFACTS so a warm `run`
+rebuild skips recompiling unchanged crates — fixing M6's null result (M6 warmed only
+CARGO_HOME/downloads, never compile time). Approach: `sccache` as `RUSTC_WRAPPER`,
+`SCCACHE_DIR` on a Modal Volume (`modal-rust-sccache`), content-addressable so it
+sidesteps cargo's single-writer target-dir + network-FS locking. CARGO_TARGET_DIR
+stays on local `/tmp`; only the content-addressed objects live on the Volume.
+sccache installed via prebuilt static musl binary (v0.15.0) at image-build time
+(fast — NOT `cargo install`). Shim: `workpads/prototype/dev_app_sccache.py`.
+
+Cache RESET first for a true cold run 1: `modal volume delete modal-rust-sccache --yes`
+(recreated empty by `create_if_missing=True`). All three runs returned
+`{"ok":true,"value":{"sum":42}}`. The run-3 edit was `sum: input.a + input.b + 0`
+(forces an `example-add` recompile but keeps the result 42), reverted via
+`git checkout -- examples/add/src/lib.rs` (tree clean, verified).
+
+| run | scenario | sccache hits/misses | hit rate | in-body cargo build | total wall-clock (real) | result |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | COLD (empty volume) | 0 / 16 (16 compilations) | 0.00 % | 25.41s | 33.09s | 42 ✓ |
+| 2 | WARM, no source change | 16 / 0 (0 compilations) | 100.00 % | 139.13s | 149.21s | 42 ✓ |
+| 3 | WARM + 1-line edit | 15 / 1 (1 compilation) | 93.75 % | 7.93s | 15.90s | 42 ✓ |
+
+**Honest verdict: sccache's cache CORRECTNESS is perfect — exactly the predicted
+hit pattern (cold all-miss; warm-unchanged 100% hits, 0 recompiles; edit hits the 15
+deps + recompiles only the edited crate). But the warm wall-clock speedup is NEGATIVE
+for this tiny crate.** Run 2 hit 100% of cache entries yet was ~4.5x SLOWER than the
+cold run (139s vs 25s build). Cause: `SCCACHE_DIR` is on a Modal Volume (network FS);
+reading 16 cached objects back over the network FS, plus sccache server round-trips,
+costs far more than just locally recompiling a 16-crate graph. For `add` (≈16 small
+crates, each compiling in well under a second), recompilation is cheaper than a
+network-FS cache fetch — so the cache "works" but loses on net time.
+
+Comparison to the M6 baseline (cold ~14s, warm null/neutral 29s, CARGO_HOME-only):
+sccache adds real artifact caching (M6 had none) and proves correctness, but on this
+graph it is **net-negative warm and only modestly positive on the edit path** (run 3
+at 15.9s real beats the cold 33.1s — incremental edits are where it helps, because
+only 1 of 16 crates recompiles). Even run 3's win is partly the local recompile being
+cheap, not the cache fetch being fast.
+
+**Where this WOULD pay off:** a real dependency-heavy project (hundreds of crates,
+multi-minute cold builds) inverts the economics — fetching a cached `.o` over the
+network is far cheaper than recompiling a crate that takes seconds-to-minutes, so a
+100%-hit warm rebuild would be dramatically faster. The `add` POC is precisely the
+worst case for any non-local cache: per-crate compile cost ≈ per-object fetch cost.
+
+**Mitigation that would likely flip this positive even for small graphs:** keep
+sccache but point `SCCACHE_DIR` at LOCAL disk and sync the (small) cache dir
+to/from the Volume around the build (snapshot-restore), instead of having sccache
+read/write each object over the network FS during compilation — same conservative
+pattern §7 already prescribes for the target-dir snapshot strategy. Not benchmarked
+this loop.
+
+**DECISION: do NOT wire sccache on by default. Wire it behind an explicit
+`--cache`/`--sccache` flag, OFF by default, and pair it with the local-SCCACHE_DIR +
+Volume-snapshot-sync strategy before promoting it.** Rationale: (1) correctness is
+proven and a miss only ever costs time (never a wrong result — `RUSTC_WRAPPER` is
+transparent and errors loudly), so it is safe to expose; (2) the direct
+Volume-`SCCACHE_DIR` wiring tested here is net-negative for small graphs and is a dev
+UX regression if defaulted on; (3) it is plausibly a large win for real
+dependency-heavy crates, which is exactly the audience a `--cache` flag targets.
+This is an experiment with an honestly-modest/mixed result for the POC crate — not an
+overclaim. Reset documented: `modal volume delete modal-rust-sccache --yes`.
+
+- Logs: `/tmp/sccache_run1_cold.log`, `/tmp/sccache_run2_warm.log`,
+  `/tmp/sccache_run3_edit.log`. Modal up/responsive throughout; no git committed.
