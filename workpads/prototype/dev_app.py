@@ -41,6 +41,10 @@ import modal
 APP_NAME = "modal-rust-poc-dev"
 RUST_VER = "1"
 LOCAL_SRC = "/Users/nicolas/devel/modal-rust"
+# The cargo PACKAGE to build (`-p <pkg>`). Required because multiple workspace
+# members share the `modal_runner` bin name, so a bare `--bin modal_runner` is
+# AMBIGUOUS; the CLI derives this from the `--project`'s `[package].name`.
+PACKAGE = "example-add"
 REMOTE_SRC = "/src"
 
 app = modal.App(APP_NAME)
@@ -183,10 +187,12 @@ def run_entrypoint(entrypoint: str, input_json: str) -> str:
         # cp -a preserves attributes; equivalent to shutil.copytree with symlinks.
         subprocess.run(["cp", "-a", REMOTE_SRC, build_dir], check=True)
 
-    # cargo build --release --bin modal_runner; all logs -> stderr (stdout stays a
-    # single JSON envelope, per the runner seam §2.2).
+    # cargo build --release -p <pkg> --bin modal_runner; all logs -> stderr (stdout
+    # stays a single JSON envelope, per the runner seam §2.2). The `-p PACKAGE` is
+    # load-bearing: the `modal_runner` bin name is shared across workspace members,
+    # so the package must be named to disambiguate the build target.
     build = subprocess.run(
-        ["cargo", "build", "--release", "--bin", "modal_runner"],
+        ["cargo", "build", "--release", "-p", PACKAGE, "--bin", "modal_runner"],
         cwd=build_dir,
         env=env,
         stdout=sys.stderr,
@@ -195,6 +201,7 @@ def run_entrypoint(entrypoint: str, input_json: str) -> str:
     if build.returncode != 0:
         raise RuntimeError(f"cargo build failed with exit code {build.returncode}")
 
+    # The package-qualified build still lands the bin in the shared target dir.
     runner = "/tmp/target/release/modal_runner"
 
     # Write the input to /tmp/in.json and feed the runner via --input-file (avoids
@@ -300,11 +307,12 @@ def run_entrypoint_cached(entrypoint: str, input_json: str) -> str:
             shutil.rmtree(build_dir)
         subprocess.run(["cp", "-a", REMOTE_SRC, build_dir], check=True)
 
-    # cargo build --release --bin modal_runner; logs -> stderr (stdout stays one
-    # JSON envelope). Time it so the cold-vs-warm wall-clock is recorded in-band.
+    # cargo build --release -p <pkg> --bin modal_runner; logs -> stderr (stdout stays
+    # one JSON envelope). The `-p PACKAGE` disambiguates the shared `modal_runner`
+    # bin across workspace members. Time it so cold-vs-warm wall-clock is in-band.
     t0 = time.monotonic()
     build = subprocess.run(
-        ["cargo", "build", "--release", "--bin", "modal_runner"],
+        ["cargo", "build", "--release", "-p", PACKAGE, "--bin", "modal_runner"],
         cwd=build_dir,
         env=env,
         stdout=sys.stderr,

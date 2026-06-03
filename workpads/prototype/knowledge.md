@@ -599,3 +599,43 @@ The M0-R follow-up is resolved in `crates/modal-rust-runtime/src/lib.rs`
 - **Gates green (default-members, OFFLINE).** `cargo fmt --check` exit 0; `cargo
   clippy --all-targets -- -D warnings` exit 0 (0 warnings); `cargo test` all suites
   green (runtime crate 11 passed, 0 ignored).
+
+### CLI package-qualified shim build + `--gpu` passthrough (2026-06-03, completed)
+
+Two CLI changes landed on top of M9a, both preserving the byte-equivalent-wrapper
+invariant. Full GPU-side detail is mirrored in
+`workpads/gpu-compute/knowledge.md` (same dated note).
+
+- **Package-qualified shim build (`-p <pkg>` derived from `--project`) — fixes the
+  multiple-`modal_runner`-bins regression.** Four workspace members
+  (`example-add`, `example-add-macro`, `example-burn-add`,
+  `example-cuda-vector-add`) each expose a `modal_runner` bin, so the bare
+  `cargo build --release --bin modal_runner` the shims used to emit became
+  ambiguous and failed. The CLI now derives `PACKAGE` from `--project` (e.g.
+  `examples/add` → `example-add`) and the generated shims build
+  `cargo build --release -p <PACKAGE> --bin modal_runner` (in dev `run_commands`
+  and deploy `run_commands` alike). The ambiguous bare `--bin modal_runner` was
+  removed from both templates AND the prototype `dev_app.py`/`deploy_app.py` refs.
+  `example-burn-add` is excluded from `default-members` (CUDA-only) — expected and
+  correct; `-p example-burn-add` still resolves on a CUDA host / Modal because it
+  stays a workspace member.
+- **`run`/`deploy` accept `--gpu <spec>` (verbatim passthrough).** When present,
+  the spec lands as a `gpu="<spec>"` kwarg on the work `@app.function` only (no GPU
+  catalog re-implemented — a bad type surfaces Modal's own error). When absent, no
+  `gpu=` kwarg is emitted, so the no-GPU shims stay byte-identical to the prototype
+  refs. The GPU shim differs from no-GPU ONLY by the injected `gpu=` kwarg — no
+  other byte changes; runner seam (`--input-file /tmp/in.json`, single stdout
+  envelope) and the call-time exec-only-`/app/modal_runner` invariant unchanged.
+- **Gates green (default-members, package-qualified).** `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, and `cargo test` all exit 0; new
+  guards: `dev_shim_injects_package_qualified_build`,
+  `deploy_shim_injects_package_qualified_build`,
+  `dev_shim_no_gpu_kwarg_when_absent`, `dev_shim_injects_gpu_kwarg_verbatim`,
+  `deploy_shim_injects_gpu_kwarg_verbatim`, plus the dev/deploy/call
+  byte-equivalence checks.
+- **Modal acceptance PASSED (not blocked, not retry-pending).** `run add` built
+  `-p example-add` cleanly → `{"ok":true,"value":{"sum":42}}`;
+  `run gpu_info --gpu T4` → envelope `exit_code:0` with `nvidia-smi` showing a
+  Tesla T4 (Driver 580.95.05, CUDA 13.0). First try, no git touched.
+- **Files:** `crates/modal-rust-cli/src/{templates.rs,workspace.rs,main.rs}`,
+  `crates/modal-rust-cli/src/templates/{dev_app,deploy_app,call_app}.py.tmpl`.

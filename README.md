@@ -9,13 +9,15 @@ problem is **Rust function discovery + remote dispatch + project packaging**,
 with a clean split between **build-at-run-time** (dev) and **build-at-deploy-time**
 (prod).
 
-> Status: **prototype complete (M0–M9).** `examples/add` runs end-to-end on Modal
-> via the `modal-rust` CLI: the dev path compiles the mounted source *in the
-> function body* and reflects local edits; the deploy path compiles *once at
-> image-build time* with the deployed runtime executing only the prebuilt binary
-> (never `cargo`). The build boundary is proven both ways. Remaining: GPU
-> (Stage 6, M10–M13). Built one boundary at a time via a file-backed workpads
-> workflow; see `workpads/prototype/`.
+> Status: **prototype + GPU + macros validated (M0–M13, E1).** `examples/add` runs
+> end-to-end via the `modal-rust` CLI (`run`/`deploy`/`call`/`doctor`, with `--gpu`
+> passthrough): dev compiles the mounted source *in the function body*, deploy
+> compiles *once at image-build time* (the runtime never runs `cargo`), and the GPU
+> path is proven on a T4 (`nvidia-smi` → cudarc vector-add → Burn tensor add). A
+> `#[modal_rust::function]` proc-macro registry compiles to the same runner shape.
+> Remaining (optional/polish): a faster run-compilation cache (M6b), a PyO3 bridge
+> (E3), and the exploratory shim-backend. Built one boundary at a time via a
+> file-backed workpads workflow; see `workpads/`.
 
 ## Try it
 
@@ -45,7 +47,7 @@ cargo test                                                                      
 cargo run -p example-add --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'   # -> {"ok":true,"value":{"sum":42}}
 ```
 
-**GPU** (validated on a T4; runs via the raw shim — `--gpu` wiring in the CLI is a follow-up):
+**GPU** (validated on a T4; `--gpu <spec>` is now wired into `modal-rust run`/`deploy` — passed through to Modal verbatim — and these raw shims still work directly):
 
 ```bash
 modal run workpads/gpu-compute/gpu_app.py::smi_py            # nvidia-smi on a T4

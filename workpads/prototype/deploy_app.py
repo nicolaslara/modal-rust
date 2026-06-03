@@ -30,6 +30,11 @@ import modal
 # baked binary survives until an explicit redeploy.
 app = modal.App("modal-rust-add-poc")
 
+# The cargo PACKAGE to build (`-p <pkg>`). Required because multiple workspace
+# members share the `modal_runner` bin name, so a bare `--bin modal_runner` is
+# AMBIGUOUS; the CLI derives this from the `--project`'s `[package].name`.
+PACKAGE = "example-add"
+
 # Deploy image — the build boundary lives HERE, in image layers:
 #   - from_registry("rust:1-slim", add_python="3.12"): the Rust toolchain image with
 #     Modal's MANDATORY Python runtime (a bare rust: image is an invalid Function
@@ -56,7 +61,10 @@ image = (
         ignore=["target", ".git", ".modal-rust", "**/*.rlib"],
     )
     .run_commands(
-        "cd /app/src && cargo build --release --bin modal_runner",
+        # `-p PACKAGE` disambiguates the `modal_runner` bin shared across workspace
+        # members. The package-qualified build still lands the bin in the shared
+        # target dir, so the cp source path below is unchanged.
+        f"cd /app/src && cargo build --release -p {PACKAGE} --bin modal_runner",
         "cp /app/src/target/release/modal_runner /app/modal_runner && chmod +x /app/modal_runner",
     )
 )

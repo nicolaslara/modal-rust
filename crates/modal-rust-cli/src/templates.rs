@@ -7,10 +7,12 @@
 //! params) — the M9a byte-equivalence guard (tasks.md M9a, boundaries.md §5/§8).
 //!
 //! The injected params are exactly the documented normalization set: the app name,
-//! the `RUST_VER` pin, and the local/manifest source path. The entrypoint name and
+//! the `RUST_VER` pin, the local/manifest source path, the cargo `package` to build
+//! (`-p <pkg>`, disambiguating the shared `modal_runner` bin — boundaries.md §8),
+//! and the optional `gpu=` passthrough (boundaries.md §9). The entrypoint name and
 //! the input are NOT baked into the shim text — they flow in at `modal run` time as
 //! `--entrypoint` / `--input-json` against the `main` local_entrypoint, so the shim
-//! body is fully parameterized by app name / rust version / source path only.
+//! body is parameterized by app name / rust version / source path / package / gpu.
 //!
 //! The CLI is a **pure wrapper**: it introduces no new Modal capability and these
 //! templates must stay byte-equivalent to the prototype shims across milestones.
@@ -30,6 +32,29 @@ pub struct ShimParams {
     pub rust_ver: String,
     /// The cargo WORKSPACE ROOT mounted as `/src` (run) or `/app/src` (deploy).
     pub local_src: String,
+    /// The cargo PACKAGE name (`[package].name`) the shim builds with `-p <pkg>`
+    /// (prototype: `example-add`). Required because multiple workspace members
+    /// share the `modal_runner` bin name, so a bare `--bin modal_runner` is
+    /// ambiguous (boundaries.md §8; the run/deploy regression this fixes).
+    pub package: String,
+    /// The optional `--gpu <spec>` passed through VERBATIM into the work
+    /// function's `@app.function(...)` decorator (boundaries.md §9). `None` = CPU
+    /// (no `gpu=` kwarg, unchanged); `Some(spec)` injects `gpu="<spec>"`. The CLI
+    /// does NOT validate the catalog — Modal surfaces any error.
+    pub gpu: Option<String>,
+}
+
+impl ShimParams {
+    /// Render the `{{GPU_KWARG}}` placeholder: a leading-comma `, gpu="<spec>"`
+    /// suffix when `--gpu` is set (verbatim passthrough, §9), or the empty string
+    /// when absent (CPU; the decorator is unchanged and byte-equivalent to the
+    /// prototype).
+    fn gpu_kwarg(&self) -> String {
+        match &self.gpu {
+            Some(spec) => format!(", gpu=\"{spec}\""),
+            None => String::new(),
+        }
+    }
 }
 
 /// Render the `run` / dev shim (the M4 runtime-build form). Byte-equivalent to
@@ -39,6 +64,8 @@ pub fn dev_app(p: &ShimParams) -> String {
         .replace("{{APP_NAME}}", &p.dev_app_name)
         .replace("{{RUST_VER}}", &p.rust_ver)
         .replace("{{LOCAL_SRC}}", &p.local_src)
+        .replace("{{PACKAGE}}", &p.package)
+        .replace("{{GPU_KWARG}}", &p.gpu_kwarg())
 }
 
 /// Render the `deploy` shim (build-time build, baked `/app/modal_runner`).
@@ -48,6 +75,8 @@ pub fn deploy_app(p: &ShimParams) -> String {
         .replace("{{APP_NAME}}", &p.deploy_app_name)
         .replace("{{RUST_VER}}", &p.rust_ver)
         .replace("{{LOCAL_SRC}}", &p.local_src)
+        .replace("{{PACKAGE}}", &p.package)
+        .replace("{{GPU_KWARG}}", &p.gpu_kwarg())
 }
 
 /// Render the `call` shim (`Function.from_name(...).remote()`). Byte-equivalent to

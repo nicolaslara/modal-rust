@@ -276,16 +276,64 @@ Tier-1 CUDA image with `libnvrtc`/`libcudart` present and all
 (`nvidia-smi` from Python then Rust) are recorded as the prerequisite
 observation steps. GPU type (T4) + per-run cost recorded for every milestone.
 
-**Follow-up (not blocking the gate):** these validations were driven via direct
-`modal run` / per-example `modal_runner` builds and `gpu_app.py`, not yet through
-the first-class CLI surface. Wire the GPU path into the `modal-rust` CLI:
-(a) `run --gpu <type>` passthrough (verbatim, with the `--yes` cost confirmation
-+ per-run cost note from §4 Q1), and (b) multi-example package-qualified
-(`-p <example>`) builds so `gpu_info` / `cuda_vector_add` / `burn_add` can be
-invoked as `cargo run -p modal-rust-cli -- run <entrypoint> --gpu T4 …` per the
-M11/M12/M13 acceptance commands. The M12 PTX-sanitize (ASCII-only,
-strip-to-`.version`) and the Tier-1 `*-devel-*`-headers requirement should be
-captured as guardrails when that wiring lands.
+**Follow-up — DONE (2026-06-03): `--gpu` is wired into the CLI + package-qualified
+shim build.** ~~these validations were driven via direct `modal run` /
+per-example `modal_runner` builds and `gpu_app.py`, not yet through the
+first-class CLI surface.~~ Both halves of this follow-up have landed (see the
+2026-06-03 dated note below): (a) `run`/`deploy` now accept `--gpu <spec>` with
+verbatim passthrough (no GPU-catalog re-implementation), and (b) the generated
+shim build is package-qualified (`-p <pkg>` derived from `--project`) so
+multi-example entrypoints build cleanly. Verified by acceptance + the three
+local gates. The M12 PTX-sanitize (ASCII-only, strip-to-`.version`) and the
+Tier-1 `*-devel-*`-headers requirement remain as guardrails for the GPU-example
+recipes (still tracked here; orthogonal to the CLI wiring, which is generic).
+
+### CLI `--gpu` passthrough + package-qualified shim build (2026-06-03, completed)
+
+The `modal-rust` CLI now wires the GPU path end-to-end, resolving the two
+follow-ups above. Decisions + evidence recorded:
+
+- **Package-qualified shim build (`-p <pkg>` from `--project`).** The generated
+  dev/deploy shims now build the runner with `cargo build --release -p <pkg>
+  --bin modal_runner`, where `<pkg>` is derived from the `--project` path (e.g.
+  `--project examples/add` → `PACKAGE = "example-add"`). This fixes the
+  **multiple-`modal_runner`-bins regression**: 4 workspace members (`example-add`,
+  `example-add-macro`, `example-burn-add`, `example-cuda-vector-add`) all expose a
+  `modal_runner` bin, so a bare `--bin modal_runner` was ambiguous and failed.
+  The ambiguous bare-`--bin modal_runner` build was removed from both templates
+  and prototype refs. Note: `example-burn-add` is excluded from `default-members`
+  (CUDA-only) — expected/correct per the workspace config; the
+  `-p example-burn-add` shim build still works on a CUDA host / Modal since it
+  remains a workspace member.
+- **`run`/`deploy` accept `--gpu <spec>` (verbatim passthrough).** The spec string
+  passes through unchanged onto the work `@app.function` as a `gpu="<spec>"` kwarg
+  — no GPU catalog is re-implemented (a bad type surfaces Modal's own error). With
+  no `--gpu`, no `gpu=` kwarg is emitted at all (byte-identical to the no-GPU
+  prototype shims). `--gpu T4` run →
+  `@app.function(image=mounted_image, timeout=1800, gpu="T4")`; deploy mirrors it
+  (`@app.function(image=image, gpu="A100")`). The gpu kwarg lands on the work
+  funcs only.
+- **Byte-equivalence preserved.** No-GPU `dev_app.py`/`deploy_app.py`/`call_app.py`
+  are byte-identical to the prototype refs; the GPU dev shim differs from no-GPU
+  ONLY by the injected `gpu="T4"` kwargs. Runner seam unchanged
+  (`--input-file /tmp/in.json`, single stdout envelope); deployed body execs only
+  `/app/modal_runner`. No unresolved `{{...}}` placeholders.
+- **Gates green (default-members, package-qualified — NOT `--workspace`/`--all-features`).**
+  `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0;
+  `cargo test` exit 0 — 25 CLI unit tests pass incl.
+  `dev_shim_injects_package_qualified_build`,
+  `deploy_shim_injects_package_qualified_build`,
+  `dev_shim_no_gpu_kwarg_when_absent`, `dev_shim_injects_gpu_kwarg_verbatim`,
+  `deploy_shim_injects_gpu_kwarg_verbatim`, plus the dev/deploy/call
+  byte-equivalence guards; 11 runtime + example tests.
+- **Modal acceptance: PASSED (not blocked, not retry-pending).** (a) `run add`
+  built `-p example-add` cleanly despite the 4 shared bins → `{"ok":true,"value":
+  {"sum":42}}`. (b) `run gpu_info --gpu T4` returned the runner envelope with
+  `exit_code:0` and `nvidia-smi` showing a `Tesla T4` (Driver 580.95.05, CUDA
+  13.0) — proving `--gpu T4` verbatim passthrough placed the function on a GPU.
+  Both completed first try (no Modal flakiness); no git touched.
+- **Files:** `crates/modal-rust-cli/src/{templates.rs,workspace.rs,main.rs}` and
+  `crates/modal-rust-cli/src/templates/{dev_app,deploy_app,call_app}.py.tmpl`.
 
 ## Open Questions
 

@@ -76,6 +76,18 @@ output produced BY RUST (Tesla T4 / driver 580.95.05 / CUDA Driver API 13.0);
 `cargo tree -p example-add` shows NO cudarc/cuda/cubecl/burn (still Tier 0).
 Evidence in knowledge.md "GPU validation (2026-06-03) — M11".
 
+> **CLI `--gpu` wiring — DONE (2026-06-03).** The "wire the GPU path into the
+> `modal-rust` CLI" follow-up has landed: `run`/`deploy` now accept `--gpu <spec>`
+> (verbatim passthrough → `gpu="<spec>"` on the work func; no GPU catalog
+> re-implemented), and the generated shim build is package-qualified
+> (`-p <pkg>` derived from `--project`), fixing the multiple-`modal_runner`-bins
+> regression so the M11 acceptance command
+> `cargo run -p modal-rust-cli -- run gpu_info --gpu T4 …` is now first-class.
+> Modal acceptance PASSED (`run gpu_info --gpu T4` → envelope exit_code:0 +
+> Tesla T4 via nvidia-smi); fmt/clippy(-D warnings)/test all green on
+> default-members. Detail in knowledge.md "CLI `--gpu` passthrough +
+> package-qualified shim build (2026-06-03, completed)".
+
 Acceptance:
 - A `gpu_info` entrypoint runs `std::process::Command::new("nvidia-smi")` and
   returns its output via the M0 JSON envelope (`{"ok":true,"value":{...}}`).

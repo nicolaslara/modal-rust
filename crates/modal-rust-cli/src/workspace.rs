@@ -52,6 +52,61 @@ fn declares_workspace(text: &str) -> bool {
         .any(|l| l == "[workspace]" || l.starts_with("[workspace."))
 }
 
+/// Read the cargo PACKAGE name (`[package].name`) from `<project>/Cargo.toml`.
+///
+/// This is the name passed to `cargo build -p <name>` in the generated shims:
+/// multiple workspace members share the `modal_runner` bin name, so a bare
+/// `--bin modal_runner` is ambiguous and the build must be package-qualified
+/// (boundaries.md §8). So `--project examples/add` (package `example-add`) builds
+/// `-p example-add --bin modal_runner`.
+///
+/// Errors if `<project>/Cargo.toml` is missing, unreadable, or carries no
+/// `[package].name` (e.g. a virtual-manifest / `[workspace]`-only directory — the
+/// user must point `--project` at a concrete package).
+pub fn package_name(project: &Path) -> Result<String> {
+    let project = project
+        .canonicalize()
+        .with_context(|| format!("project dir does not exist: {}", project.display()))?;
+    let manifest = project.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("could not read {}", manifest.display()))?;
+    package_name_in_manifest(&text).ok_or_else(|| {
+        anyhow!(
+            "no [package].name in {} — point --project at a concrete package directory \
+             (e.g. examples/add), not a workspace/virtual manifest",
+            manifest.display()
+        )
+    })
+}
+
+/// Extract `[package].name` from a manifest's text. A tolerant line-scan that
+/// tracks the active TOML table header (no TOML-parser dependency, keeping the
+/// CLI's dep surface minimal — matching the doctor's hand-rolled scanner). Only
+/// the `[package]` table's `name = "..."` is read; `[workspace.package]` etc. are
+/// ignored.
+fn package_name_in_manifest(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(rest) = line.strip_prefix("name") {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('=') {
+                    let v = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +120,47 @@ mod tests {
         assert!(!declares_workspace(
             "[package]\nname = \"x\"\n[dependencies]\n"
         ));
+    }
+
+    #[test]
+    fn package_name_read_from_package_table() {
+        let text = "[package]\nname = \"example-add\"\nedition = \"2021\"\n";
+        assert_eq!(
+            package_name_in_manifest(text).as_deref(),
+            Some("example-add")
+        );
+    }
+
+    #[test]
+    fn package_name_ignores_workspace_package_table() {
+        // A virtual/workspace manifest with [workspace.package] but no [package]
+        // must NOT yield a package name (the user must target a concrete crate).
+        let text = "[workspace]\nmembers = []\n[workspace.package]\nname = \"nope\"\n";
+        assert_eq!(package_name_in_manifest(text), None);
+    }
+
+    #[test]
+    fn package_name_reads_only_package_table_name() {
+        // `name` appears in multiple tables; only [package].name counts.
+        let text =
+            "[package]\nname = \"example-cuda-vector-add\"\n[[bin]]\nname = \"modal_runner\"\n";
+        assert_eq!(
+            package_name_in_manifest(text).as_deref(),
+            Some("example-cuda-vector-add")
+        );
+    }
+
+    #[test]
+    fn package_name_from_project_dir() {
+        let dir = std::env::temp_dir().join(format!("mr-pkg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"example-burn-add\"\n",
+        )
+        .unwrap();
+        assert_eq!(package_name(&dir).unwrap(), "example-burn-add");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
