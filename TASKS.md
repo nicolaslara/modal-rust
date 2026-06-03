@@ -99,3 +99,13 @@ little cost (T4, ~cents); the loop is incremental + gated.
   because the central open question — "can we compile at runtime on a normal
   Function?" — can only be answered empirically. Keep spikes small and record
   evidence. Larger implementation waits for the architecture gate.
+
+- **AFK autonomous run (2026-06-03 night).** User is away and authorized
+  *commit-and-continue without waiting*: proceed through the remaining plan
+  (gpu-compute → ergonomics → shim-backend, plus the M0-R panic-capture and M6b
+  smart-cache follow-ups), committing at each milestone with a clear message, and
+  report a summary when done. This **overrides the default "confirm before commit"**
+  for this run. Per-milestone commits + knowledge-file notes are the durable record
+  if context falls off — a fresh context should read this note, the latest commits,
+  and the active-workpad knowledge.md, then continue (still: never log/commit Modal
+  tokens; GPU stays on cheap T4; Modal flakiness → retry, never block).
