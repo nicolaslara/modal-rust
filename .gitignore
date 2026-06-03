@@ -1,0 +1,23 @@
+# Generated Modal shims and modal-rust scratch
+.modal-rust/
+tmp/
+.research/
+
+# Secrets / Modal credentials
+.env
+.env.*
+!.env.example
+.modal.toml
+
+# Rust
+/target
+**/target
+
+# Python (for generated shims / maturin spikes)
+.venv/
+__pycache__/
+*.pyc
+/wheels/
+
+# OS
+.DS_Store

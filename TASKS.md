@@ -1,0 +1,79 @@
+# Project Task Queue
+
+**You edit this file.** It tells agents which workpad to load for `/next` and
+similar commands.
+
+Read top to bottom. The **first unchecked** item is the active workpad unless
+Notes override it. Check items off when a phase is finished, not when pausing
+mid-phase.
+
+## Active Now
+
+**architecture** — Ratify and finalize the canonical contract `boundaries.md`
+(A0–A8) against the verified research findings, resolving each `[spike: Rx]`-tagged
+decision and passing the architecture gate. The contract is drafted from the
+planning workflow's synthesis; this phase confirms it section-by-section.
+
+The plan deliberately validates **one boundary at a time**. Do not jump ahead to
+later milestones because they look more concrete; the point is to fail fast at
+each boundary.
+
+> **Doc-research already done.** The multi-agent planning workflow
+> (`.claude/workflows/plan-research.js`) performed the doc-level research
+> (`workpads/architecture/research-synthesis.md` §1, grounded in primary Modal/
+> modal-rs docs) and the architecture design + adversarial review (§2). So
+> **research** is checked off at the doc level below. The two genuinely *empirical*
+> confirmations — does `add_local_dir(copy=False)` mount writably, and does a normal
+> `@app.function` actually `cargo build` at runtime — are intentionally carried into
+> **prototype** M2/M4 (which run real Modal calls anyway), per the validation-first
+> method. If you'd rather confirm runtime-compile empirically *before* ratifying the
+> architecture, re-open `research` and run the R2 live spike first (it's recorded in
+> `workpads/research/tasks.md` R2).
+
+## Workpad Queue
+
+- [x] **research** — Doc-level research complete via the planning workflow:
+  Modal image/copy semantics, runtime-compile feasibility (in principle),
+  `copy=False` mount, Cargo-cache, the `modal-rs` capability matrix, and GPU/CUDA
+  facts are recorded in `research-synthesis.md` §1 + `research/knowledge.md`. Live
+  runtime-compile + mount-writability spikes are carried into prototype M2/M4.
+- [ ] **architecture** — Crate/workspace layout, runner protocol + registry API
+  (macro-compatible), the **run-vs-deploy build boundary**, generated Python shim
+  design (dev/deploy/call), CLI command surface, Cargo-cache design, ignore
+  rules. Gate: boundaries + contracts recorded; user-sensitive decisions called
+  out.
+- [ ] **prototype** — The `add` function end to end (M0-M9): local dispatcher ->
+  generated Function control path -> source mount -> remote runtime compile ->
+  source-edit reactivity -> Cargo cache -> deploy-time build -> deployed call
+  with no runtime compile -> `modal-rust` CLI wrapping the shims. Gate: `add`
+  runs via `modal-rust run` and `modal-rust call` with the build boundary proven.
+- [ ] **gpu-compute** — GPU path (M10-M13): nvidia-smi from the Python shim ->
+  nvidia-smi from a Rust function -> real Rust CUDA vector add -> Burn tensor
+  smoke. Gate: a real Rust GPU compute returns a verified result, Burn-free
+  first, then a Burn smoke.
+- [ ] **ergonomics** — Proc-macro registry (`inventory`, `#[modal_rust::function]`)
+  that compiles to the same `Registry` shape, plus an optional PyO3/maturin
+  bridge to replace the subprocess boundary. Gate: macros produce the validated
+  runner shape; PyO3 path proven as optional, not required.
+
+## Notes
+
+- Source-of-truth product prompt lives in `project.md`. The design stances:
+  **(1)** direct-execution-first — try normal Modal Functions; a Sandbox is a
+  documented fallback (not banned) if a Function-body build is infeasible;
+  **(2)** the build boundary is the hard invariant — `run`
+  builds at function-execution time, `deploy` builds at image-build time and the
+  deployed runtime never runs `cargo`.
+- CLI name is `modal-rust`. Internal crates may have other names. `modal-rs` is
+  the existing unofficial SDK we may consume.
+- Skip proc-macros and PyO3 until the manual-registry subprocess path works end
+  to end. Design the v0 API so macros can be added without changing the runner
+  protocol.
+- Keep the first GPU proof independent of Burn. Order: nvidia-smi (python) ->
+  nvidia-smi (Rust) -> CUDA kernel -> Burn.
+- Research and architecture may overlap only when task boundaries are independent
+  and findings are recorded before the dependent architecture decision is made.
+- Spikes (running real Modal calls) are authorized inside the `research` workpad
+  because the central open question — "can we compile at runtime on a normal
+  Function?" — can only be answered empirically. Keep spikes small and record
+  evidence. Larger implementation waits for the architecture gate.

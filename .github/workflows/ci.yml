@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.94"
+  TMPDIR: /tmp
+
+# NOTE: The Rust job is gated on a Cargo workspace existing. Until prototype M0
+# creates `Cargo.toml`, the job no-ops. Live Modal runs/deploys and GPU smokes
+# are opt-in (they cost money and need credentials) and are never part of this
+# unattended CI.
+jobs:
+  rust:
+    name: Rust Workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Detect Cargo workspace
+        id: detect
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — skipping Rust checks (pre-M0 scaffold)."
+          fi
+
+      - name: Install Rust
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+          rustc +"$RUST_TOOLCHAIN" --version
+          cargo +"$RUST_TOOLCHAIN" --version
+
+      - name: Check Formatting
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo +"$RUST_TOOLCHAIN" fmt --check
+
+      - name: Lint
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo +"$RUST_TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        if: steps.detect.outputs.has_cargo == 'true'
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace
+
+      - name: Check Whitespace
+        run: git diff --check
