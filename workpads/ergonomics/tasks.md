@@ -1,9 +1,10 @@
 # Ergonomics Tasks
 
-Tasks E1–E2: proc-macro registry and an optional PyO3/maturin bridge. This
-workpad starts only AFTER the prototype gate passes (`add` runs via `modal-rust
-run` and is callable via `modal-rust call`, with the run-vs-deploy build boundary
-proven). Background and decisions live in `knowledge.md`; sources in
+Tasks E1–E3: proc-macro registry, generated local Rust remote-call stubs, and an
+optional PyO3/maturin bridge. This workpad starts only AFTER the prototype gate
+passes (`add` runs via `modal-rust run` and is callable via `modal-rust call`,
+with the run-vs-deploy build boundary proven). Background and decisions live in
+`knowledge.md`; sources in
 `references.md`; contracts in `../architecture/boundaries.md` and
 `../architecture/research-synthesis.md`.
 
@@ -11,14 +12,17 @@ proven). Background and decisions live in `knowledge.md`; sources in
 
 Add ergonomic sugar WITHOUT changing the frozen seam: a
 `#[modal_rust::function]` proc-macro that registers functions via `inventory`,
-and an OPTIONAL PyO3/maturin bridge that can replace the subprocess boundary.
-Both are additive — the macro must compile down to the SAME `Registry` /
-`HandlerFn` (monomorphized `fn`-pointer) shape the manual path produces, and the
-PyO3 path must be provably optional (the subprocess control path keeps working
-unchanged). Do not contradict the synthesis or the design stances (build
-boundary is the hard invariant — `run` builds at function-execution time,
-`deploy` builds at image-build time and the deployed runtime never runs `cargo`;
-direct-execution-first with a Sandbox fallback; prefer static dispatch).
+generated local Rust client stubs so user code can call `app.add(20, 2).await?`
+without writing `AddInput`/`AddOutput` wrapper structs, and an OPTIONAL
+PyO3/maturin bridge that can replace the subprocess boundary. All are additive —
+the macro must compile down to the SAME `Registry` / `HandlerFn` (monomorphized
+`fn`-pointer) shape the manual path produces, the remote-call stubs must compile
+down to the same `modal-rust-client` transport/envelope path, and the PyO3 path
+must be provably optional (the subprocess control path keeps working unchanged).
+Do not contradict the synthesis or the design stances (build boundary is the hard
+invariant — `run` builds at function-execution time, `deploy` builds at
+image-build time and the deployed runtime never runs `cargo`; direct-execution-
+first with a Sandbox fallback; prefer static dispatch).
 
 ## Gate
 
@@ -27,8 +31,10 @@ The ergonomics gate passes when `knowledge.md` records, with evidence: (1)
 the macro builds a `Registry` byte-for-byte equivalent in behaviour to the
 manual `Registry::new().function("add", typed!(add))`, the runner CLI protocol
 (five frozen error kinds, stdout-only envelope, exit codes, precedence) is
-UNCHANGED, and `add` still returns `{"ok":true,"value":{"sum":42}}`; and (2)
-PyO3 is proven OPTIONAL — the generated extension crate builds via
+UNCHANGED, and `add` still returns `{"ok":true,"value":{"sum":42}}`; (2)
+local Rust code can call the deployed function as `app.add(20, 2).await?`,
+with generated private transport types and the real output type returned to the
+caller; and (3) PyO3 is proven OPTIONAL — the generated extension crate builds via
 `maturin build`/`develop`, a wheel installs in a Modal image and dispatches
 through the same `Registry`, AND the existing subprocess `run`/`deploy`/`call`
 path still passes with PyO3 absent from the dependency tree. The macro-
@@ -85,7 +91,49 @@ Evidence:
 - `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings
   && cargo test --workspace` (green).
 
-## E2 - Optional PyO3/maturin bridge (replace the subprocess boundary)
+## E2 - Generated local Rust remote-call stubs (`app.add(...).await?`)
+
+Status: pending
+
+Acceptance:
+- The macro/codegen layer produces a user-facing app client where a deployed
+  function is called as `app.add(20, 2).await?` (or the closest Rust-valid module
+  form if method generation requires an explicit generated client type). The
+  caller does NOT name `AddInput` or `AddOutput` wrapper structs for the common
+  case.
+- Multi-arg functions generate a private named-field input struct internally,
+  preserving the existing named-object wire format; the user passes normal Rust
+  arguments.
+- The method returns the handler's real output type directly. For example, if
+  `add(a: i32, b: i32) -> anyhow::Result<i32>`, then
+  `app.add(20, 2).await?` has type `i32`, not `AddOutput`.
+- The generated method lowers to the same `modal-rust-client` transport:
+  serialize the private input struct with the active codec, invoke deployed
+  `call_entrypoint(entrypoint, input_json)` via the validated generated-Python
+  path or validated `modal-rs` backend, parse the runner envelope, and map errors
+  to the frozen `RunnerError` shape.
+- The generated remote-call stubs do NOT alter `HandlerFn`, `Registry`, `typed!`,
+  the runner CLI protocol, or the run-vs-deploy build boundary.
+- Compare API alternatives before locking syntax: `app.add(20, 2).await?`,
+  `remote!(add, 20, 2).await?`, and `remote!(add(a: 20, b: 2)).await?`. Default
+  preference is `app.add(...)` because it hides transport types and naturally
+  scopes calls to a Modal app/deployment.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
+  warnings`, and `cargo test --workspace` all pass.
+
+Evidence:
+- A local Rust example/test calling deployed `add` as `app.add(20, 2).await?` and
+  asserting the returned value has the real output type.
+- A macro expansion or generated-code snapshot showing the private input struct,
+  generated method, and lowering to `modal-rust-client`.
+- Error-path evidence showing a remote `decode_error`/`function_error`/`panic`
+  envelope maps to the same client error shape as `modal-rust call`.
+- A short syntax comparison note recording why `app.add(...)` won over
+  `remote!(...)` or which syntax remains open.
+- `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings
+  && cargo test --workspace` (green).
+
+## E3 - Optional PyO3/maturin bridge (replace the subprocess boundary)
 
 Status: pending
 

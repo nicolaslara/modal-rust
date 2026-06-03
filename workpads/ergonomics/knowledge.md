@@ -3,9 +3,10 @@
 ## Objective
 
 Capture the decisions, facts, and open questions for the ergonomics phase —
-proc-macro registry (`#[modal_rust::function]` via `inventory`) and an optional
-PyO3/maturin bridge — so both can be added as PURE SUGAR without touching the
-frozen runner seam. The canonical contracts live in
+proc-macro registry (`#[modal_rust::function]` via `inventory`), generated local
+Rust remote-call stubs (`app.add(20, 2).await?`), and an optional PyO3/maturin
+bridge — so they can be added as PURE SUGAR without touching the frozen runner
+seam. The canonical contracts live in
 `../architecture/boundaries.md` and `../architecture/research-synthesis.md`; this
 file records the reasoning, confidence, and what remains user-sensitive. The
 design stances bind: the build boundary is the hard, non-negotiable invariant
@@ -22,12 +23,14 @@ The ergonomics gate passes when this file records, with evidence: (1) the
 `#[modal_rust::function]` macro produces the validated runner shape — the same
 `Registry`/`HandlerFn` (monomorphized `fn`-pointer) dispatch and the UNCHANGED
 runner CLI protocol, with `add` still returning
-`{"ok":true,"value":{"sum":42}}`; and (2) PyO3 is
-proven OPTIONAL — a maturin-built wheel dispatches through the same `Registry` in
-a Modal image while the subprocess `run`/`deploy`/`call` path still passes with
-PyO3 absent from the default dependency tree (per `WORKING.md` Workpad Gates and
-`AGENTS.md`: macros must not change the runner protocol). The macro-compatibility
-invariant in `../architecture/boundaries.md` is the contract this gate protects.
+`{"ok":true,"value":{"sum":42}}`; (2) generated local Rust stubs let user code call
+the deployed function as `app.add(20, 2).await?`, with private transport structs
+and the real output type returned; and (3) PyO3 is proven OPTIONAL — a
+maturin-built wheel dispatches through the same `Registry` in a Modal image while
+the subprocess `run`/`deploy`/`call` path still passes with PyO3 absent from the
+default dependency tree (per `WORKING.md` Workpad Gates and `AGENTS.md`: macros
+must not change the runner protocol). The macro-compatibility invariant in
+`../architecture/boundaries.md` is the contract this gate protects.
 
 ## Decisions
 
@@ -80,6 +83,17 @@ macro path is additive, not seam-breaking.
   `null`); stdout-only single-envelope, exit-code mirrors `ok`, precedence
   (parse → lookup → decode → call → encode). Any change must be additive-only and
   reviewed against the manual-registry runner. (§2.2, AGENTS.md, WORKING.md)
+- **User-facing remote ergonomics should hide transport wrapper types.** The
+  low-level client may still have `RemoteFunction<In, Out>` internally, but the
+  macro/codegen target is `app.add(20, 2).await?`: generated private named input
+  structs preserve the wire format, and the method returns the handler's real
+  output type directly. This avoids making users write or think about `AddInput`
+  / `AddOutput` for the common path. (E2)
+- **`app.add(...)` is the preferred default syntax to evaluate first.** It scopes
+  calls to a deployment/app handle and matches the planned macro-generated stubs
+  better than a free `remote!(add, ...)` macro. Keep `remote!(add, 20, 2)` and
+  `remote!(add(a: 20, b: 2))` as alternatives to compare before locking the API,
+  but do not let either expose generated transport structs. (E2 open design)
 - **[CHANGED — Rust #5] Codec-neutral `fn`-pointer shape makes future formats
   additive.** `type HandlerFn = fn(&[u8]) -> Result<Vec<u8>, RunnerError>` (static
   dispatch, no trait object). The macro emits `typed!(..)`/`typed_async!(..)`
@@ -112,7 +126,7 @@ macro path is additive, not seam-breaking.
 ## Findings
 
 Seeded from `research-synthesis.md` §1 / §2.3 and `project.md`. Confidence as
-noted; PyO3/maturin specifics are to be VERIFIED during E2 (no spike run yet).
+noted; PyO3/maturin specifics are to be VERIFIED during E3 (no spike run yet).
 
 - The frozen seam already reserves exactly what the macro phase needs:
   codec-neutral `fn`-pointer shape `type HandlerFn = fn(&[u8]) -> Result<Vec<u8>,
@@ -134,28 +148,33 @@ noted; PyO3/maturin specifics are to be VERIFIED during E2 (no spike run yet).
 - PyO3/maturin specifics (abi3 vs version-specific wheels, manylinux/linux-amd64
   wheel compatibility with the `rust:slim` + `add_python='3.12'` image, whether
   `maturin develop` is usable inside an image build vs only `maturin build` + `pip
-  install`) are UNVERIFIED here — E2 must establish them with a spike and record
+  install`) are UNVERIFIED here — E3 must establish them with a spike and record
   pins. (open) (project.md PyO3/maturin references)
 
 ## Open Questions
 
 Product- and design-sensitive decisions for this phase. None are gate blockers on
-their own, but E2's "optional" requirement and the wire format affect API shape —
-surface to the user before locking. The four §4 synthesis questions remain in
-force; the ones below are ergonomics-specific.
+their own, but E2's remote-call syntax and E3's "optional" requirement / wire
+format affect API shape — surface to the user before locking. The four §4
+synthesis questions remain in force; the ones below are ergonomics-specific.
 
 - **Macro surface — `name` inference vs explicit.** Default: support explicit
   `#[modal_rust::function(name = "add")]`; infer the entrypoint name from the fn
   name when `name` is omitted. Option: require explicit names to avoid collisions
   in large crates. (E1 design; not a blocker)
+- **Remote-call syntax.** Default candidate: generated app methods,
+  `app.add(20, 2).await?`, because the app handle scopes deployment/auth and the
+  macro can hide both input and output wrapper types. Alternatives to compare:
+  `remote!(add, 20, 2).await?` and `remote!(add(a: 20, b: 2)).await?`. The
+  selected syntax must not expose `AddInput`/`AddOutput` in the common path. (E2)
 - **PyO3 packaging — feature flag vs separate crate.** Default: keep the PyO3
   bridge behind a non-default cargo feature and/or in a separate crate so the
   default build's `cargo tree` shows no `pyo3`/`maturin` (the "proven optional"
-  requirement). Option: a dedicated `modal-rust-pyo3` crate. (E2 design)
+  requirement). Option: a dedicated `modal-rust-pyo3` crate. (E3 design)
 - **Whether PyO3 ever becomes the default `call`/dispatch boundary.** Default: NO
   for v0 — subprocess stays the validated control path; PyO3 is an opt-in
   optimization, promoted only after a proven non-scalar round-trip and an
-  equivalence check of the five-kind envelope across the boundary. (E2; mirrors
+  equivalence check of the five-kind envelope across the boundary. (E3; mirrors
   the §4.3 default `call` mode stance)
 - **Wire format across the PyO3 boundary.** Default: JSON envelope as a Python
   `str` (same as the subprocess `--input-json`/stdout text), since the `Handler`

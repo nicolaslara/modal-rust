@@ -5,7 +5,7 @@
 Build **modal-rust**, a general **Rust-on-Modal function runtime**: a CLI plus
 runtime crates that let a user write ordinary Rust library functions, run them on
 Modal during development, deploy them as persistent Modal Functions, and invoke
-them remotely — including on GPUs.
+them remotely from the CLI or local Rust code — including on GPUs.
 
 Burn (Rust ML) is **one downstream consumer**, not the core abstraction. The
 hard design problem is **Rust function discovery + remote dispatch + project
@@ -109,7 +109,7 @@ modal-rust/
   crates/
     modal-rust-runtime/               # Registry, typed!(), Codec, HandlerFn (static dispatch), runner protocol
     modal-rust-cli/                   # produces the `modal-rust` binary; generates shims
-    modal-rust-client/                # control-plane: talk to Modal (modal-rs and/or generated python)
+    modal-rust-client/                # control-plane + typed local Rust remote-call API
     modal-rust-macros/                # placeholder for v2 #[modal_rust::function]
   examples/
     add/                              # examples/add/src/lib.rs + src/bin/modal_runner.rs
@@ -168,7 +168,10 @@ v2 macro (must expand to the same registry shape):
 
 ```rust
 #[modal_rust::function(name = "add")]
-pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { ... }
+pub fn add(a: i32, b: i32) -> anyhow::Result<i32> { ... }
+
+let app = modal_rust::app("modal-rust-add-poc");
+let sum = app.add(20, 2).await?;
 ```
 
 ## Desired Capabilities
@@ -179,7 +182,7 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { ... }
 | Dispatch | Named functions, typed JSON in/out, structured errors, panic capture |
 | Dev run | Mount source, compile remotely when inputs changed, reuse a smart run cache when unchanged; reflects local edits |
 | Deploy | Build once at deploy time; persistent Modal Function; no runtime compile |
-| Invoke | Call deployed functions from the CLI (via modal-rs, generated python, or HTTPS) |
+| Invoke | Call deployed functions from the CLI and from local Rust code (`app.add(...).await?` generated stubs) |
 | Caching | Source-fingerprint binary cache plus Cargo registry/git/target cache on a Modal Volume for tolerable dev iteration |
 | GPU | Run Rust in GPU-attached containers; CUDA driver access; real GPU compute |
 | Ergonomics | Proc-macros (`inventory` registry) and optional PyO3/maturin bridge — later |
@@ -193,7 +196,7 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { ... }
 | Runner binary | Links the user crate; `--entrypoint`/`--input-json` -> JSON result |
 | `modal-rust-cli` | `doctor`/`run`/`deploy`/`call`; generates Python shims; orchestrates build stage |
 | Generated shim | Private Python Modal app (dev_app/deploy_app/call_app); run-vs-deploy build placement |
-| `modal-rust-client` | Talk to Modal (modal-rs where it suffices; generated python / HTTPS otherwise) |
+| `modal-rust-client` | Talk to Modal (modal-rs where it suffices; generated python / HTTPS otherwise), and back generated local Rust app-method stubs |
 | Build stage | **run = build in function body; deploy = build in image layer** (the product boundary) |
 | GPU layer | `--gpu` parameter mapping; CUDA-capable image; native dep management |
 
@@ -253,11 +256,15 @@ validated **before** they are depended on:
 
 ## Global Backlog
 
-- Decide modal-rs vs generated-python for each of: create app, build image, deploy function, invoke function.
+- Decide modal-rs vs generated-python for each of: create app, build image, deploy
+  function, invoke function, and local Rust `.remote`-style calls.
 - Define the runner protocol and registry API (manual now, macro-compatible).
 - Prove runtime compile on a normal Modal Function.
 - Prove deploy-time build with no runtime compile.
 - Add a smart Cargo run cache for dev iteration: no-op runs reuse a cached
   `modal_runner`; changed sources rebuild against a warm target cache.
+- Add generated local Rust app-method stubs: local user code can call a remote
+  `modal-rust` Function as `app.add(20, 2).await?`, with private transport types
+  and no runner-protocol change.
 - Prove GPU placement and real Rust GPU compute, Burn-free first.
 - Add proc-macros and optional PyO3/maturin bridge once the manual path is solid.

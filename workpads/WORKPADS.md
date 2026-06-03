@@ -28,6 +28,7 @@ for `dyn` only for genuinely open sets.
 | `prototype` | Planned | The `add` function end to end (M0–M9): local dispatch → remote runtime compile → deploy-time build → deployed call with no runtime compile → `modal-rust` CLI wrapper |
 | `gpu-compute` | Planned | The GPU path (M10–M13): nvidia-smi from Python → from Rust → real Rust CUDA vector add → Burn tensor smoke |
 | `ergonomics` | Planned | Proc-macro registry (`inventory`, `#[modal_rust::function]`) compiling to the same `Registry` shape, plus an optional PyO3/maturin bridge |
+| `shim-backend` | Exploratory | Static/data-driven shim backend alternatives: generated templates vs static shims + env/path config vs module/cache/direct backends |
 
 ## research
 
@@ -251,9 +252,11 @@ the runner protocol).
 
 Objective: Add the deferred ergonomics on top of the proven manual path — a
 proc-macro registry (`#[modal_rust::function]` + `inventory`) that compiles to the
-**same** static-dispatch `Registry` shape and runner protocol, and an optional
-PyO3/maturin bridge that may replace the subprocess boundary. The v0 handler is
-already frozen as a codec-neutral bare `fn` pointer
+**same** static-dispatch `Registry` shape and runner protocol, generated local
+Rust client stubs (`app.add(20, 2).await?`) that hide generated input/output
+transport types, and an optional PyO3/maturin bridge that may replace the
+subprocess boundary. The v0 handler is already frozen as a codec-neutral bare `fn`
+pointer
 (`type HandlerFn = fn(&[u8]) -> Result<Vec<u8>, RunnerError>`, no `Box<dyn>`) with
 a reserved `typed_async!` and a frozen named-object argument shape, so both stay
 strictly additive — the proc-macro generates the same monomorphized wrapper + an
@@ -291,8 +294,65 @@ Rules:
 - The macro detects `async fn` and expands to `typed_async!` vs `typed!` (yielding
   the same bare `fn`-pointer `HandlerFn` shape, no `dyn`/`Box`); duplicate-name
   rejection and the named-object argument shape are preserved.
+- The macro/client-stub layer may generate private named input structs and typed
+  remote methods, but the user-facing API should prefer `app.add(20, 2).await?`
+  over exposing `AddInput`/`AddOutput` wrapper types.
 - A future concurrent PyO3 host (in-process Mode B) must revisit per-call panic
   routing and the panic-then-reuse hazard before enabling concurrency (the v0
   panic-capture uses a process-global slot).
 - The PyO3 path is proven as optional, not required — the subprocess runner stays
   the known-good control path. Do not contradict the design stances.
+
+## shim-backend
+
+Status: Exploratory (queued after the planned validation phases unless
+`TASKS.md` Notes override it).
+
+Objective: Define the design space for the Modal Python control-plane backend as
+apps grow beyond the `add` POC: status quo parameterized templates; fully static
+shims with env/path config; static shims as an installed Python module; hidden
+temp/cache materialization; image-baked shims; Python SDK subprocess control; and
+lower-level `modal-rs`/protobuf authoring. The leading hypothesis is static
+Python source plus data-driven config, with Rust embedding/hashing the static
+shim bytes and materializing them only when the official Modal CLI requires an
+importable file/module. This workpad is design-only unless a follow-up task
+explicitly implements a spike. It must preserve the hard run-vs-deploy build
+boundary and the current known-good CLI path until a replacement is proven.
+
+**Load:**
+
+```text
+../TASKS.md
+../AGENTS.md
+../project.md
+../WORKING.md
+WORKPADS.md
+shim-backend/tasks.md
+shim-backend/knowledge.md
+shim-backend/references.md
+architecture/boundaries.md
+prototype/tasks.md
+crates/modal-rust-cli/src/main.rs
+crates/modal-rust-cli/src/templates.rs
+crates/modal-rust-cli/src/templates/dev_app.py.tmpl
+crates/modal-rust-cli/src/templates/deploy_app.py.tmpl
+crates/modal-rust-cli/src/templates/call_app.py.tmpl
+```
+
+Quick nav:
+
+- Current generated-template path: [`../crates/modal-rust-cli/src/templates.rs`](../crates/modal-rust-cli/src/templates.rs), [`../crates/modal-rust-cli/src/main.rs`](../crates/modal-rust-cli/src/main.rs)
+- Generated shim contract: [`architecture/boundaries.md`](./architecture/boundaries.md) (§5, §8)
+- Prototype evidence for current CLI wrapper: [`prototype/tasks.md`](./prototype/tasks.md) (M9a)
+
+Rules:
+
+- Distinguish "no generated Python source", "no local shim file", and "no Python
+  control plane at all"; they are different levels of change.
+- Values used to construct `modal.App`, `modal.Image`, decorators, volumes,
+  secrets, GPU, and `run_commands` must be available at Python module import time.
+  `entrypoint` and `input_json` can remain local-entrypoint runtime data.
+- Prefer static shim source plus config data over a richer template language
+  unless there is a concrete reason to keep generating Python syntax.
+- Do not replace the current generated-template CLI path until a spike proves the
+  static/backend path with the same run/deploy/call behavior.

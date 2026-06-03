@@ -48,6 +48,7 @@ deferred
 | `prototype` | 3 | The `add` function end to end (M0-M9) |
 | `gpu-compute` | 4 | nvidia-smi -> Rust GPU -> CUDA kernel -> Burn (M10-M13) |
 | `ergonomics` | 5 | Proc-macro registry + optional PyO3/maturin bridge |
+| `shim-backend` | exploratory | Static/data-driven shim backend alternatives for complex apps |
 
 ## Gates
 

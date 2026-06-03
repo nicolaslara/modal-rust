@@ -9,15 +9,19 @@ mid-phase.
 
 ## Active Now
 
-**prototype** — Build the `add` function end to end (M0–M9), validating the
-central beliefs fastest: M0 (local runner contract) → M1 (auth + control path) →
-**M2/M3/M4 (the runtime-compile-in-a-Function-body belief)** → M5/M6 (dev loop) →
-M7/M8 (deploy boundary) → M9 (CLI). Stages 0–2 (M0–M4) are the de-risking POC.
+**gpu-compute** — The GPU path (M10–M13), Burn-free first: `nvidia-smi` from the
+Python shim (M10) → `nvidia-smi` from a Rust function via the runner (M11) → real
+Rust CUDA vector-add with cudarc precompiled-PTX (M12) → Burn tensor smoke on a
+Tier-1 image (M13). Cheapest `T4` GPU; gated so the expensive CUDA-toolkit/Burn
+tiers only run if the cheap nvidia-smi steps pass.
 
-The plan deliberately validates **one boundary at a time**. Do not jump ahead to
-later milestones because they look more concrete; the point is to fail fast at
-each boundary. Deploy (M7/M8, persistent app) and GPU (gpu-compute) incur cost —
-confirm before spending.
+**Prototype complete (M0–M9) 2026-06-03.** `add` runs end-to-end via the
+`modal-rust` CLI (run/deploy/call/doctor); the build boundary is proven both ways.
+Non-blocking follow-ups tracked: **M0-R** (panic-capture review) and **M6b** (a
+smarter run-compilation cache — M6's volume cache was a null result).
+
+The plan deliberately validates **one boundary at a time**. GPU runs incur a
+little cost (T4, ~cents); the loop is incremental + gated.
 
 > **Architecture gate passed (design-complete) 2026-06-03.** `boundaries.md` is
 > complete, internally consistent, and derived from the adversarially-reviewed
@@ -50,7 +54,10 @@ confirm before spending.
   build boundary**, the generated shim design (dev/deploy/call), CLI surface,
   Cargo-cache design, and ignore rules — internally consistent and derived from the
   reviewed synthesis. Empirical confirmation deferred to prototype M2/M4.
-- [ ] **prototype** — The `add` function end to end (M0-M9): local dispatcher ->
+- [x] **prototype** — Complete (M0–M9) 2026-06-03: `add` runs via `modal-rust
+  run/deploy/call`, build boundary proven both ways. Follow-ups M0-R (panic review)
+  + M6b (smart run cache) tracked in `workpads/prototype/tasks.md`. Original scope:
+  The `add` function end to end (M0-M9): local dispatcher ->
   generated Function control path -> source mount -> remote runtime compile ->
   source-edit reactivity -> Cargo cache -> deploy-time build -> deployed call
   with no runtime compile -> `modal-rust` CLI wrapping the shims. Gate: `add`
@@ -63,6 +70,10 @@ confirm before spending.
   that compiles to the same `Registry` shape, plus an optional PyO3/maturin
   bridge to replace the subprocess boundary. Gate: macros produce the validated
   runner shape; PyO3 path proven as optional, not required.
+- [ ] **shim-backend** — Exploratory follow-up: compare generated templates vs
+  static/data-driven Python shims, env/path config, hidden cache/module
+  materialization, image-baked shims, and deeper Modal authoring backends. Gate: a
+  decision-ready design matrix + spike plan; does not change the active GPU path.
 
 ## Notes
 
@@ -79,6 +90,9 @@ confirm before spending.
   protocol.
 - Keep the first GPU proof independent of Burn. Order: nvidia-smi (python) ->
   nvidia-smi (Rust) -> CUDA kernel -> Burn.
+- Shim-backend exploration is intentionally queued after the planned validation
+  phases unless Notes override it; do not let it distract from proving the GPU
+  path.
 - Research and architecture may overlap only when task boundaries are independent
   and findings are recorded before the dependent architecture decision is made.
 - Spikes (running real Modal calls) are authorized inside the `research` workpad

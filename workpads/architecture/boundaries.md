@@ -374,6 +374,39 @@ dev-loop target is:
   shims stay private/gitignored and byte-equivalent (modulo params) to the
   prototype shims.
 
+**Local Rust remote-call API (`modal-rust-client`):** separate from the CLI
+`call` command, local user code needs typed calls analogous to Modal Python's
+`.remote()`. The low-level transport can be explicit:
+
+```rust
+let add = modal_rust_client::RemoteFunction::<__AddInput, i32>::from_name(
+    "modal-rust-add-poc",
+    "add",
+);
+let sum = add.remote(__AddInput { a: 40, b: 2 }).await?;
+assert_eq!(sum, 42);
+```
+
+But the ergonomic target hides both generated transport types:
+
+```rust
+#[modal_rust::function]
+fn add(a: i32, b: i32) -> anyhow::Result<i32> { ... }
+
+let app = modal_rust::app("modal-rust-add-poc");
+let sum = app.add(40, 2).await?;
+assert_eq!(sum, 42);
+```
+
+Macro-generated stubs synthesize the private named input struct (preserving the
+single named-object wire shape) and return the handler's real output type
+directly. The transport still serializes `In` with the same codec, invokes the
+deployed `call_entrypoint` (`entrypoint`, `input_json`) through the validated
+generated-Python path or a validated `modal-rs` backend, parses the runner
+envelope, and returns typed `Out` or the frozen `RunnerError` shape. The macro
+must compile to this same client API and must not change the runner protocol,
+registry shape, or run-vs-deploy build boundary.
+
 > **modal-rs vs generated Python (resolved):** `FunctionCreate` requires a
 > serialized **Python** callable + `image_id`, so modal-rs does **not** remove the
 > Python shim, and its `serde-pickle` (protocol 2/3) vs cloudpickle (protocol 4)
