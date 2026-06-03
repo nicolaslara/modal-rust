@@ -114,8 +114,13 @@ cli     -> client + runtime
   → call → encode `Out`. Malformed JSON + bad entrypoint → `decode_error`
   (documented + unit-tested in M0).
 - **Panic capture:** panic hook records message + `std::backtrace::Backtrace` into
-  a Mutex slot; each handler runs in `std::panic::catch_unwind`; the **shim sets
-  `RUST_BACKTRACE=1`**. Requires `panic = "unwind"` (see §6).
+  a per-thread slot; each handler runs in `std::panic::catch_unwind`. Requires
+  `panic = "unwind"` (see §6). *(Additive note — M0-R, 2026-06-03, not a protocol
+  change: the implementation captures with `Backtrace::force_capture()` so the
+  backtrace is populated regardless of `RUST_BACKTRACE` — the shim no longer needs
+  to set it; and uses a `thread_local!` slot + a `std::sync::Once`-installed hook
+  rather than a process-global `Mutex` slot, so parallel panics on different
+  threads never race. The frozen envelope is unchanged.)*
 - **User-error wrapping (top-level enum):** the runner models failure as a Rust
   enum that **wraps** the user's error rather than stringifying it early:
 
@@ -208,6 +213,10 @@ pub fn modal_registry() -> Registry {
 > and the process exits after one call → correct for v0. A future concurrent host
 > (PyO3 Mode B) must revisit per-call panic routing and the panic-then-reuse
 > hazard before enabling concurrency.
+> *(Additive note — M0-R, 2026-06-03: capture is now a `thread_local!` slot + a
+> `Once`-installed hook, so the process-global-slot race is already resolved for the
+> process-exits-after-one-call v0 path and made safe under the parallel test
+> harness. The PyO3-Mode-B panic-then-reuse review still stands.)*
 
 ---
 

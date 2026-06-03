@@ -609,7 +609,7 @@ Evidence:
 
 ## M0-R - Review: panic-capture robustness (follow-up)
 
-Status: pending
+Status: completed
 
 risk: low. depends_on: [M0]
 

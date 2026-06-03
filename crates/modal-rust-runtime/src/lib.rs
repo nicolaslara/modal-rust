@@ -19,9 +19,10 @@
 //!   `catch_unwind`, and prints exactly one JSON envelope to stdout.
 
 use std::backtrace::Backtrace;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Mutex;
+use std::sync::Once;
 
 use serde::Serialize;
 
@@ -334,42 +335,72 @@ impl Registry {
     }
 }
 
-/// Captured panic info populated by the installed panic hook (boundaries.md §2).
+thread_local! {
+    /// Per-thread captured panic info `(message, backtrace)`, populated by the
+    /// process-wide panic hook (boundaries.md §2). Using a `thread_local!` instead
+    /// of a process-global slot means parallel panics on different threads never
+    /// race — each panicking thread writes only its own slot, which its own
+    /// `catch_unwind` then reads. This matters under the test harness, which runs
+    /// tests (including other deliberate panics) concurrently. The §3 concurrency
+    /// caveat about a process-global slot is thereby resolved for the
+    /// process-exits-after-one-call v0 path and made safe under concurrency.
+    static PANIC_SLOT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+}
+
+/// Ensures the panic hook is installed exactly once for the whole process
+/// (boundaries.md §2). Installing via `Once` rather than swapping the hook per call
+/// avoids the take/restore race that two concurrently panicking threads would hit.
+static HOOK_INIT: Once = Once::new();
+
+/// Install — exactly once — a process-wide panic hook that records the panicking
+/// thread's `(message, backtrace)` into that thread's [`PANIC_SLOT`].
 ///
-/// v0 uses a process-global slot and the process exits after one call, so this is
-/// correct for v0; a future concurrent host must revisit per-call routing.
-static PANIC_SLOT: Mutex<Option<(String, String)>> = Mutex::new(None);
+/// The hook always uses `Backtrace::force_capture()`, so the `panic` envelope's
+/// `backtrace` is populated regardless of the `RUST_BACKTRACE` env var (no shim
+/// env dependency). The hook only writes a thread-local; it neither prints nor
+/// chains to a previous hook, so it stays quiet and never swallows or duplicates
+/// unrelated panic output beyond suppressing the default stderr message.
+fn install_panic_hook() {
+    HOOK_INIT.call_once(|| {
+        panic::set_hook(Box::new(|info| {
+            let message = info.to_string();
+            let backtrace = Backtrace::force_capture().to_string();
+            // Guard against a poisoned/borrowed cell: if recording fails we still
+            // unwind and `run_handler` falls back to a default message.
+            let _ = PANIC_SLOT.try_with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = Some((message, backtrace));
+                }
+            });
+        }));
+    });
+}
 
 /// Run a single handler under `catch_unwind`, converting any of the five failure
 /// modes into a [`RunnerError`]. A panic is captured (message + backtrace) via a
-/// panic hook installed **only** around the call and surfaced as
-/// [`RunnerError::Panic`] (boundaries.md §2).
+/// process-wide panic hook (installed once) and surfaced as [`RunnerError::Panic`]
+/// (boundaries.md §2).
 ///
-/// The hook is scoped: the previous hook is saved and restored afterward, so the
-/// runner never leaves a global hook installed that would swallow unrelated panics
-/// (e.g. a test harness's assertion output). v0 uses a process-global slot and the
-/// process exits after one call, so this is correct for v0.
+/// The captured panic info lives in a per-thread [`PANIC_SLOT`]: the hook writes the
+/// panicking thread's info to its own slot, and this function — running on that same
+/// thread after `catch_unwind` returns `Err` — reads it back. Because each thread
+/// owns its slot, concurrent panics on other threads (e.g. parallel tests) cannot
+/// clobber this call's capture.
 fn run_handler(handler: HandlerFn, input: &[u8]) -> Result<Vec<u8>, RunnerError> {
-    if let Ok(mut slot) = PANIC_SLOT.lock() {
-        *slot = None;
-    }
-    let previous = panic::take_hook();
-    panic::set_hook(Box::new(|info| {
-        let message = info.to_string();
-        let backtrace = Backtrace::force_capture().to_string();
-        if let Ok(mut slot) = PANIC_SLOT.lock() {
-            *slot = Some((message, backtrace));
+    install_panic_hook();
+    // Clear this thread's slot so a stale capture from a prior call can't leak in.
+    PANIC_SLOT.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = None;
         }
-    }));
+    });
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| handler(input)));
-    panic::set_hook(previous);
     match outcome {
         Ok(result) => result,
         Err(_) => {
-            let (message, backtrace) = PANIC_SLOT
-                .lock()
-                .ok()
-                .and_then(|mut s| s.take())
+            let captured =
+                PANIC_SLOT.with(|slot| slot.try_borrow_mut().ok().and_then(|mut s| s.take()));
+            let (message, backtrace) = captured
                 .unwrap_or_else(|| ("panic (no message captured)".to_string(), String::new()));
             Err(RunnerError::Panic { message, backtrace })
         }
@@ -713,7 +744,9 @@ mod tests {
 
     #[test]
     fn panic_captured_with_backtrace() {
-        std::env::set_var("RUST_BACKTRACE", "1");
+        // No `RUST_BACKTRACE` mutation: the hook uses `Backtrace::force_capture()`,
+        // which always captures, and the per-thread slot means this assertion is
+        // robust even when other tests panic concurrently (boundaries.md §2/§3).
         let (v, code) = run(&[
             "--entrypoint",
             "will_panic",

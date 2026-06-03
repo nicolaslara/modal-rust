@@ -564,3 +564,38 @@ the `doctor` + offline (shim-generation / byte-equivalence) surfaces. The wrappe
 so they are real end-to-end as well — Modal was healthy throughout; no Modal-blocked
 note applies. (README CLI commands left for the human to review before adding to the
 Try-it section.)
+
+### M0-R — panic-capture robustness review (2026-06-03, completed)
+
+The M0-R follow-up is resolved in `crates/modal-rust-runtime/src/lib.rs`
+(panic-capture: lib.rs:338-408). Decisions recorded:
+
+- **Backtrace via `force_capture()` (no env dependency).** The panic hook always
+  uses `std::backtrace::Backtrace::force_capture()`, so the `panic` envelope's
+  `backtrace` is populated in every context — local `modal_runner --entrypoint
+  will_panic` with no `RUST_BACKTRACE` set now yields a full backtrace, not
+  `"backtrace":""`. The decision (force_capture vs env-gated) is force_capture.
+- **Per-thread capture, hook installed once (no process-global race).** The old
+  process-global `Mutex<Option<(String,String)>>` slot + per-call hook swap is
+  replaced by a `thread_local! PANIC_SLOT` plus a `std::sync::Once` (`HOOK_INIT`)
+  that installs the process-wide hook exactly once. The hook writes the panicking
+  thread's `(message, backtrace)` to its own thread-local; `run_handler` clears its
+  slot before `catch_unwind` and reads it back after — so concurrent panics on
+  different threads (e.g. the parallel test harness) never race.
+- **`set_var` removed (edition-2024 safe).** The M0 test no longer calls
+  `std::env::set_var("RUST_BACKTRACE", ...)` (was `unsafe` under edition 2024,
+  rust-analyzer E0133). force_capture removes the need to mutate the env at all.
+- **Test un-ignored + stress-passed.** `panic_captured_with_backtrace` is NOT
+  `#[ignore]`d; it asserts `kind=="panic"`, a non-empty message, AND a non-empty
+  backtrace with NO env var set. De-flaked across 25× `cargo test -p
+  modal-rust-runtime panic_captured_with_backtrace -- --exact` (FLAKED=0) and 5×
+  full `cargo test` (concurrent harness, multiple deliberate panics) — 0 flakes.
+- **Protocol unchanged.** The 5-kind `RunnerError` taxonomy, the frozen panic
+  envelope, exit codes, `typed!`/`Registry`/`HandlerFn`, and the `panic="unwind"`
+  profile are all left intact — this is a capture-mechanism hardening, not a
+  protocol change. Acceptance command (`env -u RUST_BACKTRACE`, built via
+  `-p example-add`) returns `kind:"panic"` with a full symbolicated backtrace and
+  exit 1; stderr 0 bytes (default panic message suppressed by the hook).
+- **Gates green (default-members, OFFLINE).** `cargo fmt --check` exit 0; `cargo
+  clippy --all-targets -- -D warnings` exit 0 (0 warnings); `cargo test` all suites
+  green (runtime crate 11 passed, 0 ignored).
