@@ -9,19 +9,25 @@ mid-phase.
 
 ## Active Now
 
-**gpu-compute** — The GPU path (M10–M13), Burn-free first: `nvidia-smi` from the
-Python shim (M10) → `nvidia-smi` from a Rust function via the runner (M11) → real
-Rust CUDA vector-add with cudarc precompiled-PTX (M12) → Burn tensor smoke on a
-Tier-1 image (M13). Cheapest `T4` GPU; gated so the expensive CUDA-toolkit/Burn
-tiers only run if the cheap nvidia-smi steps pass.
+**Paused for user input (2026-06-03 night).** The validated core is DONE and
+committed: prototype **M0–M9**, GPU **M10–M13** (T4: nvidia-smi → cudarc vector-add
+→ Burn), ergonomics **E1** (`#[modal_rust::function]` proc-macro), the **M0-R**
+panic-capture hardening, the CLI `--gpu` + multi-bin `-p` fix, and the **M6b**
+sccache cache experiment (null payoff on the toy graph → opt-in `--cache` deferred
+as `M6b-wire`). `cargo test`/`clippy`/`fmt` green on default-members; README "Try
+it" is current.
 
-**Prototype complete (M0–M9) 2026-06-03.** `add` runs end-to-end via the
-`modal-rust` CLI (run/deploy/call/doctor); the build boundary is proven both ways.
-Non-blocking follow-ups tracked: **M0-R** (panic-capture review) and **M6b** (a
-smarter run-compilation cache — M6's volume cache was a null result).
+The remaining items each need a decision or are optional/exploratory, so the
+autonomous overnight run paused here rather than churn fragile work:
 
-The plan deliberately validates **one boundary at a time**. GPU runs incur a
-little cost (T4, ~cents); the loop is incremental + gated.
+- **ergonomics E2** (remote-call stubs `app.add(20,2).await?`) — needs the §4-Q3
+  invoke-mode decision: a *real* in-process Rust client wants the unofficial,
+  pre-1.0 `modal-rs` (pickle-protocol caveats); a no-`modal-rs` version is just a
+  thin wrapper over the proven `modal-rust call` subprocess. **Your call.**
+- **ergonomics E3** (PyO3/maturin bridge) — explicitly optional.
+- **shim-backend** — your exploratory design workpad; left for you to drive.
+- **M6b-wire** — implement `--cache` (OFF by default) + the local-SCCACHE_DIR +
+  Volume-snapshot-sync strategy; low value until a dependency-heavy example exists.
 
 > **Architecture gate passed (design-complete) 2026-06-03.** `boundaries.md` is
 > complete, internally consistent, and derived from the adversarially-reviewed
@@ -62,14 +68,14 @@ little cost (T4, ~cents); the loop is incremental + gated.
   source-edit reactivity -> Cargo cache -> deploy-time build -> deployed call
   with no runtime compile -> `modal-rust` CLI wrapping the shims. Gate: `add`
   runs via `modal-rust run` and `modal-rust call` with the build boundary proven.
-- [ ] **gpu-compute** — GPU path (M10-M13): nvidia-smi from the Python shim ->
-  nvidia-smi from a Rust function -> real Rust CUDA vector add -> Burn tensor
-  smoke. Gate: a real Rust GPU compute returns a verified result, Burn-free
-  first, then a Burn smoke.
-- [ ] **ergonomics** — Proc-macro registry (`inventory`, `#[modal_rust::function]`)
-  that compiles to the same `Registry` shape, plus an optional PyO3/maturin
-  bridge to replace the subprocess boundary. Gate: macros produce the validated
-  runner shape; PyO3 path proven as optional, not required.
+- [x] **gpu-compute** — Complete (M10–M13) 2026-06-03: verified on T4 — nvidia-smi
+  (Python + Rust), cudarc precompiled-PTX vector-add (Tier 0), and a Burn tensor
+  add (Tier-1 `nvidia/cuda:12.6.3-devel`). `--gpu <spec>` wired into the CLI.
+  CUDA-only `example-burn-add` excluded from `default-members`.
+- [~] **ergonomics** — E1 DONE (`#[modal_rust::function]` proc-macro + `inventory`
+  + `Registry::from_inventory()`, byte-identical to manual `typed!`). E2 (remote-call
+  stubs) + E3 (PyO3/maturin, optional) remain — E2 needs the invoke-mode decision
+  (see Active Now). Gate: macros produce the validated runner shape (met for E1).
 - [ ] **shim-backend** — Exploratory follow-up: compare generated templates vs
   static/data-driven Python shims, env/path config, hidden cache/module
   materialization, image-baked shims, and deeper Modal authoring backends. Gate: a
