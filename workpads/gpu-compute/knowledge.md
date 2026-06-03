@@ -124,6 +124,169 @@ confidence in the synthesis §1.4). Append empirical spike results per milestone
   add only `gpu=` placement (M10/M11) and the image tier (M12/M13). M11's
   acceptance states this explicitly so exactly one boundary is under test.
 
+### M13 — Burn tensor smoke (Tier 1, CUDA image) — PASSED (2026-06-03)
+
+- **Result (verified correct on T4):**
+  `cargo build --release -p example-burn-add --bin modal_runner` then
+  `modal_runner --entrypoint burn_add --input-file …` returned, via the M0 JSON
+  envelope: `{"ok":true,"value":{"backend":"burn-cuda (CubeCL CUDA / cudarc)",`
+  `"libcudart":"libcudart.so","libnvrtc":"libnvrtc.so","n":256,`
+  `"samples":[[0,0.0,0.0],[128,384.0,384.0],[255,765.0,765.0]],"valid":true}}`,
+  exit 0. The GPU tensor add `c=a+b` (a[i]=i, b[i]=2i ⇒ c[i]=3i) matches the CPU
+  reference element-wise (`valid:true`; samples 128→384, 255→765). Run on
+  `gpu="T4"` (cheapest family). Cold run: CUDA-devel image build + rustup +
+  cold Burn compile (~1m34s cargo build in the Function body) + GPU exec.
+- **Pinned version set (pinned TOGETHER; from Cargo.lock):**
+  `burn 0.21.0` + `burn-cuda 0.21.0` → `cubecl 0.10.0` (cuda) → `cubecl-cuda 0.10.0`
+  → `cudarc 0.19.7` (features `driver, nvrtc, std, fallback-dynamic-loading,
+  fallback-latest, cuda-version-from-build-system`). burn-cuda pulls cudarc with
+  dynamic loading, so the crate builds with **no CUDA toolkit at build time** (it
+  built fine on the CPU-only Mac host and in the Modal Function body); CubeCL
+  dlopens cudarc/NVRTC at runtime. CUDA container major **12.x ≤ host** (observed
+  Driver API 13.0; drifts — not hardcoded).
+- **Tier 1 recipe (recorded):** `nvidia/cuda:12.6.3-devel-ubuntu22.04` +
+  `add_python="3.12"` + rustup-installed stable Rust toolchain, `gpu="T4"`,
+  `CUDA_PATH=/usr/local/cuda`. Build path otherwise IDENTICAL to the M4/M7/M11/M12
+  recipe (mount `copy=False`, `cargo build` in the Function body to a
+  known-writable `/tmp/target`); the image tier is the only new variable.
+- **EMPIRICAL FINDING — `-runtime-` is NOT sufficient for Burn/CubeCL; need the
+  CUDA headers (`-devel-`).** First attempt on `nvidia/cuda:12.6.3-runtime-ubuntu22.04`
+  built + dlopen-self-checked fine (libnvrtc/libcudart present) but the Burn op
+  FAILED at the first kernel launch with NVRTC error `catastrophic error: cannot
+  open source file "cuda_runtime.h"`. Root cause: CubeCL JIT-compiles its CUDA C
+  kernels via NVRTC and the generated source `#include <cuda_runtime.h>`;
+  `cubecl-cuda` passes `--include-path=$CUDA_PATH/include` (default
+  `/usr/local/cuda/include`) to NVRTC, so the CUDA **headers** must be on disk —
+  not just the runtime shared libs. The `*-runtime-*` image ships `libcudart` +
+  `libnvrtc` but NOT the headers; the `*-devel-*` image ships them at
+  `/usr/local/cuda/include`. This is what "burn-cuda requires CUDA 12.x on PATH"
+  means in practice. We still do NOT invoke `nvcc` ourselves — NVRTC (the Tier-1
+  runtime mechanism) does the compiling — but it needs the toolkit headers the
+  devel image provides. **Refinement to the §2.8 tiering note for the Burn path:
+  pip `nvidia-cuda-runtime-cu12`/`-nvrtc-cu12` or a `*-runtime-*` tag alone are
+  insufficient for CubeCL; use a `*-devel-*` image (headers) or otherwise place
+  `cuda_runtime.h` under `$CUDA_PATH/include`.**
+- **Hard Tier-1 self-check verified as a real gate.** The runner's
+  `tier1_self_check()` dlopens `libnvrtc`+`libcudart` before touching Burn. On the
+  CPU-only Mac host (and any accidentally Tier-0 image) it returns the loud
+  `function_error` envelope (`"Tier-1 self-check FAILED: could not dlopen
+  libnvrtc…"`, exit 1) — proven locally; on T4 it passes and reports the opened
+  sonames (`libnvrtc.so`, `libcudart.so`) in the result.
+- **`gpu="T4"` passthrough** exercised again — string passed verbatim, placed on a
+  real NVIDIA T4. Cost-sensitive: the run attaches a T4 GPU (Modal on-demand T4 is
+  the cheapest family; on the order of ~$0.60/hr, billed per-second for the ~mins
+  of cold build + exec).
+
+## GPU validation (2026-06-03)
+
+Full M10→M13 GPU chain run end-to-end on Modal; all four milestones produced
+verified results on a real NVIDIA **Tesla T4**. The chain did NOT stop — the GPU
+gate passes. Point-in-time host values observed across the whole chain: driver
+**580.95.05** / CUDA Driver API **13.0** (these drift — not hardcoded; re-verify
+in `nvidia-smi`). GPU type `T4` (cheapest family) for every milestone; per-run
+cost is on the order of Modal's on-demand T4 (~$0.60/hr, billed per-second for
+the few minutes of cold build + exec). No Modal incidents/flakiness — bugs hit
+along the way were real (M12 PTX) and were fixed, not retried-around.
+
+### M10 — GPU placement (Tier 0, Python shim) — PASS
+
+- `@app.function(gpu="T4")` body running `subprocess.run(["nvidia-smi"])`
+  (returned via the `smi_py` `@app.local_entrypoint()`), file
+  `/Users/nicolas/devel/modal-rust/workpads/gpu-compute/gpu_app.py`.
+- Remote `nvidia-smi` showed a real **Tesla T4** (15360 MiB / ~15 GB), **Driver
+  Version 580.95.05**, **CUDA Version (Driver API) 13.0** — matching the seeded
+  point-in-time values, confirming Tier 0 (driver + `nvidia-smi` preinstalled).
+- NO CUDA toolkit installed: image is `debian_slim()` + `gpu="T4"` as the only
+  new variable — no `nvidia-cuda-*` wheels, no `nvidia/cuda:*` base, no
+  `nvcc`/`libnvrtc`/`libcudart`.
+- `gpu=` passthrough behaves as specified (boundaries.md §9): `"T4"` parses and
+  places verbatim; modal-rust does not re-implement the drifting catalog, so a
+  bad type would surface Modal's own error.
+
+### M11 — Rust-sees-GPU (Tier 0, no CUDA crate) — PASS
+
+- Target `gpu_info_runner` (`@app.function(gpu="T4", timeout=1800)`) using the
+  exact `dev_app.py` M4 mounted-workspace (`copy=False`) build-in-body recipe:
+  `cargo build --release -p example-add --bin modal_runner`, then exec
+  `--entrypoint gpu_info --input-file`, driven by `gpu_info_rust`
+  `@app.local_entrypoint()`. `example-add` was already a workspace member.
+- Build path IDENTICAL to the prototype M4/M7 recipe; the SOLE new variable is
+  `gpu="T4"`. The single Modal run showed `cargo` updating the crates.io index,
+  downloading, and compiling in the Function body (`Finished release profile in
+  8.16s`) with source mounted `copy=False`, then returned one JSON envelope.
+- Result produced BY RUST (verbatim from the runner's single stdout envelope):
+  `{"ok":true,"value":{"exit_code":0,"nvidia_smi":"… NVIDIA-SMI 580.95.05  Driver
+  Version: 580.95.05  CUDA Version: 13.0 … Tesla T4 … 15360MiB …","stderr":""}}`
+  — matches M10, now from Rust.
+- Tier 0 confirmed: `cargo tree -p example-add` shows only
+  `anyhow`/`serde`/`serde_json` (no `cudarc`/`cuda`/`cubecl`/`burn`);
+  `Cargo.lock` has 0 `cudarc` entries. Tests/clippy/fmt clean; succeeded first
+  attempt (no Modal flakiness).
+
+### M12 — cudarc vector-add (Tier 0, precompiled PTX, driver-only) — PASS
+
+- **Result:** cudarc 0.19.7 (dynamic-loading) vector-add `c[i]=a[i]+b[i]` via the
+  CUDA **Driver API** + **precompiled PTX** on Tesla T4 (driver 580.95.05 / CUDA
+  13.0, `driver_version=13000`), `valid:true` element-wise vs a CPU reference at
+  **n=1024** and re-confirmed at **n=4096** (`valid:true`).
+- **Tier:** Tier 0 confirmed. Image is `rust:1-slim` + `add_python` only (no CUDA
+  toolkit installed). cudarc `dynamic-loading` links with NO CUDA at build time
+  (compiles on macOS with no CUDA present); only `libcuda` is dlopened at
+  runtime. PTX is precompiled with forward-compatible `.target sm_52` (driver-JIT
+  to T4 sm_75) — no nvcc/NVRTC/libcudart on the runtime path. Build is
+  package-qualified (`-p example-cuda-vector-add`) since `modal_runner` is shared.
+- **Self-check proven to fail loudly with no GPU:** cudarc panics listing all
+  `libcuda.so*` names searched → structured `panic` envelope, exit 1.
+- **Two REAL bugs found and fixed (not Modal flakiness):** (1) first hand-written
+  PTX was rejected with `CUDA_ERROR_INVALID_PTX` — fixed by generating
+  authoritative nvcc PTX; (2) the JIT error log (via `cuModuleLoadDataEx` +
+  `CU_JIT_ERROR_LOG_BUFFER`) revealed `ptxas fatal: Unexpected non-ASCII
+  character on line 10` — an em-dash/§ in the PTX comment header. Fixed by making
+  the file ASCII-only and stripping the comment header to `.version` before
+  loading (`sanitize_ptx`).
+- The `modal-rust` CLI and `examples/add` were not touched.
+
+### M13 — Burn smoke + Tier-1 recipe/pins — PASS
+
+See the detailed "M13 — Burn tensor smoke (Tier 1, CUDA image) — PASSED
+(2026-06-03)" block above for full evidence. Summary:
+
+- Burn CUDA-backend tensor add `c=a+b` verified correct on T4 (`valid:true`;
+  samples 128→384, 255→765), JSON envelope exit 0, backend `burn-cuda (CubeCL
+  CUDA / cudarc)`, `libnvrtc.so`/`libcudart.so` dlopen self-check passed.
+- **Pins (together, from Cargo.lock):** `burn 0.21.0` + `burn-cuda 0.21.0` →
+  `cubecl 0.10.0` / `cubecl-cuda 0.10.0` → `cudarc 0.19.7` (features `driver,
+  nvrtc, std, fallback-dynamic-loading, fallback-latest,
+  cuda-version-from-build-system`).
+- **Tier-1 recipe:** `nvidia/cuda:12.6.3-devel-ubuntu22.04` + `add_python="3.12"`
+  + rustup stable + `CUDA_PATH=/usr/local/cuda`, `gpu="T4"`. Empirical: a
+  `*-runtime-*` image (libs only) is INSUFFICIENT — CubeCL's runtime NVRTC needs
+  the CUDA **headers** (`cuda_runtime.h`), so `*-devel-*` (or headers under
+  `$CUDA_PATH/include`) is required. We never invoke `nvcc` ourselves; NVRTC does
+  the compiling at runtime. CUDA container major 12.x ≤ host Driver API 13.0
+  (drifts; not hardcoded).
+
+### Gate verdict & follow-up
+
+**GPU gate: PASSED.** Both gate conditions are met with evidence: (1) the M12
+cudarc precompiled-PTX vector-add verified element-wise on a Tier-0 driver-only
+image; **then** (2) the M13 Burn CUDA-backend tensor add verified correct on a
+Tier-1 CUDA image with `libnvrtc`/`libcudart` present and all
+`burn`/`burn-cuda`/`cubecl`/`cudarc` versions pinned together. M10/M11
+(`nvidia-smi` from Python then Rust) are recorded as the prerequisite
+observation steps. GPU type (T4) + per-run cost recorded for every milestone.
+
+**Follow-up (not blocking the gate):** these validations were driven via direct
+`modal run` / per-example `modal_runner` builds and `gpu_app.py`, not yet through
+the first-class CLI surface. Wire the GPU path into the `modal-rust` CLI:
+(a) `run --gpu <type>` passthrough (verbatim, with the `--yes` cost confirmation
++ per-run cost note from §4 Q1), and (b) multi-example package-qualified
+(`-p <example>`) builds so `gpu_info` / `cuda_vector_add` / `burn_add` can be
+invoked as `cargo run -p modal-rust-cli -- run <entrypoint> --gpu T4 …` per the
+M11/M12/M13 acceptance commands. The M12 PTX-sanitize (ASCII-only,
+strip-to-`.version`) and the Tier-1 `*-devel-*`-headers requirement should be
+captured as guardrails when that wiring lands.
+
 ## Open Questions
 
 GPU-relevant; each has a recommended default in the synthesis (none block

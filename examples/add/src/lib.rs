@@ -98,6 +98,41 @@ pub fn will_panic(_input: AddInput) -> anyhow::Result<AddOutput> {
     panic!("deliberate panic from `will_panic`");
 }
 
+/// The (empty) input for `gpu_info` (M11). The runner argument is always a single
+/// named JSON object (boundaries.md §3); a fieldless struct deserializes cleanly
+/// from `{}`, so M11 is driven with `--input '{}'`.
+#[derive(Debug, Deserialize)]
+pub struct GpuInfoInput {}
+
+/// The output of `gpu_info`: the captured `nvidia-smi` report (M11).
+#[derive(Debug, Serialize)]
+pub struct GpuInfoOutput {
+    /// `nvidia-smi`'s stdout — the GPU + driver version + CUDA Driver API version,
+    /// now produced BY RUST.
+    pub nvidia_smi: String,
+    /// `nvidia-smi`'s exit code (0 on success).
+    pub exit_code: i32,
+    /// Any `nvidia-smi` stderr (normally empty).
+    pub stderr: String,
+}
+
+/// `gpu_info` (M11): observe the GPU from RUST. Shells out to `nvidia-smi` via
+/// `std::process::Command` and returns its stdout through the M0 JSON envelope.
+///
+/// This is the Burn-free, CUDA-crate-free GPU observation step (Tier 0): the GPU
+/// machine preinstalls the NVIDIA driver + Driver API (`libcuda`) + `nvidia-smi`,
+/// so no CUDA toolkit and no `cudarc` are needed. The ONLY new variable over the
+/// CPU-proven M4/M7 build path is `gpu=` placement on the Function — the build
+/// recipe is identical (boundaries.md §9, research-synthesis.md §3 M11).
+pub fn gpu_info(_input: GpuInfoInput) -> anyhow::Result<GpuInfoOutput> {
+    let output = std::process::Command::new("nvidia-smi").output()?;
+    Ok(GpuInfoOutput {
+        nvidia_smi: String::from_utf8_lossy(&output.stdout).into_owned(),
+        exit_code: output.status.code().unwrap_or(-1),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
 /// The manual v0 registry (boundaries.md §3). Registers `add` plus the named test
 /// entrypoints used to exercise the remaining error kinds. A future
 /// `#[modal_rust::function]` macro path would generate the SAME `__wrap` fn and
@@ -109,6 +144,7 @@ pub fn modal_registry() -> Registry {
         .function("fail_structured", typed!(fail_structured))
         .function("bad_encode", typed!(bad_encode))
         .function("will_panic", typed!(will_panic))
+        .function("gpu_info", typed!(gpu_info))
 }
 
 #[cfg(test)]
@@ -124,9 +160,23 @@ mod tests {
     #[test]
     fn registry_has_all_entrypoints() {
         let reg = modal_registry();
-        for name in ["add", "fail", "fail_structured", "bad_encode", "will_panic"] {
+        for name in [
+            "add",
+            "fail",
+            "fail_structured",
+            "bad_encode",
+            "will_panic",
+            "gpu_info",
+        ] {
             assert!(reg.get(name).is_some(), "missing entrypoint {name}");
         }
         assert!(reg.get("nope").is_none());
+    }
+
+    #[test]
+    fn gpu_info_input_decodes_from_empty_object() {
+        // M11 is driven with `--input '{}'`; the fieldless input must decode from
+        // an empty JSON object.
+        let _: GpuInfoInput = serde_json::from_str("{}").unwrap();
     }
 }

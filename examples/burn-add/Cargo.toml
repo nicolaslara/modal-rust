@@ -1,0 +1,49 @@
+[package]
+name = "example-burn-add"
+version = "0.0.0"
+edition = "2021"
+description = "M13: a Burn tensor smoke — a minimal burn-cuda (CubeCL) tensor add on the CUDA backend (Tier 1, CUDA-runtime image; CubeCL JIT-compiles via NVRTC at runtime; needs libnvrtc + libcudart)."
+publish = false
+
+[lib]
+name = "example_burn_add"
+path = "src/lib.rs"
+
+[[bin]]
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+modal-rust-runtime = { path = "../../crates/modal-rust-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# `libloading` powers the HARD startup self-check (boundaries.md §9; tasks.md
+# M13): we dlopen `libnvrtc.so` + `libcudart.so` ourselves so an accidentally
+# Tier-0 image fails LOUDLY at startup, instead of CubeCL hiding the missing lib
+# until the first kernel JIT.
+libloading = "0.8"
+
+# ---------------------------------------------------------------------------
+# M13 PINNED VERSION SET (pinned TOGETHER — Burn is pre-1.0 with frequent
+# breaking releases; tasks.md M13). The chain is:
+#   burn 0.21  +  burn-cuda 0.21  ->  cubecl 0.10 (cuda)  ->  cubecl-cuda 0.10
+#     ->  cudarc ^0.19 with `fallback-dynamic-loading` + `fallback-latest`
+#         + `cuda-version-from-build-system`.
+# burn-cuda pulls cudarc transitively with dynamic loading, so the crate builds
+# with NO CUDA toolkit on the build host (the Modal Function body / this Mac),
+# and CubeCL dlopens libnvrtc/libcudart at runtime (Tier 1). The exact resolved
+# patch versions are recorded in Cargo.lock and quoted in knowledge.md.
+# ---------------------------------------------------------------------------
+
+# `burn` with `cuda` feature, default-features off to avoid pulling in extra
+# backends (wgpu/ndarray) and dataset/std machinery we don't need for the smoke.
+[dependencies.burn]
+version = "0.21"
+default-features = false
+features = ["cuda"]
+
+# burn-cuda gives us the `Cuda` backend type + `CudaDevice` directly. Pinned to
+# the SAME minor as `burn` (0.21) — they release in lockstep.
+[dependencies.burn-cuda]
+version = "0.21"

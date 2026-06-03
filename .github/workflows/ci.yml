@@ -58,11 +58,14 @@ jobs:
 
       - name: Lint
         if: steps.detect.outputs.has_cargo == 'true'
-        run: cargo +"$RUST_TOOLCHAIN" clippy --all-targets --all-features -- -D warnings
+        # No --workspace / --all-features: that would pull example-burn-add
+        # (cubecl-cuda), which only compiles against a CUDA toolkit. default-members
+        # (set in Cargo.toml) excludes it; it is built/verified on Modal.
+        run: cargo +"$RUST_TOOLCHAIN" clippy --all-targets -- -D warnings
 
       - name: Test
         if: steps.detect.outputs.has_cargo == 'true'
-        run: cargo +"$RUST_TOOLCHAIN" test --workspace
+        run: cargo +"$RUST_TOOLCHAIN" test
 
       - name: Check Whitespace
         run: git diff --check

@@ -45,7 +45,10 @@ observation steps. GPU cost is recorded for every milestone.
 
 ## M10 - GPU `nvidia-smi` from the Python shim (Tier 0 sanity)
 
-Status: pending
+Status: completed (2026-06-03) — `gpu="T4"` placed on a real Tesla T4 (15360 MiB);
+`nvidia-smi` from the Python shim reports Driver 580.95.05 / CUDA Driver API 13.0;
+no CUDA toolkit installed (Tier 0); `gpu=` passthrough verbatim. Evidence in
+knowledge.md "GPU validation (2026-06-03) — M10".
 
 Acceptance:
 - `@app.function(gpu='T4')` body runs `subprocess.run(['nvidia-smi'])` and
@@ -67,7 +70,11 @@ Evidence:
 
 ## M11 - `nvidia-smi` from a Rust function (Tier 0, no CUDA crate)
 
-Status: pending
+Status: completed (2026-06-03) — `gpu_info` runner (built in-body via the M4
+recipe; sole new variable `gpu="T4"`) returned `{"ok":true,...}` with `nvidia-smi`
+output produced BY RUST (Tesla T4 / driver 580.95.05 / CUDA Driver API 13.0);
+`cargo tree -p example-add` shows NO cudarc/cuda/cubecl/burn (still Tier 0).
+Evidence in knowledge.md "GPU validation (2026-06-03) — M11".
 
 Acceptance:
 - A `gpu_info` entrypoint runs `std::process::Command::new("nvidia-smi")` and
@@ -89,7 +96,12 @@ Evidence:
 
 ## M12 - Real Rust CUDA vector add (cudarc, precompiled PTX, driver-only)
 
-Status: pending
+Status: completed (2026-06-03) — cudarc 0.19.7 (dynamic-loading) vector-add via
+the Driver API + precompiled PTX on Tesla T4 (driver 580.95.05 / CUDA 13.0),
+`valid:true` element-wise vs CPU ref at n=1024 and n=4096. Tier 0 confirmed
+(`rust:1-slim`+add_python only; libcuda-only at runtime, no NVRTC/nvcc/libcudart;
+forward-compatible `.target sm_52` → T4 sm_75). Self-check fails loudly without a
+GPU. Evidence in knowledge.md "GPU validation (2026-06-03) — M12".
 
 Acceptance:
 - cudarc added with `-F dynamic-loading` (links with NO CUDA present at build
@@ -117,7 +129,15 @@ Evidence:
 
 ## M13 - Burn tensor smoke (Tier 1, CUDA-runtime image)
 
-Status: pending
+Status: completed (2026-06-03) — verified Burn CUDA-backend tensor add on T4
+(`valid:true`; samples 128→384, 255→765). Pinned set: burn 0.21.0 / burn-cuda
+0.21.0 / cubecl 0.10.0 / cubecl-cuda 0.10.0 / cudarc 0.19.7. Tier-1 recipe:
+`nvidia/cuda:12.6.3-devel-ubuntu22.04` + add_python=3.12 + rustup,
+`CUDA_PATH=/usr/local/cuda`, gpu="T4". Empirical: CubeCL's runtime NVRTC needs
+the CUDA **headers** (`cuda_runtime.h`) — a `*-runtime-*` image (libs only)
+fails; `*-devel-*` (or headers under `$CUDA_PATH/include`) is required. Hard
+`dlopen` self-check of libnvrtc+libcudart passes on T4, fails loudly on Tier 0.
+See knowledge.md "M13 — Burn tensor smoke … PASSED" for full evidence.
 
 Acceptance:
 - Tier 1 image: `nvidia/cuda:<12.x|13.x>-runtime-<os>` + `add_python='3.12'`, OR

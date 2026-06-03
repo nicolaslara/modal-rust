@@ -83,7 +83,7 @@ Every task needs evidence before completion. Match depth to scope:
 | --- | --- |
 | Research only | Primary/source links, dated notes, and — where the question is empirical — a small Modal spike with the exact command and result |
 | Architecture docs | Boundary review, failure modes, explicit assumptions, user-sensitive decisions called out |
-| Rust code | `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test` (once a Cargo workspace exists) |
+| Rust code | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (operate on `default-members`; **not** `--workspace`/`--all-features`, which pull the CUDA-only `example-burn-add` — that builds on Modal / a CUDA host only) |
 | Generated Python shim | The shim runs via `modal run` / `modal deploy`; record the command and observed output |
 | `run` milestone | Remote build happened at execution time (in the function body on the happy path, or a recorded Sandbox fallback if a Function-body build is infeasible); a local source edit changed the next run's output |
 | `deploy` milestone | `cargo build` appears in deploy/build logs and is **absent** from call logs; deployed result is stable until redeploy |
@@ -171,7 +171,9 @@ it does not. Record intentional version pins in the relevant workpad.
 ## CI
 
 Once a Cargo workspace exists, GitHub Actions enforces the deterministic
-unattended subset: `cargo fmt --check`, `cargo clippy --all-targets
---all-features -- -D warnings`, `cargo test --workspace`, and `git diff --check`.
-Live Modal runs, deploys, and GPU smokes are opt-in and stay out of unattended CI
-(they cost money and need credentials).
+unattended subset: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test`, and `git diff --check` — all on `default-members` (which
+excludes the CUDA-only `example-burn-add`; `--workspace`/`--all-features` are
+avoided so the no-CUDA CI box stays green). Live Modal runs, deploys, and GPU
+smokes are opt-in and stay out of unattended CI (they cost money and need
+credentials).

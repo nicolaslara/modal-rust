@@ -4,6 +4,22 @@ members = [
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "examples/add",
+    "examples/cuda-vector-add",
+    "examples/burn-add",
+]
+
+# `example-burn-add` is GPU/CUDA-only: it pulls `cubecl-cuda`, which only compiles
+# against a CUDA toolkit (present on Modal's Tier-1 image, absent on a typical dev
+# box / this macOS host). It stays a workspace MEMBER so the Modal shim can build it
+# with `-p example-burn-add`, but it is excluded from `default-members` so bare
+# `cargo build`/`test`/`clippy` and CI stay green without CUDA. Build it explicitly
+# on a CUDA host or on Modal. (`example-cuda-vector-add` uses cudarc dynamic-loading,
+# which links with no CUDA at build time, so it stays in the default set.)
+default-members = [
+    "crates/modal-rust-runtime",
+    "crates/modal-rust-cli",
+    "examples/add",
+    "examples/cuda-vector-add",
 ]
 
 # M0 build-profile constraint (boundaries.md §6): `catch_unwind` requires the

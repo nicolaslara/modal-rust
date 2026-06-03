@@ -1,0 +1,38 @@
+[package]
+name = "example-cuda-vector-add"
+version = "0.0.0"
+edition = "2021"
+description = "M12: a real Rust GPU compute proof — a cudarc vector-add via the CUDA Driver API loading a precompiled PTX kernel (Tier 0, driver-only; no NVRTC, no nvcc, no libcudart)."
+publish = false
+
+[lib]
+name = "example_cuda_vector_add"
+path = "src/lib.rs"
+
+[[bin]]
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+modal-rust-runtime = { path = "../../crates/modal-rust-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# cudarc with `dynamic-loading`: links with NO CUDA present at build time and
+# dlopens `libcuda.so` at runtime (boundaries.md §9; tasks.md M12). We disable
+# default features (which include `cuda-version-from-build-system`, requiring
+# nvcc at build time) and pin an explicit CUDA major.minor (`cuda-12060`) so the
+# bindings compile without any CUDA toolkit on the build host. CUDA 12.x ≤ the
+# Modal host driver's supported major (observed Driver API 13.0, drifts — never
+# hardcoded) keeps the container toolkit major ≤ host (12.x/13.x compatible).
+[dependencies.cudarc]
+version = "0.19"
+default-features = false
+# `nvrtc` here enables ONLY the Rust-side `Ptx` type + `CudaContext::load_module`
+# wrappers (the safe PTX-loading API). It does NOT make us Tier 1: on our path
+# (`Ptx::from_src` -> `load_module` -> `cuModuleLoadData`) only `libcuda` symbols
+# are dlopened at runtime. `libnvrtc.so` is dlopened lazily and ONLY if
+# `compile_ptx` is ever called — which this crate never does. So the runtime
+# stays driver-only (Tier 0): no NVRTC, no nvcc, no libcudart needed.
+features = ["dynamic-loading", "driver", "nvrtc", "cuda-12060"]

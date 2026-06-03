@@ -41,8 +41,17 @@ modal-rust call   add --input '{"a":40,"b":2}'   # invoke the deployed function 
 **Local only** (offline — no Modal):
 
 ```bash
-cargo test --workspace
+cargo test                                                                       # default-members (skips the CUDA-only burn example)
 cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'   # -> {"ok":true,"value":{"sum":42}}
+```
+
+**GPU** (validated on a T4; runs via the raw shim — `--gpu` wiring in the CLI is a follow-up):
+
+```bash
+modal run workpads/gpu-compute/gpu_app.py::smi_py            # nvidia-smi on a T4
+modal run workpads/gpu-compute/gpu_app.py::gpu_info_rust     # nvidia-smi from a Rust function
+modal run workpads/gpu-compute/gpu_app.py::cuda_vector_add   # cudarc vector-add (real Rust GPU compute)
+modal run workpads/gpu-compute/gpu_app.py::burn_add          # Burn tensor add (Tier-1 CUDA image)
 ```
 
 <details><summary><b>Under the hood</b> — what the CLI generates</summary>
