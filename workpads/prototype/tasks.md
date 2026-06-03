@@ -290,7 +290,7 @@ Evidence:
 
 ## M5 - Source-edit reactivity
 
-Status: in_progress (M4 dependency satisfied; not executed in the 2026-06-03 POC loop, which stopped after M4)
+Status: completed
 
 risk: low. depends_on: [M4]
 
@@ -315,7 +315,7 @@ Evidence (raw `modal run` against the `main` local_entrypoint — `--input-json`
 
 ## M6 - Cargo-cache Volume (best-effort dev-iteration speedup)
 
-Status: in_progress (best-effort; M4 dependency satisfied with a 9.34s cold baseline recorded; cache benchmark not executed in the 2026-06-03 POC loop)
+Status: completed (best-effort; cold/warm benchmarked, correctness held both runs; warm speedup is the accepted null/neutral result — CARGO_HOME-only warming on the ephemeral target-dir path)
 
 risk: medium. depends_on: [M4]
 
@@ -368,7 +368,7 @@ Evidence:
 
 ## M7 - Deploy-time build (`copy=True` + `run_commands` cargo build, bake `/app/modal_runner`)
 
-Status: in_progress (M4 dependency satisfied; deploy-time build not executed in the 2026-06-03 POC loop, which stopped after M4)
+Status: completed
 
 risk: high. depends_on: [M4]
 
@@ -409,7 +409,7 @@ Evidence:
 
 ## M8 - Deployed runtime does NOT compile (the deploy invariant)
 
-Status: blocked (depends_on M7, which has not been executed yet)
+Status: completed
 
 risk: medium. depends_on: [M7]
 
@@ -541,3 +541,32 @@ Evidence:
 - A simulated-missing-prereq run showing the actionable structured error (M0 model).
 - `cargo run -p modal-rust-cli -- doctor --rust` against a `panic = "abort"` crate
   (flagged/failed) vs the default unwind profile (passes) — the abort-detection proof.
+
+## M0-R - Review: panic-capture robustness (follow-up)
+
+Status: pending
+
+risk: low. depends_on: [M0]
+
+Raised during M0–M8 manual validation (2026-06-03); review the `panic` error kind:
+
+- **Backtrace is empty unless `RUST_BACKTRACE=1`.** Capture is env-gated, so a local
+  `modal_runner --entrypoint will_panic` (without the env var) yields
+  `"backtrace":""`. The shims set `RUST_BACKTRACE=1` remotely so dev/deploy runs
+  populate it, but consider `std::backtrace::Backtrace::force_capture()` (always
+  captures, ignores the env var) for a consistent `panic` envelope in every context.
+- **`std::env::set_var` is `unsafe` on edition 2024.** The M0 test sets
+  `RUST_BACKTRACE` via `std::env::set_var` (fine on edition 2021; rust-analyzer flags
+  E0133 under 2024). `force_capture()` would remove the need to mutate the env at all.
+  Revisit before any edition-2024 migration.
+- **Decode precedes the handler (correct — document it).** `will_panic` with `{}`
+  returns `decode_error` (input is decoded before the handler runs); valid input is
+  required to reach the `panic` path. Correct precedence; note it so it isn't
+  mistaken for a panic-capture failure.
+
+Acceptance: a recorded decision (force_capture vs env-gated), the edition-2024
+`set_var` risk resolved or tracked, and a test that exercises the `panic` envelope
+without a process-global env mutation.
+
+Evidence: `crates/modal-rust-runtime/src/lib.rs` (panic hook + `catch_unwind`);
+`workpads/prototype/knowledge.md` POC validation notes.

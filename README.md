@@ -9,11 +9,47 @@ problem is **Rust function discovery + remote dispatch + project packaging**,
 with a clean split between **build-at-run-time** (dev) and **build-at-deploy-time**
 (prod).
 
-> Status: **early prototype.** The walking skeleton runs: `examples/add` compiles
-> and executes on Modal, and the central belief — *a normal Modal Function can
-> `cargo build` mounted Rust source at runtime* — is validated (prototype M0–M4).
-> Built one boundary at a time via a file-backed workpads workflow; see
-> `project.md`, `TASKS.md`, and `workpads/prototype/`.
+> Status: **prototype gate met (M0–M8).** `examples/add` runs end-to-end on Modal:
+> the dev path compiles the mounted source *in the function body* and reflects local
+> edits, and the deploy path compiles *once at image-build time* with the deployed
+> runtime executing only the prebuilt binary (never `cargo`). The build boundary is
+> proven both ways. Remaining: M9 (the `modal-rust` CLI wrapper) and GPU. Built one
+> boundary at a time via a file-backed workpads workflow; see `workpads/prototype/`.
+
+## Try it
+
+> The **`modal-rust` CLI doesn't exist yet** (that's milestone **M9**). Today you
+> drive what the prototype produced directly: the **`modal_runner`** binary (built
+> from `examples/add`) and the **generated Python shims** under
+> `workpads/prototype/`. The CLI will later generate those shims for you.
+
+**Prerequisites:** a Rust toolchain ([`rustup`](https://rustup.rs)) and the Modal
+CLI authenticated — `pip install modal && modal token new` (or an existing
+`~/.modal.toml`). Run everything from the repo root.
+
+**Test it locally** (offline — no Modal):
+
+```bash
+cargo test --workspace
+cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'
+# -> {"ok":true,"value":{"sum":42}}
+```
+
+**Run it on Modal** (source is mounted and compiled *inside* the container, then executed):
+
+```bash
+modal run workpads/prototype/dev_app.py::main
+# builds examples/add in the container, prints {"ok":true,"value":{"sum":42}}
+# override the call (defaults to add + {"a":40,"b":2}):
+modal run workpads/prototype/dev_app.py::main --entrypoint add --input-json '{"a":2,"b":3}'
+```
+
+**Deploy & call** (compiles *once* at deploy time; the deployed runtime only runs the prebuilt binary, never `cargo`):
+
+```bash
+modal deploy workpads/prototype/deploy_app.py       # bakes /app/modal_runner into the image (app: modal-rust-add-poc)
+modal run    workpads/prototype/call_app.py::main    # -> {"ok":true,"value":{"sum":42}}
+```
 
 ## The idea
 
@@ -25,7 +61,8 @@ generated runner binary     # links the user crate, dispatches by name
 remote Modal container      # runs the runner, calls the function by name
 ```
 
-The intended user experience:
+The intended user experience — the `modal-rust` CLI (milestone **M9, not built
+yet**; until then use the **Current state** commands above):
 
 ```bash
 modal-rust run add    --project examples/add --input-json '{"a":2,"b":40}'
@@ -48,39 +85,6 @@ user error when its error type is `Serialize` (else `null`):
 ```text
 -> {"ok":false,"error":{"kind":"function_error","message":"...","details":null,"backtrace":"..."}}
 ```
-
-## Try it
-
-**Prerequisites:** a Rust toolchain ([`rustup`](https://rustup.rs)) and the Modal
-CLI authenticated — `pip install modal && modal token new` (or an existing
-`~/.modal.toml`). The Modal CLI reads your credentials itself; nothing to copy.
-
-**Test it locally** (offline — no Modal, no cost):
-
-```bash
-cargo test --workspace
-# run the function through the runner, locally:
-cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}'
-# -> {"ok":true,"value":{"sum":42}}
-```
-
-**Run it on Modal** (the real thing — your source is mounted and compiled *inside*
-the container, then executed):
-
-```bash
-modal run workpads/prototype/dev_app.py::main
-# builds examples/add in the Modal container, prints {"ok":true,"value":{"sum":42}}
-```
-
-It defaults to `add` with `{"a":40,"b":2}`; override either:
-
-```bash
-modal run workpads/prototype/dev_app.py::main --entrypoint add --input-json '{"a":2,"b":3}'
-```
-
-> These are the raw generated shims under `workpads/prototype/`. The
-> `modal-rust run/deploy/call` CLI (prototype M9) will wrap them so you won't call
-> `modal` directly. Deploy/call commands are added here once M7–M8 land.
 
 ## Design stances
 

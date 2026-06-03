@@ -219,3 +219,121 @@ def run_entrypoint(entrypoint: str, input_json: str) -> str:
 @app.local_entrypoint()
 def main(entrypoint: str = "add", input_json: str = '{"a":40,"b":2}'):
     print(run_entrypoint.remote(entrypoint, input_json))
+
+
+# --------------------------------------------------------------------------- M6
+# Best-effort Cargo-cache Volume (dev-iteration speedup). A SECOND run-path variant
+# of `run_entrypoint` that additionally mounts a persistent Volume holding
+# `CARGO_HOME` (the crates.io index + downloaded `.crate` sources) so a warm rebuild
+# can skip re-fetching the registry index and crate tarballs.
+#
+# Contract (boundaries.md §7, tasks.md M6):
+#   - `Volume.from_name("modal-rust-cargo-cache", create_if_missing=True)` at a
+#     STABLE mount path (`/cache`). create_if_missing makes the first (cold) run
+#     create an EMPTY volume; the second (warm) run sees what cargo wrote.
+#   - `CARGO_HOME` lives ON the Volume (`/cache/cargo`): index/downloads are
+#     read-mostly and low-risk to persist.
+#   - `CARGO_TARGET_DIR` stays `/tmp/target` by DEFAULT (off the Volume): cargo's
+#     many small stat/lock ops + the volume-busy/partial-commit hazards make a
+#     network-FS target dir the rejected default (boundaries.md §4/§7). It is NOT
+#     promoted to the Volume in v0.
+#   - NEVER `vol.reload()` on the build path: cargo holds file locks, so reload
+#     would risk "volume busy"; we rely on Modal's automatic background/shutdown
+#     commits to persist `CARGO_HOME` (boundaries.md §7). No explicit commit/reload
+#     call appears below.
+#
+# Correctness rule (boundaries.md §7): a cache miss only costs time, never a wrong
+# result. The build inputs are the mounted `/src` + (on the cached path) a warm
+# `CARGO_HOME`; correctness never depends on cache state, so a null/neutral speedup
+# is an acceptable, recorded outcome.
+#
+# M2 branch (recorded up front): the mount is WRITABLE in place, so the build runs in
+# `/src` with `CARGO_TARGET_DIR=/tmp/target`. The target dir is therefore EPHEMERAL
+# every run on this default; only `CARGO_HOME` (download/index time) is warmed by the
+# Volume. Expected speedup is bounded to crate-download/index time saved, NOT compile
+# time — and for this tiny dep graph (anyhow/serde/serde_json) that bound is small,
+# so a small/neutral delta is the honest expectation before benchmarking.
+CARGO_CACHE_VOLUME = modal.Volume.from_name(
+    "modal-rust-cargo-cache", create_if_missing=True
+)
+CACHE_MOUNT = "/cache"  # STABLE mount path (held constant across cold + warm runs)
+
+
+@app.function(
+    image=mounted_image,
+    timeout=1800,
+    volumes={CACHE_MOUNT: CARGO_CACHE_VOLUME},
+)
+def run_entrypoint_cached(entrypoint: str, input_json: str) -> str:
+    import os
+    import shutil
+    import sys
+    import time
+
+    env = dict(os.environ)
+    # CARGO_HOME on the Volume (warmed across runs); CARGO_TARGET_DIR stays /tmp.
+    env["CARGO_HOME"] = f"{CACHE_MOUNT}/cargo"
+    env["CARGO_TARGET_DIR"] = "/tmp/target"
+    env["RUST_BACKTRACE"] = "1"
+    os.makedirs(env["CARGO_HOME"], exist_ok=True)
+
+    # Report cache warmth as an explicit signal (cold = empty CARGO_HOME).
+    reg_cache = f"{env['CARGO_HOME']}/registry"
+    warm = os.path.isdir(reg_cache) and bool(os.listdir(reg_cache))
+    print(
+        f"[run-cached] CARGO_HOME={env['CARGO_HOME']} on Volume "
+        f"'modal-rust-cargo-cache' at {CACHE_MOUNT}; cache {'WARM' if warm else 'COLD (empty)'}",
+        file=sys.stderr,
+    )
+
+    # Build location derived from mount writability (M2 probe = WRITABLE in place).
+    if os.access(REMOTE_SRC, os.W_OK):
+        build_dir = REMOTE_SRC
+        print(f"[run-cached] mount {REMOTE_SRC} writable; building in place", file=sys.stderr)
+    else:
+        build_dir = "/tmp/build"
+        print(
+            f"[run-cached] mount {REMOTE_SRC} read-only; cp -a {REMOTE_SRC} {build_dir}",
+            file=sys.stderr,
+        )
+        if os.path.exists(build_dir):
+            shutil.rmtree(build_dir)
+        subprocess.run(["cp", "-a", REMOTE_SRC, build_dir], check=True)
+
+    # cargo build --release --bin modal_runner; logs -> stderr (stdout stays one
+    # JSON envelope). Time it so the cold-vs-warm wall-clock is recorded in-band.
+    t0 = time.monotonic()
+    build = subprocess.run(
+        ["cargo", "build", "--release", "--bin", "modal_runner"],
+        cwd=build_dir,
+        env=env,
+        stdout=sys.stderr,
+        stderr=sys.stderr,
+    )
+    build_secs = time.monotonic() - t0
+    if build.returncode != 0:
+        raise RuntimeError(f"cargo build failed with exit code {build.returncode}")
+    print(f"[run-cached] cargo build wall-clock: {build_secs:.2f}s", file=sys.stderr)
+
+    runner = "/tmp/target/release/modal_runner"
+
+    with open("/tmp/in.json", "w") as f:
+        f.write(input_json)
+
+    proc = subprocess.run(
+        [runner, "--entrypoint", entrypoint, "--input-file", "/tmp/in.json"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
+    print(f"[run-cached] modal_runner exit={proc.returncode}", file=sys.stderr)
+    # NOTE: deliberately NO vol.reload()/commit() on this build path — Modal's
+    # automatic background/shutdown commits persist CARGO_HOME (boundaries.md §7).
+    return proc.stdout.strip()
+
+
+@app.local_entrypoint()
+def cached_main(entrypoint: str = "add", input_json: str = '{"a":40,"b":2}'):
+    print(run_entrypoint_cached.remote(entrypoint, input_json))
