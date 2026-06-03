@@ -1,0 +1,24 @@
+[package]
+name = "example-add-macro"
+version = "0.0.0"
+edition = "2021"
+description = "The macro-path twin of examples/add: #[modal_rust::function] registers `add` via inventory, producing the SAME Registry/HandlerFn shape and runner protocol as the manual typed! path (ergonomics E1)."
+publish = false
+
+[lib]
+name = "example_add_macro"
+path = "src/lib.rs"
+
+[[bin]]
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+modal-rust-runtime = { path = "../../crates/modal-rust-runtime" }
+modal-rust-macros = { path = "../../crates/modal-rust-macros" }
+# `inventory::submit!` is emitted by the macro; the user crate must carry the
+# `inventory` dependency (boundaries.md §3, ergonomics E1).
+inventory = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

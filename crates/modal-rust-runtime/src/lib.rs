@@ -252,6 +252,26 @@ pub mod __macro_support {
     }
 }
 
+/// A distributed registration entry collected by [`inventory`] (boundaries.md §3,
+/// ergonomics E1). The `#[modal_rust::function]` proc-macro submits one of these
+/// per annotated handler — `name` defaults to the fn name (overridable with
+/// `#[modal_rust::function(name = "...")]`), and `handler` is the SAME
+/// monomorphized `typed!` wrapper `fn` pointer the manual builder uses.
+///
+/// [`Registry::from_inventory`] collects every submission into the SAME
+/// `BTreeMap<&'static str, HandlerFn>` the manual
+/// `Registry::new().function(name, typed!(f))` builder produces, so both
+/// registration paths converge on one dispatch path (boundaries.md §3). There is
+/// no `dyn`, no `Box`, no vtable: `handler` is a bare `fn` pointer.
+pub struct Registration {
+    /// The entrypoint name (registry key).
+    pub name: &'static str,
+    /// The monomorphized [`typed!`] wrapper `fn` pointer.
+    pub handler: HandlerFn,
+}
+
+inventory::collect!(Registration);
+
 /// The handler registry: `BTreeMap<&'static str, HandlerFn>` (boundaries.md §3).
 /// Static-str keys, fn-pointer values — no allocation, no `dyn`. Built with
 /// [`Registry::new`] + [`Registry::function`]; **duplicate names are rejected**
@@ -267,6 +287,28 @@ impl Registry {
         Registry {
             handlers: BTreeMap::new(),
         }
+    }
+
+    /// Assemble a [`Registry`] from every [`Registration`] submitted via
+    /// [`inventory`] by the `#[modal_rust::function]` macro (boundaries.md §3,
+    /// ergonomics E1).
+    ///
+    /// This converges on the SAME dispatch path as the manual builder: each
+    /// collected entry is inserted through the same insertion logic as
+    /// [`Registry::function`], so the resulting `BTreeMap<&'static str, HandlerFn>`
+    /// is shape-identical to one built by hand.
+    ///
+    /// # Panics
+    /// Panics (the SAME hard startup error as [`Registry::function`]) if two
+    /// submissions share a name — duplicate names are rejected, never silently
+    /// last-write-wins. This matters more in the macro/inventory world, where a
+    /// duplicate `#[modal_rust::function(name = "x")]` is easy to write.
+    pub fn from_inventory() -> Self {
+        let mut registry = Registry::new();
+        for registration in inventory::iter::<Registration> {
+            registry = registry.function(registration.name, registration.handler);
+        }
+        registry
     }
 
     /// Register a handler under `name`.

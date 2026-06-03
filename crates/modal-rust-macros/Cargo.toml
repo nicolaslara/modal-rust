@@ -1,0 +1,14 @@
+[package]
+name = "modal-rust-macros"
+version = "0.0.0"
+edition = "2021"
+description = "Additive proc-macro sugar for modal-rust: #[modal_rust::function] expands to the SAME typed!() wrapper + an inventory::submit! registration the manual Registry path produces. Changes no runner protocol."
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

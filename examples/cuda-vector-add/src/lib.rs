@@ -118,7 +118,10 @@ fn capture_ptx_jit_error_log(
             values.as_mut_ptr(),
         )
     };
-    let nul = err_buf.iter().position(|&b| b == 0).unwrap_or(err_buf.len());
+    let nul = err_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(err_buf.len());
     let log = String::from_utf8_lossy(&err_buf[..nul]).trim().to_string();
     if log.is_empty() {
         format!("<empty> (cuModuleLoadDataEx returned {res:?})")
@@ -202,8 +205,7 @@ pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> {
     builder.arg(&a_dev);
     builder.arg(&b_dev);
     builder.arg(&n_i32);
-    unsafe { builder.launch(cfg) }
-        .map_err(|e| anyhow::anyhow!("kernel launch failed: {e:?}"))?;
+    unsafe { builder.launch(cfg) }.map_err(|e| anyhow::anyhow!("kernel launch failed: {e:?}"))?;
 
     // Device -> host.
     let c_host = stream
@@ -224,8 +226,10 @@ pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> {
     }
     idxs.push(n - 1);
     idxs.dedup();
-    let samples: Vec<(usize, f32, f32)> =
-        idxs.into_iter().map(|i| (i, c_host[i], cpu_ref[i])).collect();
+    let samples: Vec<(usize, f32, f32)> = idxs
+        .into_iter()
+        .map(|i| (i, c_host[i], cpu_ref[i]))
+        .collect();
 
     Ok(VectorAddOutput {
         valid,

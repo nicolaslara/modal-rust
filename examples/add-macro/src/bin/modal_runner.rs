@@ -1,0 +1,18 @@
+//! The runner binary for the macro example (boundaries.md §1.4, ergonomics E1).
+//!
+//! Identical in shape to `examples/add`'s runner, except the registry is assembled
+//! from the macro's `inventory` submissions via `Registry::from_inventory()`
+//! instead of a hand-written `modal_registry()` builder. Both converge on the SAME
+//! `Registry` and the UNCHANGED `run_cli`, so the runner protocol is identical.
+//!
+//! It prints exactly one JSON envelope to stdout and mirrors `ok` in the exit code
+//! (boundaries.md §2): `0` success, `1` failure.
+
+// The macro's `inventory::submit!` lives in the library crate; pull it in so its
+// registration is linked and visible to `Registry::from_inventory()`.
+use example_add_macro as _;
+
+fn main() -> std::process::ExitCode {
+    let code = modal_rust_runtime::run_cli(modal_rust_runtime::Registry::from_inventory());
+    std::process::ExitCode::from(code as u8)
+}

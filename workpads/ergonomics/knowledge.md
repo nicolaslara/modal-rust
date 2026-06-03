@@ -180,3 +180,86 @@ synthesis questions remain in force; the ones below are ergonomics-specific.
   `str` (same as the subprocess `--input-json`/stdout text), since the `Handler`
   trait is codec-neutral on `&[u8]`. Option: pass `bytes` for a future
   CBOR/msgpack `Codec`. (mirrors §4.4 wire-format default)
+
+## E1 proc-macro registry (2026-06-03)
+
+E1 is DONE: build + verify both pass with captured evidence. The
+`#[modal_rust::function]` macro lands as pure additive sugar — the macro path is
+byte-identical in behaviour to the manual `Registry::new().function("add",
+typed!(add))` builder, and the frozen runner seam is untouched.
+
+**What the macro generates.** `#[modal_rust::function]` (optionally
+`#[modal_rust::function(name = "add")]`) is an attribute macro at
+`crates/modal-rust-macros/src/lib.rs`. Applied to a handler such as `pub fn
+add(input: AddInput) -> anyhow::Result<AddOutput>`, it emits two things:
+(1) the **original function verbatim**, unchanged; and (2) an
+`inventory::submit!` of a `modal_rust_runtime::Registration { name, handler }`
+whose `handler` is the SAME monomorphized `modal_rust_runtime::typed!(add)`
+wrapper `fn` pointer the manual builder produces. The entrypoint name defaults to
+the fn name and is overridable via `name = "..."`. The macro never invents a wire
+format — `typed!` still owns all decode/encode, so the registration reduces to the
+one dispatch path `name -> typed! wrapper (fn pointer) -> JSON bytes in -> JSON
+bytes out`. Verified: runtime diff is **+42/−0** (only a new `Registration` struct
++ `inventory::collect!` + `from_inventory()`, reusing the existing `.function()`);
+`HandlerFn` stays a bare `fn` pointer (no `Box`/`dyn`/vtable).
+
+**The `Registry::from_inventory()` addition.** A new associated constructor on the
+existing (unchanged-shape) `Registry` in
+`crates/modal-rust-runtime/src/lib.rs`. It iterates the `inventory`-collected
+`Registration` submissions and assembles the SAME `BTreeMap<&'static str,
+HandlerFn>` as the manual builder, routing each through the existing
+`.function()` so duplicate names hit the same hard "duplicate entrypoint" error
+(no silent last-write-wins). The runner binary body collapses to exactly
+`modal_rust_runtime::run_cli(modal_rust_runtime::Registry::from_inventory())`.
+
+**The example.** `examples/add-macro` mirrors `examples/add`:
+`#[modal_rust::function] pub fn add(AddInput) -> anyhow::Result<AddOutput>` in
+`src/lib.rs`, the one-line `from_inventory()` runner in
+`src/bin/modal_runner.rs`. It carries lib tests (byte-identical envelope,
+`from_inventory` lookup, `unknown_entrypoint`) plus a separate-binary integration
+test `tests/duplicate_rejected.rs` proving two registrations of the same name make
+`from_inventory()` fail with the frozen "duplicate entrypoint" error. Workspace
+`members` + `default-members` updated for both new crates
+(`modal-rust-macros`, `add-macro`).
+
+**async / `typed_async!`: DEFERRED, not implemented.** The macro DETECTS `async
+fn` but does NOT emit `typed_async!` — `typed_async!` is reserved in the runtime
+(boundaries.md §3) but not yet implemented, so emitting it would not compile.
+Instead the macro rejects `async fn` with a clear `compile_error!` ("use a
+synchronous handler that may `block_on` internally for now"), keeping the original
+fn so the rest of the crate still type-checks. Multi-arg handlers are likewise
+DEFERRED with a `compile_error!` (v0 supports exactly one `In` argument, matching
+`typed!(add)`); the reserved private-args-struct + shim expansion is not built yet.
+Both rejections are diagnostics, never silent mis-registration. When `typed_async!`
+lands, the async arm switches from diagnostic to emitting `typed_async!(..)` with
+the identical `HandlerFn` shape — no seam change required.
+
+**Manual path + frozen runner protocol UNCHANGED (confirmed).** `HandlerFn`,
+`Registry` (shape), `typed!`, `run_cli`, and the five-kind `RunnerError`
+(`decode_error|unknown_entrypoint|function_error|encode_error|panic`) are all
+unmodified. Verified by running the macro-built runner: `--entrypoint add
+--input-json '{"a":40,"b":2}'` → exactly `{"ok":true,"value":{"sum":42}}`, exit 0,
+`cmp`-clean against the manual `examples/add` capture; `unknown_entrypoint` → exit
+1 with `details:null` and known-list `["add"]`; `decode_error` (malformed JSON) →
+byte-identical macro-vs-manual (`expected ident at line 1 column 2`, exit 1);
+precedence (bad JSON + unknown entrypoint → `decode_error`) → byte-identical, exit
+1. stdout-only single-envelope and exit-code mapping behave identically.
+Default-members `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+and `cargo test` all exit 0. No git mutations.
+
+Caveats: verification ran clippy/test on `default-members` (not
+`--workspace`/`--all-features` literally), but covered both new crates. One
+pre-existing flaky runtime unit test (`panic_captured_with_backtrace`, the
+documented process-global panic-hook race per boundaries §3) flaked once mid-run
+then passed 5/5 subsequent full runs; unrelated to this change (no edits to
+`run_handler`, the panic hook, or the global slot).
+
+Evidence files: `crates/modal-rust-macros/src/lib.rs`,
+`crates/modal-rust-runtime/src/lib.rs`, `examples/add-macro/src/lib.rs`,
+`examples/add-macro/src/bin/modal_runner.rs`,
+`examples/add-macro/tests/duplicate_rejected.rs`.
+
+**Next (optional):** E2 (generated local Rust remote-call stubs,
+`app.add(20, 2).await?`) and then E3 (PyO3/maturin bridge) remain the optional
+next ergonomics steps; neither is started. The frozen seam already reserves what
+they need.

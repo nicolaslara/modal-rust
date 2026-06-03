@@ -43,7 +43,15 @@ gate protects: macros must not change the runner protocol.
 
 ## E1 - Proc-macro registry (`#[modal_rust::function]` → `inventory::submit!`)
 
-Status: pending
+Status: completed (2026-06-03) — build + verify both pass with evidence. Macro
+registers `add` via `inventory::submit!` + `typed!`; `Registry::from_inventory()`
+runner prints byte-identical `{"ok":true,"value":{"sum":42}}` (exit 0) vs manual
+`examples/add`; unknown_entrypoint→exit 1 (`details:null`); duplicate names
+hard-rejected; frozen `HandlerFn`/`Registry`/`typed!`/`run_cli` unchanged
+(runtime diff +42/-0, additive only); default-members `cargo fmt --check` /
+`clippy --all-targets -D warnings` / `cargo test` all exit 0. async &
+multi-arg deferred (clear `compile_error!`, not silently mis-registered). See
+`knowledge.md` → "E1 proc-macro registry (2026-06-03)".
 
 Acceptance:
 - `crates/modal-rust-macros` provides `#[modal_rust::function]` (optionally with

@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
+    "crates/modal-rust-macros",
     "examples/add",
+    "examples/add-macro",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -18,7 +20,9 @@ members = [
 default-members = [
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
+    "crates/modal-rust-macros",
     "examples/add",
+    "examples/add-macro",
     "examples/cuda-vector-add",
 ]
 

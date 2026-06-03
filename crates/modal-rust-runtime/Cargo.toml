@@ -9,6 +9,11 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# `inventory` is the distributed-registration backbone for the macro path
+# (boundaries.md §3, ergonomics E1). It is a zero-Modal / zero-network /
+# zero-Python crate (link-section based collection), so it does NOT violate the
+# runtime's minimal-dependency rule (boundaries.md §1).
+inventory = "0.3"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
