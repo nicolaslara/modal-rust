@@ -41,6 +41,10 @@ pub enum Error {
     /// alternative. (No facade surface returns this currently; retained as a stable
     /// variant for future stubs.)
     NotImplemented(String),
+    /// An invalid facade CONFIG was supplied (e.g. a user volume whose mount path
+    /// collides with the reserved cargo-cache mount). Distinct from a control-plane
+    /// failure: nothing was sent to Modal.
+    Config(String),
 }
 
 /// The facade `Result` alias.
@@ -54,6 +58,11 @@ impl Error {
              (App::new / App::from_inventory are offline-only, for `.local()`)."
                 .to_string(),
         )
+    }
+
+    /// Build an [`Error::Config`] from a message (invalid facade config).
+    pub(crate) fn config(msg: impl Into<String>) -> Error {
+        Error::Config(msg.into())
     }
 }
 
@@ -77,6 +86,7 @@ impl std::fmt::Display for Error {
             Error::Sdk(e) => write!(f, "control-plane operation failed: {e}"),
             Error::NotConnected(msg) => write!(f, "{msg}"),
             Error::NotImplemented(msg) => write!(f, "{msg}"),
+            Error::Config(msg) => write!(f, "invalid config: {msg}"),
         }
     }
 }
@@ -88,9 +98,10 @@ impl std::error::Error for Error {
             Error::Encode(e) => Some(e),
             Error::Decode(e) => Some(e),
             Error::Sdk(e) => Some(e),
-            Error::UnknownEntrypoint { .. } | Error::NotConnected(_) | Error::NotImplemented(_) => {
-                None
-            }
+            Error::UnknownEntrypoint { .. }
+            | Error::NotConnected(_)
+            | Error::NotImplemented(_)
+            | Error::Config(_) => None,
         }
     }
 }

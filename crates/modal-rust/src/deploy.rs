@@ -141,6 +141,17 @@ pub struct DeployConfig {
     /// [`for_app`](DeployConfig::for_app), so the `MODAL_RUST_INSTALL_RUST` env default
     /// flows through automatically (parity with `base_image`).
     pub install_rust: bool,
+    /// Named Modal secrets to attach (from `#[function(secrets = [..])]`). Resolved
+    /// to `secret_id`s and attached to `Function.secret_ids`; Modal injects their
+    /// key/values as ENV VARS. DEFAULT EMPTY. Set by `App::deploy_with` from the
+    /// decorated entrypoint's config (parity with the RUN path).
+    pub secrets: Vec<String>,
+    /// User volumes to attach as `(mount_path, volume_name)` pairs (from
+    /// `#[function(volumes = ["/data=my-vol"])]`). Each `volume_name` is resolved via
+    /// [`ModalClient::volume_get_or_create`] and mounted at `mount_path`. The DEPLOY
+    /// path has no cargo cache, so there is no `/cache` collision concern. DEFAULT
+    /// EMPTY.
+    pub volumes: Vec<(String, String)>,
 }
 
 impl DeployConfig {
@@ -160,6 +171,8 @@ impl DeployConfig {
             gpu: None,
             timeout_override_secs: None,
             install_rust: base.install_rust,
+            secrets: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 }
@@ -324,11 +337,32 @@ pub(crate) async fn deploy_function(
     // overrides the deploy default. Deploy has no in-body build, so its timeout is
     // purely the function's. `with_gpu(None)` is a CPU no-op (wire bytes identical).
     let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
-    let fn_spec = FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
+    let mut fn_spec = FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
         .with_mount_ids(vec![client_mount_id])
         .with_mount_client_dependencies(true)
         .with_timeout_secs(timeout)
         .with_gpu(config.gpu.clone())?;
+    // 6b. USER secrets (`#[function(secrets=..)]`): resolve each named secret to an
+    //     id (from_name lookup) and attach → Function.secret_ids (Modal injects their
+    //     key/values as ENV VARS). Empty ⇒ no-op (wire-identical to before). Values
+    //     never logged. The DEPLOY runtime never builds, so secrets are purely the
+    //     function's runtime env — consistent with the RUN path.
+    let mut secret_ids: Vec<String> = Vec::with_capacity(config.secrets.len());
+    for name in &config.secrets {
+        secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
+    }
+    if !secret_ids.is_empty() {
+        fn_spec = fn_spec.with_secret_ids(secret_ids);
+    }
+    // 6c. USER volumes (`#[function(volumes=["/mount=name"])]`): resolve each named
+    //     volume (create-if-missing, V1) and attach at its mount_path. DEPLOY has no
+    //     cargo cache, so no `/cache` collision concern. Empty ⇒ no-op.
+    for (mount_path, name) in &config.volumes {
+        let vid = client
+            .volume_get_or_create(name, false /* v1 */, true /* create */, None)
+            .await?;
+        fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
+    }
     let created = client
         .function_create(&app_id, &precreate_id, &fn_spec)
         .await?;
@@ -520,5 +554,29 @@ mod tests {
         // install_rust is inherited from RemoteConfig::default() (env-aware) and
         // defaults OFF, so the default deploy path stays byte-identical.
         assert!(!cfg.install_rust, "install_rust defaults off");
+        // User secrets/volumes default EMPTY (wire-identical to before).
+        assert!(cfg.secrets.is_empty(), "secrets default empty");
+        assert!(cfg.volumes.is_empty(), "volumes default empty");
+    }
+
+    #[test]
+    fn deploy_config_secrets_volumes_are_settable_non_macro() {
+        // Non-macro override: `DeployConfig`'s public fields let a builder/explicit
+        // caller set secrets + user volumes WITHOUT the decorator.
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Struct-update over the env-aware config: a non-macro caller sets ONLY
+        // secrets/volumes and keeps every other field.
+        let cfg = DeployConfig {
+            secrets: vec!["api-creds".to_string()],
+            volumes: vec![("/models".to_string(), "weights".to_string())],
+            ..DeployConfig::for_app("my-app")
+        };
+        assert_eq!(cfg.secrets, vec!["api-creds".to_string()]);
+        assert_eq!(
+            cfg.volumes,
+            vec![("/models".to_string(), "weights".to_string())]
+        );
     }
 }

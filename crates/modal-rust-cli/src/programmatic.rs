@@ -32,12 +32,18 @@ const DESCRIBE_SCHEMA_MAJOR: u32 = 1;
 
 /// The serialized view of `modal_rust_runtime::FunctionConfig` from the
 /// `--describe` manifest (P9 §A.3): `gpu: string|null`, `timeout_secs: u32|null`,
-/// `cache: bool|null`.
+/// `cache: bool|null`, plus the additive `secrets: [string]` and `volumes:
+/// [[mount, name]]`. The two list fields default empty (`#[serde(default)]`) so an
+/// OLD manifest (pre-secrets/volumes) still parses.
 #[derive(Debug, Clone, Deserialize)]
 struct FunctionConfigView {
     gpu: Option<String>,
     timeout_secs: Option<u32>,
     cache: Option<bool>,
+    #[serde(default)]
+    secrets: Vec<String>,
+    #[serde(default)]
+    volumes: Vec<(String, String)>,
 }
 
 /// One entrypoint in the parsed manifest.
@@ -89,7 +95,37 @@ fn to_function_config(view: &FunctionConfigView) -> FunctionConfig {
         gpu: view.gpu.clone().map(|s| &*Box::leak(s.into_boxed_str())),
         timeout_secs: view.timeout_secs,
         cache: view.cache,
+        // Same bounded leak for secrets/volumes (≤ a few per entrypoint): the manifest
+        // strings become the `&'static` slices `FunctionConfig` requires. The facade
+        // reads them back to owned `String`s before any RPC, so this is a one-shot leak.
+        secrets: leak_str_slice(&view.secrets),
+        volumes: leak_pair_slice(&view.volumes),
     }
+}
+
+/// Leak a `&[String]` to a `&'static [&'static str]` (bounded one-time CLI leak,
+/// see [`to_function_config`]).
+fn leak_str_slice(items: &[String]) -> &'static [&'static str] {
+    let leaked: Vec<&'static str> = items
+        .iter()
+        .map(|s| &*Box::leak(s.clone().into_boxed_str()))
+        .collect();
+    Box::leak(leaked.into_boxed_slice())
+}
+
+/// Leak a `&[(String, String)]` to a `&'static [(&'static str, &'static str)]`
+/// (bounded one-time CLI leak, see [`to_function_config`]).
+fn leak_pair_slice(items: &[(String, String)]) -> &'static [(&'static str, &'static str)] {
+    let leaked: Vec<(&'static str, &'static str)> = items
+        .iter()
+        .map(|(a, b)| {
+            (
+                &*Box::leak(a.clone().into_boxed_str()),
+                &*Box::leak(b.clone().into_boxed_str()),
+            )
+        })
+        .collect();
+    Box::leak(leaked.into_boxed_slice())
 }
 
 /// Build the manifest configs (`name -> FunctionConfig`) the facade `App` carries.
@@ -352,11 +388,16 @@ mod tests {
             gpu: Some("A100".to_string()),
             timeout_secs: Some(900),
             cache: Some(true),
+            secrets: vec!["my-secret".to_string()],
+            volumes: vec![("/data".to_string(), "my-vol".to_string())],
         };
         let c = to_function_config(&view);
         assert_eq!(c.gpu, Some("A100"));
         assert_eq!(c.timeout_secs, Some(900));
         assert_eq!(c.cache, Some(true));
+        // Secrets/volumes flow through (leaked to `&'static`).
+        assert_eq!(c.secrets, &["my-secret"]);
+        assert_eq!(c.volumes, &[("/data", "my-vol")]);
     }
 
     #[test]

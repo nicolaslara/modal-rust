@@ -337,9 +337,30 @@ workload:
   `call` so the build happens once at image-build time.
 
 The GPU spec maps to Modal exactly: `"TYPE[:count]"` (e.g. `"H100:4"`); memory
-variants like `"A100-80GB"` pass through as the GPU type. `gpu`, `timeout`, and
-`cache` on `#[function(...)]` are sourced from the registry at call time — the
-decorator is the config, no extra flags.
+variants like `"A100-80GB"` pass through as the GPU type.
+
+## Secrets and Volumes
+
+Attach Modal secrets (injected as environment variables) and persistent volumes
+(mounted at a path) the same way — on the function:
+
+```rust
+#[function(
+    gpu = "T4",
+    secrets = ["my-api-key"],          // injected as env vars in the container
+    volumes = ["/data=my-dataset"],    // a Modal Volume mounted at /data (persists)
+)]
+pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
+    let key = std::env::var("API_KEY")?;          // from the secret
+    std::fs::write("/data/checkpoint", /* ... */)?; // persisted on the volume
+    /* ... */
+}
+```
+
+Everything on `#[function(...)]` — `gpu`, `timeout`, `cache`, `secrets`,
+`volumes` — is sourced from the registry at call time. The decorator is the
+config; there are no extra CLI flags. (Non-macro users can set the same fields on
+`RemoteConfig` / `DeployConfig`.)
 
 ## Development
 

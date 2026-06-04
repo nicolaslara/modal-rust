@@ -305,6 +305,17 @@ pub struct RemoteConfig {
     /// `#[function(cache=false)]` overrides this per-entrypoint (app.rs). A cache
     /// miss/failure only costs time — it NEVER changes the build result.
     pub cache: bool,
+    /// Named Modal secrets to attach (from `#[function(secrets = [..])]`). Each name
+    /// is resolved to a `secret_id` via [`ModalClient::secret_get_or_create`] and
+    /// attached to `FunctionCreate.secret_ids`; Modal injects the secret's
+    /// key/values as ENV VARS in the container. DEFAULT EMPTY (wire-identical to
+    /// before). Set by `App::resolve_function` from `config_for(entrypoint)`.
+    pub secrets: Vec<String>,
+    /// User volumes to attach as `(mount_path, volume_name)` pairs (from
+    /// `#[function(volumes = ["/data=my-vol"])]`). Each `volume_name` is resolved via
+    /// [`ModalClient::volume_get_or_create`] and mounted at `mount_path` — a SEPARATE
+    /// mount from the P6 cargo cache (`/cache`), so both coexist. DEFAULT EMPTY.
+    pub volumes: Vec<(String, String)>,
 }
 
 impl Default for RemoteConfig {
@@ -321,6 +332,8 @@ impl Default for RemoteConfig {
             timeout_override_secs: None,
             install_rust: discover_install_rust(),
             cache: discover_cache(),
+            secrets: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 }
@@ -457,6 +470,36 @@ pub(crate) async fn ensure_function(
         None
     };
 
+    // 1b. User secrets (USER-facing `#[function(secrets=..)]`): resolve each named
+    //     Modal secret to a secret_id (pure lookup via from_name semantics) so it can
+    //     be attached below. Modal injects the secret's key/values as ENV VARS in the
+    //     container. EMPTY ⇒ no secrets ⇒ wire-identical to before. Values never
+    //     logged. SEPARATE concern from the cargo cache.
+    let mut secret_ids: Vec<String> = Vec::with_capacity(config.secrets.len());
+    for name in &config.secrets {
+        secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
+    }
+
+    // 1c. User volumes (USER-facing `#[function(volumes=["/mount=name"])]`): resolve
+    //     each named Modal volume to a volume_id (create-if-missing) so it can be
+    //     attached at its mount_path below. These are DISTINCT mounts from the P6
+    //     cargo cache (`/cache`) — both coexist. User volumes use V1 (server default;
+    //     general-purpose persistent storage), not the V2 the cargo cache needs. A
+    //     user mount at `/cache` would collide with the cargo cache, so reject it.
+    let mut user_volume_mounts: Vec<(String, String)> = Vec::with_capacity(config.volumes.len());
+    for (mount_path, name) in &config.volumes {
+        if config.cache && mount_path == CACHE_MOUNT {
+            return Err(Error::config(format!(
+                "user volume mount path {CACHE_MOUNT:?} collides with the cargo-cache \
+                 volume; choose a different mount path (or disable the cache)"
+            )));
+        }
+        let vid = client
+            .volume_get_or_create(name, false /* v1 */, true /* create */, None)
+            .await?;
+        user_volume_mounts.push((vid, mount_path.clone()));
+    }
+
     // 2. Client mount (modal source importable in the FILE-mode container).
     let client_mount_id = client.client_mount_id(None).await?;
 
@@ -567,6 +610,16 @@ pub(crate) async fn ensure_function(
     // wire-identical to pre-P6).
     if let Some(vid) = cache_vol_id {
         fn_spec = fn_spec.with_volume_mount(vid, CACHE_MOUNT);
+    }
+    // USER volumes: attach each resolved (volume_id, mount_path) at its DISTINCT
+    // mount path — SEPARATE from the cargo cache above (both coexist). Empty ⇒ no-op.
+    for (vid, mount_path) in user_volume_mounts {
+        fn_spec = fn_spec.with_volume_mount(vid, mount_path);
+    }
+    // USER secrets: attach the resolved secret ids → Function.secret_ids (Modal
+    // injects their key/values as ENV VARS). Empty ⇒ no-op (wire-identical).
+    if !secret_ids.is_empty() {
+        fn_spec = fn_spec.with_secret_ids(secret_ids);
     }
     let created = client
         .function_create(app_id, &precreate_id, &fn_spec)
@@ -763,6 +816,30 @@ mod tests {
     }
 
     #[test]
+    fn remote_config_secrets_volumes_are_settable_non_macro() {
+        // Non-macro override: `RemoteConfig`'s public fields let a builder/explicit
+        // caller set secrets + user volumes WITHOUT the decorator. Serialized against
+        // env-mutating tests (RemoteConfig::default reads MODAL_RUST_*).
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Struct-update over the env-aware default: a non-macro caller sets ONLY
+        // secrets/volumes and keeps every discovered default.
+        let cfg = RemoteConfig {
+            secrets: vec!["api-creds".to_string()],
+            volumes: vec![("/data".to_string(), "my-vol".to_string())],
+            ..RemoteConfig::default()
+        };
+        assert_eq!(cfg.secrets, vec!["api-creds".to_string()]);
+        assert_eq!(
+            cfg.volumes,
+            vec![("/data".to_string(), "my-vol".to_string())]
+        );
+        // The user volume mount must not be the reserved cargo-cache path.
+        assert_ne!(cfg.volumes[0].0, CACHE_MOUNT);
+    }
+
+    #[test]
     fn parse_envelope_ok_decodes_value() {
         #[derive(serde::Deserialize, PartialEq, Debug)]
         struct Out {
@@ -881,6 +958,9 @@ mod tests {
         assert!(!cfg.install_rust, "install_rust defaults off");
         // P6: the cargo build cache is ON by default.
         assert!(cfg.cache, "cache defaults ON");
+        // User secrets/volumes default EMPTY (wire-identical to before).
+        assert!(cfg.secrets.is_empty(), "secrets default empty");
+        assert!(cfg.volumes.is_empty(), "volumes default empty");
 
         // Same test (one process-env mutation site, no cross-test race): the env
         // overrides flip the CUDA Tier-1 knob + base image. `MODAL_RUST_INSTALL_RUST`

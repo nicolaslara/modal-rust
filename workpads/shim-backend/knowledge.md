@@ -993,6 +993,26 @@ client's `get_all_outputs`), `LAST_ENTRY_ID_INITIAL` in `ops/invoke.rs`. Gates g
 
 ---
 
+### ✅ Secrets + user volumes (2026-06-04, AFK run)
+
+`#[modal_rust::function(secrets = ["name"], volumes = ["/mount=name"])]` now attaches Modal secrets (injected
+as ENV VARS) + user Volumes (persistent storage at a mount path) to a function, on RUN and DEPLOY. **Proven
+live** (self-provisioned, ephemeral): a fn read `std::env::var("MODAL_RUST_TEST_SECRET") == "hello-secrets"`,
+and wrote a marker to `/data/marker` on a user volume in container A that a SEPARATE fresh container B read back
+identically — proving real cross-call persistence. The user volume (`/data`) coexists with the P6 cargo-cache
+volume (`/cache`) on the same function (distinct mounts; a `/cache` collision guard rejects user mounts there).
+
+SDK: `ops/secret.rs` `secret_get_or_create(name)` (from_name lookup, UNSPECIFIED) + `secret_from_dict(name,env)`
+(CREATE_IF_MISSING, for tests/ephemeral), retry_unary over `SecretGetOrCreate`; `FunctionSpec.secret_ids` ->
+`Function.secret_ids` (field 10, default empty -> wire-identical). Runtime: `FunctionConfig.secrets` +
+`.volumes` (const `&'static` slices, default empty); `--describe` view + CLI `FunctionConfigView` updated
+additively (`#[serde(default)]` for old-manifest compat; schema stays `@1`). Macro: `parse_str_list` parses
+`secrets=[...]` + `volumes=["/m=name"]` (split-on-first-`=`); bare macro + gpu/timeout/cache byte-identical.
+Facade: RemoteConfig/DeployConfig `secrets`/`volumes` (non-macro override); `ensure_function`/`deploy_function`
+resolve + attach both. Gates green (180 tests); 2/2 reviews PASS. README updated (Secrets and Volumes).
+
+---
+
 ### ✅ P6 — cargo build cache (V2-Volume archive, ON by default) (2026-06-04, AFK run)
 
 The `run`-path in-body cargo build is now CACHED, ON by default. Mechanism (per §C, NOT CARGO_HOME-on-volume):

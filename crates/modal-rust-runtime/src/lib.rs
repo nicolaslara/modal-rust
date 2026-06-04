@@ -288,7 +288,9 @@ pub struct Registration {
 ///
 /// `gpu` is `Option<&'static str>` (not `String`): `inventory::submit!` builds a
 /// `static` initializer, so only `const`-constructible values are allowed; a string
-/// literal is `&'static str` (matches [`Registration::name`]).
+/// literal is `&'static str` (matches [`Registration::name`]). The same constraint
+/// is why `secrets`/`volumes` are `&'static` slices (not `Vec`): a `Vec` is not
+/// `const`-constructible, but a slice literal `&["a", "b"]` is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionConfig {
     /// GPU spec string, Modal-format (`"T4"`, `"A100"`, `"A100-80GB"`, `"H100:4"`).
@@ -298,18 +300,32 @@ pub struct FunctionConfig {
     pub timeout_secs: Option<u32>,
     /// Cache hint. `None` => default. Reserved/inert for P4 (no proto target yet).
     pub cache: Option<bool>,
+    /// Named Modal secrets to attach (`#[function(secrets = ["a", "b"])]`). The
+    /// facade resolves each name to a `secret_id` and attaches it to
+    /// `FunctionCreate.secret_ids`; the secret's key/values are injected as ENV VARS
+    /// in the container. EMPTY (the bare-decorator default) => no secrets => wire-
+    /// identical to before. METADATA ONLY — the runner ignores it.
+    pub secrets: &'static [&'static str],
+    /// User-volume mounts to attach (`#[function(volumes = ["/data=my-vol"])]`),
+    /// parsed by the macro into `(mount_path, name)` pairs. The facade resolves each
+    /// `name` via `volume_get_or_create` and attaches a `FunctionVolumeMount` at
+    /// `mount_path` — a SEPARATE mount from the P6 cargo cache (`/cache`). EMPTY =>
+    /// no user volumes => wire-identical to before. METADATA ONLY.
+    pub volumes: &'static [(&'static str, &'static str)],
 }
 
 impl FunctionConfig {
-    /// A `const` all-`None` config (the bare-decorator default). Usable in a
-    /// `static` `inventory::submit!` initializer, where the non-`const`
-    /// `Default::default()` is not allowed. The bare `#[modal_rust::function]`
-    /// macro emits the equivalent struct literal directly.
+    /// A `const` all-default config (the bare-decorator default): all `None`, empty
+    /// `secrets`/`volumes`. Usable in a `static` `inventory::submit!` initializer,
+    /// where the non-`const` `Default::default()` is not allowed. The bare
+    /// `#[modal_rust::function]` macro emits the equivalent struct literal directly.
     pub const fn new() -> Self {
         FunctionConfig {
             gpu: None,
             timeout_secs: None,
             cache: None,
+            secrets: &[],
+            volumes: &[],
         }
     }
 }
@@ -712,14 +728,18 @@ struct DescribeEntry<'a> {
 }
 
 /// The serialized view of [`FunctionConfig`] for the manifest (P9 §A.3): `gpu:
-/// string|null`, `timeout_secs: u32|null`, `cache: bool|null`. A dedicated view
-/// (rather than `#[derive(Serialize)]` on `FunctionConfig`) keeps `gpu`'s
-/// `&'static str` lifetime out of the public type and pins the wire shape here.
+/// string|null`, `timeout_secs: u32|null`, `cache: bool|null`, plus the additive
+/// `secrets: [string]` and `volumes: [[mount_path, name]]`. A dedicated view
+/// (rather than `#[derive(Serialize)]` on `FunctionConfig`) keeps the `&'static`
+/// lifetimes out of the public type and pins the wire shape here. The two new
+/// fields are EMPTY for every pre-existing manifest, so the schema stays `@1`.
 #[derive(Serialize)]
 struct DescribeConfig {
     gpu: Option<&'static str>,
     timeout_secs: Option<u32>,
     cache: Option<bool>,
+    secrets: &'static [&'static str],
+    volumes: &'static [(&'static str, &'static str)],
 }
 
 impl From<&FunctionConfig> for DescribeConfig {
@@ -728,6 +748,8 @@ impl From<&FunctionConfig> for DescribeConfig {
             gpu: c.gpu,
             timeout_secs: c.timeout_secs,
             cache: c.cache,
+            secrets: c.secrets,
+            volumes: c.volumes,
         }
     }
 }
@@ -982,6 +1004,8 @@ mod tests {
                 gpu: Some("T4"),
                 timeout_secs: Some(1800),
                 cache: Some(false),
+                secrets: &["my-secret"],
+                volumes: &[("/data", "my-vol")],
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -1009,12 +1033,35 @@ mod tests {
         assert_eq!(add["config"]["gpu"], "T4");
         assert_eq!(add["config"]["timeout_secs"], 1800);
         assert_eq!(add["config"]["cache"], false);
+        // Secrets + user volumes ride the manifest additively.
+        assert_eq!(add["config"]["secrets"], serde_json::json!(["my-secret"]));
+        assert_eq!(
+            add["config"]["volumes"],
+            serde_json::json!([["/data", "my-vol"]])
+        );
         // An entrypoint absent from `configs` falls back to the all-null default.
         let bad = &eps[1];
         assert_eq!(bad["name"], "bad_encode");
         assert_eq!(bad["config"]["gpu"], serde_json::Value::Null);
         assert_eq!(bad["config"]["timeout_secs"], serde_json::Value::Null);
         assert_eq!(bad["config"]["cache"], serde_json::Value::Null);
+        // The default config has EMPTY secrets/volumes (wire-identical to before).
+        assert_eq!(bad["config"]["secrets"], serde_json::json!([]));
+        assert_eq!(bad["config"]["volumes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn function_config_default_has_empty_secrets_and_volumes() {
+        // The bare-decorator default (and `FunctionConfig::new()` const ctor) carry
+        // EMPTY secrets/volumes, so a function with no decorator extras is wire-
+        // identical to before this addition.
+        let d = FunctionConfig::default();
+        assert!(d.secrets.is_empty());
+        assert!(d.volumes.is_empty());
+        let c = FunctionConfig::new();
+        assert!(c.secrets.is_empty());
+        assert!(c.volumes.is_empty());
+        assert_eq!(d, c, "Default and new() agree");
     }
 
     #[test]

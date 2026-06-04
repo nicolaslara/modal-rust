@@ -148,8 +148,15 @@ pub struct FunctionSpec {
     pub mount_client_dependencies: bool,
     /// Persistent-volume attachments → `Function.volume_mounts`. DEFAULT EMPTY: an
     /// unset list keeps the create wire-identical to pre-P6, so every existing
-    /// function is unchanged. P6 pushes the cargo-cache volume here.
+    /// function is unchanged. P6 pushes the cargo-cache volume here; user volumes
+    /// (`#[function(volumes = [..])]`) push additional, DISTINCT-mount-path mounts.
     pub volume_mounts: Vec<FunctionVolumeMount>,
+    /// Resolved secret ids → `Function.secret_ids` (proto field 10). DEFAULT EMPTY:
+    /// an unset list keeps the create wire-identical to before, so every existing
+    /// function is unchanged. The USER-facing `#[function(secrets = [..])]` path
+    /// resolves named secrets via [`ModalClient::secret_get_or_create`] and pushes
+    /// the ids here; Modal injects each secret's key/values as ENV VARS.
+    pub secret_ids: Vec<String>,
 }
 
 impl FunctionSpec {
@@ -169,6 +176,7 @@ impl FunctionSpec {
             resources: FunctionResources::default(),
             mount_client_dependencies: true,
             volume_mounts: Vec::new(),
+            secret_ids: Vec::new(),
         }
     }
 
@@ -236,6 +244,19 @@ impl FunctionSpec {
     ) -> Self {
         self.volume_mounts
             .push(FunctionVolumeMount::new(volume_id, mount_path));
+        self
+    }
+
+    /// Attach resolved secret ids (→ `Function.secret_ids`). Replaces any existing
+    /// list. EMPTY keeps the create wire-identical to before.
+    pub fn with_secret_ids(mut self, secret_ids: Vec<String>) -> Self {
+        self.secret_ids = secret_ids;
+        self
+    }
+
+    /// Append a single resolved secret id (→ `Function.secret_ids`).
+    pub fn with_secret_id(mut self, secret_id: impl Into<String>) -> Self {
+        self.secret_ids.push(secret_id.into());
         self
     }
 }
@@ -324,8 +345,13 @@ impl ModalClient {
             // builder), so the add_python image needs no `pip install modal` layer.
             mount_client_dependencies: spec.mount_client_dependencies,
             // Empty list ⇒ prost omits field 33 ⇒ byte-identical to pre-P6 for all
-            // existing (no-volume) callers. P6 attaches the cargo-cache volume here.
+            // existing (no-volume) callers. P6 attaches the cargo-cache volume here;
+            // user volumes (`#[function(volumes=..)]`) attach DISTINCT-path mounts.
             volume_mounts: spec.volume_mounts.iter().map(|m| m.to_proto()).collect(),
+            // Empty list ⇒ prost omits field 10 ⇒ byte-identical for all existing
+            // (no-secret) callers. The user `#[function(secrets=..)]` path pushes
+            // resolved secret ids here; Modal injects their key/values as ENV VARS.
+            secret_ids: spec.secret_ids.clone(),
             ..Default::default()
         };
 
@@ -425,6 +451,8 @@ mod tests {
         assert!(spec.mount_client_dependencies);
         // No volume by default (wire-identical to pre-P6).
         assert!(spec.volume_mounts.is_empty());
+        // No secrets by default (wire-identical to before).
+        assert!(spec.secret_ids.is_empty());
     }
 
     #[test]
@@ -434,6 +462,48 @@ mod tests {
             spec.volume_mounts.is_empty(),
             "volume_mounts must default empty (wire-identical to pre-P6)"
         );
+    }
+
+    #[test]
+    fn secret_ids_default_empty() {
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(
+            spec.secret_ids.is_empty(),
+            "secret_ids must default empty (wire-identical to before)"
+        );
+    }
+
+    #[test]
+    fn with_secret_ids_attaches_and_flows_to_proto() {
+        // Builder appends; the resolved ids flow into Function.secret_ids (field 10).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_secret_id("se-1")
+            .with_secret_id("se-2");
+        assert_eq!(
+            spec.secret_ids,
+            vec!["se-1".to_string(), "se-2".to_string()]
+        );
+        // `with_secret_ids` replaces.
+        let replaced = spec.with_secret_ids(vec!["se-3".to_string()]);
+        assert_eq!(replaced.secret_ids, vec!["se-3".to_string()]);
+    }
+
+    #[test]
+    fn user_volume_and_cache_volume_coexist() {
+        // A user volume (e.g. /data) and the P6 cargo-cache volume (/cache) attach as
+        // TWO DISTINCT mounts on the SAME function — they must coexist, not collide.
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_volume_mount("vo-cache", "/cache") // P6 cargo cache
+            .with_volume_mount("vo-data", "/data"); // user volume
+        assert_eq!(spec.volume_mounts.len(), 2);
+        let cache = spec.volume_mounts[0].to_proto();
+        let data = spec.volume_mounts[1].to_proto();
+        assert_eq!(cache.volume_id, "vo-cache");
+        assert_eq!(cache.mount_path, "/cache");
+        assert_eq!(data.volume_id, "vo-data");
+        assert_eq!(data.mount_path, "/data");
+        // Distinct mount paths => independent mounts.
+        assert_ne!(cache.mount_path, data.mount_path);
     }
 
     #[test]

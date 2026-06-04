@@ -10,6 +10,7 @@
 //! - [`function`] — `FunctionPrecreate` + `FunctionCreate` (FILE mode, fix #1) + `FunctionGet`.
 //! - [`invoke`] — `FunctionMap` → `FunctionPutInputs` fallback (fix #3) → poll `FunctionGetOutputs`.
 //! - [`volume`] — `VolumeGetOrCreate` (create-if-missing, V2) → `volume_id` (P6 cargo cache).
+//! - [`secret`] — `SecretGetOrCreate` (from_name lookup / from_dict create) → `secret_id`.
 //!
 //! ## The three fixes (why modal-rs failed; see `workpads/shim-backend/spike-notes.md`)
 //!
@@ -26,6 +27,7 @@ pub mod image;
 pub mod invoke;
 pub mod local_dir;
 pub mod mount;
+pub mod secret;
 pub mod volume;
 
 use crate::proto::api::generic_result::GenericStatus;

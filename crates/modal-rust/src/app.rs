@@ -254,6 +254,14 @@ impl App {
         // defers to `run_config.cache` (folded from MODAL_RUST_NO_CACHE / default ON).
         // Matches the gpu/timeout override semantics.
         let cfg_cache: Option<bool> = cfg.cache;
+        // USER secrets/volumes from the decorator: owned copies for the create.
+        // Empty ⇒ no extras ⇒ wire-identical to before.
+        let cfg_secrets: Vec<String> = cfg.secrets.iter().map(|s| s.to_string()).collect();
+        let cfg_volumes: Vec<(String, String)> = cfg
+            .volumes
+            .iter()
+            .map(|(m, n)| (m.to_string(), n.to_string()))
+            .collect();
 
         // Resolve (and memoize) the invokable function_id. `get_or_try_init`
         // single-flights the create sequence under concurrent RUN-path calls.
@@ -264,6 +272,8 @@ impl App {
                 run_config.gpu = cfg_gpu.clone();
                 run_config.timeout_override_secs = cfg_timeout;
                 run_config.cache = cfg_cache.unwrap_or(run_config.cache);
+                run_config.secrets = cfg_secrets.clone();
+                run_config.volumes = cfg_volumes.clone();
                 let mut client = handle.client.lock().await;
                 remote::ensure_function(&mut client, &handle.app_id, &handle.app_name, &run_config)
                     .await
@@ -400,19 +410,30 @@ impl App {
         if let Some(cfg) = self.deploy_target_config() {
             config.gpu = cfg.gpu.map(|s| s.to_string());
             config.timeout_override_secs = cfg.timeout_secs;
+            config.secrets = cfg.secrets.iter().map(|s| s.to_string()).collect();
+            config.volumes = cfg
+                .volumes
+                .iter()
+                .map(|(m, n)| (m.to_string(), n.to_string()))
+                .collect();
         }
         let mut client = handle.client.lock().await;
         deploy::deploy_function(&mut client, &config).await
     }
 
     /// Pick the decorator config to apply at deploy time. Returns the first
-    /// entrypoint config that sets gpu/timeout (the typical single-decorated-fn
-    /// deploy); falls back to the first registered config, else `None` (manual
-    /// path => deploy defaults).
+    /// entrypoint config that sets ANY extra (gpu/timeout/secrets/volumes) — the
+    /// typical single-decorated-fn deploy; falls back to the first registered config,
+    /// else `None` (manual path => deploy defaults).
     fn deploy_target_config(&self) -> Option<modal_rust_runtime::FunctionConfig> {
         self.configs
             .values()
-            .find(|c| c.gpu.is_some() || c.timeout_secs.is_some())
+            .find(|c| {
+                c.gpu.is_some()
+                    || c.timeout_secs.is_some()
+                    || !c.secrets.is_empty()
+                    || !c.volumes.is_empty()
+            })
             .or_else(|| self.configs.values().next())
             .cloned()
     }
@@ -496,6 +517,26 @@ mod tests {
     }
 
     #[test]
+    fn from_inventory_captures_secrets_and_volumes() {
+        // The decorated `add_extras` (`secrets=["my-secret"], volumes=["/data=my-vol"]`)
+        // flows through `config_for` so the RUN/DEPLOY paths can resolve + attach them.
+        let app = App::from_inventory();
+        let cfg = app.config_for("add_extras");
+        assert_eq!(cfg.secrets, &["my-secret"]);
+        assert_eq!(cfg.volumes, &[("/data", "my-vol")]);
+        // A bare entrypoint carries no extras (empty), so it stays wire-identical.
+        let bare = app.config_for("add");
+        assert!(bare.secrets.is_empty());
+        assert!(bare.volumes.is_empty());
+        // The deploy-target selector picks `add_extras` (it sets extras) even though it
+        // has no gpu/timeout — proving secrets/volumes count as a decorated target.
+        let target = app
+            .deploy_target_config()
+            .expect("a decorated config exists");
+        assert!(!target.secrets.is_empty() || !target.volumes.is_empty());
+    }
+
+    #[test]
     fn decorator_cache_override_precedence() {
         // Mirror the `resolve_function` precedence: `cfg_cache.unwrap_or(base)`.
         // `Some(false)` (an explicit `#[function(cache=false)]`) wins over either
@@ -542,6 +583,8 @@ mod tests {
             gpu: Some("A100"),
             timeout_secs: Some(900),
             cache: Some(true),
+            secrets: &["my-secret"],
+            volumes: &[("/data", "my-vol")],
         };
         let app = App::from_manifest([("add".to_string(), cfg.clone())]);
         assert_eq!(app.config_for("add"), cfg);

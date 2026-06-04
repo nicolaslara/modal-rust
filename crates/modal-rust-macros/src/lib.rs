@@ -27,9 +27,23 @@
 //! [`modal_rust_runtime::FunctionConfig`] alongside the registration. This is
 //! METADATA ONLY — the runner ignores it; only the control-plane facade reads it
 //! when creating the Modal function (`Resources.gpu_config`, `timeout_secs`). All
-//! three keys are optional; the bare `#[modal_rust::function]` and `name = "..."`
-//! forms record `FunctionConfig::default()` (all `None`), so the runtime-observable
-//! behavior is byte-identical to before this addition.
+//! keys are optional; the bare `#[modal_rust::function]` and `name = "..."` forms
+//! record `FunctionConfig::default()` (all `None`, empty secrets/volumes), so the
+//! runtime-observable behavior is byte-identical to before this addition.
+//!
+//! ## User-facing secrets + volumes
+//!
+//! `#[modal_rust::function(secrets = ["my-secret", "other"])]` attaches named Modal
+//! secrets: the facade resolves each name to a `secret_id`, attaches it to
+//! `FunctionCreate.secret_ids`, and the secret's key/values are injected as ENV
+//! VARS in the container (readable via `std::env`).
+//!
+//! `#[modal_rust::function(volumes = ["/data=my-vol", "/models=weights"])]` attaches
+//! user Modal volumes: each `"MOUNT=NAME"` string is parsed into a `(mount_path,
+//! name)` pair; the facade resolves `name` via `volume_get_or_create` and mounts it
+//! at `mount_path` — a SEPARATE mount from the P6 cargo cache (`/cache`), so both
+//! coexist. The string-list `"MOUNT=NAME"` form is used because map syntax is hard
+//! to parse in attribute position. Both lists default EMPTY.
 //!
 //! ## async
 //!
@@ -50,7 +64,8 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn, LitBool, LitInt, LitStr};
+use syn::punctuated::Punctuated;
+use syn::{parse_macro_input, ItemFn, LitBool, LitInt, LitStr, Token};
 
 /// Attribute macro that registers a handler with the modal-rust runner via
 /// `inventory`, producing the SAME registry shape as the manual `typed!` path.
@@ -76,6 +91,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut gpu: Option<LitStr> = None; // gpu = "T4"
     let mut timeout_secs: Option<u64> = None; // timeout = 1800   (LitInt -> u64, narrow at emit)
     let mut cache: Option<bool> = None; // cache = false
+    let mut secrets: Vec<String> = Vec::new(); // secrets = ["a", "b"]
+    let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     if !attr.is_empty() {
         let parser = syn::meta::parser(|meta| {
             if meta.path.is_ident("name") {
@@ -92,10 +109,50 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let lit: LitBool = meta.value()?.parse()?; // true / false
                 cache = Some(lit.value);
                 Ok(())
+            } else if meta.path.is_ident("secrets") {
+                // secrets = ["my-secret", "other"] — a bracketed list of string
+                // literals. Each is a Modal secret deployment-name the facade
+                // resolves to a secret_id.
+                for s in parse_str_list(meta.value()?)? {
+                    secrets.push(s.value());
+                }
+                Ok(())
+            } else if meta.path.is_ident("volumes") {
+                // volumes = ["/data=my-vol", ..] — a bracketed list of "MOUNT=NAME"
+                // string literals. Split on the FIRST '=' into (mount_path, name).
+                // Map syntax is hard to parse in attribute position, so the simplest
+                // parseable form is a string list.
+                for s in parse_str_list(meta.value()?)? {
+                    let raw = s.value();
+                    let (mount, name) = raw.split_once('=').ok_or_else(|| {
+                        syn::Error::new_spanned(
+                            &s,
+                            format!(
+                                "`volumes` entries must be \"MOUNT_PATH=VOLUME_NAME\" \
+                                 (path=name pairs), got {raw:?}"
+                            ),
+                        )
+                    })?;
+                    let mount = mount.trim();
+                    let name = name.trim();
+                    if mount.is_empty() || name.is_empty() {
+                        return Err(syn::Error::new_spanned(
+                            &s,
+                            format!(
+                                "`volumes` entry {raw:?} must have a non-empty mount path \
+                                 AND volume name (\"MOUNT_PATH=VOLUME_NAME\")"
+                            ),
+                        ));
+                    }
+                    volumes.push((mount.to_string(), name.to_string()));
+                }
+                Ok(())
             } else {
                 Err(meta.error(
                     "unsupported `#[modal_rust::function]` argument; recognized: \
-                     `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, `cache = <bool>`",
+                     `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
+                     `cache = <bool>`, `secrets = [\"name\", ..]`, \
+                     `volumes = [\"/mount=name\", ..]`",
                 ))
             }
         });
@@ -172,6 +229,19 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(b) => quote! { ::core::option::Option::Some(#b) },
         None => quote! { ::core::option::Option::None },
     };
+    // `secrets`/`volumes` are `&'static` slices on `FunctionConfig` (const-valid in
+    // the `static` `inventory::submit!` initializer, exactly like `gpu`/`name`). An
+    // empty list emits `&[]`, byte-identical to the bare default.
+    let secrets_tok = {
+        let items = secrets.iter();
+        quote! { &[ #( #items ),* ] }
+    };
+    let volumes_tok = {
+        let items = volumes
+            .iter()
+            .map(|(mount, name)| quote! { (#mount, #name) });
+        quote! { &[ #( #items ),* ] }
+    };
 
     let expanded = quote! {
         #func
@@ -184,10 +254,23 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
                     cache: #cache_tok,
+                    secrets: #secrets_tok,
+                    volumes: #volumes_tok,
                 },
             }
         }
     };
 
     expanded.into()
+}
+
+/// Parse a bracketed list of string literals from a `meta.value()` parse stream:
+/// `["a", "b", "c"]`. Used by both `secrets = [..]` and `volumes = [..]`. Returns
+/// the [`LitStr`]s (so callers keep the spans for good diagnostics). An empty list
+/// `[]` is allowed (yields no items).
+fn parse_str_list(input: syn::parse::ParseStream) -> syn::Result<Vec<LitStr>> {
+    let content;
+    syn::bracketed!(content in input);
+    let items: Punctuated<LitStr, Token![,]> = Punctuated::parse_terminated(&content)?;
+    Ok(items.into_iter().collect())
 }
