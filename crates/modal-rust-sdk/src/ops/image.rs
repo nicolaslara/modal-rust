@@ -50,13 +50,19 @@ const BUILD_DEADLINE: Duration = Duration::from_secs(600);
 pub struct ImageSpec {
     /// Base registry tag (default [`DEFAULT_BASE_IMAGE`]).
     pub base_image: String,
+    /// Raw Dockerfile commands rendered BEFORE the wrapper bakes (and before the
+    /// optional pip line). Used to provision a runtime that the bake step needs —
+    /// e.g. `apt-get install python3` on a bare `rust:1-slim` base, whose
+    /// base64-decode bake (`python3 -c ...`) requires python3 to already exist.
+    /// See [`ImageSpec::with_apt`].
+    pub pre_bake_commands: Vec<String>,
     /// Wrapper modules to bake: `(module_name, python_source)`. Each is written to
     /// `/root/<module_name>.py` (an importable path inside the container).
     pub wrapper_modules: Vec<(String, String)>,
     /// Extra raw `RUN`/`ENV`/… Dockerfile commands appended after the bakes.
     pub extra_commands: Vec<String>,
-    /// Off by default: append `RUN pip install --no-cache-dir modal` to provision
-    /// the modal client's pip dependency closure into the image. REQUIRED for a
+    /// Off by default: append `RUN python3 -m pip install --no-cache-dir modal` to
+    /// provision the modal client's pip dependency closure into the image. REQUIRED for a
     /// bare registry base (the client mount supplies only the modal *source*, not
     /// its deps — see the module docs); unnecessary for a base that already carries
     /// those deps. The mounted source at `/pkg` still wins on `PYTHONPATH`.
@@ -68,6 +74,7 @@ impl ImageSpec {
     pub fn from_registry(base_image: impl Into<String>) -> Self {
         Self {
             base_image: base_image.into(),
+            pre_bake_commands: Vec::new(),
             wrapper_modules: Vec::new(),
             extra_commands: Vec::new(),
             pip_install_modal: false,
@@ -96,6 +103,25 @@ impl ImageSpec {
         self
     }
 
+    /// Append a canonical `apt-get install` line to [`pre_bake_commands`] (rendered
+    /// BEFORE the wrapper bakes). Required on a bare base whose bake step itself
+    /// runs `python3 -c ...`: the runtime must exist before the bake. Renders the
+    /// proven single-RUN form (update + install + clean) so quoting is correct:
+    ///
+    /// ```text
+    /// RUN apt-get update && apt-get install -y --no-install-recommends <pkgs> && rm -rf /var/lib/apt/lists/*
+    /// ```
+    ///
+    /// [`pre_bake_commands`]: ImageSpec::pre_bake_commands
+    pub fn with_apt(mut self, packages: &[&str]) -> Self {
+        let pkgs = packages.join(" ");
+        self.pre_bake_commands.push(format!(
+            "RUN apt-get update && apt-get install -y --no-install-recommends {pkgs} \
+             && rm -rf /var/lib/apt/lists/*"
+        ));
+        self
+    }
+
     /// Provision the modal client's pip dependency closure via `pip install
     /// modal`. Required for a bare registry base; the client mount only supplies
     /// the modal *source* (see the module docs).
@@ -104,12 +130,33 @@ impl ImageSpec {
         self
     }
 
-    /// Render the full `dockerfile_commands` list: `FROM`, optional pip fallback,
-    /// the wrapper bakes, then extra commands.
+    /// Render the full `dockerfile_commands` list: `FROM`, pre-bake commands (e.g.
+    /// apt), optional pip line, the wrapper bakes, then extra commands.
+    ///
+    /// Order is load-bearing: pre-bake commands MUST precede both the pip line and
+    /// the bakes, because on a bare base they provision the runtime (`python3`)
+    /// those later steps invoke.
     fn dockerfile_commands(&self) -> Vec<String> {
         let mut cmds = vec![format!("FROM {}", self.base_image)];
+        cmds.extend(self.pre_bake_commands.iter().cloned());
         if self.pip_install_modal {
-            cmds.push("RUN pip install --no-cache-dir modal".to_string());
+            // `python3 -m pip` is universal: it works on a slim apt-provisioned
+            // python (which may expose no bare `pip` shim) AND on stock `python:`
+            // bases. Replaces the bare `pip install` form.
+            //
+            // `--break-system-packages` is required on modern Debian bases
+            // (bookworm/trixie, e.g. `rust:1-slim` → Python 3.13) whose apt python
+            // is PEP-668 externally-managed: without it, `pip install` aborts with
+            // `error: externally-managed-environment` and the image build fails
+            // (live-verified 2026-06-04). The flag is a benign no-op on stock
+            // `python:` bases that are not externally-managed, so it is safe to
+            // always emit. We install into the system site-packages deliberately:
+            // this is a throwaway build image, and the mounted client `/pkg` still
+            // wins on `PYTHONPATH`, so the mounted modal source stays authoritative.
+            cmds.push(
+                "RUN python3 -m pip install --no-cache-dir --break-system-packages modal"
+                    .to_string(),
+            );
         }
         for (module_name, source) in &self.wrapper_modules {
             cmds.push(bake_command(module_name, source));
@@ -192,6 +239,16 @@ impl ModalClient {
     }
 
     /// Long-poll `ImageJoinStreaming` until the build reaches a terminal result.
+    ///
+    /// Image builds routinely outlast a single gRPC stream window (a heavy
+    /// `pip install` / `apt-get` step can take minutes), so the long-poll connection
+    /// is reconnected — resuming from `last_entry_id` — on BOTH a clean window end
+    /// AND a transient transport reset (`h2 protocol error` / connection reset),
+    /// bounded by [`BUILD_DEADLINE`]. A *real* build failure is never a transport
+    /// error: it arrives in-band as a terminal [`ResultState::Failure`], which we
+    /// always surface immediately. So this reconnect-on-transient logic cannot mask
+    /// a genuine build failure — it only rides out the network blips Modal warns
+    /// long polls will see.
     async fn poll_image_build(&mut self, image_id: &str) -> Result<()> {
         let started = std::time::Instant::now();
         let mut last_entry_id = String::new();
@@ -204,37 +261,64 @@ impl ModalClient {
                 )));
             }
 
-            let mut stream = self
-                .inner_mut()
-                .image_join_streaming(ImageJoinStreamingRequest {
-                    image_id: image_id.to_string(),
-                    timeout: JOIN_STREAM_TIMEOUT_SECS,
-                    last_entry_id: last_entry_id.clone(),
-                    include_logs_for_finished: false,
-                })
-                .await?
-                .into_inner();
-
-            // Drain this stream window; a terminal result ends the poll.
-            while let Some(item) = stream.message().await? {
-                if !item.entry_id.is_empty() {
-                    last_entry_id = item.entry_id;
+            match self.drain_build_window(image_id, &mut last_entry_id).await {
+                Ok(Some(())) => return Ok(()),
+                // Clean window end with no terminal result — reconnect and resume.
+                Ok(None) => {}
+                // Transient transport reset mid-poll — reconnect and resume from the
+                // last entry. Re-surface any non-transient error (e.g. auth).
+                Err(err) if err.is_transient() => {
+                    eprintln!("[image-build] stream reconnect after transient error: {err}");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                match result_status(item.result.as_ref()) {
-                    ResultState::Success => return Ok(()),
-                    ResultState::Failure(status) => {
-                        let result = item.result.expect("failure implies a result");
-                        return Err(Error::build(describe_failure(
-                            "image build",
-                            status,
-                            &result,
-                        )));
-                    }
-                    ResultState::Pending => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Open one `ImageJoinStreaming` window and drain it. Returns `Ok(Some(()))` on
+    /// terminal success, `Ok(None)` when the window ends without a terminal result
+    /// (caller should reconnect), and `Err` for a terminal build failure or a
+    /// transport error (the caller decides whether the latter is retryable).
+    async fn drain_build_window(
+        &mut self,
+        image_id: &str,
+        last_entry_id: &mut String,
+    ) -> Result<Option<()>> {
+        let mut stream = self
+            .inner_mut()
+            .image_join_streaming(ImageJoinStreamingRequest {
+                image_id: image_id.to_string(),
+                timeout: JOIN_STREAM_TIMEOUT_SECS,
+                last_entry_id: last_entry_id.clone(),
+                include_logs_for_finished: true,
+            })
+            .await?
+            .into_inner();
+
+        while let Some(item) = stream.message().await? {
+            for log in &item.task_logs {
+                if !log.data.is_empty() {
+                    eprint!("[image-build] {}", log.data);
                 }
             }
-            // Stream window ended without a terminal result — reconnect and resume.
+            if !item.entry_id.is_empty() {
+                *last_entry_id = item.entry_id;
+            }
+            match result_status(item.result.as_ref()) {
+                ResultState::Success => return Ok(Some(())),
+                ResultState::Failure(status) => {
+                    let result = item.result.expect("failure implies a result");
+                    return Err(Error::build(describe_failure(
+                        "image build",
+                        status,
+                        &result,
+                    )));
+                }
+                ResultState::Pending => {}
+            }
         }
+        Ok(None)
     }
 }
 
@@ -260,7 +344,39 @@ mod tests {
             .with_wrapper_module("m", "x = 1\n")
             .dockerfile_commands();
         assert_eq!(cmds[0], format!("FROM {DEFAULT_BASE_IMAGE}"));
-        assert!(cmds[1].contains("pip install --no-cache-dir modal"));
+        assert!(cmds[1].contains("python3 -m pip install"));
+        assert!(cmds[1].contains("--break-system-packages"));
+        assert!(cmds[1].ends_with(" modal"));
+    }
+
+    #[test]
+    fn apt_renders_before_pip_and_bake() {
+        let cmds = ImageSpec::from_registry("rust:1-slim")
+            .with_apt(&["python3", "python3-pip"])
+            .with_pip_install_modal()
+            .with_wrapper_module(
+                "modal_rust_run_wrapper",
+                "def handler(e, i):\n    return i\n",
+            )
+            .with_command("ENTRYPOINT []")
+            .dockerfile_commands();
+        assert_eq!(cmds[0], "FROM rust:1-slim");
+        // apt line first (provisions python3 the bake/pip steps invoke).
+        assert!(cmds[1].starts_with("RUN apt-get update"));
+        assert!(cmds[1].contains("python3 python3-pip"));
+        // pip uses `python3 -m pip` (universal launcher), AFTER apt.
+        let pip_idx = cmds
+            .iter()
+            .position(|c| c.contains("python3 -m pip install"))
+            .expect("pip line present");
+        let bake_idx = cmds
+            .iter()
+            .position(|c| c.contains("/root/modal_rust_run_wrapper.py"))
+            .expect("bake line present");
+        assert!(pip_idx > 1, "apt must precede pip");
+        assert!(bake_idx > pip_idx, "pip must precede the wrapper bake");
+        // ENTRYPOINT [] is last (extra command).
+        assert_eq!(cmds.last().unwrap(), "ENTRYPOINT []");
     }
 
     #[test]

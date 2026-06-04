@@ -3,12 +3,14 @@
 //! - [`Function::local`] runs the registered handler IN-PROCESS via the frozen
 //!   [`Registry`] (zero Modal, zero network) and returns the typed output. This
 //!   mirrors Modal Python's `Function.local()` = `raw_f(*args)`.
-//! - [`Function::remote`] / [`Function::spawn`] / [`Function::map`] are the LOCKED
-//!   async surface; they return [`Error::NotImplemented`] this milestone. Remote
-//!   execution needs SDK source-upload (MountPutFile/blob), which `modal-rust-sdk`
-//!   does not have yet — tracked as the next workflow milestone. The signatures
-//!   and docs are frozen now so the next milestone fills the bodies without an API
-//!   change.
+//! - [`Function::remote`] runs the handler REMOTELY on Modal (the RUN path): the
+//!   source crate is uploaded as a mount, `cargo build` runs IN THE FUNCTION BODY
+//!   at invoke time, and the freshly built `modal_runner` execs the handler —
+//!   returning the SAME typed `Result` as `.local()`. Requires
+//!   [`App::connect`](crate::App::connect).
+//! - [`Function::spawn`] / [`Function::map`] remain the LOCKED async surface and
+//!   return [`Error::NotImplemented`] (fire-and-forget / fan-out land in a later
+//!   milestone).
 //!
 //! # Quick start (single-dep App/Function path)
 //!
@@ -62,6 +64,7 @@ pub use modal_rust_macros::function;
 mod app;
 mod error;
 mod function;
+mod remote;
 
 pub use app::App;
 pub use error::{Error, Result};

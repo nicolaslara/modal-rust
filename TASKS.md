@@ -29,8 +29,17 @@ done + a large slice of P3** (see `workpads/shim-backend/{knowledge.md,tasks.md}
 runner uses (`add.local({40,2}) == {sum:42}`, 6/6 tests). `.remote()/.spawn()/.map()`
 signatures locked, returning an honest `NotImplemented` (pending SDK source-upload).
 `examples/add` got additive symmetric serde derives (required by `.local()` bounds). Built
-via `facade-local-orchestration`; 3/3 reviews PASS; gates green. **Next: SDK source-upload
-(`MountPutFile`/`BlobCreate`/`reqwest`) + real `.remote()` running `modal_runner` live.**
+via `facade-local-orchestration`; 3/3 reviews PASS; gates green.
+
+**[2026-06-04] SDK source-upload + real `.remote()` — code-complete + offline-green; live `{sum:42}`
+pending (transient transport resets).** SDK gained `mount_local_dir` (`ops/local_dir.rs`) + `blob.rs`
+(`MountGetOrCreate(create)`+`MountPutFile`+`BlobCreate`+`reqwest`; upload **proven live** →
+`mo-jsAF1yjh6g08SkWmoy9l9Z`). The run-path FILE-mode wrapper (`crates/modal-rust/src/remote.rs`) ports
+`dev_app.py` (cargo build in the function body), and `Function::remote` wires ensure-create + invoke +
+envelope→`Result`. Offline gates GREEN. Live found+fixed 2 bugs (notably PEP-668: `pip install modal`
+on Debian needs `--break-system-packages`), then hit transient `ConnectionReset` during the long
+apt+pip image build → **retrying** (never blocked). Built via `source-upload-remote`. Open follow-up:
+image-build long-poll resilience / faster (cached) image. See `workpads/shim-backend/knowledge.md`.
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/

@@ -55,14 +55,16 @@ fn local_surfaces_decode_error_on_wrong_output_shape() {
 }
 
 #[tokio::test]
-async fn remote_returns_not_implemented() {
-    // The stub future is immediately ready; the #[tokio::test] runtime drives it.
+async fn remote_on_offline_app_is_not_connected() {
+    // `.remote()` needs App::connect; an offline App (App::new) has no control-plane
+    // handle, so it errors with NotConnected BEFORE any network call. The
+    // #[tokio::test] runtime drives the immediately-ready future.
     let app = App::new(modal_registry());
     let res = app
         .function("add")
         .remote::<_, AddOutput>(AddInput { a: 1, b: 2 })
         .await;
-    assert!(matches!(res, Err(Error::NotImplemented(_))), "got {res:?}");
+    assert!(matches!(res, Err(Error::NotConnected(_))), "got {res:?}");
 }
 
 #[tokio::test]

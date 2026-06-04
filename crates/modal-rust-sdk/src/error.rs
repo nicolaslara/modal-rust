@@ -53,6 +53,41 @@ impl Error {
     pub fn invalid_metadata(err: impl fmt::Display) -> Self {
         Error::Invalid(format!("invalid gRPC metadata value: {err}"))
     }
+
+    /// Whether this error is a transient transport blip that is safe to retry
+    /// (connection reset, h2 protocol body read, broken pipe, `UNAVAILABLE`,
+    /// deadline-exceeded). Long-poll streams (image builds) reconnect on these;
+    /// callers may also retry whole operations. Terminal failures
+    /// ([`Error::Build`], [`Error::Status`] with a definite error like
+    /// `INVALID_ARGUMENT`/`UNAUTHENTICATED`) are NOT transient.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Channel/TLS establishment errors are virtually always transient.
+            Error::Transport(_) => true,
+            Error::Status(s) => {
+                use tonic::Code;
+                if matches!(
+                    s.code(),
+                    Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted
+                ) {
+                    return true;
+                }
+                // h2/transport resets often arrive as Unknown/Internal with a
+                // recognizable message; sniff the text.
+                let m = s.message().to_ascii_lowercase();
+                m.contains("connection reset")
+                    || m.contains("connectionreset")
+                    || m.contains("error reading a body")
+                    || m.contains("h2 protocol error")
+                    || m.contains("broken pipe")
+                    || m.contains("transport error")
+                    || m.contains("socket connection closed")
+                    || m.contains("goaway")
+                    || m.contains("connection closed")
+            }
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Error {

@@ -19,9 +19,11 @@
 //!    the input, then polls `FunctionGetOutputs` ([`invoke`]).
 
 pub mod app;
+pub mod blob;
 pub mod function;
 pub mod image;
 pub mod invoke;
+pub mod local_dir;
 pub mod mount;
 
 use crate::proto::api::generic_result::GenericStatus;

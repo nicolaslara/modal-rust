@@ -29,6 +29,10 @@ toml = "0.9"                   # parse ~/.modal.toml
 base64 = "0.22"               # bake wrapper source into dockerfile_commands
 sha2 = "0.10"                 # content hashing for mounts/images
 anyhow = "1"                  # ops-level error context (NOT the public error type — see error.rs)
+walkdir = "2"                 # recursive local-dir walk with early directory pruning (mount upload)
+# HTTP PUT for large mount-file blobs. rustls only (no default features) so the
+# no-CUDA CI box needs no system OpenSSL; tonic already pulls ring/rustls.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.3"

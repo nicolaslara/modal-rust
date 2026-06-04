@@ -50,23 +50,38 @@ impl Function<'_> {
         serde_json::from_slice(&out).map_err(Error::Decode)
     }
 
-    /// Run the function body REMOTELY on Modal. NOT YET IMPLEMENTED: returns
-    /// [`Error::NotImplemented`] — remote execution needs SDK source-upload,
-    /// tracked as the next workflow milestone. Signature + docs are LOCKED now so
-    /// the next milestone fills the body (via `sdk::ModalClient::invoke_cbor`)
-    /// without any API change.
-    #[allow(clippy::unused_async)] // body lands next milestone (sdk::invoke_cbor)
+    /// Run the function body REMOTELY on Modal (the RUN path), returning the typed
+    /// output with the SAME semantics as [`Function::local`].
+    ///
+    /// Requires a connected App ([`App::connect`](crate::App::connect)) — otherwise
+    /// [`Error::NotConnected`]. On first call the App ensures the wrapper function
+    /// exists (uploads the source crate as a mount, builds the run image, creates +
+    /// publishes the FILE-mode function); subsequent calls reuse the memoized
+    /// `function_id`. The user's Rust crate is `cargo build`-ed IN THE FUNCTION
+    /// BODY at invoke time (the run boundary), then `modal_runner` execs the
+    /// registered handler and emits the same JSON envelope `.local()` produces.
+    ///
+    /// # Errors
+    /// - [`Error::NotConnected`] if the App was not connected.
+    /// - [`Error::Encode`] if `input` fails to serialize to JSON.
+    /// - [`Error::Sdk`] for any control-plane / upload / build / invoke failure
+    ///   (including a remote `cargo build` failure, surfaced with its traceback).
+    /// - [`Error::Runner`] wrapping the frozen five-kind taxonomy (identical to
+    ///   `.local()`) when the handler itself reports a structured failure.
+    /// - [`Error::Decode`] if the envelope / output does not match `Out`.
     pub async fn remote<In, Out>(&self, input: In) -> Result<Out>
     where
         In: serde::Serialize,
         Out: serde::de::DeserializeOwned,
     {
-        let _ = input;
-        Err(Error::not_implemented("Function::remote"))
+        let input_json = serde_json::to_string(&input).map_err(Error::Encode)?;
+        let envelope = self.app.remote_invoke(&self.name, input_json).await?;
+        crate::remote::parse_envelope::<Out>(&envelope)
     }
 
     /// Fire-and-forget spawn returning a [`FunctionCall`] handle. NOT YET
-    /// IMPLEMENTED: returns [`Error::NotImplemented`] (see [`Function::remote`]).
+    /// IMPLEMENTED: returns [`Error::NotImplemented`] (a later milestone; use
+    /// [`Function::remote`] for a single typed remote call today).
     #[allow(clippy::unused_async)]
     pub async fn spawn<In>(&self, input: In) -> Result<FunctionCall>
     where
@@ -77,7 +92,8 @@ impl Function<'_> {
     }
 
     /// Fan-out over many inputs. NOT YET IMPLEMENTED: returns
-    /// [`Error::NotImplemented`] (see [`Function::remote`]).
+    /// [`Error::NotImplemented`] (a later milestone; use [`Function::remote`] per
+    /// input today).
     #[allow(clippy::unused_async)]
     pub async fn map<In, Out, I>(&self, inputs: I) -> Result<Vec<Out>>
     where

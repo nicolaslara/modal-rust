@@ -9,6 +9,11 @@ publish = false
 [lib]
 name = "modal_rust"
 
+[features]
+# Opt-in live Modal round-trip test for `.remote()`. Gated so the no-CUDA CI box
+# NEVER runs it; enable locally with `--features live`.
+live = []
+
 [dependencies]
 modal-rust-sdk     = { path = "../modal-rust-sdk" }
 modal-rust-runtime = { path = "../modal-rust-runtime" }
@@ -16,10 +21,11 @@ modal-rust-runtime = { path = "../modal-rust-runtime" }
 modal-rust-macros  = { path = "../modal-rust-macros" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `sync` for the RemoteHandle Mutex<ModalClient> + the function_id OnceCell;
+# `rt`/`macros` so the async `.remote()` surface is drivable.
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 # The real .local() proof: example-add::modal_registry() gives a frozen Registry.
 # Acyclic — example-add depends only on modal-rust-runtime, never on modal-rust.
 example-add = { path = "../../examples/add" }
-# Drives the immediately-ready async stub future in remote_returns_not_implemented.
-tokio = { version = "1", features = ["rt", "macros"] }

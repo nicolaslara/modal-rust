@@ -2935,6 +2935,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "reqwest",
  "serde",
  "serde_cbor",
  "sha2",
@@ -2943,6 +2944,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "walkdir",
 ]
 
 [[package]]

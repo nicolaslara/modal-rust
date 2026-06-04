@@ -32,9 +32,13 @@ pub enum Error {
     /// A control-plane (remote) operation failed. Reserved for
     /// `.remote()`/`.spawn()`/`.map()` and `connect()`.
     Sdk(modal_rust_sdk::Error),
+    /// `.remote()` was called on an [`App`](crate::App) that was built offline
+    /// (`App::new`/`App::from_inventory`) and never [`connect`](crate::App::connect)ed.
+    /// Remote execution needs the live control-plane handle.
+    NotConnected(String),
     /// A surface intentionally not wired this milestone
-    /// (`.remote()`/`.spawn()`/`.map()`/`FunctionCall::get`): carries a message
-    /// pointing to the next workflow.
+    /// (`.spawn()`/`.map()`/`FunctionCall::get`): carries a message pointing to the
+    /// next workflow.
     NotImplemented(String),
 }
 
@@ -42,15 +46,23 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    /// Build the standard [`Error::NotImplemented`] for a remote surface, with a
-    /// message pointing to the next milestone (SDK source-upload).
+    /// Build the standard [`Error::NotImplemented`] for a still-stubbed surface,
+    /// with a message pointing to the next milestone.
     pub(crate) fn not_implemented(surface: &str) -> Error {
         Error::NotImplemented(format!(
-            "`{surface}` is not implemented yet: remote execution needs SDK \
-             source-upload (MountPutFile/blob), which modal-rust-sdk does not \
-             have yet. Tracked as the next workflow milestone. Use .local() for \
-             in-process execution today."
+            "`{surface}` is not implemented yet: fire-and-forget spawn / fan-out map \
+             are a later workflow milestone. Use .remote() for a single typed remote \
+             call, or .local() for in-process execution today."
         ))
+    }
+
+    /// Build the standard [`Error::NotConnected`] for `.remote()` on an offline App.
+    pub(crate) fn not_connected() -> Error {
+        Error::NotConnected(
+            "`.remote()` requires a connected App: call `App::connect(name).await` \
+             (App::new / App::from_inventory are offline-only, for `.local()`)."
+                .to_string(),
+        )
     }
 }
 
@@ -72,6 +84,7 @@ impl std::fmt::Display for Error {
             Error::Encode(e) => write!(f, "failed to encode .local() input to JSON: {e}"),
             Error::Decode(e) => write!(f, "failed to decode handler output from JSON: {e}"),
             Error::Sdk(e) => write!(f, "control-plane operation failed: {e}"),
+            Error::NotConnected(msg) => write!(f, "{msg}"),
             Error::NotImplemented(msg) => write!(f, "{msg}"),
         }
     }
@@ -84,7 +97,9 @@ impl std::error::Error for Error {
             Error::Encode(e) => Some(e),
             Error::Decode(e) => Some(e),
             Error::Sdk(e) => Some(e),
-            Error::UnknownEntrypoint { .. } | Error::NotImplemented(_) => None,
+            Error::UnknownEntrypoint { .. } | Error::NotConnected(_) | Error::NotImplemented(_) => {
+                None
+            }
         }
     }
 }

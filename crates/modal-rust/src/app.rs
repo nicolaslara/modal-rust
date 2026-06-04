@@ -5,7 +5,10 @@
 //! real `sdk::ModalClient` for the future remote path, but no unit/integration
 //! test calls it, so the offline gates stay green.
 
-use crate::{Function, Registry, Result};
+use tokio::sync::{Mutex, OnceCell};
+
+use crate::remote::{self, RemoteConfig};
+use crate::{Error, Function, Registry, Result};
 
 /// The user-facing application handle.
 ///
@@ -16,19 +19,27 @@ use crate::{Function, Registry, Result};
 pub struct App {
     /// Owned registry; the ONLY field `.local()` needs.
     registry: Registry,
-    /// `None` until [`App::connect`]; written by `connect_with_registry` and read
-    /// by the next-milestone remote body (the stubbed `.remote()`/`.spawn()`/`.map()`
-    /// surface does not touch it yet).
-    #[allow(dead_code)]
+    /// `None` until [`App::connect`]; the live control-plane handle `.remote()`
+    /// consumes. `.local()` never touches it.
     remote: Option<RemoteHandle>,
 }
 
-/// A live control-plane handle, built by [`App::connect`]. Private — the remote
-/// surface that consumes it is stubbed this milestone.
-#[allow(dead_code)] // fields consumed by the next-milestone remote body.
+/// A live control-plane handle, built by [`App::connect`]. Private — `.remote()`
+/// drives it through [`App::remote_invoke`].
 struct RemoteHandle {
-    client: modal_rust_sdk::ModalClient,
+    /// Interior mutability: `App::function` hands out `Function<'_>` borrowing
+    /// `&App`, but `invoke_cbor`/the ensure sequence need `&mut ModalClient`. The
+    /// `Mutex` also single-flights concurrent `.remote()` calls cleanly.
+    client: Mutex<modal_rust_sdk::ModalClient>,
+    /// Resolved control-plane app id (`AppGetOrCreate`).
     app_id: String,
+    /// App name — needed for `app_publish` / `from_name` resolution.
+    app_name: String,
+    /// Memoized invokable `function_id` for the single wrapper function that serves
+    /// every entrypoint. `get_or_try_init` gives correct single-flight create.
+    function_id: OnceCell<String>,
+    /// RUN-path knobs (source dir, package, image, timeout, ignore set).
+    config: RemoteConfig,
 }
 
 impl App {
@@ -51,9 +62,8 @@ impl App {
     /// `sdk::ModalClient` (reads `~/.modal.toml` / `MODAL_TOKEN_*`) and resolve an
     /// `app_id` via `AppGetOrCreate`. Uses the inventory [`Registry`].
     ///
-    /// `.remote()`/`.spawn()`/`.map()` still return [`crate::Error::NotImplemented`]
-    /// THIS milestone; `.local()` never needs this call. Wired for real so the next
-    /// milestone is a pure addition.
+    /// Enables [`Function::remote`](crate::Function::remote); `.local()` never
+    /// needs this call. `.spawn()`/`.map()` remain stubbed.
     pub async fn connect(name: &str) -> Result<Self> {
         App::connect_with_registry(name, Registry::from_inventory()).await
     }
@@ -66,8 +76,54 @@ impl App {
         let app_id = client.app_get_or_create_id(name, None).await?;
         Ok(App {
             registry,
-            remote: Some(RemoteHandle { client, app_id }),
+            remote: Some(RemoteHandle {
+                client: Mutex::new(client),
+                app_id,
+                app_name: name.to_string(),
+                function_id: OnceCell::new(),
+                config: RemoteConfig::default(),
+            }),
         })
+    }
+
+    /// Drive the RUN path for one entrypoint: ensure the wrapper function exists on
+    /// Modal (once per App, single-flighted via the `function_id` [`OnceCell`]),
+    /// then invoke it with `(entrypoint, input_json)` and return the runner's
+    /// one-line JSON envelope string. The caller ([`Function::remote`]) parses it.
+    ///
+    /// `cargo build` runs in the function body at invoke time (the RUN boundary);
+    /// this method only orchestrates the control plane + the CBOR round-trip.
+    pub(crate) async fn remote_invoke(
+        &self,
+        entrypoint: &str,
+        input_json: String,
+    ) -> Result<String> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+
+        // Resolve (and memoize) the invokable function_id. `get_or_try_init`
+        // single-flights the create sequence under concurrent `.remote()` calls.
+        let function_id = handle
+            .function_id
+            .get_or_try_init(|| async {
+                let mut client = handle.client.lock().await;
+                remote::ensure_function(
+                    &mut client,
+                    &handle.app_id,
+                    &handle.app_name,
+                    &handle.config,
+                )
+                .await
+            })
+            .await?;
+
+        // Invoke: two positional args (entrypoint, input_json), no kwargs. R=String
+        // (the wrapper returns the runner stdout envelope verbatim).
+        let empty_kwargs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        let mut client = handle.client.lock().await;
+        let envelope: String = client
+            .invoke_cbor(function_id, &(entrypoint, input_json), &empty_kwargs)
+            .await?;
+        Ok(envelope)
     }
 
     /// Get a [`Function`] handle by entrypoint name. Resolves the [`crate::HandlerFn`]

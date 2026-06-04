@@ -738,3 +738,40 @@ This advances the staged plan: **P1 (auth + invoke) DONE**, and a large slice of
 FunctionCreate, FILE mode)** proven at the SDK-primitive level. Next: wire the SDK into the
 `App`/`Function` `.remote()`/`.local()` ergonomics + migrate the CLI off codegen (P3→P9), then deploy
 (P5), dynamic config from the registry (P4), cache (P6), local orchestration (P7).
+
+---
+
+### SOURCE-UPLOAD + real `.remote()` — code-complete + offline-green; live `{sum:42}` pending (2026-06-04)
+
+Two more milestones landed at the CODE level (offline gates GREEN: fmt/clippy `-D warnings`/build/test on
+default-members):
+
+1. **Facade `crates/modal-rust` + real `.local()`** (committed `aff1cff`): in-process Registry dispatch,
+   `add.local({40,2}) == {sum:42}`; `.remote()/.spawn()/.map()` API locked.
+2. **SDK source-upload + real `.remote()` (run path)**:
+   - SDK gained the `add_local_dir` equivalent — `ModalClient::mount_local_dir` (`ops/local_dir.rs`) +
+     `blob_create_and_put` (`ops/blob.rs`): walk + sha256 + ignore, `MountGetOrCreate(create)` +
+     `MountPutFile` (inline `<4 MiB`) + `BlobCreate` → `reqwest` PUT (`≥4 MiB`). **Proven live**: uploaded a
+     dir → `mount_id mo-jsAF1yjh6g08SkWmoy9l9Z`. New deps: `reqwest` (rustls, no-default-features), `walkdir`.
+   - The run-path FILE-mode wrapper (`crates/modal-rust/src/remote.rs`) ports `dev_app.py run_entrypoint`
+     byte-faithfully: mounted source, `cargo build --release -p <pkg> --bin modal_runner` **in the function
+     body**, exec the runner, return the envelope. `Function::remote` wires ensure-create (app + run image +
+     uploaded source mount + client mount + FunctionCreate FILE) + `invoke_cbor` + envelope→`Result` (same
+     semantics as `.local()`). Build boundary intact (no cargo at image-build time).
+
+**LIVE STATUS: `{sum:42}` NOT yet confirmed — blocked by transient transport resets, not a code bug.** The
+live run surfaced + fixed TWO real bugs, then hit Modal flakiness:
+
+> **DURABLE FINDING — `pip install modal` on a Debian `rust:slim` base needs `--break-system-packages`.**
+> Modern Debian is PEP-668 externally-managed; a bare `RUN python3 -m pip install modal` aborts with
+> `error: externally-managed-environment`. Fixed in `ops/image.rs:157`
+> (`pip install --no-cache-dir --break-system-packages modal`). (The run image provisions Python via
+> `apt-get install python3 python3-pip` since `rust:slim` has no Python.)
+
+After that fix the image build proceeded (apt python ✓, pip step ✓) but the long `ImageGetOrCreate` /
+`ImageJoinStreaming` poll kept hitting transient `ConnectionReset` / `h2 protocol error` (the apt+pip image
+build takes minutes → a long-lived stream → reset-prone). Per the project rule this is RETRY-not-block.
+**Open follow-up:** make the image-build long-poll resilient (reconnect/resume on transport reset, like the
+Python SDK) and/or shrink the build (a base image that already carries rust+python, or rely on Modal layer
+caching so re-runs reuse the built image). Re-running the live test after the layers cache should narrow the
+reset window. Code is committed; the live confirmation is being retried.
