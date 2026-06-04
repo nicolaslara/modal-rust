@@ -171,6 +171,26 @@ assert_eq!(out.sum, 42);
 # }
 ```
 
+`map` fans out across many inputs (results come back in input order), and
+`spawn` is fire-and-forget — it returns a handle immediately that you poll later:
+
+```rust
+# use modal_rust::App;
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Serialize, Deserialize)] pub struct AddInput { pub a: i64, pub b: i64 }
+# #[derive(Debug, Serialize, Deserialize)] pub struct AddOutput { pub sum: i64 }
+# async fn example(app: &App) -> anyhow::Result<()> {
+let sums: Vec<AddOutput> = app
+    .function("add")
+    .map(vec![AddInput { a: 1, b: 1 }, AddInput { a: 40, b: 2 }])
+    .await?; // -> [{sum:2}, {sum:42}], in input order
+
+let call = app.function("add").spawn(AddInput { a: 40, b: 2 }).await?; // returns immediately
+let out: AddOutput = call.get().await?; // -> {sum:42}
+# Ok(())
+# }
+```
+
 The manual registration path is also supported if you do not want to use the
 attribute macro:
 

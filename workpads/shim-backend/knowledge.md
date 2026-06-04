@@ -970,3 +970,23 @@ burn-add stays CUDA-only + OUT of default-members (offline gates don't build it;
 `workspace_default_members` confirms exclusion). Offline gates green (155 tests); 2/2 reviews PASS. **The
 through-line is complete: write Rust → `.remote()`/`deploy` a real GPU ML workload on Modal, via our own
 client — CLI or facade, CPU or GPU, trivial or heavy.**
+
+---
+
+### ✅ `.spawn()` / `.map()` — fan-out + fire-and-forget (2026-06-04, AFK run)
+
+`Function::map(inputs) -> Vec<Out>` (fan-out, **input order**) and `Function::spawn(input) -> FunctionCall` +
+`FunctionCall::get() -> Out` (fire-and-forget) now work — the `NotImplemented` stubs are filled. **Proven live**
+(ephemeral, CPU `add`): `map([{1,1},{2,2},{3,3},{40,2}]) -> [2,4,6,42]` in order (distinct 42-last rules out
+coincidental ordering); `spawn(40,2) -> fc-... returned immediately -> .get() -> {sum:42}`.
+
+Reuses the proven invoke RPCs (FunctionMap + FunctionPutInputs fallback + FunctionGetOutputs), CBOR, and
+`retry_transient`; shares `resolve_function`/`ensure_function` so decorator gpu/timeout config is respected.
+SDK: `poll_outputs_indexed(fcid, index, deadline)` (`.remote()` passes `None` -> byte-identical), `spawn_cbor`/
+`get_by_call_cbor` (index 0), `map_cbor` (enqueue N with `idx=ordinal`, collect into a `BTreeMap<idx,_>`,
+`reassemble_in_order`). spawn sends `FunctionCallInvocationType::Async` (vs SYNC for `.remote()`); map opens a
+`FUNCTION_CALL_TYPE_MAP` call. `FunctionCall<'a>` has a manual `Debug`.
+
+**Real bug fixed live:** the indexed `FunctionGetOutputs` poll sent an empty `last_entry_id` -> Modal rejects with
+INVALID_ARGUMENT "No last_entry_id provided." Fix: seed the cursor with the `"0-0"` sentinel (matches the Python
+client's `get_all_outputs`), `LAST_ENTRY_ID_INITIAL` in `ops/invoke.rs`. Gates green; 2/2 reviews PASS.

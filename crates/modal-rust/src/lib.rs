@@ -8,9 +8,11 @@
 //!   at invoke time, and the freshly built `modal_runner` execs the handler —
 //!   returning the SAME typed `Result` as `.local()`. Requires
 //!   [`App::connect`](crate::App::connect).
-//! - [`Function::spawn`] / [`Function::map`] remain the LOCKED async surface and
-//!   return [`Error::NotImplemented`] (fire-and-forget / fan-out land in a later
-//!   milestone).
+//! - [`Function::spawn`] fire-and-forget enqueues one input on Modal and returns a
+//!   [`FunctionCall`] handle immediately; [`FunctionCall::get`] fetches the result
+//!   later. [`Function::map`] fans out N inputs and collects the outputs in INPUT
+//!   ORDER. Both drive the SAME RUN path as `.remote()` and require
+//!   [`App::connect`](crate::App::connect).
 //!
 //! # Quick start (single-dep App/Function path)
 //!

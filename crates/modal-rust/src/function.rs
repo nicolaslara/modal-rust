@@ -1,5 +1,5 @@
-//! The [`Function`] handle: real in-process `.local()` plus the locked
-//! `.remote()`/`.spawn()`/`.map()` async surface.
+//! The [`Function`] handle: real in-process `.local()` plus the live
+//! `.remote()`/`.spawn()`/`.map()` async RUN-path surface.
 //!
 //! `.local()` dispatches through the FROZEN [`Registry`](crate::Registry) exactly
 //! as the runner would, minus the subprocess: `serde_json::to_vec(&input)` →
@@ -22,7 +22,7 @@ pub struct Function<'a> {
     pub(crate) handler: Option<HandlerFn>,
 }
 
-impl Function<'_> {
+impl<'a> Function<'a> {
     /// Run the registered handler IN-PROCESS via the FROZEN [`Registry`](crate::Registry):
     /// serialize `input` to JSON, invoke the [`HandlerFn`], deserialize the JSON
     /// output to `Out`. Zero Modal, zero network. Mirrors Modal Python's
@@ -79,30 +79,61 @@ impl Function<'_> {
         crate::remote::parse_envelope::<Out>(&envelope)
     }
 
-    /// Fire-and-forget spawn returning a [`FunctionCall`] handle. NOT YET
-    /// IMPLEMENTED: returns [`Error::NotImplemented`] (a later milestone; use
-    /// [`Function::remote`] for a single typed remote call today).
-    #[allow(clippy::unused_async)]
-    pub async fn spawn<In>(&self, input: In) -> Result<FunctionCall>
+    /// Fire-and-forget spawn (the RUN path): enqueue ONE input on Modal and return
+    /// a [`FunctionCall`] handle carrying the `function_call_id` IMMEDIATELY, without
+    /// waiting for the output. Fetch the result later with [`FunctionCall::get`].
+    ///
+    /// Mirrors Modal Python's `Function.spawn`. The FIRST spawn on a fresh App
+    /// ensures the wrapper function exists (upload + create + publish), exactly as
+    /// `.remote()`; the spawned input pays the cold in-body `cargo build` when its
+    /// container first handles it (covered by the `get` poll deadline).
+    ///
+    /// # Errors
+    /// - [`Error::NotConnected`] if the App was not connected.
+    /// - [`Error::Encode`] if `input` fails to serialize to JSON.
+    /// - [`Error::Sdk`] for any control-plane / upload / enqueue failure.
+    pub async fn spawn<In>(&self, input: In) -> Result<FunctionCall<'a>>
     where
         In: serde::Serialize,
     {
-        let _ = input;
-        Err(Error::not_implemented("Function::spawn"))
+        let input_json = serde_json::to_string(&input).map_err(Error::Encode)?;
+        let function_call_id = self.app.remote_spawn(&self.name, input_json).await?;
+        Ok(FunctionCall {
+            app: self.app,
+            function_call_id,
+        })
     }
 
-    /// Fan-out over many inputs. NOT YET IMPLEMENTED: returns
-    /// [`Error::NotImplemented`] (a later milestone; use [`Function::remote`] per
-    /// input today).
-    #[allow(clippy::unused_async)]
+    /// Fan-out over many inputs (the RUN path): enqueue N inputs under ONE map call
+    /// and collect the N typed outputs in INPUT ORDER (Modal tags each output with
+    /// its input ordinal; the SDK reassembles by ordinal), running across containers
+    /// in parallel. Each output decodes with the SAME semantics as
+    /// [`Function::local`]/[`Function::remote`].
+    ///
+    /// Mirrors Modal Python's `Function.map`. Fail-fast: the first remote failure
+    /// surfaces immediately. The FIRST map on a fresh App ensures the wrapper exists,
+    /// exactly as `.remote()`.
+    ///
+    /// # Errors
+    /// - [`Error::NotConnected`] if the App was not connected.
+    /// - [`Error::Encode`] if any input fails to serialize to JSON.
+    /// - [`Error::Sdk`] for any control-plane / upload / enqueue / poll failure.
+    /// - [`Error::Runner`] / [`Error::Decode`] per output, identical to `.remote()`.
     pub async fn map<In, Out, I>(&self, inputs: I) -> Result<Vec<Out>>
     where
         In: serde::Serialize,
         Out: serde::de::DeserializeOwned,
         I: IntoIterator<Item = In>,
     {
-        let _ = inputs;
-        Err(Error::not_implemented("Function::map"))
+        let inputs_json = inputs
+            .into_iter()
+            .map(|i| serde_json::to_string(&i).map_err(Error::Encode))
+            .collect::<Result<Vec<_>>>()?;
+        let envelopes = self.app.remote_map(&self.name, inputs_json).await?;
+        envelopes
+            .iter()
+            .map(|e| crate::remote::parse_envelope::<Out>(e))
+            .collect()
     }
 
     /// Build the [`Error::UnknownEntrypoint`] for this handle, listing the App's
@@ -115,21 +146,57 @@ impl Function<'_> {
     }
 }
 
-/// Handle returned by [`Function::spawn`]. Locks the `spawn().get()` shape without
-/// depending on the SDK's internal call-handle type yet.
-pub struct FunctionCall {
-    _private: (),
+/// Handle returned by [`Function::spawn`], carrying the spawned call's
+/// `function_call_id` and a borrow of the [`App`](crate::App) it was spawned on
+/// (which owns the live control-plane client). Mirrors Modal Python's
+/// `_FunctionCall`, which carries `(function_call_id, client)`.
+///
+/// The borrow ties the handle's lifetime to the App: hold the App alive (it owns
+/// the ephemeral run) and call [`get`](FunctionCall::get) to fetch the result.
+pub struct FunctionCall<'a> {
+    app: &'a crate::App,
+    function_call_id: String,
 }
 
-impl FunctionCall {
-    /// Await the spawned call's result. NOT YET IMPLEMENTED: returns
-    /// [`Error::NotImplemented`] (see [`Function::remote`]).
-    #[allow(clippy::unused_async)]
+// Manual `Debug` (not derived): the `&App` field is not `Debug` and printing the
+// live control-plane handle is noise — the call id is the useful identity.
+impl std::fmt::Debug for FunctionCall<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionCall")
+            .field("function_call_id", &self.function_call_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FunctionCall<'_> {
+    /// The spawned call's `function_call_id` (Modal's handle for the queued call).
+    pub fn function_call_id(&self) -> &str {
+        &self.function_call_id
+    }
+
+    /// Await the spawned call's result (the RUN path): poll Modal's
+    /// `FunctionGetOutputs` for this call's single output (index `0` — spawn enqueues
+    /// one input) and decode it with the SAME semantics as
+    /// [`Function::local`]/[`Function::remote`].
+    ///
+    /// `timeout` bounds the output poll. `None` uses the wrapper's container timeout
+    /// plus a buffer (covering the cold in-body `cargo build` the spawned input may
+    /// still be running).
+    ///
+    /// # Errors
+    /// - [`Error::NotConnected`] if the App was not connected.
+    /// - [`Error::Sdk`] for any poll failure or a no-output timeout.
+    /// - [`Error::Runner`] wrapping the frozen five-kind taxonomy (identical to
+    ///   `.local()`) when the handler reports a structured failure.
+    /// - [`Error::Decode`] if the envelope / output does not match `Out`.
     pub async fn get<Out>(&self, timeout: Option<std::time::Duration>) -> Result<Out>
     where
         Out: serde::de::DeserializeOwned,
     {
-        let _ = timeout;
-        Err(Error::not_implemented("FunctionCall::get"))
+        let envelope = self
+            .app
+            .remote_get(&self.function_call_id, 0, timeout)
+            .await?;
+        crate::remote::parse_envelope::<Out>(&envelope)
     }
 }

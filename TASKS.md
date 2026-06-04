@@ -101,8 +101,12 @@ reviews PASS; gates green (152 tests).
 byte-for-byte from the M13 `gpu_app.py` recipe; base `nvidia/cuda:12.6.3-devel`. Heavy `cargo build -p
 example-burn-add` ran at **image-build time** (proven: no cargo at call). burn-add stays CUDA-only + out of
 default-members. Built via `burn-gpu-capstone`; 2/2 reviews PASS; gates green (155 tests). **The through-line
-is complete** (write Rust → run/deploy a real GPU ML workload via our own client). **Remaining (optional):
-P10 cleanup (delete codegen/shims), `.spawn()`/`.map()` + cargo cache (P6), user-facing secrets/volumes.**
+is complete** (write Rust → run/deploy a real GPU ML workload via our own client). **Remaining (AFK run):
+~~`.spawn()`/`.map()`~~ ✅, then cargo cache (P6), user-facing secrets/volumes, P10 cleanup.**
+
+**[2026-06-04 AFK] ✅ `.spawn()`/`.map()`** — fan-out (input order) + fire-and-forget (`FunctionCall::get`).
+Proven live (`map → [2,4,6,42]` ordered; `spawn → fc-… → get → 42`); fixed the `last_entry_id` "0-0" sentinel
+bug. README updated. Built via `spawn-map`; 2/2 reviews PASS; gates green.
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/

@@ -68,13 +68,20 @@ async fn remote_on_offline_app_is_not_connected() {
 }
 
 #[tokio::test]
-async fn spawn_and_map_return_not_implemented() {
+async fn spawn_and_map_on_offline_app_are_not_connected() {
+    // `.spawn()`/`.map()` are implemented now and drive the SAME RUN path as
+    // `.remote()`; on an offline App (no `connect`) they hit the same NotConnected
+    // guard BEFORE any network call. This also pins the implemented surface shapes:
+    // `spawn` returns a `FunctionCall<'_>` handle, `map` returns `Vec<Out>`.
     let app = App::new(modal_registry());
     let f = app.function("add");
     let spawned = f.spawn(AddInput { a: 1, b: 2 }).await;
-    assert!(matches!(spawned, Err(Error::NotImplemented(_))));
+    assert!(
+        matches!(spawned, Err(Error::NotConnected(_))),
+        "{spawned:?}"
+    );
     let mapped = f
         .map::<_, AddOutput, _>(vec![AddInput { a: 1, b: 2 }])
         .await;
-    assert!(matches!(mapped, Err(Error::NotImplemented(_))));
+    assert!(matches!(mapped, Err(Error::NotConnected(_))), "{mapped:?}");
 }

@@ -29,16 +29,17 @@ pub enum Error {
     Encode(serde_json::Error),
     /// Deserializing the handler's JSON output into `Out` failed (AFTER it ran).
     Decode(serde_json::Error),
-    /// A control-plane (remote) operation failed. Reserved for
-    /// `.remote()`/`.spawn()`/`.map()` and `connect()`.
+    /// A control-plane (remote) operation failed. Reserved for the RUN-path surface
+    /// (`.remote()`/`.spawn()`/`.map()`/`FunctionCall::get`) and `connect()`.
     Sdk(modal_rust_sdk::Error),
-    /// `.remote()` was called on an [`App`](crate::App) that was built offline
-    /// (`App::new`/`App::from_inventory`) and never [`connect`](crate::App::connect)ed.
-    /// Remote execution needs the live control-plane handle.
+    /// A RUN-path call (`.remote()`/`.spawn()`/`.map()`) was made on an
+    /// [`App`](crate::App) that was built offline (`App::new`/`App::from_inventory`)
+    /// and never [`connect`](crate::App::connect)ed. Remote execution needs the live
+    /// control-plane handle.
     NotConnected(String),
-    /// A surface intentionally not wired this milestone
-    /// (`.spawn()`/`.map()`/`FunctionCall::get`): carries a message pointing to the
-    /// next workflow.
+    /// A surface intentionally not wired yet: carries a message pointing to the
+    /// alternative. (No facade surface returns this currently; retained as a stable
+    /// variant for future stubs.)
     NotImplemented(String),
 }
 
@@ -46,16 +47,6 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    /// Build the standard [`Error::NotImplemented`] for a still-stubbed surface,
-    /// with a message pointing to the next milestone.
-    pub(crate) fn not_implemented(surface: &str) -> Error {
-        Error::NotImplemented(format!(
-            "`{surface}` is not implemented yet: fire-and-forget spawn / fan-out map \
-             are a later workflow milestone. Use .remote() for a single typed remote \
-             call, or .local() for in-process execution today."
-        ))
-    }
-
     /// Build the standard [`Error::NotConnected`] for `.remote()` on an offline App.
     pub(crate) fn not_connected() -> Error {
         Error::NotConnected(

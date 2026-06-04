@@ -11,6 +11,12 @@ use crate::deploy::{self, DeployConfig, DeployedApp};
 use crate::remote::{self, RemoteConfig};
 use crate::{Error, Function, Registry, Result};
 
+/// One `map` input as the SDK's `map_cbor` expects it: `(args, kwargs)` where
+/// `args = (entrypoint, input_json)` (the SAME 2-tuple `.remote()` sends) and
+/// `kwargs` is the empty map. Aliased to keep [`App::remote_map`]'s annotation
+/// readable (clippy `type_complexity`).
+type MapInput<'a> = ((&'a str, String), std::collections::HashMap<String, ()>);
+
 /// The user-facing application handle.
 ///
 /// Build one from an explicit [`Registry`] ([`App::new`]) or from the
@@ -202,20 +208,50 @@ impl App {
         input_json: String,
     ) -> Result<String> {
         let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let (function_id, deadline) = self.resolve_function(handle, entrypoint).await?;
 
-        // Resolve the invoked entrypoint's decorator config (gpu/timeout) and apply
-        // it to a per-call clone of the path config BEFORE `ensure_function`. NOTE:
-        // the wrapper `function_id` is memoized in a `OnceCell`, so the create (and
-        // thus this config) is BOUND at the FIRST `.remote()` call on this App.
-        // Acceptable for the single-GPU required path: one app typically targets one
-        // GPU class. (A later GPU-list / per-entrypoint-function design would lift
-        // this.)
+        // Invoke: two positional args (entrypoint, input_json), no kwargs. R=String
+        // (the wrapper returns the runner stdout envelope verbatim).
+        let empty_kwargs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        let mut client = handle.client.lock().await;
+        let envelope: String = client
+            .invoke_cbor_with_deadline(
+                &function_id,
+                &(entrypoint, input_json),
+                &empty_kwargs,
+                deadline,
+            )
+            .await?;
+        Ok(envelope)
+    }
+
+    /// Shared RUN-path head reused by `.remote()`/`.spawn()`/`.map()`: resolve (and
+    /// memoize) the invokable wrapper `function_id` for `entrypoint`, applying its
+    /// decorator gpu/timeout, and compute the output-poll `deadline`.
+    ///
+    /// Resolves the invoked entrypoint's decorator config (gpu/timeout) and applies
+    /// it to a per-call clone of the path config BEFORE `ensure_function`. NOTE: the
+    /// wrapper `function_id` is memoized in a `OnceCell`, so the create (and thus
+    /// this config) is BOUND at the FIRST RUN-path call on this App. Acceptable for
+    /// the single-GPU required path: one app typically targets one GPU class.
+    ///
+    /// The deadline must cover the cold in-body `cargo build` (the RUN boundary):
+    /// the first call to a fresh container compiles the whole dep tree, which can
+    /// take many minutes — far past the SDK's 600s default. Match the function's own
+    /// container timeout (honoring the decorator override, the same value
+    /// `ensure_function` sets) plus a small queue/schedule buffer. spawn/map hit the
+    /// SAME wrapper, so the SAME deadline applies.
+    async fn resolve_function(
+        &self,
+        handle: &RemoteHandle,
+        entrypoint: &str,
+    ) -> Result<(String, std::time::Duration)> {
         let cfg = self.config_for(entrypoint);
         let cfg_gpu: Option<String> = cfg.gpu.map(|s| s.to_string());
         let cfg_timeout: Option<u32> = cfg.timeout_secs;
 
         // Resolve (and memoize) the invokable function_id. `get_or_try_init`
-        // single-flights the create sequence under concurrent `.remote()` calls.
+        // single-flights the create sequence under concurrent RUN-path calls.
         let function_id = handle
             .function_id
             .get_or_try_init(|| async {
@@ -226,32 +262,79 @@ impl App {
                 remote::ensure_function(&mut client, &handle.app_id, &handle.app_name, &run_config)
                     .await
             })
-            .await?;
+            .await?
+            .clone();
 
-        // Invoke: two positional args (entrypoint, input_json), no kwargs. R=String
-        // (the wrapper returns the runner stdout envelope verbatim).
-        //
-        // The output-poll deadline must cover the cold in-body `cargo build` (the
-        // RUN boundary): the first call to a fresh container compiles the whole
-        // dep tree, which can take many minutes — far past the SDK's 600s default.
-        // Match the function's own container timeout (plus a small queue/schedule
-        // buffer) so the client keeps polling for as long as the function may run.
-        // The function's effective timeout honors the decorator override (the same
-        // value `ensure_function` set on the created function), so the poll deadline
-        // tracks the actual container timeout.
         let effective_timeout = cfg_timeout.unwrap_or(handle.config.timeout_secs);
-        let empty_kwargs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
         let deadline = std::time::Duration::from_secs(effective_timeout as u64 + 120);
+        Ok((function_id, deadline))
+    }
+
+    /// Fire-and-forget RUN-path spawn: ensure the wrapper exists (same head as
+    /// `.remote()`), enqueue ONE input, and return its `function_call_id`
+    /// IMMEDIATELY (no output wait). [`Function::spawn`](crate::Function::spawn)
+    /// wraps the id in a [`FunctionCall`](crate::FunctionCall).
+    pub(crate) async fn remote_spawn(
+        &self,
+        entrypoint: &str,
+        input_json: String,
+    ) -> Result<String> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let (function_id, _deadline) = self.resolve_function(handle, entrypoint).await?;
+        let empty_kwargs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
         let mut client = handle.client.lock().await;
-        let envelope: String = client
-            .invoke_cbor_with_deadline(
-                function_id,
-                &(entrypoint, input_json),
-                &empty_kwargs,
-                deadline,
-            )
-            .await?;
-        Ok(envelope)
+        client
+            .spawn_cbor(&function_id, &(entrypoint, input_json), &empty_kwargs)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Poll ONE output of a previously-spawned call by `function_call_id` + `index`,
+    /// returning the runner's one-line JSON envelope VERBATIM (the caller parses it,
+    /// exactly as `.remote()` does). The call id is self-describing, so no
+    /// `function_id`/config resolution is needed — but the deadline must still cover
+    /// the cold in-body `cargo build` the first spawned input pays, so it tracks the
+    /// path timeout + buffer.
+    pub(crate) async fn remote_get(
+        &self,
+        function_call_id: &str,
+        index: i32,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<String> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let deadline = timeout.unwrap_or_else(|| {
+            std::time::Duration::from_secs(handle.config.timeout_secs as u64 + 120)
+        });
+        let mut client = handle.client.lock().await;
+        client
+            .get_by_call_cbor::<String>(function_call_id, index, deadline)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Fan-out RUN-path map: ensure the wrapper exists (same head as `.remote()`),
+    /// enqueue N inputs under one map call, and return the runner envelopes in INPUT
+    /// ORDER (the SDK reorders by input ordinal). [`Function::map`](crate::Function::map)
+    /// parses each envelope via the SAME taxonomy as `.local()`/`.remote()`.
+    pub(crate) async fn remote_map(
+        &self,
+        entrypoint: &str,
+        inputs_json: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let (function_id, deadline) = self.resolve_function(handle, entrypoint).await?;
+        // Each input's args = (entrypoint, input_json_i), kwargs = {} — the SAME
+        // shape `.remote()` sends, one per input. The element type matches
+        // `map_cbor`'s `&[(A, K)]` slice (A = (entrypoint, json), K = empty map).
+        let inputs: Vec<MapInput<'_>> = inputs_json
+            .into_iter()
+            .map(|j| ((entrypoint, j), std::collections::HashMap::new()))
+            .collect();
+        let mut client = handle.client.lock().await;
+        client
+            .map_cbor::<_, _, String>(&function_id, &inputs, deadline)
+            .await
+            .map_err(Into::into)
     }
 
     /// Run one entrypoint (the RUN path) and return the runner's one-line JSON
