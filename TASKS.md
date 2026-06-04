@@ -31,15 +31,17 @@ signatures locked, returning an honest `NotImplemented` (pending SDK source-uplo
 `examples/add` got additive symmetric serde derives (required by `.local()` bounds). Built
 via `facade-local-orchestration`; 3/3 reviews PASS; gates green.
 
-**[2026-06-04] SDK source-upload + real `.remote()` — code-complete + offline-green; live `{sum:42}`
-pending (transient transport resets).** SDK gained `mount_local_dir` (`ops/local_dir.rs`) + `blob.rs`
-(`MountGetOrCreate(create)`+`MountPutFile`+`BlobCreate`+`reqwest`; upload **proven live** →
-`mo-jsAF1yjh6g08SkWmoy9l9Z`). The run-path FILE-mode wrapper (`crates/modal-rust/src/remote.rs`) ports
-`dev_app.py` (cargo build in the function body), and `Function::remote` wires ensure-create + invoke +
-envelope→`Result`. Offline gates GREEN. Live found+fixed 2 bugs (notably PEP-668: `pip install modal`
-on Debian needs `--break-system-packages`), then hit transient `ConnectionReset` during the long
-apt+pip image build → **retrying** (never blocked). Built via `source-upload-remote`. Open follow-up:
-image-build long-poll resilience / faster (cached) image. See `workpads/shim-backend/knowledge.md`.
+**[2026-06-04] ✅ real `.remote()` PROVEN LIVE — P3 (run path) complete.** `add(40,2).remote() ==
+AddOutput{sum:42}` against real Modal: our own client uploads the crate, Modal `cargo build`s it **in
+the function body**, runs the user's REAL Rust `add` — no `modal` CLI, no per-project `.py`, no
+`modal-rs`. SDK gained `mount_local_dir`+`blob.rs` (upload) and `retry.rs` (`retry_transient` on every
+unary RPC); the run-path FILE-mode wrapper (`crates/modal-rust/src/remote.rs`) ports `dev_app.py`.
+Took 4 bugs (built across `source-upload-remote` + `remote-live-resilience`): references/ in the
+upload (14 MB→732 KB), no transient-retry, invoke deadline 600s<container-timeout, and the blocker —
+Modal's init execs bare `python` so a `rust:slim` base needs `python-is-python3` (+ PEP-668
+`--break-system-packages`). Offline gates green (108 tests); 2/2 reviews PASS. Details in
+`workpads/shim-backend/knowledge.md`. **Next: deploy (P5, build-at-image-time), dynamic config from the
+registry (P4, drop `--gpu`), migrate the CLI off codegen (P9), `.spawn()`/`.map()` + cache (P6).**
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/

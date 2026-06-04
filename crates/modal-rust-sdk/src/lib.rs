@@ -48,6 +48,7 @@ pub mod codec;
 pub mod config;
 pub mod error;
 pub mod ops;
+pub(crate) mod retry;
 
 /// Generated Modal control-plane protobuf types and the `ModalClient` gRPC stub
 /// (`package modal.client`). Re-exported so consumers and later phases can build

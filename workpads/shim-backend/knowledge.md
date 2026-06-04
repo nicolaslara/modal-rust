@@ -759,8 +759,8 @@ default-members):
      uploaded source mount + client mount + FunctionCreate FILE) + `invoke_cbor` + envelope→`Result` (same
      semantics as `.local()`). Build boundary intact (no cargo at image-build time).
 
-**LIVE STATUS: `{sum:42}` NOT yet confirmed — blocked by transient transport resets, not a code bug.** The
-live run surfaced + fixed TWO real bugs, then hit Modal flakiness:
+**LIVE STATUS: ✅ NOW PROVEN — `{sum:42}` confirmed live (see "real `.remote()` PROVEN LIVE" below).** The
+live run surfaced + fixed FOUR real bugs total. The first two (this section):
 
 > **DURABLE FINDING — `pip install modal` on a Debian `rust:slim` base needs `--break-system-packages`.**
 > Modern Debian is PEP-668 externally-managed; a bare `RUN python3 -m pip install modal` aborts with
@@ -775,3 +775,40 @@ build takes minutes → a long-lived stream → reset-prone). Per the project ru
 Python SDK) and/or shrink the build (a base image that already carries rust+python, or rely on Modal layer
 caching so re-runs reuse the built image). Re-running the live test after the layers cache should narrow the
 reset window. Code is committed; the live confirmation is being retried.
+
+---
+
+### ✅ real `.remote()` PROVEN LIVE end-to-end (2026-06-04)
+
+`LIVE OK: add(40,2).remote() = AddOutput { sum: 42 }` — our own client uploaded the crate, Modal built it
+**in the function body** (`Compiling example-add … Finished release in 14.37s`, `modal_runner exit=0`), and
+returned the user's REAL Rust `add`. No `modal` CLI, no per-project `.py`, no `modal-rs` dep. FunctionCreate:
+FILE mode, empty `function_serialized`, `module_name=modal_rust_run_wrapper`+`function_name=handler`,
+`mount_ids=[client_mount, source_mount]`. Full run 63.59s (cold image build ~30s, then warm). **P3 (run path)
+is now fully proven live**, not just at the SDK-primitive level. Built via `remote-live-resilience`; reviews
+PASS (retry masks only transient errors; RUN build-boundary intact — cargo only in the function body).
+
+Two MORE bugs surfaced during the live run (beyond the references-upload + transient-retry fixes above).
+The durable, non-obvious gotchas for any non-Python base image / long remote build:
+
+3. **Invoke poll deadline was hard-capped at 600s** while the function container timeout is 1800s — the client
+   gave up mid-build (`produced no output within 600s`). Fixed: `invoke_*_with_deadline`; the facade passes
+   `config.timeout_secs + 120`.
+4. **THE blocker — `python` vs `python3`.** Modal's container init (`dumb-init`) execs **bare `python`**, but a
+   `rust:slim` base + `apt install python3` provides only `python3` → every container crash-looped at startup
+   with `[dumb-init] python: No such file or directory` (never reached cargo; diagnosed via `modal app logs`).
+   Fix: add **`python-is-python3`** to the apt install. (`add_python` via the hosted python-standalone mount
+   remains the cleaner long-term image — deferred; the apt+pip image works and Modal caches it by hash.)
+
+And the two diagnosed up front:
+
+1. **`references/` was being uploaded** with the source (`RemoteConfig::default().ignore` didn't exclude it) —
+   ~14 MB of vendored clones per call. Excluding `references/` (+ `workpads`, `.github`, `.claude/.cursor/
+   .opencode`, `tmp`, `.research`) dropped the upload to ~732 KB.
+2. **No transient-retry on the control-plane RPCs** (only the image join-poll had it). Added `retry_transient`/
+   `retry_unary` (`crates/modal-rust-sdk/src/retry.rs`: 100ms→5s backoff + full jitter, 8 attempts, 120s cap)
+   around EVERY unary RPC + per-file `MountPutFile`/`BlobCreate`/blob-PUT; extended `Error::is_transient` to
+   include gRPC `Internal`/`Unknown`. Mirrors Modal's `retry_transient_errors`. Caught a live `ConnectionReset`
+   on `function_get_outputs` and recovered.
+
+Offline gates green throughout (108 tests). Live tests stay `#[ignore]` + `live`-feature gated.

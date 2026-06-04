@@ -31,11 +31,17 @@ use crate::proto::api::{
     DataFormat, FunctionCallInvocationType, FunctionCallType, FunctionGetOutputsRequest,
     FunctionInput, FunctionMapRequest, FunctionPutInputsItem, FunctionPutInputsRequest,
 };
+use crate::retry::retry_unary;
 
 /// Per-poll timeout (seconds) for `FunctionGetOutputs` long-poll reconnects.
 const OUTPUTS_TIMEOUT_SECS: f32 = 55.0;
-/// Safety cap on total wall-clock time spent waiting for a function output.
-const INVOKE_DEADLINE: Duration = Duration::from_secs(600);
+/// Default safety cap on total wall-clock time spent waiting for a function
+/// output. Used by [`ModalClient::invoke_cbor`]/[`invoke_raw`] (ordinary calls).
+/// The RUN path overrides this with [`invoke_cbor_with_deadline`] because its
+/// first invocation triggers a cold in-body `cargo build` that can run for many
+/// minutes — the client must poll at least as long as the function's own
+/// container timeout, not give up at the default.
+const DEFAULT_INVOKE_DEADLINE: Duration = Duration::from_secs(600);
 
 /// A decoded function output plus the wire format it arrived in.
 #[derive(Debug, Clone)]
@@ -79,9 +85,31 @@ impl ModalClient {
         K: Serialize,
         R: DeserializeOwned,
     {
+        self.invoke_cbor_with_deadline(function_id, args, kwargs, DEFAULT_INVOKE_DEADLINE)
+            .await
+    }
+
+    /// Like [`invoke_cbor`](Self::invoke_cbor) but with an explicit wall-clock
+    /// `deadline` for the output poll. The RUN path passes its function's
+    /// container timeout here so the client keeps polling while the cold in-body
+    /// `cargo build` runs (the default 600s is far too short for a first build).
+    pub async fn invoke_cbor_with_deadline<A, K, R>(
+        &mut self,
+        function_id: &str,
+        args: &A,
+        kwargs: &K,
+        deadline: Duration,
+    ) -> Result<R>
+    where
+        A: Serialize,
+        K: Serialize,
+        R: DeserializeOwned,
+    {
         let payload = (args, kwargs);
         let encoded = codec::encode(&payload)?;
-        let invocation = self.invoke_raw(function_id, encoded).await?;
+        let invocation = self
+            .invoke_raw_with_deadline(function_id, encoded, deadline)
+            .await?;
         invocation.decode_cbor()
     }
 
@@ -95,6 +123,18 @@ impl ModalClient {
         function_id: &str,
         args_serialized: Vec<u8>,
     ) -> Result<Invocation> {
+        self.invoke_raw_with_deadline(function_id, args_serialized, DEFAULT_INVOKE_DEADLINE)
+            .await
+    }
+
+    /// Like [`invoke_raw`](Self::invoke_raw) but with an explicit output-poll
+    /// `deadline` (see [`invoke_cbor_with_deadline`](Self::invoke_cbor_with_deadline)).
+    pub async fn invoke_raw_with_deadline(
+        &mut self,
+        function_id: &str,
+        args_serialized: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<Invocation> {
         let item = FunctionPutInputsItem {
             idx: 0,
             input: Some(FunctionInput {
@@ -107,17 +147,27 @@ impl ModalClient {
         };
 
         // Step 1 — FunctionMap with the input pipelined.
-        let map = self
-            .inner_mut()
-            .function_map(FunctionMapRequest {
-                function_id: function_id.to_string(),
-                function_call_type: FunctionCallType::Unary as i32,
-                function_call_invocation_type: FunctionCallInvocationType::Sync as i32,
-                pipelined_inputs: vec![item.clone()],
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        //
+        // CARE: FunctionMap enqueues an input, so a retry could double-enqueue. For
+        // v0 the run path only invokes the pure `add` (idempotent) and poll_outputs
+        // reads exactly ONE output, so a duplicate enqueue is observably harmless —
+        // we retry on transient like Python (which relies on server-side input
+        // dedup). A non-idempotent user function would need a server idempotency
+        // token before enabling this generally.
+        let map_req = FunctionMapRequest {
+            function_id: function_id.to_string(),
+            function_call_type: FunctionCallType::Unary as i32,
+            function_call_invocation_type: FunctionCallInvocationType::Sync as i32,
+            pipelined_inputs: vec![item.clone()],
+            ..Default::default()
+        };
+        let stub = self.stub();
+        let map = retry_unary("function_map", || {
+            let mut stub = stub.clone();
+            let req = map_req.clone();
+            async move { Ok(stub.function_map(req).await?.into_inner()) }
+        })
+        .await?;
 
         let function_call_id = map.function_call_id;
         if function_call_id.is_empty() {
@@ -128,15 +178,21 @@ impl ModalClient {
 
         // Step 2 — fix #3: if the input was NOT pipelined (echoed back), enqueue it.
         if map.pipelined_inputs.is_empty() {
-            let put = self
-                .inner_mut()
-                .function_put_inputs(FunctionPutInputsRequest {
-                    function_id: function_id.to_string(),
-                    function_call_id: function_call_id.clone(),
-                    inputs: vec![item],
-                })
-                .await?
-                .into_inner();
+            // Same double-enqueue caveat as FunctionMap; same v0 stance (retry —
+            // harmless for the pure `add`). The item carries idx/function_call_id
+            // so the server can dedup within a call.
+            let put_req = FunctionPutInputsRequest {
+                function_id: function_id.to_string(),
+                function_call_id: function_call_id.clone(),
+                inputs: vec![item],
+            };
+            let stub = self.stub();
+            let put = retry_unary("function_put_inputs", || {
+                let mut stub = stub.clone();
+                let req = put_req.clone();
+                async move { Ok(stub.function_put_inputs(req).await?.into_inner()) }
+            })
+            .await?;
             if put.inputs.is_empty() {
                 return Err(Error::build(
                     "FunctionPutInputs accepted no inputs (input queue full?)".to_string(),
@@ -145,35 +201,46 @@ impl ModalClient {
         }
 
         // Step 3 — poll FunctionGetOutputs until the result arrives.
-        self.poll_outputs(&function_call_id).await
+        self.poll_outputs(&function_call_id, deadline).await
     }
 
     /// Long-poll `FunctionGetOutputs` (api.proto:4247), advancing `last_entry_id`,
     /// until an output for the call arrives; decode its terminal `GenericResult`.
-    async fn poll_outputs(&mut self, function_call_id: &str) -> Result<Invocation> {
+    /// Gives up after `deadline` wall-clock with a clear "no output" build error.
+    async fn poll_outputs(
+        &mut self,
+        function_call_id: &str,
+        deadline: Duration,
+    ) -> Result<Invocation> {
         let started = std::time::Instant::now();
         let mut last_entry_id = String::new();
 
         loop {
-            if started.elapsed() > INVOKE_DEADLINE {
+            if started.elapsed() > deadline {
                 return Err(Error::build(format!(
                     "function call {function_call_id} produced no output within {}s",
-                    INVOKE_DEADLINE.as_secs()
+                    deadline.as_secs()
                 )));
             }
 
-            let resp = self
-                .inner_mut()
-                .function_get_outputs(FunctionGetOutputsRequest {
-                    function_call_id: function_call_id.to_string(),
-                    max_values: 1,
-                    timeout: OUTPUTS_TIMEOUT_SECS,
-                    last_entry_id: last_entry_id.clone(),
-                    clear_on_success: true,
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
+            // Pure read with a last_entry_id cursor — a transient reset retries the
+            // single poll window rather than failing the whole invoke (analogous to
+            // the image-build poll reconnect).
+            let req = FunctionGetOutputsRequest {
+                function_call_id: function_call_id.to_string(),
+                max_values: 1,
+                timeout: OUTPUTS_TIMEOUT_SECS,
+                last_entry_id: last_entry_id.clone(),
+                clear_on_success: true,
+                ..Default::default()
+            };
+            let stub = self.stub();
+            let resp = retry_unary("function_get_outputs", || {
+                let mut stub = stub.clone();
+                let req = req.clone();
+                async move { Ok(stub.function_get_outputs(req).await?.into_inner()) }
+            })
+            .await?;
 
             if !resp.last_entry_id.is_empty() {
                 last_entry_id = resp.last_entry_id;

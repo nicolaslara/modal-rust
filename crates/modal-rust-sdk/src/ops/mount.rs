@@ -17,6 +17,7 @@ use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::ops::CLIENT_VERSION;
 use crate::proto::api::{DeploymentNamespace, MountGetOrCreateRequest, ObjectCreationType};
+use crate::retry::retry_unary;
 
 /// Hosted client-mount deployment name for a given Modal client version
 /// (`client_mount_name()`, mount.py:62-69). The Python helper strips any
@@ -49,17 +50,21 @@ impl ModalClient {
         let environment_name = self.env_or_default(environment);
         let deployment_name = client_mount_name(version);
 
-        let resp = self
-            .inner_mut()
-            .mount_get_or_create(MountGetOrCreateRequest {
-                deployment_name: deployment_name.clone(),
-                namespace: DeploymentNamespace::Global as i32,
-                environment_name,
-                object_creation_type: ObjectCreationType::Unspecified as i32,
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        // Pure GLOBAL lookup (UNSPECIFIED creation) — fully idempotent, safe to retry.
+        let req = MountGetOrCreateRequest {
+            deployment_name: deployment_name.clone(),
+            namespace: DeploymentNamespace::Global as i32,
+            environment_name,
+            object_creation_type: ObjectCreationType::Unspecified as i32,
+            ..Default::default()
+        };
+        let stub = self.stub();
+        let resp = retry_unary("mount_get_or_create(client)", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.mount_get_or_create(req).await?.into_inner()) }
+        })
+        .await?;
 
         if resp.mount_id.is_empty() {
             return Err(Error::build(format!(

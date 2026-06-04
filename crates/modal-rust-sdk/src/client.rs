@@ -15,6 +15,7 @@ use crate::config::{read_modal_config, ModalConfig};
 use crate::error::Result;
 use crate::proto::api::modal_client_client::ModalClientClient;
 use crate::proto::api::{AppGetOrCreateRequest, ObjectCreationType};
+use crate::retry::retry_unary;
 
 /// The inner stub type: the generated gRPC client over a TLS channel with the
 /// auth interceptor applied. Exposed via [`ModalClient::inner_mut`] so the `ops`
@@ -89,13 +90,28 @@ impl ModalClient {
         &mut self.inner
     }
 
+    /// A fresh clone of the underlying gRPC stub. The tonic stub is cheap to
+    /// clone (the channel is an `Arc`-backed multiplexed handle), so each
+    /// transient-retry attempt clones its own owned stub — letting the retried
+    /// future own its borrow (`retry_unary`'s `FnMut` cannot hold `&mut self`).
+    pub(crate) fn stub(&self) -> ModalClientStub {
+        self.inner.clone()
+    }
+
     /// Connect-time handshake (`ClientHello`, api.proto:4171). Free, no GPU/cost.
     /// Acts as the post-connect auth probe: a bad token id/secret surfaces here
     /// as an [`crate::Error::Status`] (Unauthenticated). The response's
     /// `warning` / `server_warnings` are advisory; the deprecated
     /// `image_builder_version` field is ignored (resolved from config instead).
     pub async fn client_hello(&mut self) -> Result<()> {
-        let _resp = self.inner.client_hello(()).await?.into_inner();
+        // Clone the (cheap, Arc-backed) stub per attempt so the retried future
+        // owns its borrow — `retry_unary`'s `FnMut` cannot hold `&mut self.inner`.
+        let stub = &self.inner;
+        let _resp = retry_unary("client_hello", || {
+            let mut stub = stub.clone();
+            async move { Ok(stub.client_hello(()).await?.into_inner()) }
+        })
+        .await?;
         Ok(())
     }
 
@@ -114,15 +130,18 @@ impl ModalClient {
             .map(str::to_string)
             .unwrap_or_else(|| self.config.environment_or_default().to_string());
 
-        let resp = self
-            .inner
-            .app_get_or_create(AppGetOrCreateRequest {
-                app_name: app_name.to_string(),
-                environment_name,
-                object_creation_type: ObjectCreationType::CreateIfMissing as i32,
-            })
-            .await?
-            .into_inner();
+        let req = AppGetOrCreateRequest {
+            app_name: app_name.to_string(),
+            environment_name,
+            object_creation_type: ObjectCreationType::CreateIfMissing as i32,
+        };
+        let stub = &self.inner;
+        let resp = retry_unary("app_get_or_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.app_get_or_create(req).await?.into_inner()) }
+        })
+        .await?;
 
         Ok(resp.app_id)
     }

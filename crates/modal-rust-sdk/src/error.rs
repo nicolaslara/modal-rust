@@ -68,7 +68,14 @@ impl Error {
                 use tonic::Code;
                 if matches!(
                     s.code(),
-                    Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted
+                    Code::Unavailable
+                        | Code::DeadlineExceeded
+                        | Code::ResourceExhausted
+                        // h2/transport resets land on Unknown/Internal mid-stream;
+                        // Python (grpc_utils.py) + modal-rs retry both. Adding the
+                        // codes makes us robust to message wording the sniff misses.
+                        | Code::Internal
+                        | Code::Unknown
                 ) {
                     return true;
                 }
@@ -145,3 +152,61 @@ impl From<toml::de::Error> for Error {
 
 /// A specialized `Result` for `modal-rust-sdk` operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::{Code, Status};
+
+    fn status(code: Code) -> Error {
+        Error::Status(Status::new(code, "x"))
+    }
+
+    #[test]
+    fn transient_codes_are_retryable() {
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+            Code::Internal,
+            Code::Unknown,
+        ] {
+            assert!(
+                status(code).is_transient(),
+                "{code:?} must be classified transient"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_codes_are_not_retryable() {
+        for code in [
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::FailedPrecondition,
+        ] {
+            assert!(
+                !status(code).is_transient(),
+                "{code:?} must surface immediately (never retried)"
+            );
+        }
+    }
+
+    #[test]
+    fn build_and_config_are_not_transient() {
+        assert!(!Error::build("remote build failed").is_transient());
+        assert!(!Error::config("missing token").is_transient());
+        assert!(!Error::invalid("bad arg").is_transient());
+        assert!(!Error::codec("bad cbor").is_transient());
+    }
+
+    #[test]
+    fn reset_message_text_is_transient_even_on_ok_code() {
+        // A reset reported as Code::Ok-with-text still trips the substring sniff.
+        let e = Error::Status(Status::new(Code::Ok, "h2 protocol error: connection reset"));
+        assert!(e.is_transient());
+    }
+}

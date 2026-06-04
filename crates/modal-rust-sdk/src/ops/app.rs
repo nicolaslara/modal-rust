@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::proto::api::{
     AppCreateRequest, AppGetOrCreateRequest, AppPublishRequest, AppState, ObjectCreationType,
 };
+use crate::retry::retry_unary;
 
 /// Outcome of a successful [`ModalClient::app_publish`] (deploy).
 #[derive(Debug, Clone, Default)]
@@ -43,15 +44,18 @@ impl ModalClient {
         environment: Option<&str>,
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
-        let resp = self
-            .inner_mut()
-            .app_get_or_create(AppGetOrCreateRequest {
-                app_name: app_name.to_string(),
-                environment_name,
-                object_creation_type: ObjectCreationType::CreateIfMissing as i32,
-            })
-            .await?
-            .into_inner();
+        let req = AppGetOrCreateRequest {
+            app_name: app_name.to_string(),
+            environment_name,
+            object_creation_type: ObjectCreationType::CreateIfMissing as i32,
+        };
+        let stub = self.stub();
+        let resp = retry_unary("app_get_or_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.app_get_or_create(req).await?.into_inner()) }
+        })
+        .await?;
         Ok(resp.app_id)
     }
 
@@ -66,17 +70,24 @@ impl ModalClient {
         environment: Option<&str>,
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
-        let resp = self
-            .inner_mut()
-            .app_create(AppCreateRequest {
-                client_id: String::new(),
-                description: description.to_string(),
-                environment_name,
-                app_state: AppState::Ephemeral as i32,
-                tags: HashMap::new(),
-            })
-            .await?
-            .into_inner();
+        // NOTE: not on the run path (which uses get-or-create). A dropped response
+        // after a transient reset could in principle create a duplicate ephemeral
+        // app, but ephemerals are GC'd when the client disconnects, so retrying is
+        // acceptable (per the resilience spec A.5).
+        let req = AppCreateRequest {
+            client_id: String::new(),
+            description: description.to_string(),
+            environment_name,
+            app_state: AppState::Ephemeral as i32,
+            tags: HashMap::new(),
+        };
+        let stub = self.stub();
+        let resp = retry_unary("app_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.app_create(req).await?.into_inner()) }
+        })
+        .await?;
         Ok(resp.app_id)
     }
 
@@ -95,18 +106,24 @@ impl ModalClient {
         function_ids: HashMap<String, String>,
         definition_ids: HashMap<String, String>,
     ) -> Result<PublishedApp> {
-        let resp = self
-            .inner_mut()
-            .app_publish(AppPublishRequest {
-                app_id: app_id.to_string(),
-                name: app_name.to_string(),
-                app_state: AppState::Deployed as i32,
-                function_ids,
-                definition_ids,
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        // AppPublish is a set-state deploy (not an append): re-publishing the same
+        // function_ids/definition_ids is idempotent, so retrying on a transient
+        // reset is safe.
+        let req = AppPublishRequest {
+            app_id: app_id.to_string(),
+            name: app_name.to_string(),
+            app_state: AppState::Deployed as i32,
+            function_ids,
+            definition_ids,
+            ..Default::default()
+        };
+        let stub = self.stub();
+        let resp = retry_unary("app_publish", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.app_publish(req).await?.into_inner()) }
+        })
+        .await?;
 
         Ok(PublishedApp {
             url: resp.url,

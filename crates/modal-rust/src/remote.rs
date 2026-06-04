@@ -152,10 +152,18 @@ impl Default for RemoteConfig {
             package: discover_package(),
             remote_src: REMOTE_SRC.to_string(),
             ignore: vec![
-                "target".to_string(),
-                ".git".to_string(),
-                ".modal-rust".to_string(),
-                "**/*.rlib".to_string(),
+                "target".to_string(),      // build artifacts (already pruned early)
+                ".git".to_string(),        // VCS
+                ".modal-rust".to_string(), // generated scratch / shims
+                "references".to_string(), // FIX: vendored modal-rs + modal-client clones (~14 MB, gitignored)
+                "workpads".to_string(),   // planning docs — not build input
+                ".github".to_string(),    // CI config — not build input
+                ".claude".to_string(),    // agent config — not build input
+                ".cursor".to_string(),    // editor config
+                ".opencode".to_string(),  // agent config
+                "tmp".to_string(),        // .gitignore scratch
+                ".research".to_string(),  // .gitignore scratch
+                "**/*.rlib".to_string(),  // stray rust libs
             ],
             base_image: format!("rust:{RUST_VER}-slim"),
             timeout_secs: REMOTE_TIMEOUT_SECS,
@@ -219,8 +227,14 @@ pub(crate) async fn ensure_function(
         .await?;
 
     // 4. Run image: rust base + python3/pip + modal deps + the baked wrapper.
+    //
+    // `python-is-python3` is REQUIRED, not cosmetic: Modal's container entrypoint
+    // (dumb-init) execs bare `python`, but `rust:slim` + apt `python3` provides
+    // only `python3` — so without the `/usr/bin/python -> python3` symlink the
+    // container crash-loops at startup with "[dumb-init] python: No such file or
+    // directory" (live-verified 2026-06-04) and the function never produces output.
     let spec = ImageSpec::from_registry(config.base_image.clone())
-        .with_apt(&["python3", "python3-pip"])
+        .with_apt(&["python3", "python3-pip", "python-is-python3"])
         .with_pip_install_modal()
         .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src(&config.package))
         .with_command("ENV RUST_BACKTRACE=1")
@@ -423,5 +437,18 @@ mod tests {
         assert_eq!(cfg.timeout_secs, 1800);
         assert!(cfg.ignore.iter().any(|p| p == "target"));
         assert!(cfg.ignore.iter().any(|p| p == "**/*.rlib"));
+        // The load-bearing upload fix: references/ (the 14 MB vendored clones) must
+        // be excluded so .remote() never uploads them.
+        assert!(
+            cfg.ignore.iter().any(|p| p == "references"),
+            "references/ MUST be in the default ignore list"
+        );
+        // Other non-source dirs are belt-and-suspenders excluded too.
+        for seg in ["workpads", ".github", ".claude"] {
+            assert!(
+                cfg.ignore.iter().any(|p| p == seg),
+                "{seg} should be ignored"
+            );
+        }
     }
 }

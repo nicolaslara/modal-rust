@@ -11,6 +11,8 @@
 //! files are tiny, so the blob branch is rarely hit, but it is correct for the
 //! occasional large vendored asset.
 
+use std::time::Instant;
+
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
@@ -18,6 +20,7 @@ use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::proto::api::blob_create_response::UploadTypeOneof;
 use crate::proto::api::BlobCreateRequest;
+use crate::retry::{jitter, retry_unary, RetryPolicy};
 
 /// Files at or above this size go through the blob path instead of inline
 /// `MountPutFile.data`. Matches Modal's `LARGE_FILE_LIMIT` (`blob_utils.py`) and
@@ -36,15 +39,21 @@ impl ModalClient {
     pub(crate) async fn blob_create_and_put(&mut self, data: &[u8]) -> Result<String> {
         let sha256_b64 = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
 
-        let resp = self
-            .inner_mut()
-            .blob_create(BlobCreateRequest {
-                content_md5: String::new(),
-                content_sha256_base64: sha256_b64,
-                content_length: data.len() as i64,
-            })
-            .await?
-            .into_inner();
+        // BlobCreate returns a presigned URL for the content-addressed sha;
+        // re-requesting is safe (a new URL for the same content), so retry on a
+        // transient reset.
+        let req = BlobCreateRequest {
+            content_md5: String::new(),
+            content_sha256_base64: sha256_b64,
+            content_length: data.len() as i64,
+        };
+        let stub = self.stub();
+        let resp = retry_unary("blob_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.blob_create(req).await?.into_inner()) }
+        })
+        .await?;
 
         let blob_id = resp.blob_id.clone();
         match resp.upload_type_oneof {
@@ -64,20 +73,65 @@ impl ModalClient {
 
 /// `PUT` `data` to a presigned URL with the octet-stream content type; require a
 /// 2xx response. Uses a fresh reqwest client (rustls; no system OpenSSL).
+///
+/// This is a plain object-store PUT (not gRPC), so `Error::is_transient` does not
+/// classify it. We add our own small retry with the same backoff shape as the
+/// control-plane unary policy: a reqwest timeout/connect error OR a `5xx`/`429`
+/// response is transient (the PUT is an idempotent same-key/same-bytes upload);
+/// any other `4xx` is terminal and surfaces immediately.
 async fn put_blob_bytes(url: &str, data: &[u8]) -> Result<()> {
+    let policy = RetryPolicy::default();
     let http = reqwest::Client::new();
-    let resp = http
-        .put(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(data.to_vec())
-        .send()
-        .await
-        .map_err(|e| Error::build(format!("blob upload PUT failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(Error::build(format!(
-            "blob upload PUT returned non-success status {}",
-            resp.status()
-        )));
+    let start = Instant::now();
+    let mut delay = policy.base_delay;
+    let mut attempt = 1u32;
+
+    loop {
+        let outcome = http
+            .put(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await;
+
+        // Decide: Ok(()) on 2xx, Err(terminal) on a non-retryable failure, or
+        // Err(transient) flagged for retry.
+        let (err, transient): (Error, bool) = match outcome {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+                let retryable =
+                    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                (
+                    Error::build(format!(
+                        "blob upload PUT returned non-success status {status}"
+                    )),
+                    retryable,
+                )
+            }
+            Err(e) => {
+                let retryable = e.is_timeout() || e.is_connect();
+                (
+                    Error::build(format!("blob upload PUT failed: {e}")),
+                    retryable,
+                )
+            }
+        };
+
+        let last_attempt = attempt >= policy.max_attempts;
+        let over_deadline = start.elapsed() + delay >= policy.total_deadline;
+        if !transient || last_attempt || over_deadline {
+            return Err(err);
+        }
+        eprintln!(
+            "[retry] blob_put attempt {attempt}/{} after transient: {err}",
+            policy.max_attempts
+        );
+        // Full jitter over [0, delay] (shared with the gRPC retry helper).
+        tokio::time::sleep(jitter(delay)).await;
+        delay = delay.mul_f64(policy.delay_factor).min(policy.max_delay);
+        attempt += 1;
     }
-    Ok(())
 }

@@ -26,6 +26,7 @@ use crate::proto::api::{
     DeploymentNamespace, MountFile, MountGetOrCreateRequest, MountPutFileRequest,
     ObjectCreationType,
 };
+use crate::retry::retry_unary;
 
 /// Client-side completion deadline for a single file's `MountPutFile` upload.
 /// After the upload `MountPutFile`, the server may still report `exists=false`
@@ -80,21 +81,26 @@ impl ModalClient {
 
         let mount_files = self.upload_files(files).await?;
 
-        let resp = self
-            .inner_mut()
-            .mount_get_or_create(MountGetOrCreateRequest {
-                deployment_name: String::new(),
-                namespace: DeploymentNamespace::Workspace as i32,
-                environment_name,
-                object_creation_type: ObjectCreationType::Ephemeral as i32,
-                files: mount_files,
-                // EPHEMERAL needs no app_id. TODO(fallback): if the server ever
-                // rejects EPHEMERAL for use in Function.mount_ids, switch to
-                // ANONYMOUS_OWNED_BY_APP (=4) with app_id set by the facade.
-                app_id: String::new(),
-            })
-            .await?
-            .into_inner();
+        // Keyed by the sha-addressed `files` set: re-sending yields the same mount,
+        // so retrying on a transient reset is safe.
+        let req = MountGetOrCreateRequest {
+            deployment_name: String::new(),
+            namespace: DeploymentNamespace::Workspace as i32,
+            environment_name,
+            object_creation_type: ObjectCreationType::Ephemeral as i32,
+            files: mount_files,
+            // EPHEMERAL needs no app_id. TODO(fallback): if the server ever
+            // rejects EPHEMERAL for use in Function.mount_ids, switch to
+            // ANONYMOUS_OWNED_BY_APP (=4) with app_id set by the facade.
+            app_id: String::new(),
+        };
+        let stub = self.stub();
+        let resp = retry_unary("mount_get_or_create(source)", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.mount_get_or_create(req).await?.into_inner()) }
+        })
+        .await?;
 
         if resp.mount_id.is_empty() {
             return Err(Error::build(
@@ -152,12 +158,19 @@ impl ModalClient {
         } else {
             DataOneof::Data(data.to_vec())
         };
-        self.inner_mut()
-            .mount_put_file(MountPutFileRequest {
-                sha256_hex: sha256.to_string(),
-                data_oneof: Some(data_oneof),
-            })
-            .await?;
+        // The server dedups by sha256_hex, so re-PUT of the same bytes is a no-op:
+        // safe to retry on a transient reset.
+        let req = MountPutFileRequest {
+            sha256_hex: sha256.to_string(),
+            data_oneof: Some(data_oneof),
+        };
+        let stub = self.stub();
+        retry_unary("mount_put_file(upload)", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.mount_put_file(req).await?.into_inner()) }
+        })
+        .await?;
 
         // Completion gate: re-probe until the server confirms (bounded).
         let deadline = Instant::now() + MOUNT_PUT_FILE_CLIENT_TIMEOUT;
@@ -175,15 +188,19 @@ impl ModalClient {
 
     /// Issue a probe-shape `MountPutFile` (no data) and return `exists`.
     async fn mount_put_file_probe(&mut self, sha256: &str) -> Result<bool> {
-        Ok(self
-            .inner_mut()
-            .mount_put_file(MountPutFileRequest {
-                sha256_hex: sha256.to_string(),
-                data_oneof: None,
-            })
-            .await?
-            .into_inner()
-            .exists)
+        // Pure existence read — idempotent, safe to retry on a transient reset.
+        let req = MountPutFileRequest {
+            sha256_hex: sha256.to_string(),
+            data_oneof: None,
+        };
+        let stub = self.stub();
+        Ok(retry_unary("mount_put_file(probe)", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.mount_put_file(req).await?.into_inner()) }
+        })
+        .await?
+        .exists)
     }
 }
 
@@ -388,6 +405,41 @@ mod tests {
         // A file literally named like a partial extension must not false-match.
         assert!(!m.is_ignored(&p("rlib")));
         assert!(!m.is_ignored(&p(".rlib")));
+    }
+
+    #[test]
+    fn ignore_matcher_prunes_references_keeps_workspace() {
+        // Mirrors RemoteConfig::default().ignore (the upload-ignore fix): the
+        // vendored reference clones and other non-source dirs are pruned, while the
+        // real workspace source (manifests + crates + examples) is KEPT so the
+        // in-container `cargo build` still resolves the workspace.
+        let m = IgnoreMatcher::new(&[
+            "target",
+            ".git",
+            ".modal-rust",
+            "references",
+            "workpads",
+            ".github",
+            ".claude",
+            ".cursor",
+            ".opencode",
+            "tmp",
+            ".research",
+            "**/*.rlib",
+        ]);
+        // Pruned: vendored clones + planning/agent dirs.
+        assert!(m.is_ignored(&p("references")));
+        assert!(m.is_ignored(&p("references/modal-rs/Cargo.toml")));
+        assert!(m.is_ignored(&p("references/modal-client/py/modal/x.py")));
+        assert!(m.is_ignored(&p("workpads/shim-backend/knowledge.md")));
+        assert!(m.is_ignored(&p(".github/workflows/ci.yml")));
+        assert!(m.is_ignored(&p(".claude/settings.json")));
+        // Kept: the whole real workspace the container needs to build.
+        assert!(!m.is_ignored(&p("Cargo.toml")));
+        assert!(!m.is_ignored(&p("Cargo.lock")));
+        assert!(!m.is_ignored(&p("crates/modal-rust-sdk/src/lib.rs")));
+        assert!(!m.is_ignored(&p("examples/add/Cargo.toml")));
+        assert!(!m.is_ignored(&p("examples/burn-add/Cargo.toml")));
     }
 
     #[test]

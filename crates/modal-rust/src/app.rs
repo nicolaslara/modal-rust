@@ -118,10 +118,22 @@ impl App {
 
         // Invoke: two positional args (entrypoint, input_json), no kwargs. R=String
         // (the wrapper returns the runner stdout envelope verbatim).
+        //
+        // The output-poll deadline must cover the cold in-body `cargo build` (the
+        // RUN boundary): the first call to a fresh container compiles the whole
+        // dep tree, which can take many minutes — far past the SDK's 600s default.
+        // Match the function's own container timeout (plus a small queue/schedule
+        // buffer) so the client keeps polling for as long as the function may run.
         let empty_kwargs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        let deadline = std::time::Duration::from_secs(handle.config.timeout_secs as u64 + 120);
         let mut client = handle.client.lock().await;
         let envelope: String = client
-            .invoke_cbor(function_id, &(entrypoint, input_json), &empty_kwargs)
+            .invoke_cbor_with_deadline(
+                function_id,
+                &(entrypoint, input_json),
+                &empty_kwargs,
+                deadline,
+            )
             .await?;
         Ok(envelope)
     }

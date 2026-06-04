@@ -20,6 +20,7 @@ use crate::proto::api::{
     DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
     Resources,
 };
+use crate::retry::retry_unary;
 
 /// CPU/memory request for a created function. FILE-mode CPU functions can use the
 /// zero default (`Resources::default()`); set modest values to be explicit.
@@ -134,18 +135,24 @@ impl ModalClient {
         app_id: &str,
         function_name: &str,
     ) -> Result<String> {
-        let resp = self
-            .inner_mut()
-            .function_precreate(FunctionPrecreateRequest {
-                app_id: app_id.to_string(),
-                function_name: function_name.to_string(),
-                function_type: FunctionType::Function as i32,
-                supported_input_formats: supported_formats(),
-                supported_output_formats: supported_formats(),
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        // Re-precreate of the same app_id+function_name returns a usable id; the
+        // downstream function_create reconciles via existing_function_id, so a
+        // retry after a dropped response is safe.
+        let req = FunctionPrecreateRequest {
+            app_id: app_id.to_string(),
+            function_name: function_name.to_string(),
+            function_type: FunctionType::Function as i32,
+            supported_input_formats: supported_formats(),
+            supported_output_formats: supported_formats(),
+            ..Default::default()
+        };
+        let stub = self.stub();
+        let resp = retry_unary("function_precreate", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.function_precreate(req).await?.into_inner()) }
+        })
+        .await?;
 
         if resp.function_id.is_empty() {
             return Err(Error::build(
@@ -183,17 +190,24 @@ impl ModalClient {
             ..Default::default()
         };
 
-        let resp = self
-            .inner_mut()
-            .function_create(FunctionCreateRequest {
-                function: Some(function),
-                app_id: app_id.to_string(),
-                existing_function_id: precreate_function_id.to_string(),
-                function_data: None, // fix #1: XOR — never both.
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        // Sent with existing_function_id = precreate id + a fixed definition; the
+        // server reconciles by precreate id, so re-sending the same definition
+        // after a dropped response is idempotent (mirrors Python, which retries
+        // FunctionCreate).
+        let req = FunctionCreateRequest {
+            function: Some(function),
+            app_id: app_id.to_string(),
+            existing_function_id: precreate_function_id.to_string(),
+            function_data: None, // fix #1: XOR — never both.
+            ..Default::default()
+        };
+        let stub = self.stub();
+        let resp = retry_unary("function_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.function_create(req).await?.into_inner()) }
+        })
+        .await?;
 
         if resp.function_id.is_empty() {
             return Err(Error::build(
@@ -230,16 +244,20 @@ impl ModalClient {
         environment: Option<&str>,
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
-        let resp = self
-            .inner_mut()
-            .function_get(FunctionGetRequest {
-                app_name: app_name.to_string(),
-                object_tag: function_name.to_string(),
-                environment_name,
-                app_version: 0,
-            })
-            .await?
-            .into_inner();
+        // Pure read — idempotent, safe to retry.
+        let req = FunctionGetRequest {
+            app_name: app_name.to_string(),
+            object_tag: function_name.to_string(),
+            environment_name,
+            app_version: 0,
+        };
+        let stub = self.stub();
+        let resp = retry_unary("function_get", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.function_get(req).await?.into_inner()) }
+        })
+        .await?;
 
         if resp.function_id.is_empty() {
             return Err(Error::build(format!(

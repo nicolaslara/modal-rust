@@ -36,6 +36,7 @@ use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::ops::{describe_failure, result_status, ResultState, DEFAULT_BASE_IMAGE};
 use crate::proto::api::{Image, ImageGetOrCreateRequest, ImageJoinStreamingRequest};
+use crate::retry::retry_unary;
 
 /// Per-stream timeout (seconds) for `ImageJoinStreaming` long-poll reconnects.
 const JOIN_STREAM_TIMEOUT_SECS: f32 = 55.0;
@@ -202,16 +203,22 @@ impl ModalClient {
     pub async fn image_get_or_create(&mut self, app_id: &str, spec: &ImageSpec) -> Result<String> {
         let builder_version = self.image_builder_version().unwrap_or_default().to_string();
 
-        let resp = self
-            .inner_mut()
-            .image_get_or_create(ImageGetOrCreateRequest {
-                image: Some(spec.to_proto()),
-                app_id: app_id.to_string(),
-                builder_version,
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
+        // Modal dedups images by content hash: re-issuing the initial
+        // get-or-create returns the same image_id/build, so it is safe to retry on
+        // a transient reset. (The build POLL has its own reconnect loop below.)
+        let req = ImageGetOrCreateRequest {
+            image: Some(spec.to_proto()),
+            app_id: app_id.to_string(),
+            builder_version,
+            ..Default::default()
+        };
+        let stub = self.stub();
+        let resp = retry_unary("image_get_or_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.image_get_or_create(req).await?.into_inner()) }
+        })
+        .await?;
 
         let image_id = resp.image_id;
         if image_id.is_empty() {
