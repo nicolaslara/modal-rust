@@ -63,8 +63,11 @@ From a local checkout, install the CLI you are editing with:
 cargo install --path crates/modal-rust-cli
 ```
 
-The CLI wraps the official `modal` CLI today, so live commands also need `modal`
-on your `PATH` and Modal credentials configured.
+By default the CLI drives the first-party SDK directly — it builds your crate,
+reads `modal_runner --describe`, and creates/invokes the function over gRPC. No
+generated Python and no `modal` CLI; just configure Modal credentials. (The legacy
+Python-shim path is still available behind `--use-shim`, which does require the
+`modal` CLI on your `PATH`.)
 
 Check your machine first:
 
@@ -280,16 +283,32 @@ The facade uses static dispatch where possible. The registry stores function
 pointers rather than boxed trait objects, and the macro compiles to the same
 typed wrapper shape as manual registration.
 
-## GPU Status
+## GPU
 
-GPU compute has been proven through the runner with:
+Request a GPU directly on the function, and it flows into the Modal function's
+resources when you `.remote()` / `deploy` it:
 
-- `examples/cuda-vector-add`, using `cudarc` and a precompiled PTX kernel.
-- `examples/burn-add`, using Burn/CubeCL on CUDA.
+```rust
+#[function(gpu = "T4")]              // also: "A100", "A100-80GB", "H100:4", ...
+pub fn vector_add(input: VecInput) -> anyhow::Result<VecOutput> { /* ... */ }
+```
 
-GPU selection through the high-level `#[modal_rust::function]` facade is still
-in progress. Today the GPU examples demonstrate the compute path; the polished
-decorator-to-Modal-resources path is not finished.
+This is proven live on a real GPU, both for a lightweight kernel and a real ML
+workload:
+
+- `examples/cuda-vector-add` — `cudarc` Driver API + a precompiled PTX kernel
+  (driver-only image), run on a T4 via `.remote()`.
+- `examples/burn-add` — a Burn/CubeCL tensor op on CUDA, deployed and called on a
+  T4. Because it needs the CUDA toolkit (NVRTC/cudart) at build and run time, the
+  image uses a `nvidia/cuda:*-devel` base with the Rust toolchain installed; set
+  this with `MODAL_RUST_BASE_IMAGE` + `MODAL_RUST_INSTALL_RUST=1` (or
+  `RemoteConfig`/`DeployConfig`). For the heavy CUDA build, prefer `deploy` +
+  `call` so the build happens once at image-build time.
+
+The GPU spec maps to Modal exactly: `"TYPE[:count]"` (e.g. `"H100:4"`); memory
+variants like `"A100-80GB"` pass through as the GPU type. `gpu`, `timeout`, and
+`cache` on `#[function(...)]` are sourced from the registry at call time — the
+decorator is the config, no extra flags.
 
 ## Development
 

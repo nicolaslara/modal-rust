@@ -9,6 +9,20 @@ mid-phase.
 
 ## Active Now
 
+> **AFK AUTONOMOUS RUN — round 2 (2026-06-04 night).** User is asleep and authorized
+> finishing the project WITHOUT check-ins: work through the remaining optional items,
+> commit each milestone, keep `README.md` current after any change that affects it,
+> retry past infra/Modal flakiness (resume workflows on socket blips; never block on
+> transient — proven pattern), and report a full summary when done. **Only stop if
+> something is genuinely wrong** (a real design failure, not flakiness). Drive each item
+> via a workflow; verify with cargo before committing (rust-analyzer diagnostics are
+> often stale here — cargo is ground truth). Order: (1) README GPU+CLI accuracy [DONE],
+> (2) `.spawn()`/`.map()` fan-out, (3) P6 cargo cache (benchmark on burn-add), (4)
+> user-facing secrets/volumes, (5) P10 delete the codegen/shims. A fresh context should
+> read this note + the latest commits + `workpads/shim-backend/knowledge.md`, then
+> continue. (Never log/commit Modal tokens; GPU stays on cheap T4; ephemeral run apps.)
+
+
 **[2026-06-04] `crates/modal-rust-sdk` landed + proven live.** The control-plane
 client decision is resolved to **(b)**: our own lean first-party Modal gRPC client,
 **no `modal-rs` dependency** (both `modal-rs` and the official `modal-client` cloned
