@@ -571,17 +571,63 @@ fn read_input(source: &InputSource) -> Result<Vec<u8>, ArgError> {
 /// call → encode `Out`. A malformed-JSON input therefore yields `decode_error`
 /// even when the entrypoint name is also unknown.
 pub fn run_cli(registry: Registry) -> i32 {
+    run_cli_with_configs(registry, &[])
+}
+
+/// [`run_cli`] plus a per-entrypoint config map for the additive `--describe`
+/// subcommand. The configs are read ONLY by `--describe`; the FROZEN
+/// `--entrypoint` dispatch ignores them entirely, so this is a strict superset of
+/// [`run_cli`] (boundaries.md §2; P9 §A).
+///
+/// The macro runner bin uses this with [`from_inventory_with_configs`] so real
+/// decorator gpu/timeout/cache flow into `--describe`. The manual-registry runner
+/// can pass `&[]` (empty configs) — `--describe` then emits each entrypoint with
+/// the default (all-`None`) config, which is correct (a manual registry carries no
+/// decorator config).
+pub fn run_cli_with_configs(registry: Registry, configs: &[(&'static str, FunctionConfig)]) -> i32 {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    run_cli_with_args(registry, &argv, &mut std::io::stdout())
+    run_cli_with_args_and_configs(registry, configs, &argv, &mut std::io::stdout())
 }
 
 /// The testable core of [`run_cli`]: takes explicit argv and an output sink so the
 /// envelope can be captured in unit tests. Diagnostics still go to stderr.
+///
+/// FROZEN: this is the zero-config wrapper over
+/// [`run_cli_with_args_and_configs`]. With empty configs the `--describe` branch
+/// still fires (emitting default config per name), and the `--entrypoint` dispatch
+/// is byte-identical to before P9.
 pub fn run_cli_with_args<W: std::io::Write>(
     registry: Registry,
     argv: &[String],
     out: &mut W,
 ) -> i32 {
+    run_cli_with_args_and_configs(registry, &[], argv, out)
+}
+
+/// The config-carrying core. ADDITIVE over [`run_cli_with_args`]: when the FIRST
+/// argv token is `--describe`, emit the registry manifest (entrypoints + each
+/// [`FunctionConfig`]) as ONE JSON object to `out` and exit `0`. Otherwise dispatch
+/// EXACTLY as the frozen `--entrypoint` path (the configs are ignored).
+///
+/// `--describe` can never collide with the frozen `--entrypoint <name> --input-*`
+/// shape (the first token differs), so the protocol/envelope/five-error-kinds are
+/// byte-identical when `--describe` is absent (P9 §A.2).
+pub fn run_cli_with_args_and_configs<W: std::io::Write>(
+    registry: Registry,
+    configs: &[(&'static str, FunctionConfig)],
+    argv: &[String],
+    out: &mut W,
+) -> i32 {
+    if argv.first().map(String::as_str) == Some("--describe") {
+        return emit_describe(&registry, configs, out);
+    }
+    run_cli_dispatch(registry, argv, out)
+}
+
+/// The FROZEN `--entrypoint` dispatch body (formerly the entire `run_cli_with_args`
+/// body). Byte-identical to pre-P9: parse the three runner flags, run exactly one
+/// handler under `catch_unwind`, and print exactly one JSON envelope.
+fn run_cli_dispatch<W: std::io::Write>(registry: Registry, argv: &[String], out: &mut W) -> i32 {
     let args = match parse_args(argv) {
         Ok(a) => a,
         Err(ArgError(msg)) => {
@@ -638,6 +684,95 @@ pub fn run_cli_with_args<W: std::io::Write>(
             emit(out, &envelope, 0)
         }
         Err(err) => emit(out, &err.to_envelope(), 1),
+    }
+}
+
+/// The `--describe` manifest schema version (P9 §A.3). `@1` is `describe@1`. The CLI
+/// warns-and-proceeds on an unknown minor; hard-errors on an unknown major.
+const DESCRIBE_SCHEMA: &str = "modal-rust/describe@1";
+
+/// The `--describe` manifest: the schema tag + the registry entrypoints, each with
+/// its [`FunctionConfig`] (P9 §A.3). A private `#[derive(Serialize)]` view — `serde`
+/// is already a runtime dep, so no new dependency.
+#[derive(Serialize)]
+struct DescribeManifest<'a> {
+    /// Version tag, e.g. `"modal-rust/describe@1"`.
+    schema: &'a str,
+    /// Entrypoints, sorted by name (BTreeMap order — deterministic).
+    entrypoints: Vec<DescribeEntry<'a>>,
+}
+
+/// One entrypoint in the `--describe` manifest: its name + serialized config.
+#[derive(Serialize)]
+struct DescribeEntry<'a> {
+    /// The entrypoint (registry key) name.
+    name: &'a str,
+    /// The per-entrypoint config, mirroring [`FunctionConfig`] EXACTLY.
+    config: DescribeConfig,
+}
+
+/// The serialized view of [`FunctionConfig`] for the manifest (P9 §A.3): `gpu:
+/// string|null`, `timeout_secs: u32|null`, `cache: bool|null`. A dedicated view
+/// (rather than `#[derive(Serialize)]` on `FunctionConfig`) keeps `gpu`'s
+/// `&'static str` lifetime out of the public type and pins the wire shape here.
+#[derive(Serialize)]
+struct DescribeConfig {
+    gpu: Option<&'static str>,
+    timeout_secs: Option<u32>,
+    cache: Option<bool>,
+}
+
+impl From<&FunctionConfig> for DescribeConfig {
+    fn from(c: &FunctionConfig) -> Self {
+        DescribeConfig {
+            gpu: c.gpu,
+            timeout_secs: c.timeout_secs,
+            cache: c.cache,
+        }
+    }
+}
+
+/// Emit the `--describe` manifest: iterate `registry.names()` (sorted BTreeMap
+/// order, the authoritative entrypoint set) and, for each, look up its
+/// [`FunctionConfig`] in `configs`, falling back to `FunctionConfig::default()`
+/// (all-`None`) when absent. Writes EXACTLY ONE JSON object to `out` and returns
+/// `0`; a serialize/write failure goes to stderr and returns `1` (P9 §A.2).
+fn emit_describe<W: std::io::Write>(
+    registry: &Registry,
+    configs: &[(&'static str, FunctionConfig)],
+    out: &mut W,
+) -> i32 {
+    let default = FunctionConfig::default();
+    let entrypoints: Vec<DescribeEntry<'_>> = registry
+        .names()
+        .map(|&name| {
+            let config = configs
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, c)| c)
+                .unwrap_or(&default);
+            DescribeEntry {
+                name,
+                config: DescribeConfig::from(config),
+            }
+        })
+        .collect();
+    let manifest = DescribeManifest {
+        schema: DESCRIBE_SCHEMA,
+        entrypoints,
+    };
+    match serde_json::to_string(&manifest) {
+        Ok(s) => {
+            if let Err(e) = writeln!(out, "{s}") {
+                eprintln!("modal_runner: failed to write describe manifest: {e}");
+                return 1;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("modal_runner: failed to serialize describe manifest: {e}");
+            1
+        }
     }
 }
 
@@ -834,6 +969,81 @@ mod tests {
         let (v, code) = run(&["--entrypoint", "nope", "--input-json", "not-json"]);
         assert_eq!(code, 1);
         assert_eq!(v["error"]["kind"], "decode_error");
+    }
+
+    #[test]
+    fn describe_emits_manifest_with_configs() {
+        // ADDITIVE: `--describe` as the FIRST token emits the manifest (entrypoints +
+        // per-entrypoint config) and returns 0. The frozen `--entrypoint` dispatch is
+        // untouched (the other tests above stay green).
+        let configs: &[(&'static str, FunctionConfig)] = &[(
+            "add",
+            FunctionConfig {
+                gpu: Some("T4"),
+                timeout_secs: Some(1800),
+                cache: Some(false),
+            },
+        )];
+        let argv = vec!["--describe".to_string()];
+        let mut buf = Vec::new();
+        let code = run_cli_with_args_and_configs(registry(), configs, &argv, &mut buf);
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_slice(&buf).expect("one JSON manifest");
+        assert_eq!(v["schema"], "modal-rust/describe@1");
+        let eps = v["entrypoints"].as_array().expect("entrypoints array");
+        // Sorted BTreeMap order: add, bad_encode, fail_anyhow, fail_structured, will_panic.
+        let names: Vec<&str> = eps.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "add",
+                "bad_encode",
+                "fail_anyhow",
+                "fail_structured",
+                "will_panic"
+            ]
+        );
+        // `add` carries the supplied decorator config.
+        let add = &eps[0];
+        assert_eq!(add["name"], "add");
+        assert_eq!(add["config"]["gpu"], "T4");
+        assert_eq!(add["config"]["timeout_secs"], 1800);
+        assert_eq!(add["config"]["cache"], false);
+        // An entrypoint absent from `configs` falls back to the all-null default.
+        let bad = &eps[1];
+        assert_eq!(bad["name"], "bad_encode");
+        assert_eq!(bad["config"]["gpu"], serde_json::Value::Null);
+        assert_eq!(bad["config"]["timeout_secs"], serde_json::Value::Null);
+        assert_eq!(bad["config"]["cache"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn describe_empty_configs_emits_default_config() {
+        // The manual-registry path passes empty configs; every entrypoint then gets
+        // the default (all-None) config in the manifest.
+        let argv = vec!["--describe".to_string()];
+        let mut buf = Vec::new();
+        let code = run_cli_with_args_and_configs(registry(), &[], &argv, &mut buf);
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_slice(&buf).expect("one JSON manifest");
+        let add = &v["entrypoints"][0];
+        assert_eq!(add["name"], "add");
+        assert_eq!(add["config"]["gpu"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn describe_does_not_affect_frozen_entrypoint_path() {
+        // Sanity: a normal `--entrypoint` run through the config-carrying entry is
+        // byte-identical to the frozen path (configs ignored).
+        let argv: Vec<String> = ["--entrypoint", "add", "--input-json", r#"{"a":40,"b":2}"#]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut buf = Vec::new();
+        let code = run_cli_with_args_and_configs(registry(), &[], &argv, &mut buf);
+        let v: serde_json::Value = serde_json::from_slice(&buf).expect("one JSON envelope");
+        assert_eq!(code, 0);
+        assert_eq!(v, serde_json::json!({"ok": true, "value": {"sum": 42}}));
     }
 
     #[test]

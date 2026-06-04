@@ -70,8 +70,16 @@ timeout=…, cache=…)]` flows into `FunctionCreate.resources.gpu_config`/timeo
 Tesla T4** (`vector_add.remote()` → `gpu_name="Tesla T4"`), CPU `.remote()` unchanged. Macro/Registration
 extended additively (runner FROZEN: bare macro byte-identical); SDK `parse_gpu_config` mirrors Modal; facade
 threads per-name config into the run+deploy `FunctionSpec`; legacy `--gpu` CLI flag dropped. Built via
-`p4-dynamic-config-gpu`; 3/3 reviews PASS; gates green. **Next: migrate the CLI off codegen (P9), `.spawn()`/
-`.map()` + cargo cache (P6), user-facing secrets/volumes, and a real heavy/Burn GPU workload as the capstone.**
+`p4-dynamic-config-gpu`; 3/3 reviews PASS; gates green.
+
+**[2026-06-04] ✅ P9 — CLI migrated off Python codegen onto the programmatic SDK.** `modal-rust run/deploy/
+call` drive the SDK/facade by default — **no generated `.py`, no `modal` CLI** (proven live with a PATH
+tripwire showing zero `modal` invocations; `run/deploy/call add → {sum:42}`). Enabler: additive `modal_runner
+--describe` (entrypoints + P4 decorator config as JSON) → a headless `App::from_manifest` drives create/invoke.
+`doctor` drops the `modal`-CLI hard requirement on the default path; `templates.rs` + the shim path kept behind
+`--use-shim` (P10 deletes). Runner protocol frozen (`--describe` additive). Built via `p9-cli-migration`; 3/3
+reviews PASS; gates green (152 tests). **Next: P10 (delete the codegen/shims), `.spawn()`/`.map()` + cargo
+cache (P6), user-facing secrets/volumes, and a real heavy/Burn GPU workload as the capstone.**
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/

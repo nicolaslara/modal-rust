@@ -95,7 +95,7 @@ impl App {
             .into_iter()
             .map(|(n, c)| (n.to_string(), c))
             .collect();
-        App::connect_inner(name, registry, configs).await
+        App::connect_inner(name, registry, configs, RemoteConfig::default()).await
     }
 
     /// As [`App::connect`], but combines an explicit [`Registry`] with a live
@@ -103,15 +103,62 @@ impl App {
     /// facade defaults). The `app_id` is resolved in the configured environment
     /// (defaults to `"main"`).
     pub async fn connect_with_registry(name: &str, registry: Registry) -> Result<Self> {
-        App::connect_inner(name, registry, std::collections::BTreeMap::new()).await
+        App::connect_inner(
+            name,
+            registry,
+            std::collections::BTreeMap::new(),
+            RemoteConfig::default(),
+        )
+        .await
     }
 
-    /// Shared connect body: build the ephemeral-app client handle and store the
-    /// supplied per-entrypoint `configs` on the returned [`App`].
+    /// Build a HEADLESS [`App`] from a `--describe` manifest: per-entrypoint config
+    /// but NO handlers (empty [`Registry`]). `.local()` would fail (no handler), but
+    /// `.remote()`/`deploy`/`call` never need handlers — they read only
+    /// [`config_for`](App::config_for) + the SDK ops (P9 §B.1). Used by the
+    /// `modal-rust` CLI, which cannot link the user crate.
+    ///
+    /// Zero Modal, zero network — pair with
+    /// [`connect_from_manifest`](App::connect_from_manifest) for the live handle.
+    pub fn from_manifest(
+        configs: impl IntoIterator<Item = (String, modal_rust_runtime::FunctionConfig)>,
+    ) -> Self {
+        App {
+            registry: Registry::new(),
+            configs: configs.into_iter().collect(),
+            remote: None,
+        }
+    }
+
+    /// As [`App::connect`], but seeds an EMPTY [`Registry`] + the manifest configs +
+    /// an EXPLICIT [`RemoteConfig`] (built by the CLI from the real workspace_root +
+    /// package), instead of `connect_inner`'s hardcoded `RemoteConfig::default()`
+    /// (which would (mis)discover `local_root`/`package` from the CLI's arbitrary
+    /// CWD). Headless: no handlers, so only `.remote()`/`deploy`/`call` work (P9 §B).
+    pub async fn connect_from_manifest(
+        name: &str,
+        configs: impl IntoIterator<Item = (String, modal_rust_runtime::FunctionConfig)>,
+        run_config: RemoteConfig,
+    ) -> Result<Self> {
+        App::connect_inner(
+            name,
+            Registry::new(),
+            configs.into_iter().collect(),
+            run_config,
+        )
+        .await
+    }
+
+    /// Shared connect body: build the ephemeral-app client handle, store the
+    /// supplied per-entrypoint `configs`, and seed the EXPLICIT `run_config` (the
+    /// only delta between `connect`/`connect_with_registry` — which pass
+    /// `RemoteConfig::default()` — and the CLI's `connect_from_manifest`, which
+    /// supplies a workspace-scoped config).
     async fn connect_inner(
         name: &str,
         registry: Registry,
         configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+        run_config: RemoteConfig,
     ) -> Result<Self> {
         let mut client = modal_rust_sdk::ModalClient::connect().await?; // From<sdk::Error>
                                                                         // RUN path = EPHEMERAL app: it is GC'd when this client disconnects, so
@@ -130,7 +177,7 @@ impl App {
                 app_id,
                 app_name: name.to_string(),
                 function_id: OnceCell::new(),
-                config: RemoteConfig::default(),
+                config: run_config,
             }),
         })
     }
@@ -205,6 +252,31 @@ impl App {
             )
             .await?;
         Ok(envelope)
+    }
+
+    /// Run one entrypoint (the RUN path) and return the runner's one-line JSON
+    /// envelope VERBATIM (P9 §B.3). A thin generic-free wrapper over the existing
+    /// `pub(crate)` [`remote_invoke`](App::remote_invoke): the `modal-rust` CLI is
+    /// generic over entrypoints (no typed `In`/`Out`), so it needs the raw envelope
+    /// to print byte-for-byte and mirror `ok` → exit code. The typed
+    /// [`Function::remote`](crate::Function::remote) path is unchanged.
+    pub async fn remote_envelope(&self, entrypoint: &str, input_json: String) -> Result<String> {
+        self.remote_invoke(entrypoint, input_json).await
+    }
+
+    /// Call a DEPLOYED entrypoint by app name and return the runner's one-line JSON
+    /// envelope VERBATIM (NO build, NO upload — the deploy-call invariant). Reuses
+    /// [`deploy::call_function`] exactly as [`App::call`] does, but returns the raw
+    /// string for the generic-over-entrypoints CLI (P9 §B.3).
+    pub async fn call_envelope(
+        &self,
+        app_name: &str,
+        entrypoint: &str,
+        input_json: String,
+    ) -> Result<String> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let mut client = handle.client.lock().await;
+        deploy::call_function(&mut client, app_name, entrypoint, input_json).await
     }
 
     /// DEPLOY the wrapper function persistently under a STABLE app name (the
@@ -343,5 +415,40 @@ mod tests {
             app.config_for("anything"),
             modal_rust_runtime::FunctionConfig::default()
         );
+    }
+
+    #[test]
+    fn from_manifest_carries_config_but_is_headless() {
+        // P9 §G.1: a headless App built from a manifest carries per-entrypoint
+        // config but NO handlers (empty Registry). `config_for` surfaces the manifest
+        // config; `known_names()` is empty (headless), so `.local()` would fail but
+        // `.remote()`/`deploy`/`call` (which never touch handlers) work.
+        let cfg = modal_rust_runtime::FunctionConfig {
+            gpu: Some("A100"),
+            timeout_secs: Some(900),
+            cache: Some(true),
+        };
+        let app = App::from_manifest([("add".to_string(), cfg.clone())]);
+        assert_eq!(app.config_for("add"), cfg);
+        assert!(app.known_names().is_empty(), "manifest App is headless");
+        // An unknown name falls back to the default config.
+        assert_eq!(
+            app.config_for("missing"),
+            modal_rust_runtime::FunctionConfig::default()
+        );
+    }
+
+    #[test]
+    fn from_manifest_default_config_roundtrips() {
+        // P9 §G.1: a default-config entry round-trips to the all-None config.
+        let app = App::from_manifest([(
+            "add".to_string(),
+            modal_rust_runtime::FunctionConfig::default(),
+        )]);
+        let c = app.config_for("add");
+        assert_eq!(c.gpu, None);
+        assert_eq!(c.timeout_secs, None);
+        assert_eq!(c.cache, None);
+        assert!(app.known_names().is_empty());
     }
 }

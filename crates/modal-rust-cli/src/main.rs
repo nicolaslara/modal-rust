@@ -1,18 +1,32 @@
-//! `modal-rust` — the public CLI (boundaries.md §8, tasks.md M9a/M9b).
+//! `modal-rust` — the public CLI (boundaries.md §8, tasks.md M9a/M9b; P9).
 //!
-//! A **pure wrapper** introducing no new Modal capability: it generates the
-//! validated Modal Python shims (byte-equivalent, modulo injected params, to
+//! ## Default path (programmatic — P9)
+//!
+//! `run`/`deploy`/`call` drive the proven SDK/facade orchestration directly: the CLI
+//! builds the user crate's `modal_runner`, runs `modal_runner --describe` to read the
+//! entrypoint manifest + per-entrypoint config, then calls the SAME `App` methods the
+//! facade `.remote()`/`deploy`/`call` use. It emits NO generated `.py` and spawns NO
+//! `modal` subprocess. `clap`/`tokio` live here (CLI-only), never in the runtime
+//! crate (boundaries.md §1).
+//!
+//! ## Fallback path (`--use-shim` — KEPT, P10 removes)
+//!
+//! With `--use-shim`, `run`/`deploy`/`call` revert to the legacy behavior: generate
+//! the validated Modal Python shims (byte-equivalent, modulo injected params, to
 //! `workpads/prototype/{dev_app,deploy_app,call_app}.py`) under the gitignored
-//! `<workspace-root>/.modal-rust/generated/`, then drives the official `modal` CLI.
-//! `clap` lives here (CLI-only), never in the runtime crate (boundaries.md §1).
+//! `<workspace-root>/.modal-rust/generated/`, then drive the official `modal` CLI.
 //!
 //! Subcommands:
-//!   - `doctor [--rust]`  — OFFLINE preflight (see [`doctor`]).
-//!   - `run <entrypoint>` — generate `dev_app.py`, then `modal run …::main`.
-//!   - `deploy <entrypoint>` — generate `deploy_app.py`, then `modal deploy`.
-//!   - `call <entrypoint>` — generate `call_app.py`, then `modal run …::main`.
+//!   - `doctor [--rust] [--use-shim]` — OFFLINE preflight (see [`doctor`]).
+//!   - `run <entrypoint> [--use-shim]` — programmatic ephemeral run (default), or
+//!     generate `dev_app.py` + `modal run …::main` (`--use-shim`).
+//!   - `deploy <entrypoint> [--use-shim]` — programmatic persistent deploy (default),
+//!     or generate `deploy_app.py` + `modal deploy` (`--use-shim`).
+//!   - `call <entrypoint> [--use-shim]` — programmatic `from_name` + invoke (default),
+//!     or generate `call_app.py` + `modal run …::main` (`--use-shim`).
 
 mod doctor;
+mod programmatic;
 mod templates;
 mod workspace;
 
@@ -47,8 +61,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// OFFLINE preflight: modal CLI + credentials (and with --rust, cargo/rustc +
-    /// panic=abort detection).
+    /// OFFLINE preflight: credentials + (with --rust) cargo/rustc + panic=abort
+    /// detection. The `modal` CLI is checked ONLY with --use-shim (the default path
+    /// is programmatic and never spawns `modal`).
     Doctor {
         /// Also check cargo/rustc and the release `panic = "abort"` profile.
         #[arg(long)]
@@ -56,8 +71,12 @@ enum Commands {
         /// Project directory whose manifest chain is inspected (defaults to cwd).
         #[arg(long, default_value = "examples/add")]
         project: PathBuf,
+        /// Also require the legacy `modal` CLI on $PATH (the --use-shim fallback).
+        #[arg(long)]
+        use_shim: bool,
     },
-    /// Generate the dev shim and run the entrypoint with a RUNTIME build.
+    /// Run the entrypoint with a RUNTIME build (default: programmatic ephemeral run;
+    /// --use-shim: generate the dev shim + `modal run`).
     Run {
         /// The registered entrypoint name (e.g. `add`).
         entrypoint: String,
@@ -69,8 +88,13 @@ enum Commands {
         /// Function timeout in seconds (informational; the shim pins timeout=1800).
         #[arg(long)]
         timeout: Option<u64>,
+        /// Use the legacy Python-shim + `modal` CLI fallback instead of the default
+        /// programmatic path (P9; P10 removes this).
+        #[arg(long)]
+        use_shim: bool,
     },
-    /// Generate the deploy shim and deploy with a BUILD-TIME build (baked binary).
+    /// Deploy with a BUILD-TIME build / baked binary (default: programmatic
+    /// persistent deploy; --use-shim: generate the deploy shim + `modal deploy`).
     Deploy {
         /// The registered entrypoint name (informational; bound at call time).
         entrypoint: String,
@@ -80,8 +104,13 @@ enum Commands {
         /// The persistent Modal app name to deploy under.
         #[arg(long, default_value = DEFAULT_DEPLOY_APP)]
         app: String,
+        /// Use the legacy Python-shim + `modal` CLI fallback instead of the default
+        /// programmatic path (P9; P10 removes this).
+        #[arg(long)]
+        use_shim: bool,
     },
-    /// Generate the call shim and invoke the deployed Function (no build).
+    /// Invoke the deployed Function (no build). Default: programmatic `from_name` +
+    /// invoke; --use-shim: generate the call shim + `modal run`.
     Call {
         /// The registered entrypoint name (e.g. `add`).
         entrypoint: String,
@@ -90,6 +119,10 @@ enum Commands {
         app: String,
         #[command(flatten)]
         input: InputArg,
+        /// Use the legacy Python-shim + `modal` CLI fallback instead of the default
+        /// programmatic path (P9; P10 removes this).
+        #[arg(long)]
+        use_shim: bool,
     },
 }
 
@@ -136,25 +169,74 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code as u8)
 }
 
+/// Build a current-thread-free multi-thread tokio runtime for the async facade ops.
+/// `main()` stays `i32`-returning; the programmatic arms `block_on` here.
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")
+}
+
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
-        Commands::Doctor { rust, project } => Ok(doctor::run(rust, &project)),
+        Commands::Doctor {
+            rust,
+            project,
+            use_shim,
+        } => Ok(doctor::run(rust, use_shim, &project)),
         Commands::Run {
             entrypoint,
             project,
             input,
             timeout,
-        } => cmd_run(&entrypoint, &project, &input.resolve()?, timeout),
+            use_shim,
+        } => {
+            let input_json = input.resolve()?;
+            if use_shim {
+                cmd_run_shim(&entrypoint, &project, &input_json, timeout)
+            } else {
+                runtime()?.block_on(programmatic::cmd_run_programmatic(
+                    &entrypoint,
+                    &project,
+                    input_json,
+                    timeout,
+                ))
+            }
+        }
         Commands::Deploy {
             entrypoint,
             project,
             app,
-        } => cmd_deploy(&entrypoint, &project, &app),
+            use_shim,
+        } => {
+            if use_shim {
+                cmd_deploy_shim(&entrypoint, &project, &app)
+            } else {
+                runtime()?.block_on(programmatic::cmd_deploy_programmatic(
+                    &entrypoint,
+                    &project,
+                    &app,
+                ))
+            }
+        }
         Commands::Call {
             entrypoint,
             app,
             input,
-        } => cmd_call(&entrypoint, &app, &input.resolve()?),
+            use_shim,
+        } => {
+            let input_json = input.resolve()?;
+            if use_shim {
+                cmd_call_shim(&entrypoint, &app, &input_json)
+            } else {
+                runtime()?.block_on(programmatic::cmd_call_programmatic(
+                    &entrypoint,
+                    &app,
+                    input_json,
+                ))
+            }
+        }
     }
 }
 
@@ -206,7 +288,9 @@ fn run_modal(args: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn cmd_run(
+/// LEGACY `--use-shim` run: render `dev_app.py` and drive `modal run …::main`.
+/// Byte-for-byte UNCHANGED from the pre-P9 `cmd_run` (P9 §C.2; P10 removes it).
+fn cmd_run_shim(
     entrypoint: &str,
     project: &Path,
     input_json: &str,
@@ -246,7 +330,9 @@ fn cmd_run(
     run_modal(&args)
 }
 
-fn cmd_deploy(entrypoint: &str, project: &Path, app: &str) -> Result<i32> {
+/// LEGACY `--use-shim` deploy: render `deploy_app.py` and drive `modal deploy`.
+/// Byte-for-byte UNCHANGED from the pre-P9 `cmd_deploy` (P9 §C.2; P10 removes it).
+fn cmd_deploy_shim(entrypoint: &str, project: &Path, app: &str) -> Result<i32> {
     let root = workspace::workspace_root(project)?;
     // Same package-qualified build as `run` (boundaries.md §8): derive `-p <pkg>`
     // from `--project`'s `[package].name`.
@@ -262,7 +348,9 @@ fn cmd_deploy(entrypoint: &str, project: &Path, app: &str) -> Result<i32> {
     run_modal(&args)
 }
 
-fn cmd_call(entrypoint: &str, app: &str, input_json: &str) -> Result<i32> {
+/// LEGACY `--use-shim` call: render `call_app.py` and drive `modal run …::main`.
+/// Byte-for-byte UNCHANGED from the pre-P9 `cmd_call` (P9 §C.2; P10 removes it).
+fn cmd_call_shim(entrypoint: &str, app: &str, input_json: &str) -> Result<i32> {
     // The call shim does not mount/copy source, so any workspace root works for the
     // generated-dir location; use the cwd's workspace root if present, else cwd.
     let cwd = std::env::current_dir().context("could not read current dir")?;
@@ -439,5 +527,55 @@ mod tests {
     fn generated_dir_is_under_modal_rust() {
         let d = generated_dir(Path::new("/tmp/ws"));
         assert!(d.ends_with(".modal-rust/generated"));
+    }
+
+    /// P9 §G.2/§G.3 (static): the DEFAULT (programmatic) path must contain no codegen
+    /// (`templates::`/`write_shim`) and must NOT spawn `modal` (no `run_modal`, no
+    /// `Command::new("modal")`). The only subprocesses it spawns are `cargo` (build)
+    /// and the user's `modal_runner` (`--describe`).
+    #[test]
+    fn programmatic_path_has_no_codegen_or_modal_subprocess() {
+        let src = include_str!("programmatic.rs");
+        assert!(
+            !src.contains("templates::"),
+            "programmatic path must not render shims"
+        );
+        assert!(
+            !src.contains("write_shim"),
+            "programmatic path must not write generated .py"
+        );
+        assert!(
+            !src.contains("run_modal"),
+            "programmatic path must not call run_modal"
+        );
+        assert!(
+            !src.contains("Command::new(\"modal\")"),
+            "programmatic path must not spawn the `modal` CLI"
+        );
+        // Positive: it DOES drive cargo (build) + the runner (--describe).
+        assert!(src.contains("Command::new(\"cargo\")"));
+        assert!(src.contains("--describe"));
+    }
+
+    /// P9 §G.3 (static): the `modal` subprocess (`run_modal`) is reachable ONLY from
+    /// the renamed `cmd_*_shim` functions (i.e. only `--use-shim`). The default
+    /// `cmd_*_programmatic` arms call into `programmatic::*`, never `run_modal`.
+    #[test]
+    fn modal_subprocess_only_in_shim_path() {
+        let src = include_str!("main.rs");
+        // The three legacy shim commands exist and own the `run_modal` calls.
+        assert!(src.contains("fn cmd_run_shim"));
+        assert!(src.contains("fn cmd_deploy_shim"));
+        assert!(src.contains("fn cmd_call_shim"));
+        // The dispatcher routes the default arms to the programmatic module and the
+        // --use-shim arms to the shim commands.
+        assert!(src.contains("programmatic::cmd_run_programmatic"));
+        assert!(src.contains("programmatic::cmd_deploy_programmatic"));
+        assert!(src.contains("programmatic::cmd_call_programmatic"));
+        // `run_modal` (the sole `modal` spawner) is defined and invoked only by the
+        // shim commands — never by a `*_programmatic` function (proven by
+        // `programmatic_path_has_no_codegen_or_modal_subprocess`, which scans
+        // programmatic.rs for `run_modal`/`Command::new("modal")`).
+        assert!(src.contains("fn run_modal"));
     }
 }

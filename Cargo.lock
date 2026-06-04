@@ -2955,7 +2955,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "modal-rust",
+ "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

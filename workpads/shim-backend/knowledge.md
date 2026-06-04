@@ -916,3 +916,27 @@ The chain (3/3 reviews PASS):
 
 Live used ephemeral RUN apps (no lingering deploy). Gates green (fmt/clippy `-D warnings`/build/test, incl.
 `--features live`). cuda-vector-add still builds locally without CUDA (dynamic-loading intact).
+
+---
+
+### ✅ P9 — CLI migrated off Python codegen onto the programmatic SDK (2026-06-04)
+
+`modal-rust run/deploy/call` now drive the **programmatic SDK/facade by default** — NO generated `.py`, NO
+`modal` CLI. **Proven live**: `run`/`deploy`/`call add → {"ok":true,"value":{"sum":42}}` with a PATH tripwire
+confirming **zero `modal` invocations** and no `.modal-rust/generated` dir; `deploy` built at image-build time,
+`call` execs the prebuilt binary (no cargo at call). 3/3 reviews PASS; gates green (152 tests).
+
+The enabler: **`modal_runner --describe`** — an ADDITIVE runner subcommand
+(`run_cli_with_configs`/`run_cli_with_args_and_configs`; the frozen `--entrypoint` dispatch was extracted
+verbatim to `run_cli_dispatch`, byte-identical) that emits JSON `{schema:"modal-rust/describe@1", entrypoints:
+[{name, gpu, timeout_secs, cache}]}`. So the standalone CLI learns the user crate's entrypoints + P4 decorator
+config WITHOUT linking it: build the user `modal_runner` → `--describe` → drive a **headless `App`**
+(`App::from_manifest` / `connect_from_manifest(name, configs, RemoteConfig)` — config but no HandlerFn, since
+`.remote()`/`deploy`/`call` don't need handlers) → `remote_envelope`/`deploy_with`/`call_envelope`, reusing the
+proven `ensure_function`/`deploy_function`/`call_function`. `--describe` config verified live: `example-add-macro`
+emits `add_gpu → {gpu:"T4", timeout_secs:1800, cache:false}` — P4 config flows through the CLI.
+
+`doctor` no longer hard-requires the `modal` CLI on the default path (kept under `--use-shim`); auth + cargo/rustc
+checks stay. `templates.rs` + the `modal`-CLI path are **retained behind `--use-shim`** (verified still renders
+`dev_app.py` + execs `modal run`) — a clean fallback; **P10** deletes them. New CLI module `programmatic.rs`; old
+bodies preserved verbatim as `cmd_*_shim`. README + examples/orchestrate untouched.

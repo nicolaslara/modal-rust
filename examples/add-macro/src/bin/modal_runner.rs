@@ -13,6 +13,11 @@
 use example_add_macro as _;
 
 fn main() -> std::process::ExitCode {
-    let code = modal_rust_runtime::run_cli(modal_rust_runtime::Registry::from_inventory());
+    // Config-carrying entry (P9 §A.4): `from_inventory_with_configs` threads the
+    // decorator gpu/timeout/cache into the additive `--describe` manifest. The
+    // FROZEN `--entrypoint` dispatch ignores the configs, so this is behavior-
+    // identical to `run_cli(Registry::from_inventory())` for the runner protocol.
+    let (registry, configs) = modal_rust_runtime::from_inventory_with_configs();
+    let code = modal_rust_runtime::run_cli_with_configs(registry, &configs);
     std::process::ExitCode::from(code as u8)
 }

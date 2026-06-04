@@ -262,21 +262,39 @@ fn release_profile_panic(text: &str) -> Option<String> {
     None
 }
 
-/// Run the full `doctor` preflight. `with_rust` enables the `--rust` checks.
+/// Run the full `doctor` preflight. `with_rust` enables the `--rust` checks;
+/// `with_shim` adds the legacy `modal`-CLI-on-$PATH check (the `--use-shim` fallback).
 /// `project_dir` is the directory whose manifest chain is inspected for the
 /// `panic = "abort"` profile check (the cwd for a bare `doctor`).
+///
+/// The DEFAULT path is programmatic (P9): it connects to Modal directly and never
+/// spawns `modal`, so the `modal` CLI is NOT a hard requirement. Only auth (always)
+/// and cargo/rustc (under `--rust`, now MORE load-bearing because the default path
+/// runs a local `cargo build` for `--describe`) are required. The `modal` CLI is
+/// checked ONLY under `--use-shim`.
 ///
 /// Prints a clear report to stdout. Returns the process exit code: `0` if every
 /// check passed; `1` if any check FAILED (the first failure's structured error is
 /// printed to stderr as a single JSON envelope line, reusing the runner shape).
-pub fn run(with_rust: bool, project_dir: &std::path::Path) -> i32 {
+pub fn run(with_rust: bool, with_shim: bool, project_dir: &std::path::Path) -> i32 {
     println!("modal-rust doctor — preflight (OFFLINE)");
+    if with_shim {
+        println!("(--use-shim: also checking the legacy `modal` CLI on $PATH)");
+    } else {
+        println!("(default path is programmatic; the modal CLI is required only with --use-shim)");
+    }
     if with_rust {
         println!("(--rust: also checking cargo/rustc and the release panic profile)");
     }
     println!();
 
-    let mut checks: Vec<Check> = vec![check_modal_cli(), check_modal_credentials()];
+    // Auth is ALWAYS a hard requirement (the default path's `App::connect_*` reads
+    // ~/.modal.toml / MODAL_TOKEN_*). The `modal` CLI is checked ONLY under
+    // --use-shim. cargo/rustc/panic under --rust.
+    let mut checks: Vec<Check> = vec![check_modal_credentials()];
+    if with_shim {
+        checks.insert(0, check_modal_cli());
+    }
     if with_rust {
         checks.push(check_cargo());
         checks.push(check_rustc());

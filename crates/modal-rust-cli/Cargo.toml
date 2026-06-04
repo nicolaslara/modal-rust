@@ -2,7 +2,7 @@
 name = "modal-rust-cli"
 version = "0.0.0"
 edition = "2021"
-description = "The `modal-rust` binary: a pure wrapper that generates the Modal Python shims and drives the official `modal` CLI. clap lives here (CLI-only), never in the runtime."
+description = "The `modal-rust` binary: by default drives the programmatic SDK/facade (run/deploy/call via `modal_runner --describe` + crates/modal-rust) — no codegen, no `modal` CLI. The legacy Python-shim path is retained behind `--use-shim`. clap lives here (CLI-only), never in the runtime."
 publish = false
 
 [[bin]]
@@ -11,5 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# The default (programmatic) path drives the facade's App orchestration directly
+# (P9 §C.1) — no codegen, no `modal` CLI. The facade pulls the SDK transitively, so
+# there is no direct SDK dep. The async facade ops run under a tokio runtime.
+modal-rust = { path = "../modal-rust" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

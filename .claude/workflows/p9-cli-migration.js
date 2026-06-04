@@ -1,0 +1,210 @@
+export const meta = {
+  name: 'p9-cli-migration',
+  description: 'P9: migrate the modal-rust CLI (run/deploy/call) off Python codegen onto the programmatic SDK. Add `modal_runner --describe` (emit entrypoints + decorator config as JSON) so the standalone CLI learns the user crate without linking it, then drive the SDK directly — no generated .py, no `modal` CLI. doctor updated; templates kept behind --use-shim as a clean fallback.',
+  phases: [
+    { title: 'Design', detail: '--describe manifest + CLI->SDK orchestration + doctor/--use-shim parity -> one spec' },
+    { title: 'Implement', detail: 'runner --describe + CLI run/deploy/call via SDK + doctor + --use-shim fallback; gates green (HARD GATE)' },
+    { title: 'Live', detail: 'modal-rust run/deploy/call add -> {sum:42} on the NEW path: no .py emitted, no `modal` CLI invoked' },
+    { title: 'Review', detail: 'parallel: parity + no-codegen/no-modal-CLI default path + frozen runner protocol; hygiene' },
+  ],
+}
+
+const ROOT = '/Users/nicolas/devel/modal-rust'
+
+const SHARED = [
+  'You are implementing P9 of modal-rust (repo root: ' + ROOT + '; git on main).',
+  '',
+  '## Where we are',
+  'The programmatic path is proven live: through our own SDK (crates/modal-rust-sdk, no modal-rs) + facade',
+  '(crates/modal-rust), `App` + `.local()`/`.remote()`/`deploy`/`call` work for CPU and GPU (P4). BUT the',
+  '`modal-rust` CLI (crates/modal-rust-cli) STILL uses the OLD mechanism: `run`/`deploy`/`call` render Python shims',
+  '(templates.rs -> .modal-rust/generated/*.py) and shell out to the official `modal` CLI. The README now documents',
+  'the facade as the product and flags the CLI as "legacy/transitional (pending migration)". P9 migrates it.',
+  '',
+  '## What P9 builds: the CLI drives the programmatic SDK (no codegen, no `modal` CLI)',
+  '`modal-rust run/deploy/call <entrypoint>` must produce the SAME result as today (same {sum:42}, same JSON',
+  'envelope) but emit NO generated `.py` and invoke NO `modal` CLI — using the SDK/facade orchestration instead.',
+  '',
+  '### The core problem + the enabler (`--describe`)',
+  'The CLI is a SEPARATE prebuilt binary; the user\'s functions + their decorator config (gpu/timeout/cache, P4) live',
+  'in the USER\'s crate (compiled into the user\'s `modal_runner` bin). The CLI canNOT link the user crate, so it',
+  'canNOT call `App::from_inventory()` directly. ENABLER: add a **`modal_runner --describe`** subcommand to the',
+  'runner (crates/modal-rust-runtime `run_cli`) that emits, as JSON, the registry entrypoints + each one\'s',
+  '`FunctionConfig` (from `Registry::from_inventory_with_configs` / the registry the runner already holds). The CLI',
+  'then: builds the user crate\'s `modal_runner` (cargo, same `-p <pkg>` it already derives) -> runs',
+  '`modal_runner --describe` -> gets the manifest (entrypoint names + config) -> drives the SDK to create + invoke',
+  '(the same ops the facade `.remote()`/`deploy`/`call` use). The container wrapper still execs `modal_runner',
+  '--entrypoint <name>` exactly as the proven `.remote()` path does. NO Python shim, NO `modal` CLI.',
+  '`--describe` is ADDITIVE — the frozen `--entrypoint`/`--input-json`/`--input-file`/`--input-stdin` protocol + the',
+  'one-JSON-envelope output + the five error kinds are UNCHANGED.',
+  '',
+  '### How the CLI reuses the orchestration',
+  'Prefer REUSING the facade/SDK orchestration, not duplicating it. Two viable shapes (design decides):',
+  '  (a) a manifest/headless `App` (e.g. `App::from_manifest(name->config)`) that carries config but no HandlerFn',
+  '      (`.remote()`/`deploy`/`call` do NOT need handlers — only `.local()` does), so the CLI builds it from',
+  '      `--describe` and calls `.remote()`/`deploy_with`/`call`; OR',
+  '  (b) the CLI calls the SDK ops directly (mount_local_dir, image_get_or_create, FunctionCreate with the config,',
+  '      invoke), reusing `crates/modal-rust/src/{remote.rs,deploy.rs}` logic.',
+  'The CLI already knows the local crate root + package (`--project`/derivation) -> set RemoteConfig/DeployConfig',
+  '(local_root, package, plus the per-entrypoint config from --describe). `run` = ephemeral app; `deploy` = persistent;',
+  '`call` = from_name + invoke.',
+  '',
+  '### doctor + fallback',
+  '- `doctor`: DROP the `modal` CLI on $PATH as a HARD requirement for the default path; KEEP the auth check',
+  '  (~/.modal.toml / MODAL_TOKEN_*) + cargo/rustc (the `--rust` checks). The `modal` CLI becomes relevant only for',
+  '  `--use-shim`.',
+  '- KEEP templates.rs + the `modal`-CLI shell-out behind a `--use-shim` flag (a clean documented fallback / revert',
+  '  boundary), NOT deleted (P10 removes it later). Default path = programmatic.',
+  '',
+  '## Ground-truth references (READ)',
+  '- crates/modal-rust-cli/src/main.rs (the run/deploy/call/doctor commands + the current shim flow + how it derives',
+  '  the package/project), src/templates.rs + src/templates/*.tmpl (the codegen to put behind --use-shim).',
+  '- crates/modal-rust-runtime/src/lib.rs (`run_cli`/`run_cli_with_args`, `Registry`, `from_inventory_with_configs`,',
+  '  `FunctionConfig`, the FROZEN --entrypoint protocol + JSON envelope + 5 error kinds).',
+  '- crates/modal-rust/src/{app.rs, remote.rs (ensure_function), deploy.rs (deploy_function/call), function.rs} —',
+  '  the orchestration to reuse; crates/modal-rust-sdk/src/ops/* — the underlying RPCs.',
+  '- examples/add (the CLI test target: `modal_runner` bin, `add` entrypoint; manual `modal_registry()` -> config is',
+  '  defaults, which is fine — `add` needs no gpu; the --describe config plumbing is still exercised).',
+  '- workpads/shim-backend/knowledge.md (status), TASKS.md (the P9 line). Do NOT touch README.md or examples/orchestrate.',
+  '',
+  '## FROZEN invariants — do NOT change',
+  '- The runner CLI protocol (`--entrypoint`/`--input-*`, one JSON envelope, five error kinds) + `HandlerFn` +',
+  '  `typed!` + dispatch are byte-identical; `--describe` is a NEW additive subcommand only.',
+  '- The run-vs-deploy build boundary; retry_transient; the add_python image + cargo-scoped upload; the ephemeral-run',
+  '  vs persistent-deploy lifecycle. Reuse them — do not reimplement or weaken them.',
+  '',
+  '## Verification rules (WORKING.md)',
+  '- Gates on default-members: cargo fmt --check ; cargo clippy --all-targets -- -D warnings ; cargo build ; cargo',
+  '  test. Keep no-CUDA CI green. Live tests / live CLI runs are best-effort; HARD gates are the offline compiles.',
+  '- Modal flakiness => RETRY. DRIVE the live CLI proof to a terminal result. Use ephemeral run apps (no lingering',
+  '  deploy); use a stable deploy name for the deploy test. CPU only (cheap).',
+  '',
+  '## How to return',
+  'End with: "RESULT: <STATUS> — <one-line>". Build phases STATUS in {BUILD_GREEN, BUILD_FAILED} + exact cargo output.',
+  'Live: the `modal-rust run/deploy/call` outputs + proof NO .py was written + NO `modal` subprocess ran, or the',
+  'precise error after retries.',
+].join('\n')
+
+phase('Design')
+const design = await parallel([
+  () => agent(SHARED + '\n\n' + [
+    'YOUR TASK (Design / --describe manifest + CLI->SDK orchestration). Read crates/modal-rust-runtime/src/lib.rs',
+    '(run_cli/run_cli_with_args, Registry, from_inventory_with_configs, FunctionConfig), crates/modal-rust-cli/src/',
+    'main.rs (how run/deploy/call build + invoke today, how the package is derived), and crates/modal-rust/src/',
+    '{app.rs,remote.rs,deploy.rs}. Produce a PRECISE spec for:',
+    '- The `modal_runner --describe` subcommand: a new arg in `run_cli` that emits JSON = a list of {entrypoint name,',
+    '  FunctionConfig{gpu,timeout,cache}} from the registry the runner holds. ADDITIVE: the existing --entrypoint',
+    '  protocol/envelope/error-kinds unchanged. (For a manual Registry without configs, emit names + default config;',
+    '  for the macro/from_inventory_with_configs path, emit the real config.) Define the JSON schema.',
+    '- The CLI orchestration: build the user `modal_runner` (cargo -p <pkg>) -> run `--describe` -> parse manifest ->',
+    '  drive the SDK/facade for run (ephemeral) / deploy (persistent) / call (from_name+invoke), passing the',
+    '  per-entrypoint config into the FunctionSpec. Recommend the cleanest reuse: a manifest/headless `App`',
+    '  (config-only, no HandlerFn) calling `.remote()`/`deploy_with`/`call`, OR the CLI calling SDK ops with',
+    '  RemoteConfig/DeployConfig. Specify which, and the exact entry points to reuse from remote.rs/deploy.rs.',
+    'Cite file:line. Keep the runner FROZEN. RESULT: SPEC_DONE — --describe + CLI orchestration spec',
+  ].join('\n'), { phase: 'Design', label: 'design:describe-orchestration' }),
+
+  () => agent(SHARED + '\n\n' + [
+    'YOUR TASK (Design / CLI surface + doctor + --use-shim + parity). Read crates/modal-rust-cli/src/main.rs (the',
+    'clap commands: run/deploy/call/doctor + flags), src/templates.rs + src/templates/*.tmpl (the codegen). Produce a',
+    'PRECISE spec for:',
+    '- The new default flow for `run`/`deploy`/`call` (programmatic) vs the `--use-shim` fallback (the EXISTING',
+    '  templates.rs + `modal` CLI path, kept intact behind the flag). How the flag selects the path; default = programmatic.',
+    '- `doctor`: drop the `modal` CLI hard requirement on the default path; keep auth (~/.modal.toml / MODAL_TOKEN_*)',
+    '  + cargo/rustc (`--rust`). The `modal` CLI check applies only under --use-shim. Exact doctor output changes.',
+    '- The acceptance/parity checks: `modal-rust run add --input \'{"a":40,"b":2}\'` -> {sum:42} same envelope as the',
+    '  shim path; NO `.modal-rust/generated/*.py` written; NO `modal` subprocess spawned (how to assert each in a test',
+    '  / live run, e.g. check the dir is empty + the programmatic path never calls Command::new("modal")).',
+    '- What stays (templates.rs/*.tmpl behind --use-shim; deleting them is P10, not P9).',
+    'Cite file:line. RESULT: SPEC_DONE — CLI surface + doctor + --use-shim + parity spec',
+  ].join('\n'), { phase: 'Design', label: 'design:cli-doctor-fallback' }),
+])
+
+const spec = await agent(SHARED + '\n\n' + [
+  'YOUR TASK (Synthesize). Merge the two notes into ONE build-ready spec and WRITE it to',
+  ROOT + '/workpads/shim-backend/p9-build-spec.md (overwrite if present): the `modal_runner --describe` subcommand +',
+  'JSON schema, the CLI run/deploy/call programmatic flow (manifest -> SDK), the doctor changes, the --use-shim',
+  'fallback, and the parity assertions (same {sum:42}/envelope, no .py, no `modal` CLI). Note which files change.',
+  'Keep the runner protocol FROZEN (--describe additive) and reuse the proven SDK/facade orchestration. Resolve',
+  'contradictions. Keep it tight.',
+  '',
+  '=== --DESCRIBE + ORCHESTRATION NOTE ===',
+  (design[0] || '(missing)'),
+  '',
+  '=== CLI SURFACE + DOCTOR + FALLBACK NOTE ===',
+  (design[1] || '(missing)'),
+  '',
+  'RESULT: SPEC_DONE — wrote p9-build-spec.md',
+].join('\n'), { phase: 'Design', label: 'design:synthesize' })
+
+phase('Implement')
+const impl = await agent(SHARED + '\n\n' + [
+  'The spec is at ' + ROOT + '/workpads/shim-backend/p9-build-spec.md — READ IT FIRST.',
+  '',
+  'YOUR TASK (Implement P9 — HARD GATE on offline gates). Per the spec:',
+  '1. Add `modal_runner --describe` to the runner (crates/modal-rust-runtime run_cli): emit the entrypoints +',
+  '   per-entrypoint FunctionConfig as JSON. ADDITIVE — the --entrypoint protocol/envelope/5-error-kinds byte-identical',
+  '   (verify a runner test still passes).',
+  '2. Migrate `modal-rust run/deploy/call` to the PROGRAMMATIC path by default: build the user modal_runner -> read',
+  '   --describe -> drive the SDK/facade (run=ephemeral, deploy=persistent, call=from_name+invoke), per-entrypoint',
+  '   config applied. NO generated .py, NO `modal` CLI on the default path.',
+  '3. doctor: drop the `modal`-CLI hard requirement (default path); keep auth + cargo/rustc.',
+  '4. Keep templates.rs + the `modal`-CLI path behind a `--use-shim` flag (intact fallback; do NOT delete — that is P10).',
+  'Do NOT change the runner protocol/HandlerFn/typed!() or the build boundary; do NOT touch README.md / examples/orchestrate.',
+  'VERIFY (offline hard): cargo fmt --check ; cargo clippy --all-targets -- -D warnings ; cargo build ; cargo test',
+  '(all default-members) — all green. Add tests: `--describe` emits the add entrypoint; the default run path writes no',
+  '.py and spawns no `modal`; --use-shim still renders the template. Paste exact output.',
+  'RESULT: BUILD_GREEN — CLI run/deploy/call programmatic by default (no codegen/no modal CLI); --describe added; --use-shim fallback kept',
+  '   (or BUILD_FAILED — <reason>)',
+].join('\n'), { phase: 'Implement', label: 'p9-impl' })
+
+const implGreen = /RESULT:\s*BUILD_GREEN/i.test(impl || '')
+let live = null
+if (!implGreen) {
+  log('Implement HARD GATE not green — P9 did not compile. Skipping Live; Review documents the blocker.')
+} else {
+  phase('Live')
+  live = await agent(SHARED + '\n\n' + [
+    'P9 is implemented and compiles. Run the LIVE CLI proof and DRIVE IT TO A TERMINAL RESULT yourself.',
+    '',
+    'YOUR TASK (LIVE — the migrated CLI, end to end, against REAL Modal). Using examples/add as the target:',
+    '  1. `cargo run -p modal-rust-cli -- run add --input \'{"a":40,"b":2}\'` (or the built `modal-rust` binary) ->',
+    '     {sum:42} via the PROGRAMMATIC path (ephemeral app). PROVE: no `.modal-rust/generated/*.py` was written, and',
+    '     NO `modal` CLI subprocess was spawned.',
+    '  2. `modal-rust deploy add` (stable name) + `modal-rust call add --input ...` -> {sum:42}; deploy builds at',
+    '     image-build time, call execs the prebuilt binary.',
+    '  3. (parity) optionally `modal-rust run add --use-shim` still works via the legacy path (same {sum:42}).',
+    'Modal flakiness => RETRY (retry_transient + image caching help). Use ephemeral run apps (no lingering deploy). If',
+    'a real bug surfaces, make the MINIMAL fix + re-verify offline gates. CPU only (cheap).',
+    'Capture: the run/deploy/call outputs ({sum:42}); the proof no .py emitted + no `modal` subprocess on the default',
+    'path; the deploy build-vs-call boundary.',
+    'RESULT: BUILD_GREEN — modal-rust run/deploy/call live == {sum:42} via the programmatic path (no .py, no modal CLI)',
+    '   (or BUILD_FAILED/INFRA_BLOCKED — <detail>)',
+  ].join('\n'), { phase: 'Live', label: 'live-cli' })
+}
+
+phase('Review')
+const reviews = await parallel([
+  () => agent(SHARED + '\n\n' + [
+    'YOUR TASK (Review / migration correctness + frozen runner). Verify against the code:',
+    '- `modal-rust run/deploy/call` DEFAULT path drives the SDK/facade (no template render, no `Command::new("modal")`,',
+    '  no `.modal-rust/generated/*.py`). Quote the default path + the `--use-shim` branch that retains the legacy flow.',
+    '- `modal_runner --describe` is ADDITIVE: the --entrypoint protocol, one-JSON-envelope output, five error kinds,',
+    '  HandlerFn/typed!/dispatch are byte-identical (point to the runner test). The manifest carries the per-entrypoint',
+    '  FunctionConfig (so P4 decorator config still applies through the CLI).',
+    '- doctor no longer hard-requires the `modal` CLI on the default path but keeps auth + cargo/rustc.',
+    '- run uses an ephemeral app; deploy persistent; the run-vs-deploy build boundary intact.',
+    'RESULT: PASS — CLI migrated, codegen/modal-CLI off the default path, runner frozen  (or FAIL — <what is wrong>)',
+  ].join('\n'), { phase: 'Review', label: 'review:migration' }),
+
+  () => agent(SHARED + '\n\n' + [
+    'YOUR TASK (Review / hygiene — RUN the gates). From ' + ROOT + ' report exact output + exit status:',
+    '- cargo fmt --check ; cargo clippy --all-targets -- -D warnings ; cargo build ; cargo test  (default-members).',
+    'Confirm: templates.rs/*.tmpl still present (behind --use-shim, not deleted — P10 deletes); example-burn-add still',
+    'excluded from default-members; live tests / live CLI runs gated; README.md + examples/orchestrate untouched; no',
+    'hand-written file grossly exceeds ~500 LOC. Report failures verbatim.',
+    'RESULT: PASS — gates green  (or FAIL — <exact failing command + output>)',
+  ].join('\n'), { phase: 'Review', label: 'review:hygiene' }),
+])
+
+return { impl_green: implGreen, impl, live, reviews }
