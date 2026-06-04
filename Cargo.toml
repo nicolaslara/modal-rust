@@ -8,6 +8,7 @@ members = [
     "crates/modal-rust-macros",
     "examples/add",
     "examples/add-macro",
+    "examples/orchestrate",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -27,6 +28,7 @@ default-members = [
     "crates/modal-rust-macros",
     "examples/add",
     "examples/add-macro",
+    "examples/orchestrate",
     "examples/cuda-vector-add",
 ]
 

@@ -1,0 +1,22 @@
+[package]
+name = "example-orchestrate"
+version = "0.0.0"
+edition = "2021"
+description = "Runnable example of the modal-rust facade: App/Function with offline .local() (the primary, zero-Modal path) plus the live .remote()/deploy/call surface (credential-gated)."
+publish = false
+
+[[bin]]
+name = "orchestrate"
+path = "src/main.rs"
+
+[dependencies]
+# The user-facing facade: App/Function + the deploy types. This is the ONE crate a
+# downstream user depends on for orchestration (it also re-exports the SDK as
+# `modal_rust::sdk`).
+modal-rust = { path = "../../crates/modal-rust" }
+# The example crate that DEFINES the registered functions (`add`/`AddInput`/
+# `AddOutput`/`modal_registry()`). In a real project this is your own library crate
+# of `#[modal_rust::function]`s; here we reuse the proven `example-add`.
+example-add = { path = "../add" }
+# `.remote()`/`deploy`/`call` are async; the example drives them with a tokio runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
