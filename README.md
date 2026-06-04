@@ -17,9 +17,9 @@ entrypoints, and call them three ways:
 - `deploy` + `call` builds once into a persistent Modal app and calls the
   prebuilt runner without rebuilding.
 
-The project includes a first-party Rust client for Modal's control plane. The
-current programmatic path does not shell out to the `modal` CLI and does not
-require per-project Python shims.
+The default command-line path is the `modal-rust` CLI. The library API also
+includes a first-party Rust client for Modal's control plane, so Rust code can
+drive local, remote, and deployed calls directly.
 
 ## Install
 
@@ -49,7 +49,58 @@ anyhow = "1"
 For live Modal calls, configure Modal credentials with either `~/.modal.toml` or
 the `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` environment variables.
 
-## Quick Start
+## CLI Usage
+
+Install the CLI from GitHub:
+
+```bash
+cargo install --git https://github.com/nicolaslara/modal-rust --package modal-rust-cli
+```
+
+From a local checkout, install the CLI you are editing with:
+
+```bash
+cargo install --path crates/modal-rust-cli
+```
+
+The CLI wraps the official `modal` CLI today, so live commands also need `modal`
+on your `PATH` and Modal credentials configured.
+
+Check your machine first:
+
+```bash
+modal-rust doctor --rust --project examples/add
+```
+
+Run a registered Rust function remotely on Modal:
+
+```bash
+modal-rust run add \
+  --project examples/add \
+  --input '{"a":40,"b":2}'
+```
+
+Deploy the project as a persistent Modal app:
+
+```bash
+modal-rust deploy add \
+  --project examples/add \
+  --app modal-rust-add-poc
+```
+
+Call the deployed function without rebuilding:
+
+```bash
+modal-rust call add \
+  --app modal-rust-add-poc \
+  --input '{"a":40,"b":2}'
+```
+
+For your own project, point `--project` at the crate that defines the
+`modal_runner` binary and registered entrypoints. `--input` accepts inline JSON
+or `@path/to/input.json`.
+
+## Library API
 
 Define a Rust function with serializable input and output types:
 
@@ -223,7 +274,7 @@ The workspace is split into focused crates:
 | `modal-rust-runtime` | Handler registry, typed wrappers, runner protocol, and error envelopes |
 | `modal-rust-macros` | `#[modal_rust::function]` registration macro |
 | `modal-rust-sdk` | First-party Rust gRPC client for Modal control-plane operations |
-| `modal-rust-cli` | Transitional legacy CLI path |
+| `modal-rust-cli` | Command-line interface for `doctor`, `run`, `deploy`, and `call` |
 
 The facade uses static dispatch where possible. The registry stores function
 pointers rather than boxed trait objects, and the macro compiles to the same
