@@ -38,6 +38,14 @@ pub(crate) const PYTHON_SERIES: &str = "3.12";
 /// In-body `cargo build` needs far longer than the SDK's 300s invoke default.
 pub(crate) const REMOTE_TIMEOUT_SECS: u32 = 1800;
 
+/// Stable in-container mount path for the cargo-cache V2 volume (P6). The single
+/// archive object lives at `{CACHE_MOUNT}/{CACHE_ARCHIVE_NAME}`.
+pub(crate) const CACHE_MOUNT: &str = "/cache";
+/// The single compressed archive object persisted on the cache volume (P6).
+pub(crate) const CACHE_ARCHIVE_NAME: &str = "cache.tar.zst";
+/// Deployment name of the persistent V2 cargo-cache volume (knowledge.md §C item 4).
+pub(crate) const CACHE_VOLUME_NAME: &str = "modal-rust-cargo-cache";
+
 /// The FILE-mode run wrapper, ported from `workpads/prototype/dev_app.py`'s
 /// `run_entrypoint`. The `{{PACKAGE}}` placeholder is substituted per package by
 /// [`run_wrapper_src`] before being baked into the image (base64) — so no shell
@@ -58,10 +66,102 @@ execs the frozen modal_runner, and RETURNS the one-line JSON envelope verbatim.
 import os, shutil, subprocess, sys
 
 PACKAGE    = "{{PACKAGE}}"      # injected: cargo -p <pkg>
+CACHE_ON   = {{CACHE}}          # injected: True / False (P6 cargo build cache)
 REMOTE_SRC = "/src"            # source mount path
 _RUNNER    = "/tmp/target/release/modal_runner"
 _MARKER    = "/tmp/.modal_rust_built"
 _BUILT     = False
+
+# P6 cache: a SINGLE compressed archive on a V2 volume mounted at /cache. We build
+# on FAST LOCAL DISK (/tmp) and persist only this one object — the volume never
+# holds CARGO_HOME/target directly (Modal volumes degrade past ~50k files). zstd is
+# preferred; if the base lacks the `zstd` binary we fall back to gzip (.tar.gz).
+# Selection is by existing-archive extension so cold<->warm stays consistent.
+_ARCHIVE_ZSTD = "{{ARCHIVE_ZSTD}}"
+_ARCHIVE_GZIP = "{{ARCHIVE_GZIP}}"
+# Lock files regenerate; excluding them avoids stale-lock churn in the archive.
+_PACK_EXCLUDES = [
+    "--exclude=cargo/registry/cache/.package-cache",
+    "--exclude=cargo/.package-cache",
+]
+
+
+def _cache_target_on():
+    # OPTIONALLY archive target/ too (largest tree). Gated by env, default OFF in v0;
+    # flip ON (MODAL_RUST_CACHE_TARGET=1) for the heavy burn-add benchmark.
+    return os.environ.get("MODAL_RUST_CACHE_TARGET", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _existing_archive():
+    # Prefer an archive that already exists (keeps cold<->warm consistent in a volume).
+    if os.path.exists(_ARCHIVE_ZSTD):
+        return _ARCHIVE_ZSTD
+    if os.path.exists(_ARCHIVE_GZIP):
+        return _ARCHIVE_GZIP
+    return None
+
+
+def _unpack_cache():
+    # Restore the warm CARGO_HOME (and optionally target/) onto /tmp BEFORE cargo runs.
+    # A missing/corrupt archive is treated as COLD (logged) — a cache miss only costs
+    # time, never changes the build result.
+    if not CACHE_ON:
+        return "disabled"
+    archive = _existing_archive()
+    if archive is None:
+        return "COLD (no archive)"
+    flag = "--zstd" if archive.endswith(".zst") else "-z"
+    try:
+        subprocess.run(["tar", flag, "-xf", archive, "-C", "/tmp"], check=True,
+                       stdout=sys.stderr, stderr=sys.stderr)
+        return "WARM"
+    except Exception as e:  # corrupt/partial archive => treat as COLD, never raise
+        print(f"[cache] unpack failed (treated as COLD): {e!r}", file=sys.stderr)
+        return "COLD (unpack failed)"
+
+
+def _pack_one(archive, flag, dirs):
+    tmp = archive + ".tmp"
+    try:
+        subprocess.run(
+            ["tar", flag, *_PACK_EXCLUDES, "-cf", tmp, "-C", "/tmp", *dirs],
+            check=True, stdout=sys.stderr, stderr=sys.stderr,
+        )
+    except Exception:
+        # tar failed mid-write (e.g. `--zstd` on a base without the zstd binary):
+        # remove the partial temp so it never lingers on the volume, then re-raise so
+        # the caller can fall back (gzip) or log+ignore. Atomic temp+rename means a
+        # reader never sees a half archive; this just keeps the volume clean.
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, archive)  # atomic rename on the same fs; no reload/commit needed
+    print(f"[cache] packed {archive}", file=sys.stderr)
+
+
+def _pack_cache():
+    # Persist the enriched archive after the FIRST cold build only. Atomic temp+rename
+    # within /cache; allow_background_commits flushes it (NO vol.reload/commit on the
+    # hot path — cargo holds locks). A failed pack must NEVER fail the call.
+    if not CACHE_ON:
+        return
+    dirs = ["cargo"]
+    if _cache_target_on():
+        dirs.append("target")
+    # Keep the same format as any existing archive; default to zstd, fall back to gzip
+    # if the `zstd` binary is missing on the base image.
+    existing = _existing_archive()
+    try:
+        if existing == _ARCHIVE_GZIP:
+            _pack_one(_ARCHIVE_GZIP, "-z", dirs)
+        else:
+            try:
+                _pack_one(_ARCHIVE_ZSTD, "--zstd", dirs)
+            except Exception as e:
+                print(f"[cache] zstd pack unavailable ({e!r}); falling back to gzip", file=sys.stderr)
+                _pack_one(_ARCHIVE_GZIP, "-z", dirs)
+    except Exception as e:  # a failed pack must NOT fail the call
+        print(f"[cache] pack failed (ignored): {e!r}", file=sys.stderr)
 
 
 def _env():
@@ -90,6 +190,7 @@ def _build(env):
         _BUILT = True
         print("[run] build cached (warm container); skipping cargo build", file=sys.stderr)
         return
+    print(f"[cache] {_unpack_cache()}", file=sys.stderr)  # warm CARGO_HOME if archive present
     build_dir = _build_dir()
     b = subprocess.run(
         ["cargo", "build", "--release", "-p", PACKAGE, "--bin", "modal_runner"],
@@ -99,6 +200,7 @@ def _build(env):
         raise RuntimeError(f"cargo build failed with exit code {b.returncode}")
     open(_MARKER, "w").close()
     _BUILT = True
+    _pack_cache()  # cold path only; persist the enriched archive (best-effort)
 
 
 def handler(entrypoint, input_json):
@@ -122,11 +224,27 @@ def handler(entrypoint, input_json):
     return out
 "#;
 
-/// Substitute `{{PACKAGE}}` into [`WRAPPER_SRC`]. `package` is a cargo package name
-/// (crate-name-shaped: `[A-Za-z0-9_-]`); it is NOT shell-quoted because the source
-/// is base64-baked into the Dockerfile.
-pub(crate) fn run_wrapper_src(package: &str) -> String {
-    WRAPPER_SRC.replace("{{PACKAGE}}", package)
+/// Substitute `{{PACKAGE}}` + `{{CACHE}}` (+ the archive paths) into [`WRAPPER_SRC`].
+/// `package` is a cargo package name (crate-name-shaped: `[A-Za-z0-9_-]`); it is NOT
+/// shell-quoted because the source is base64-baked into the Dockerfile. `cache`
+/// renders the literal Python `True`/`False` for `CACHE_ON` (the wrapper's only config
+/// channel for P6) — with `False` the unpack/pack are no-ops and the wrapper is
+/// shape-identical to pre-P6.
+///
+/// The archive paths are derived from [`CACHE_MOUNT`] + [`CACHE_ARCHIVE_NAME`] (the
+/// gzip fallback swaps `.zst` → `.gz`), so the Python literals can never drift from
+/// the Rust constants used to mount + attach the volume.
+pub(crate) fn run_wrapper_src(package: &str, cache: bool) -> String {
+    let archive_zstd = format!("{CACHE_MOUNT}/{CACHE_ARCHIVE_NAME}");
+    let archive_gzip = archive_zstd
+        .strip_suffix(".zst")
+        .map(|stem| format!("{stem}.gz"))
+        .unwrap_or_else(|| format!("{archive_zstd}.gz"));
+    WRAPPER_SRC
+        .replace("{{PACKAGE}}", package)
+        .replace("{{CACHE}}", if cache { "True" } else { "False" })
+        .replace("{{ARCHIVE_ZSTD}}", &archive_zstd)
+        .replace("{{ARCHIVE_GZIP}}", &archive_gzip)
 }
 
 /// All knobs for the RUN path. One struct, no per-project file.
@@ -182,6 +300,11 @@ pub struct RemoteConfig {
     /// `rust:1-slim` base already carries Rust). Env override:
     /// `MODAL_RUST_INSTALL_RUST` (`1`/`true`/`yes`/`on`).
     pub install_rust: bool,
+    /// Enable the P6 cargo build cache (one archive on a V2 volume at `/cache`).
+    /// DEFAULT ON. Env opt-out: `MODAL_RUST_NO_CACHE` truthy. The decorator
+    /// `#[function(cache=false)]` overrides this per-entrypoint (app.rs). A cache
+    /// miss/failure only costs time — it NEVER changes the build result.
+    pub cache: bool,
 }
 
 impl Default for RemoteConfig {
@@ -197,6 +320,7 @@ impl Default for RemoteConfig {
             gpu: None,
             timeout_override_secs: None,
             install_rust: discover_install_rust(),
+            cache: discover_cache(),
         }
     }
 }
@@ -256,6 +380,35 @@ fn discover_install_rust() -> bool {
         .unwrap_or(false)
 }
 
+/// Discover whether the cargo build cache is ON: default ON; `MODAL_RUST_NO_CACHE`
+/// truthy (`1`/`true`/`yes`/`on`, case-insensitive) ⇒ OFF.
+fn discover_cache() -> bool {
+    !std::env::var("MODAL_RUST_NO_CACHE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Discover whether to ALSO archive `target/` (not just CARGO_HOME) in the cache:
+/// `MODAL_RUST_CACHE_TARGET` truthy (`1`/`true`/`yes`/`on`, case-insensitive) ⇒
+/// `true`. Default OFF. When ON (and caching is on) the facade bakes the same var
+/// into the image ENV so the remote wrapper packs/unpacks `target/` too — the local
+/// process env does NOT otherwise reach the Modal container.
+fn discover_cache_target() -> bool {
+    std::env::var("MODAL_RUST_CACHE_TARGET")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Ensure the run function exists on Modal and return its invokable `function_id`.
 ///
 /// Runs the full create sequence (client mount, uploaded source mount, run image,
@@ -283,6 +436,27 @@ pub(crate) async fn ensure_function(
     app_name: &str,
     config: &RemoteConfig,
 ) -> Result<String> {
+    // 1. Cargo-cache volume (P6, RUN path only): resolve the persistent V2 volume
+    //    (create-if-missing) when caching is on, so we can attach it below. When
+    //    caching is off (decorator `cache=false` / `MODAL_RUST_NO_CACHE`) we resolve
+    //    NO volume and the wrapper renders `CACHE_ON = False` — wire-identical to
+    //    pre-P6. The DEPLOY path never reaches here (it has its own build at
+    //    image-build time and never attaches a volume).
+    let cache_vol_id: Option<String> = if config.cache {
+        Some(
+            client
+                .volume_get_or_create(
+                    CACHE_VOLUME_NAME,
+                    true, /* v2 */
+                    true, /* create */
+                    None,
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+
     // 2. Client mount (modal source importable in the FILE-mode container).
     let client_mount_id = client.client_mount_id(None).await?;
 
@@ -351,10 +525,23 @@ pub(crate) async fn ensure_function(
     if config.install_rust {
         spec = spec.with_rust_toolchain();
     }
-    let spec = spec
-        .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src(&config.package))
-        .with_command("ENV RUST_BACKTRACE=1")
-        .with_command("ENTRYPOINT []");
+    let mut spec = spec
+        .with_wrapper_module(
+            WRAPPER_MODULE,
+            run_wrapper_src(&config.package, config.cache),
+        )
+        .with_command("ENV RUST_BACKTRACE=1");
+    // P6: target/ caching is opt-in via `MODAL_RUST_CACHE_TARGET` (default OFF: in v0
+    // only CARGO_HOME — registry index + crate tarballs — is archived). The wrapper
+    // reads this var from the CONTAINER env, but the local process env does NOT cross
+    // to Modal, so when caching is on AND the var is set locally we BAKE it into the
+    // image ENV. This is what makes the warm build skip recompilation (cargo sees a
+    // restored `target/` → `Fresh`, not `Compiling`), which is the dominant warm win
+    // on a heavy crate. Default path (var unset) renders byte-identical to pre-P6.
+    if config.cache && discover_cache_target() {
+        spec = spec.with_command("ENV MODAL_RUST_CACHE_TARGET=1");
+    }
+    let spec = spec.with_command("ENTRYPOINT []");
     let image_id = client.image_get_or_create(app_id, &spec).await?;
 
     // 5. Precreate the function (name = the wrapper callable, "handler").
@@ -370,11 +557,17 @@ pub(crate) async fn ensure_function(
     // cold build (no floor is imposed). `with_gpu(None)` is a CPU no-op (gpu_config
     // stays unset → CPU wire bytes identical).
     let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
-    let fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
+    let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
         .with_mount_ids(vec![client_mount_id, source_mount_id])
         .with_mount_client_dependencies(true)
         .with_timeout_secs(timeout)
         .with_gpu(config.gpu.clone())?;
+    // P6: attach the resolved cargo-cache volume at /cache with background commits
+    // ENABLED. Only when caching is on (else `cache_vol_id` is None ⇒ no volume ⇒
+    // wire-identical to pre-P6).
+    if let Some(vid) = cache_vol_id {
+        fn_spec = fn_spec.with_volume_mount(vid, CACHE_MOUNT);
+    }
     let created = client
         .function_create(app_id, &precreate_id, &fn_spec)
         .await?;
@@ -461,14 +654,112 @@ mod tests {
 
     #[test]
     fn wrapper_src_substitutes_package_and_is_pythonish() {
-        let src = run_wrapper_src("example-add");
+        let src = run_wrapper_src("example-add", true);
         assert!(!src.contains("{{PACKAGE}}"), "placeholder must be replaced");
+        assert!(
+            !src.contains("{{CACHE}}"),
+            "cache placeholder must be replaced"
+        );
         assert!(src.contains(r#"PACKAGE    = "example-add""#));
         // Load-bearing run-path lines.
         assert!(src.contains("def handler(entrypoint, input_json):"));
         assert!(src.contains("cargo"));
         assert!(src.contains("modal_runner"));
         assert!(src.contains("/tmp/in.json"));
+    }
+
+    #[test]
+    fn wrapper_src_renders_cache_flag_both_ways() {
+        // cache=true => CACHE_ON = True, and the unpack/pack machinery is present.
+        let on = run_wrapper_src("example-add", true);
+        assert!(
+            !on.contains("{{CACHE}}"),
+            "cache placeholder must be replaced"
+        );
+        assert!(on.contains("CACHE_ON   = True"));
+        assert!(on.contains("def _unpack_cache():"));
+        assert!(on.contains("def _pack_cache():"));
+        // The wrapper's archive path MUST match the Rust constants (guards against
+        // drift between the `/cache` mount + `cache.tar.zst` name and the Python
+        // literal the wrapper packs/unpacks).
+        let archive_path = format!("{CACHE_MOUNT}/{CACHE_ARCHIVE_NAME}");
+        assert_eq!(archive_path, "/cache/cache.tar.zst");
+        assert!(
+            !on.contains("{{ARCHIVE_ZSTD}}"),
+            "archive placeholder replaced"
+        );
+        assert!(
+            !on.contains("{{ARCHIVE_GZIP}}"),
+            "archive placeholder replaced"
+        );
+        assert!(
+            on.contains(&format!(r#"_ARCHIVE_ZSTD = "{archive_path}""#)),
+            "wrapper archive path must match CACHE_MOUNT/CACHE_ARCHIVE_NAME"
+        );
+        assert!(
+            on.contains(r#"_ARCHIVE_GZIP = "/cache/cache.tar.gz""#),
+            "gzip fallback path derived from the zstd archive"
+        );
+
+        // cache=false => CACHE_ON = False (no-op-shaped wrapper). The unpack/pack
+        // functions still EXIST (rendered verbatim) but both short-circuit on
+        // `if not CACHE_ON`, so no volume archive is ever read/written.
+        let off = run_wrapper_src("example-add", false);
+        assert!(off.contains("CACHE_ON   = False"));
+        assert!(!off.contains("CACHE_ON   = True"));
+        // The build pipeline (the load-bearing run path) is unchanged either way.
+        assert!(off.contains("def handler(entrypoint, input_json):"));
+        assert!(off.contains("modal_runner"));
+    }
+
+    #[test]
+    fn discover_cache_target_default_off_env_flips_on() {
+        // Serialized against other env-mutating tests (see `crate::ENV_TEST_LOCK`).
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("MODAL_RUST_CACHE_TARGET");
+        assert!(!discover_cache_target(), "target caching defaults OFF");
+        for truthy in ["1", "true", "YES", "On"] {
+            std::env::set_var("MODAL_RUST_CACHE_TARGET", truthy);
+            assert!(
+                discover_cache_target(),
+                "MODAL_RUST_CACHE_TARGET={truthy:?} must turn target caching ON"
+            );
+        }
+        std::env::set_var("MODAL_RUST_CACHE_TARGET", "no");
+        assert!(!discover_cache_target(), "non-truthy value keeps it OFF");
+        std::env::remove_var("MODAL_RUST_CACHE_TARGET");
+    }
+
+    #[test]
+    fn discover_cache_default_on_env_flips_off() {
+        // Serialized against other env-mutating tests (see `crate::ENV_TEST_LOCK`).
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("MODAL_RUST_NO_CACHE");
+        assert!(discover_cache(), "cache defaults ON");
+        assert!(
+            RemoteConfig::default().cache,
+            "RemoteConfig::default().cache defaults ON"
+        );
+
+        for truthy in ["1", "true", "YES", "On"] {
+            std::env::set_var("MODAL_RUST_NO_CACHE", truthy);
+            assert!(
+                !discover_cache(),
+                "MODAL_RUST_NO_CACHE={truthy:?} must turn cache OFF"
+            );
+            assert!(
+                !RemoteConfig::default().cache,
+                "MODAL_RUST_NO_CACHE={truthy:?} flips RemoteConfig::default().cache OFF"
+            );
+        }
+        // A non-truthy value leaves cache ON.
+        std::env::set_var("MODAL_RUST_NO_CACHE", "no");
+        assert!(discover_cache(), "non-truthy value keeps cache ON");
+        std::env::remove_var("MODAL_RUST_NO_CACHE");
     }
 
     #[test]
@@ -578,6 +869,7 @@ mod tests {
         std::env::remove_var("MODAL_RUST_PACKAGE");
         std::env::remove_var("MODAL_RUST_BASE_IMAGE");
         std::env::remove_var("MODAL_RUST_INSTALL_RUST");
+        std::env::remove_var("MODAL_RUST_NO_CACHE");
         let cfg = RemoteConfig::default();
         assert_eq!(cfg.remote_src, "/src");
         assert_eq!(cfg.base_image, "rust:1-slim");
@@ -587,6 +879,8 @@ mod tests {
         // The CUDA Tier-1 knob defaults OFF, so the default rust:1-slim path stays
         // byte-identical (no rustup, no CUDA env).
         assert!(!cfg.install_rust, "install_rust defaults off");
+        // P6: the cargo build cache is ON by default.
+        assert!(cfg.cache, "cache defaults ON");
 
         // Same test (one process-env mutation site, no cross-test race): the env
         // overrides flip the CUDA Tier-1 knob + base image. `MODAL_RUST_INSTALL_RUST`

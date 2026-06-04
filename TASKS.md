@@ -102,7 +102,12 @@ byte-for-byte from the M13 `gpu_app.py` recipe; base `nvidia/cuda:12.6.3-devel`.
 example-burn-add` ran at **image-build time** (proven: no cargo at call). burn-add stays CUDA-only + out of
 default-members. Built via `burn-gpu-capstone`; 2/2 reviews PASS; gates green (155 tests). **The through-line
 is complete** (write Rust → run/deploy a real GPU ML workload via our own client). **Remaining (AFK run):
-~~`.spawn()`/`.map()`~~ ✅, then cargo cache (P6), user-facing secrets/volumes, P10 cleanup.**
+~~`.spawn()`/`.map()`~~ ✅, ~~cargo cache (P6)~~ ✅, then user-facing secrets/volumes, P10 cleanup.**
+
+**[2026-06-04 AFK] ✅ P6 cargo cache** — V2-Volume `cache.tar.zst` archive, ON by default, `cache=false`/
+`MODAL_RUST_NO_CACHE` opt-out, RUN-path only. Live: cold 6.45s → warm 0.06s (`Fresh`); ~3.5× end-to-end;
+miss-safe. SDK `ops/volume.rs` + `FunctionSpec.volume_mounts`. Fixed 2 live bugs (target/ ENV bake; orphan
+.tmp). README updated. Built via `p6-cargo-cache`; 2/2 reviews PASS; gates green.
 
 **[2026-06-04 AFK] ✅ `.spawn()`/`.map()`** — fan-out (input order) + fire-and-forget (`FunctionCall::get`).
 Proven live (`map → [2,4,6,42]` ordered; `spawn → fc-… → get → 42`); fixed the `last_entry_id` "0-0" sentinel

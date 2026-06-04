@@ -9,6 +9,7 @@
 //! - [`mount`]  — resolve the hosted client mount (`MountGetOrCreate`, GLOBAL) → `mount_id`.
 //! - [`function`] — `FunctionPrecreate` + `FunctionCreate` (FILE mode, fix #1) + `FunctionGet`.
 //! - [`invoke`] — `FunctionMap` → `FunctionPutInputs` fallback (fix #3) → poll `FunctionGetOutputs`.
+//! - [`volume`] — `VolumeGetOrCreate` (create-if-missing, V2) → `volume_id` (P6 cargo cache).
 //!
 //! ## The three fixes (why modal-rs failed; see `workpads/shim-backend/spike-notes.md`)
 //!
@@ -25,6 +26,7 @@ pub mod image;
 pub mod invoke;
 pub mod local_dir;
 pub mod mount;
+pub mod volume;
 
 use crate::proto::api::generic_result::GenericStatus;
 use crate::proto::api::GenericResult;

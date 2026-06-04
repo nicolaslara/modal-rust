@@ -287,6 +287,17 @@ That split is the core product invariant. The development path optimizes for
 fast iteration from local Rust source; the deployed path optimizes for stable
 invocation without rebuilding.
 
+### Build cache
+
+To keep the `.remote()` development loop fast, the in-container Cargo build is
+cached **on by default**: `CARGO_HOME` (and the build `target/`) are persisted as
+a single compressed archive on a Modal Volume, unpacked on container start and
+repacked on exit. A warm run skips the registry fetch and recompilation — on a
+heavy crate this turns a cold rebuild into a `Fresh` no-op. A cache miss only ever
+costs time; it never changes the result. Disable it per function with
+`#[function(cache = false)]`, or globally with `MODAL_RUST_NO_CACHE=1`. (`deploy`
+builds once at image-build time, so the cache applies to the `run` path only.)
+
 ## Architecture
 
 The workspace is split into focused crates:

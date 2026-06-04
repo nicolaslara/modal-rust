@@ -990,3 +990,27 @@ SDK: `poll_outputs_indexed(fcid, index, deadline)` (`.remote()` passes `None` ->
 **Real bug fixed live:** the indexed `FunctionGetOutputs` poll sent an empty `last_entry_id` -> Modal rejects with
 INVALID_ARGUMENT "No last_entry_id provided." Fix: seed the cursor with the `"0-0"` sentinel (matches the Python
 client's `get_all_outputs`), `LAST_ENTRY_ID_INITIAL` in `ops/invoke.rs`. Gates green; 2/2 reviews PASS.
+
+---
+
+### ✅ P6 — cargo build cache (V2-Volume archive, ON by default) (2026-06-04, AFK run)
+
+The `run`-path in-body cargo build is now CACHED, ON by default. Mechanism (per §C, NOT CARGO_HOME-on-volume):
+a V2 Volume `modal-rust-cargo-cache` at `/cache` holds ONE archive (`cache.tar.zst`, gzip fallback if zstd
+absent); the wrapper unpacks it to `/tmp` on start (build on fast local disk: `CARGO_HOME=/tmp/cargo`,
+`CARGO_TARGET_DIR=/tmp/target`) and repacks on exit, relying on `allow_background_commits` (no `vol.reload` on
+the hot path). **Proven live (RUN path, `add`):** cold cargo build 6.45s → warm **0.06s** (`Fresh`, no
+`Compiling`/`Downloaded`); end-to-end 32.9s → 9.3s (~3.5×). Miss-safe: correct `{sum:42}` cold/warm/opt-out.
+
+SDK: `ops/volume.rs` `volume_get_or_create(name, v2, create_if_missing)` + `FunctionVolumeMount` +
+`FunctionSpec.volume_mounts` → `Function.volume_mounts` (field 33; default empty ⇒ wire-identical pre-P6,
+prost omits it). Facade (`remote.rs`): wrapper `_unpack_cache`/`_pack_cache` (atomic temp+replace, all failures
+caught → logged, never raise); `RemoteConfig.cache` (default ON) + `discover_cache()` (`MODAL_RUST_NO_CACHE`);
+the decorator `cache=false` wins (`app.rs::resolve_function`). Volume attached on the RUN path ONLY (deploy uses
+its own wrapper, attaches no volume — verified). cache=false / opt-out ⇒ no volume mount.
+
+**Two real bugs fixed live:** (1) `target/` caching never engaged — `MODAL_RUST_CACHE_TARGET` is read in the
+container but the local env doesn't cross to Modal; fix bakes `ENV MODAL_RUST_CACHE_TARGET=1` into the run image
+when set locally (this produced the `Fresh` 0.06s warm build). (2) orphan `.tmp` on the volume when `tar --zstd`
+fails without the zstd binary; fix removes the partial before the gzip fallback. Gates green; 2/2 reviews PASS;
+ephemeral apps (no lingering deploy). README updated (Build cache section).

@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::proto::api::function::{DefinitionType, FunctionType};
 use crate::proto::api::{
     DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
-    GpuConfig, Resources,
+    GpuConfig, Resources, VolumeMount,
 };
 use crate::retry::retry_unary;
 
@@ -82,6 +82,41 @@ impl FunctionResources {
     }
 }
 
+/// One persistent-volume attachment for a function. Maps to proto `VolumeMount`
+/// on `Function.volume_mounts`. Additive: a spec with an empty `volume_mounts`
+/// is wire-identical to before P6.
+#[derive(Debug, Clone)]
+pub struct FunctionVolumeMount {
+    /// Resolved volume id ([`ModalClient::volume_get_or_create`]).
+    pub volume_id: String,
+    /// In-container mount path (e.g. `"/cache"` for the cargo archive).
+    pub mount_path: String,
+    /// Enable automatic background commits (proto field 3). `true` for the cargo
+    /// cache so the repacked archive is persisted without a hot-path `reload()`.
+    pub allow_background_commits: bool,
+}
+
+impl FunctionVolumeMount {
+    /// New mount with background commits ENABLED (the cargo-cache default).
+    pub fn new(volume_id: impl Into<String>, mount_path: impl Into<String>) -> Self {
+        Self {
+            volume_id: volume_id.into(),
+            mount_path: mount_path.into(),
+            allow_background_commits: true,
+        }
+    }
+
+    fn to_proto(&self) -> VolumeMount {
+        VolumeMount {
+            volume_id: self.volume_id.clone(),
+            mount_path: self.mount_path.clone(),
+            allow_background_commits: self.allow_background_commits,
+            read_only: false, // cargo cache must be writable
+            sub_path: None,   // field 5 unset
+        }
+    }
+}
+
 /// Declarative spec for a FILE-mode function create.
 ///
 /// FILE mode carries NO serialized bytecode: the function is identified by
@@ -111,6 +146,10 @@ pub struct FunctionSpec {
     /// `ModuleNotFoundError`. Mirrors `_functions.py:936-939`/`:1014`. Defaults to
     /// `true`.
     pub mount_client_dependencies: bool,
+    /// Persistent-volume attachments → `Function.volume_mounts`. DEFAULT EMPTY: an
+    /// unset list keeps the create wire-identical to pre-P6, so every existing
+    /// function is unchanged. P6 pushes the cargo-cache volume here.
+    pub volume_mounts: Vec<FunctionVolumeMount>,
 }
 
 impl FunctionSpec {
@@ -129,6 +168,7 @@ impl FunctionSpec {
             timeout_secs: 300,
             resources: FunctionResources::default(),
             mount_client_dependencies: true,
+            volume_mounts: Vec::new(),
         }
     }
 
@@ -178,6 +218,24 @@ impl FunctionSpec {
     /// fallback) or where runtime dep-mounting is unavailable.
     pub fn with_mount_client_dependencies(mut self, enabled: bool) -> Self {
         self.mount_client_dependencies = enabled;
+        self
+    }
+
+    /// Attach volume mounts (e.g. the cargo build cache). Replaces any existing list.
+    pub fn with_volume_mounts(mut self, volume_mounts: Vec<FunctionVolumeMount>) -> Self {
+        self.volume_mounts = volume_mounts;
+        self
+    }
+
+    /// Append a single volume mount (background commits ENABLED). Convenience for
+    /// the cargo-cache attach: `with_volume_mount(vid, "/cache")`.
+    pub fn with_volume_mount(
+        mut self,
+        volume_id: impl Into<String>,
+        mount_path: impl Into<String>,
+    ) -> Self {
+        self.volume_mounts
+            .push(FunctionVolumeMount::new(volume_id, mount_path));
         self
     }
 }
@@ -265,6 +323,9 @@ impl ModalClient {
             // Worker injects the client dep closure at container start (modern
             // builder), so the add_python image needs no `pip install modal` layer.
             mount_client_dependencies: spec.mount_client_dependencies,
+            // Empty list ⇒ prost omits field 33 ⇒ byte-identical to pre-P6 for all
+            // existing (no-volume) callers. P6 attaches the cargo-cache volume here.
+            volume_mounts: spec.volume_mounts.iter().map(|m| m.to_proto()).collect(),
             ..Default::default()
         };
 
@@ -362,6 +423,30 @@ mod tests {
         assert_eq!(spec.timeout_secs, 120);
         // add_python images rely on worker-injected client deps by default.
         assert!(spec.mount_client_dependencies);
+        // No volume by default (wire-identical to pre-P6).
+        assert!(spec.volume_mounts.is_empty());
+    }
+
+    #[test]
+    fn volume_mounts_default_empty() {
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(
+            spec.volume_mounts.is_empty(),
+            "volume_mounts must default empty (wire-identical to pre-P6)"
+        );
+    }
+
+    #[test]
+    fn with_volume_mount_appends_and_to_proto() {
+        let spec = FunctionSpec::new("m", "handler", "im-1").with_volume_mount("vo-1", "/cache");
+        assert_eq!(spec.volume_mounts.len(), 1);
+        let m = spec.volume_mounts[0].to_proto();
+        assert_eq!(m.volume_id, "vo-1");
+        assert_eq!(m.mount_path, "/cache");
+        // Cargo cache: writable + background commits, no sub_path.
+        assert!(m.allow_background_commits, "bg-commits ON for cargo cache");
+        assert!(!m.read_only, "cargo cache must be writable");
+        assert!(m.sub_path.is_none(), "sub_path (field 5) unset");
     }
 
     #[test]

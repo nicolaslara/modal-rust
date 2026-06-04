@@ -249,6 +249,11 @@ impl App {
         let cfg = self.config_for(entrypoint);
         let cfg_gpu: Option<String> = cfg.gpu.map(|s| s.to_string());
         let cfg_timeout: Option<u32> = cfg.timeout_secs;
+        // P6 cache precedence: the decorator `#[function(cache=…)]` (explicit
+        // `Some(_)`) OVERRIDES the env/default base; a bare `#[function]` (`None`)
+        // defers to `run_config.cache` (folded from MODAL_RUST_NO_CACHE / default ON).
+        // Matches the gpu/timeout override semantics.
+        let cfg_cache: Option<bool> = cfg.cache;
 
         // Resolve (and memoize) the invokable function_id. `get_or_try_init`
         // single-flights the create sequence under concurrent RUN-path calls.
@@ -258,6 +263,7 @@ impl App {
                 let mut run_config = handle.config.clone();
                 run_config.gpu = cfg_gpu.clone();
                 run_config.timeout_override_secs = cfg_timeout;
+                run_config.cache = cfg_cache.unwrap_or(run_config.cache);
                 let mut client = handle.client.lock().await;
                 remote::ensure_function(&mut client, &handle.app_id, &handle.app_name, &run_config)
                     .await
@@ -487,6 +493,32 @@ mod tests {
         // The bare decorated entrypoint has the default (all-None) config.
         let bare = app.config_for("add");
         assert_eq!(bare, modal_rust_runtime::FunctionConfig::default());
+    }
+
+    #[test]
+    fn decorator_cache_override_precedence() {
+        // Mirror the `resolve_function` precedence: `cfg_cache.unwrap_or(base)`.
+        // `Some(false)` (an explicit `#[function(cache=false)]`) wins over either
+        // base; `None` (bare `#[function]`) defers to the env/default base.
+        let apply = |cfg_cache: Option<bool>, base: bool| cfg_cache.unwrap_or(base);
+
+        // Decorator cache=false beats a default-ON base AND an OFF base.
+        assert!(!apply(Some(false), true), "Some(false) overrides base ON");
+        assert!(!apply(Some(false), false));
+        // Decorator cache=true beats an OFF (env MODAL_RUST_NO_CACHE) base.
+        assert!(apply(Some(true), false), "Some(true) overrides base OFF");
+        // Bare decorator (None) defers to whatever the base is.
+        assert!(apply(None, true), "None defers to base ON");
+        assert!(!apply(None, false), "None defers to base OFF");
+
+        // The decorated `add_gpu` entrypoint carries cache=Some(false) end-to-end, so
+        // the RUN path will force cache off for it regardless of the env base.
+        let app = App::from_inventory();
+        assert_eq!(app.config_for("add_gpu").cache, Some(false));
+        assert!(!apply(app.config_for("add_gpu").cache, true));
+        // The bare `add` entrypoint defers (cache=None).
+        assert_eq!(app.config_for("add").cache, None);
+        assert!(apply(app.config_for("add").cache, true));
     }
 
     #[test]
