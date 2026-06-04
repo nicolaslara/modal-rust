@@ -102,7 +102,14 @@ byte-for-byte from the M13 `gpu_app.py` recipe; base `nvidia/cuda:12.6.3-devel`.
 example-burn-add` ran at **image-build time** (proven: no cargo at call). burn-add stays CUDA-only + out of
 default-members. Built via `burn-gpu-capstone`; 2/2 reviews PASS; gates green (155 tests). **The through-line
 is complete** (write Rust → run/deploy a real GPU ML workload via our own client). **Remaining (AFK run):
-~~`.spawn()`/`.map()`~~ ✅, ~~cargo cache (P6)~~ ✅, ~~secrets/volumes~~ ✅, then P10 cleanup (last).**
+~~`.spawn()`/`.map()`~~ ✅, ~~cargo cache (P6)~~ ✅, ~~secrets/volumes~~ ✅, ~~P10 cleanup~~ ✅ — **🏁 ALL DONE.**
+
+**[2026-06-04 AFK] ✅ P10 — legacy codegen deleted; CLI is programmatic-only.** Removed templates.rs +
+templates/*.tmpl + `--use-shim` + cmd_*_shim + the doctor modal-CLI check + dead shim tests. `programmatic.rs`
+is the only path; doctor keeps auth + `--rust`. Live re-confirm: `run/deploy/call add → {sum:42}`, `--use-shim`
+gone, no `.py`/`modal` subprocess. Kept workpads/*.py as reference. Built via `p10-remove-codegen`; 2/2 reviews
+PASS; gates green. README updated (dropped `--use-shim`). **🏁 The project is complete — see
+`workpads/shim-backend/knowledge.md` "Project complete".**
 
 **[2026-06-04 AFK] ✅ Secrets + user volumes** — `#[function(secrets=[…], volumes=["/data=name"])]` →
 `Function.secret_ids` (env injected) + a user Volume mount; coexists with the P6 cache volume. Live: secret

@@ -1034,3 +1034,31 @@ container but the local env doesn't cross to Modal; fix bakes `ENV MODAL_RUST_CA
 when set locally (this produced the `Fresh` 0.06s warm build). (2) orphan `.tmp` on the volume when `tar --zstd`
 fails without the zstd binary; fix removes the partial before the gzip fallback. Gates green; 2/2 reviews PASS;
 ephemeral apps (no lingering deploy). README updated (Build cache section).
+
+---
+
+### ✅ P10 — legacy Python-shim codegen deleted; CLI is programmatic-only (2026-06-04, AFK run)
+
+The shim path (kept behind `--use-shim` since P9 as a safety net) is now DELETED — the programmatic path is
+proven everywhere, so the fallback is dead weight. Removed: `crates/modal-rust-cli/src/templates.rs` +
+`templates/{dev,deploy,call}_app.py.tmpl` (+ `mod templates;`), the `--use-shim` flag on all commands, the
+`cmd_*_shim`/`run_modal`/`write_shim`/`generated_dir`/`shim_params` functions, the doctor `check_modal_cli`
+branch, and all dead shim/gpu-kwarg/byte-equivalence tests. `doctor` keeps only auth (~/.modal.toml /
+MODAL_TOKEN_*) + the `--rust` cargo/rustc checks; the `modal` CLI is no longer referenced anywhere. KEPT:
+`programmatic.rs` (the only path now), the runner/facade/SDK/examples, and `workpads/{prototype,gpu-compute}/*.py`
+as historical reference (the recipes they proved are now encoded in the SDK). Also fixed the stale clap `--help`
+`about` string. **Live re-confirm:** `modal-rust run/deploy/call add → {sum:42}` via the programmatic path, with
+`--use-shim` rejected by clap, no `.py` written, no `modal` subprocess. `grep -rn "use_shim|cmd_run_shim|
+templates::" crates/` is empty. Gates green; 2/2 reviews PASS. README updated (dropped the `--use-shim` note).
+
+---
+
+## 🏁 Project complete (2026-06-04)
+
+modal-rust delivers its full vision, every piece proven LIVE on Modal via our own first-party gRPC client
+(no `modal` CLI, no `modal-rs`, no per-project Python): write an ordinary Rust function (`#[modal_rust::function
+(gpu=…, timeout=…, cache=…, secrets=[…], volumes=[…])]` or manual registry) and `.local()` / `.remote()` /
+`deploy` + `call` it — from the facade or the `modal-rust` CLI — for CPU or GPU, trivial or a real Burn/CUDA ML
+workload, with fan-out (`.map`/`.spawn`), a build cache (on by default), secrets, and volumes. The image +
+upload match the official client (add_python / CUDA-devel + rustup; cargo-metadata-scoped uploads with
+`.modalignore`>`.gitignore`>defaults). See the dated sections above for each milestone's live evidence.

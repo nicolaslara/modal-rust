@@ -63,11 +63,10 @@ From a local checkout, install the CLI you are editing with:
 cargo install --path crates/modal-rust-cli
 ```
 
-By default the CLI drives the first-party SDK directly — it builds your crate,
-reads `modal_runner --describe`, and creates/invokes the function over gRPC. No
-generated Python and no `modal` CLI; just configure Modal credentials. (The legacy
-Python-shim path is still available behind `--use-shim`, which does require the
-`modal` CLI on your `PATH`.)
+The CLI drives the first-party SDK directly — it builds your crate, reads
+`modal_runner --describe`, and creates/invokes the function over gRPC. There is no
+generated Python and no dependency on the `modal` CLI; just configure Modal
+credentials.
 
 Check your machine first:
 

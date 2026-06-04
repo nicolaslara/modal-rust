@@ -1,7 +1,6 @@
 //! `modal-rust doctor` — an OFFLINE preflight (boundaries.md §8, tasks.md M9b).
 //!
 //! Checks, in order:
-//!   - `modal` is on `$PATH` (and `modal --version` runs).
 //!   - Modal credentials are present (`~/.modal.toml` or `MODAL_TOKEN_*`).
 //!   - with `--rust`: `cargo` and `rustc` are present, AND the resolved release
 //!     profile is NOT `panic = "abort"` (which would silently degrade the frozen
@@ -69,32 +68,6 @@ fn capture_version(bin: &str, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(s)
-    }
-}
-
-/// Check: `modal` CLI is on `$PATH` and `modal --version` runs.
-fn check_modal_cli() -> Check {
-    match which("modal") {
-        Some(path) => match capture_version("modal", &["--version"]) {
-            Some(ver) => Check::Ok(format!("modal CLI: {} ({})", ver, path.display())),
-            None => Check::Fail(fail_envelope(
-                "missing_prerequisite",
-                "`modal` is on $PATH but `modal --version` failed to run",
-                json!({
-                    "prerequisite": "modal CLI",
-                    "found_at": path.display().to_string(),
-                    "remediation": "Verify the modal CLI install; try `modal --version` manually."
-                }),
-            )),
-        },
-        None => Check::Fail(fail_envelope(
-            "missing_prerequisite",
-            "`modal` CLI not found on $PATH",
-            json!({
-                "prerequisite": "modal CLI",
-                "remediation": "Install the Modal CLI: `pip install modal` (or `uv tool install modal`), then ensure it is on $PATH."
-            }),
-        )),
     }
 }
 
@@ -262,39 +235,29 @@ fn release_profile_panic(text: &str) -> Option<String> {
     None
 }
 
-/// Run the full `doctor` preflight. `with_rust` enables the `--rust` checks;
-/// `with_shim` adds the legacy `modal`-CLI-on-$PATH check (the `--use-shim` fallback).
+/// Run the full `doctor` preflight. `with_rust` enables the `--rust` checks.
 /// `project_dir` is the directory whose manifest chain is inspected for the
 /// `panic = "abort"` profile check (the cwd for a bare `doctor`).
 ///
-/// The DEFAULT path is programmatic (P9): it connects to Modal directly and never
-/// spawns `modal`, so the `modal` CLI is NOT a hard requirement. Only auth (always)
-/// and cargo/rustc (under `--rust`, now MORE load-bearing because the default path
-/// runs a local `cargo build` for `--describe`) are required. The `modal` CLI is
-/// checked ONLY under `--use-shim`.
+/// The path is programmatic (P9/P10): it connects to Modal directly and never
+/// spawns `modal`, so the `modal` CLI is NOT a requirement. Only auth (always)
+/// and cargo/rustc (under `--rust`, load-bearing because the programmatic path
+/// runs a local `cargo build` for `--describe`) are required.
 ///
 /// Prints a clear report to stdout. Returns the process exit code: `0` if every
 /// check passed; `1` if any check FAILED (the first failure's structured error is
 /// printed to stderr as a single JSON envelope line, reusing the runner shape).
-pub fn run(with_rust: bool, with_shim: bool, project_dir: &std::path::Path) -> i32 {
+pub fn run(with_rust: bool, project_dir: &std::path::Path) -> i32 {
     println!("modal-rust doctor — preflight (OFFLINE)");
-    if with_shim {
-        println!("(--use-shim: also checking the legacy `modal` CLI on $PATH)");
-    } else {
-        println!("(default path is programmatic; the modal CLI is required only with --use-shim)");
-    }
+    println!("(programmatic path; the modal CLI is not required — auth + --rust cargo/rustc only)");
     if with_rust {
         println!("(--rust: also checking cargo/rustc and the release panic profile)");
     }
     println!();
 
-    // Auth is ALWAYS a hard requirement (the default path's `App::connect_*` reads
-    // ~/.modal.toml / MODAL_TOKEN_*). The `modal` CLI is checked ONLY under
-    // --use-shim. cargo/rustc/panic under --rust.
+    // Auth is ALWAYS a hard requirement (the programmatic path's `App::connect_*`
+    // reads ~/.modal.toml / MODAL_TOKEN_*). cargo/rustc/panic under --rust.
     let mut checks: Vec<Check> = vec![check_modal_credentials()];
-    if with_shim {
-        checks.insert(0, check_modal_cli());
-    }
     if with_rust {
         checks.push(check_cargo());
         checks.push(check_rustc());
