@@ -2886,6 +2886,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "modal-rust"
+version = "0.1.0"
+dependencies = [
+ "example-add",
+ "modal-rust-macros",
+ "modal-rust-runtime",
+ "modal-rust-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "modal-rust-cli"
 version = "0.0.0"
 dependencies = [

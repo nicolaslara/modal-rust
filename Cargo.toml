@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/modal-rust-sdk",
+    "crates/modal-rust",
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",
@@ -20,6 +21,7 @@ members = [
 # which links with no CUDA at build time, so it stays in the default set.)
 default-members = [
     "crates/modal-rust-sdk",
+    "crates/modal-rust",
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",

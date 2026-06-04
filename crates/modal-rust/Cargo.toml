@@ -1,0 +1,25 @@
+[package]
+name = "modal-rust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Ergonomic user-facing facade for modal-rust: App/Function handles with in-process .local() (frozen Registry) and the locked .remote()/.spawn()/.map() async surface. Re-exports modal_rust_sdk as `sdk`."
+publish = false
+
+[lib]
+name = "modal_rust"
+
+[dependencies]
+modal-rust-sdk     = { path = "../modal-rust-sdk" }
+modal-rust-runtime = { path = "../modal-rust-runtime" }
+# Re-exported so users can spell `#[modal_rust::function]` (see lib.rs caveat).
+modal-rust-macros  = { path = "../modal-rust-macros" }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The real .local() proof: example-add::modal_registry() gives a frozen Registry.
+# Acyclic — example-add depends only on modal-rust-runtime, never on modal-rust.
+example-add = { path = "../../examples/add" }
+# Drives the immediately-ready async stub future in remote_returns_not_implemented.
+tokio = { version = "1", features = ["rt", "macros"] }

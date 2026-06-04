@@ -22,6 +22,16 @@ test on default-members; 23 sdk unit tests; live tests `#[ignore]`+`live`-featur
 3/3 adversarial reviews PASS. Built via the `build-modal-rust-sdk` workflow. This is **P1
 done + a large slice of P3** (see `workpads/shim-backend/{knowledge.md,tasks.md}`).
 
+**[2026-06-04] `crates/modal-rust` facade + real `.local()` landed.** The umbrella crate
+(lib `modal_rust`): `pub use modal_rust_sdk as sdk;` + runtime re-exports + the
+`#[modal_rust::function]` macro (with a documented 3-dep caveat). `App`/`Function` with a
+**real `.local()`** — in-process dispatch through the *same frozen Registry + HandlerFn* the
+runner uses (`add.local({40,2}) == {sum:42}`, 6/6 tests). `.remote()/.spawn()/.map()`
+signatures locked, returning an honest `NotImplemented` (pending SDK source-upload).
+`examples/add` got additive symmetric serde derives (required by `.local()` bounds). Built
+via `facade-local-orchestration`; 3/3 reviews PASS; gates green. **Next: SDK source-upload
+(`MountPutFile`/`BlobCreate`/`reqwest`) + real `.remote()` running `modal_runner` live.**
+
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/
 > call` off Python codegen (P3→P9), then deploy path (P5), dynamic config from the registry

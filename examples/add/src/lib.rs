@@ -15,7 +15,13 @@ use serde::{Deserialize, Serialize};
 
 /// The single named-JSON-object input for `add` (boundaries.md §3: never a
 /// positional array).
-#[derive(Debug, Deserialize)]
+///
+/// Derives both `Serialize` and `Deserialize`: the runner only needs
+/// `Deserialize` (it decodes the input), but the facade's `Function::local`/
+/// `.remote()` callers construct and serialize an `In` value, so the input type
+/// must also be `Serialize`. Adding `Serialize` is additive and changes no
+/// behavior.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AddInput {
     /// First addend.
     pub a: i64,
@@ -24,7 +30,13 @@ pub struct AddInput {
 }
 
 /// The output of `add`.
-#[derive(Debug, Serialize)]
+///
+/// Derives both `Serialize` and `Deserialize`: the runner only needs `Serialize`
+/// (it encodes the output), but the facade's `Function::local`/`.remote()` callers
+/// deserialize the handler's JSON output back into an `Out` value, so the output
+/// type must also be `Deserialize`. Adding `Deserialize` is additive and changes
+/// no behavior.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AddOutput {
     /// `a + b`.
     pub sum: i64,
