@@ -812,3 +812,34 @@ And the two diagnosed up front:
    on `function_get_outputs` and recovered.
 
 Offline gates green throughout (108 tests). Live tests stay `#[ignore]` + `live`-feature gated.
+
+---
+
+### ✅ DEPLOY path (P5) PROVEN LIVE + the run-vs-deploy app lifecycle fixed (2026-06-04)
+
+`app.call("modal-rust-add-deploy","add",AddInput{40,2}) == {sum:42}` against a PERSISTENT deployed app, with
+the build at **IMAGE-BUILD time** and the deployed runtime running **no cargo**. Boundary proven both ways from
+logs: `Step 5: RUN cd /app/src && cargo build --release … Finished release in 9.07s` (binary baked to
+`/app/modal_runner`), and **zero** `cargo` in the deployed app's call/runtime logs (body execs only
+`/app/modal_runner`). Re-deploy under the **stable** name replaces in place (no accumulation).
+
+- **copy=True mechanism**: `ImageSpec` gained `context_mount_id` (proto `Image.context_mount_id=15`) +
+  `context_files` (`=7`). DEPLOY reuses our `mount_local_dir` upload as the image **build context**, then the
+  dockerfile does `COPY . /` + `cargo build` at build time + `cp` to bake `/app/modal_runner`. RUN images are
+  byte-identical when these are unset.
+- **Deploy wrapper** (`crates/modal-rust/src/deploy.rs`): a FILE-mode module that execs ONLY `/app/modal_runner`
+  — no cargo, no source mount (enforced by a test). `App::deploy`/`deploy_with` (persistent) + `App::call`
+  (from_name + invoke; no upload/build/publish).
+
+**Run-vs-deploy app lifecycle FIX (closes the crash-loop accumulation the user flagged):** `.remote()` was
+leaving a PERSISTENT `deployed` app because `ensure_function` called `app_publish` with `APP_STATE_DEPLOYED`
+— promoting the ephemeral app to persistent (so broken pre-fix ones lingered + crash-looped). Fixed to match
+Modal's `runner.py`: the SDK `app_publish` now takes an `app_state` (+ `app_publish_ephemeral`/`_deployed`
+wrappers); **RUN publishes `APP_STATE_EPHEMERAL` and invokes the `function_id` directly** (`from_name` only
+resolves DEPLOYED apps), so the app **GCs on client disconnect**; **DEPLOY** is the only `app_publish_deployed`
+path. Live-verified: after `.remote()`, `modal app list` shows the run app as `ephemeral`/`stopped`, NOT
+`deployed`. Only intentional deploys persist (`modal-rust-add-deploy` + the legacy `modal-rust-add-poc`).
+
+Offline gates green (fmt/clippy `-D warnings`/build/test on default-members). One adversarial reviewer died on
+an infra socket error; the boundary is independently covered by the live logs + the runtime-pure-wrapper test,
+and the hygiene reviewer passed all 4 gates. **The run/deploy/call triad is now fully programmatic + live.**

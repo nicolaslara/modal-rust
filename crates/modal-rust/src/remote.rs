@@ -207,10 +207,25 @@ fn discover_package() -> String {
 
 /// Ensure the run function exists on Modal and return its invokable `function_id`.
 ///
-/// Runs the full create sequence (steps 2-8 of the spec): client mount, uploaded
-/// source mount, run image, precreate, FunctionCreate FILE, AppPublish, from_name.
+/// Runs the full create sequence (client mount, uploaded source mount, run image,
+/// precreate, FunctionCreate FILE, **EPHEMERAL** AppPublish, from_name).
 /// Idempotent at the Modal level (get-or-create semantics); callers memoize the
 /// result per App so it runs at most once per process.
+///
+/// ## RUN publishes EPHEMERAL, not DEPLOYED
+///
+/// The RUN path runs inside an EPHEMERAL app ([`crate::App::connect`] uses
+/// `app_create_ephemeral`). It DOES call `AppPublish` — publishing is REQUIRED to
+/// make the created function invokable (without it, `FunctionMap` fails "function
+/// not found", live-verified 2026-06-04) — but with `APP_STATE_EPHEMERAL`, NOT
+/// `APP_STATE_DEPLOYED`. The ephemeral state keeps the app "discharged when the
+/// client disconnects" (proto), so a `.remote()` leaves NO lingering persistent
+/// deploy. Publishing with `APP_STATE_DEPLOYED` (the prior bug) promoted the
+/// ephemeral app to a PERSISTENT `deployed` one that lingered (`modal app list`
+/// showed `modal-rust-live-remote` `deployed`, `Stopped at: None`). This mirrors
+/// Modal Python's `runner.py`, which publishes ephemeral runs and deploys alike,
+/// differing ONLY in the state. PERSISTENT (DEPLOYED) publish is DEPLOY-only
+/// ([`crate::App::deploy`]).
 pub(crate) async fn ensure_function(
     client: &mut ModalClient,
     app_id: &str,
@@ -252,7 +267,13 @@ pub(crate) async fn ensure_function(
         .function_create(app_id, &precreate_id, &fn_spec)
         .await?;
 
-    // 7. AppPublish so from_name resolves the function.
+    // 7. AppPublish with APP_STATE_EPHEMERAL. Publishing is REQUIRED to make the
+    //    created function INVOKABLE (without it, FunctionMap fails "function not
+    //    found" — live-verified 2026-06-04). The EPHEMERAL state keeps the app
+    //    throwaway: it is "discharged when the client disconnects" (proto), so the
+    //    RUN path leaves NO lingering deploy. PERSISTENT (DEPLOYED) publish is
+    //    DEPLOY-only (`crate::deploy`). Mirrors Modal Python's `runner.py`, which
+    //    publishes ephemeral runs and deploys alike, differing only in state.
     let mut function_ids = HashMap::new();
     function_ids.insert(WRAPPER_CALLABLE.to_string(), created.function_id.clone());
     let mut definition_ids = HashMap::new();
@@ -260,14 +281,16 @@ pub(crate) async fn ensure_function(
         definition_ids.insert(created.function_id.clone(), created.definition_id.clone());
     }
     client
-        .app_publish(app_id, app_name, function_ids, definition_ids)
+        .app_publish_ephemeral(app_id, app_name, function_ids, definition_ids)
         .await?;
 
-    // 8. Resolve the invokable function_id.
-    let invoke_id = client
-        .function_from_name(app_name, WRAPPER_CALLABLE, None)
-        .await?;
-    Ok(invoke_id)
+    // 8. Invoke via the FunctionCreate `function_id` DIRECTLY — NOT `from_name`.
+    //    `from_name`/`FunctionGet` is the DEPLOYED lookup; an EPHEMERAL app is not
+    //    name-resolvable in the environment (live-verified 2026-06-04: from_name on
+    //    the ephemeral app failed "App '...' not found in environment 'main'").
+    //    Modal Python's ephemeral `app.run()` likewise invokes the loaded function
+    //    handle by its `object_id`, never re-resolving by name.
+    Ok(created.function_id)
 }
 
 /// Parse the runner's one-line JSON envelope into `Result<Out, Error>`, mirroring

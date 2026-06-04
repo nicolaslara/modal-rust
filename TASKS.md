@@ -40,8 +40,18 @@ Took 4 bugs (built across `source-upload-remote` + `remote-live-resilience`): re
 upload (14 MB→732 KB), no transient-retry, invoke deadline 600s<container-timeout, and the blocker —
 Modal's init execs bare `python` so a `rust:slim` base needs `python-is-python3` (+ PEP-668
 `--break-system-packages`). Offline gates green (108 tests); 2/2 reviews PASS. Details in
-`workpads/shim-backend/knowledge.md`. **Next: deploy (P5, build-at-image-time), dynamic config from the
-registry (P4, drop `--gpu`), migrate the CLI off codegen (P9), `.spawn()`/`.map()` + cache (P6).**
+`workpads/shim-backend/knowledge.md`.
+
+**[2026-06-04] ✅ DEPLOY (P5) PROVEN LIVE + run-vs-deploy lifecycle fixed — the run/deploy/call triad is
+fully programmatic.** `app.call("modal-rust-add-deploy","add",{40,2}) == {sum:42}` against a persistent
+deploy, built at **image-build time** (cargo in build logs, **absent** at call; deployed body execs only
+`/app/modal_runner`). `copy=True` via `ImageSpec.context_mount_id`/`context_files` (reuses `mount_local_dir`
+as build context); new `crates/modal-rust/src/deploy.rs` (deploy wrapper + `App::deploy`/`call`). Also fixed
+the crash-loop accumulation: `.remote()` now publishes `APP_STATE_EPHEMERAL` + invokes `function_id` directly
+(GCs on disconnect); only `App::deploy` persists. Live-verified run apps are `ephemeral`/`stopped`. Built via
+`deploy-path`; gates green (one reviewer died on an infra socket, boundary independently covered by live logs
++ a runtime-pure-wrapper test). **Next: dynamic config from the registry (P4, drop `--gpu`), migrate the CLI
+off codegen + refresh the stale README (P9), `.spawn()`/`.map()` + cache (P6).**
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/

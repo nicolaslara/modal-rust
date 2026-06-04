@@ -7,6 +7,7 @@
 
 use tokio::sync::{Mutex, OnceCell};
 
+use crate::deploy::{self, DeployConfig, DeployedApp};
 use crate::remote::{self, RemoteConfig};
 use crate::{Error, Function, Registry, Result};
 
@@ -31,9 +32,14 @@ struct RemoteHandle {
     /// `&App`, but `invoke_cbor`/the ensure sequence need `&mut ModalClient`. The
     /// `Mutex` also single-flights concurrent `.remote()` calls cleanly.
     client: Mutex<modal_rust_sdk::ModalClient>,
-    /// Resolved control-plane app id (`AppGetOrCreate`).
+    /// Resolved control-plane app id. For the RUN path this is an EPHEMERAL app
+    /// (`AppCreate`, GC'd on disconnect) — so `.remote()` never leaves a lingering
+    /// persistent deployment. The RUN path publishes the wrapper with
+    /// `APP_STATE_EPHEMERAL` (publishing is needed to make the function invokable,
+    /// but the ephemeral state keeps the app throwaway); persistent (DEPLOYED)
+    /// `AppPublish` is DEPLOY-only.
     app_id: String,
-    /// App name — needed for `app_publish` / `from_name` resolution.
+    /// App name — needed for the EPHEMERAL `app_publish` + `from_name` resolution.
     app_name: String,
     /// Memoized invokable `function_id` for the single wrapper function that serves
     /// every entrypoint. `get_or_try_init` gives correct single-flight create.
@@ -73,7 +79,14 @@ impl App {
     /// (defaults to `"main"`).
     pub async fn connect_with_registry(name: &str, registry: Registry) -> Result<Self> {
         let mut client = modal_rust_sdk::ModalClient::connect().await?; // From<sdk::Error>
-        let app_id = client.app_get_or_create_id(name, None).await?;
+                                                                        // RUN path = EPHEMERAL app: it is GC'd when this client disconnects, so
+                                                                        // `.remote()` never leaves a lingering persistent deployment (the
+                                                                        // crash-loop-clutter fix). `ensure_function` creates the wrapper in this
+                                                                        // ephemeral app and invokes its `function_id` DIRECTLY — it does NOT
+                                                                        // `app_publish` (which would set APP_STATE_DEPLOYED and promote this
+                                                                        // throwaway app to a lingering persistent deploy). PERSISTENT publish is
+                                                                        // DEPLOY-only (`App::deploy`).
+        let app_id = client.app_create_ephemeral(name, None).await?;
         Ok(App {
             registry,
             remote: Some(RemoteHandle {
@@ -136,6 +149,68 @@ impl App {
             )
             .await?;
         Ok(envelope)
+    }
+
+    /// DEPLOY the wrapper function persistently under a STABLE app name (the
+    /// PERSISTENT path — the ONLY one that uses `AppPublish` into a named app).
+    ///
+    /// Builds the deploy image (source COPYed into a layer; `cargo build --release`
+    /// runs AT image-build time), creates the FILE-mode function with the client
+    /// mount ONLY (the prebuilt `/app/modal_runner` is baked in the image — NO
+    /// runtime source mount, NO cargo at call time), and publishes it. Re-deploys
+    /// REPLACE the named app, so re-runs never accumulate.
+    ///
+    /// Requires a connected App ([`App::connect`](crate::App::connect)). The deploy
+    /// app name comes from [`DeployConfig`] (default `"modal-rust-add-deploy"`,
+    /// override `MODAL_RUST_DEPLOY_APP`); use [`App::deploy_with`] to pass an
+    /// explicit config.
+    pub async fn deploy(&self) -> Result<DeployedApp> {
+        self.deploy_with(DeployConfig::default()).await
+    }
+
+    /// As [`App::deploy`], with an explicit [`DeployConfig`] (STABLE app name,
+    /// source root, package, base image, ignore set).
+    pub async fn deploy_with(&self, config: DeployConfig) -> Result<DeployedApp> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let mut client = handle.client.lock().await;
+        deploy::deploy_function(&mut client, &config).await
+    }
+
+    /// CALL a DEPLOYED function by app name + entrypoint, returning the typed
+    /// output with the SAME semantics as [`Function::local`](crate::Function::local).
+    ///
+    /// NO upload, NO image build, NO `app_publish` — that absence IS the deploy
+    /// invariant. The deployed function is resolved by name (`from_name`) and
+    /// invoked directly; the prebuilt `/app/modal_runner` execs the handler.
+    ///
+    /// Requires a connected App ([`App::connect`](crate::App::connect)).
+    pub async fn call<In, Out>(&self, app_name: &str, entrypoint: &str, input: In) -> Result<Out>
+    where
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned,
+    {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let input_json = serde_json::to_string(&input).map_err(Error::Encode)?;
+        let mut client = handle.client.lock().await;
+        let envelope = deploy::call_function(&mut client, app_name, entrypoint, input_json).await?;
+        crate::remote::parse_envelope::<Out>(&envelope)
+    }
+
+    /// CALL a [`DeployedApp`] returned by [`App::deploy`] directly (resolves by its
+    /// stable name). Convenience wrapper over [`App::call`].
+    pub async fn call_deployed<In, Out>(
+        &self,
+        deployed: &DeployedApp,
+        entrypoint: &str,
+        input: In,
+    ) -> Result<Out>
+    where
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned,
+    {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let mut client = handle.client.lock().await;
+        deployed.call_with(&mut client, entrypoint, input).await
     }
 
     /// Get a [`Function`] handle by entrypoint name. Resolves the [`crate::HandlerFn`]

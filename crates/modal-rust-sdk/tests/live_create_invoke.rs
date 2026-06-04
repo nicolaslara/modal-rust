@@ -209,10 +209,13 @@ async fn round_trip() -> Result<HashMap<String, serde_cbor::Value>, Error> {
     if !created.definition_id.is_empty() {
         definition_ids.insert(created.function_id.clone(), created.definition_id.clone());
     }
+    // EPHEMERAL publish (the app was created ephemeral, line ~150): publishing is
+    // required to make the function invokable, but the ephemeral state keeps the
+    // app throwaway so this live test leaves no lingering deploy.
     let published = retry!(
         "app_publish",
         5,
-        client.app_publish(
+        client.app_publish_ephemeral(
             &app_id,
             &app_name,
             function_ids.clone(),
@@ -221,13 +224,14 @@ async fn round_trip() -> Result<HashMap<String, serde_cbor::Value>, Error> {
     )?;
     eprintln!("MILESTONE published: {published:?}");
 
-    // 7. Resolve the deployed function by name.
-    let invoke_id = retry!(
-        "function_from_name",
-        6,
-        client.function_from_name(&app_name, FN_NAME, None)
-    )?;
-    eprintln!("MILESTONE resolved invoke function_id = {invoke_id}");
+    // 7. Invoke via the FunctionCreate `function_id` DIRECTLY. The app was
+    //    published EPHEMERAL (so it GCs on disconnect, leaving no lingering
+    //    deploy), and `from_name`/`FunctionGet` only resolves DEPLOYED apps — an
+    //    ephemeral app is not name-resolvable in the environment. So we invoke the
+    //    created id directly, exactly like the facade RUN path and Modal Python's
+    //    ephemeral `app.run()` (which invokes the loaded handle by `object_id`).
+    let invoke_id = created.function_id.clone();
+    eprintln!("MILESTONE invoke function_id = {invoke_id}");
 
     // 8. Invoke with CBOR (args, kwargs) = ((payload,), {}) and decode the echo.
     let mut payload = HashMap::new();

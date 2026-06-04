@@ -35,7 +35,9 @@ use base64::Engine;
 use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::ops::{describe_failure, result_status, ResultState, DEFAULT_BASE_IMAGE};
-use crate::proto::api::{Image, ImageGetOrCreateRequest, ImageJoinStreamingRequest};
+use crate::proto::api::{
+    Image, ImageContextFile, ImageGetOrCreateRequest, ImageJoinStreamingRequest,
+};
 use crate::retry::retry_unary;
 
 /// Per-stream timeout (seconds) for `ImageJoinStreaming` long-poll reconnects.
@@ -68,6 +70,17 @@ pub struct ImageSpec {
     /// its deps — see the module docs); unnecessary for a base that already carries
     /// those deps. The mounted source at `/pkg` still wins on `PYTHONPATH`.
     pub pip_install_modal: bool,
+    /// Image build CONTEXT mount id (a `mount_id` from
+    /// [`ModalClient::mount_local_dir`]). When set, emitted as
+    /// `Image.context_mount_id` (proto field 15); a `COPY` step (added via
+    /// [`ImageSpec::with_command`]) then brings the context into an image LAYER at
+    /// build time so `cargo build` can compile the source AT image-build time.
+    /// `None` for the RUN path (default); DEPLOY-only.
+    pub context_mount_id: Option<String>,
+    /// Inline small context files → `Image.context_files` (proto field 7). Unused
+    /// by the Rust deploy recipe (the source rides the context mount, not inline
+    /// files); kept for proto parity. Default empty.
+    pub context_files: Vec<(String, Vec<u8>)>,
 }
 
 impl ImageSpec {
@@ -79,6 +92,8 @@ impl ImageSpec {
             wrapper_modules: Vec::new(),
             extra_commands: Vec::new(),
             pip_install_modal: false,
+            context_mount_id: None,
+            context_files: Vec::new(),
         }
     }
 
@@ -131,6 +146,17 @@ impl ImageSpec {
         self
     }
 
+    /// Set the image build-context mount (a `mount_id` from
+    /// [`ModalClient::mount_local_dir`]). Emitted as `Image.context_mount_id`
+    /// (proto field 15). The caller adds the matching `COPY` step (use
+    /// [`ImageSpec::with_command`], e.g. `"COPY . /"`) plus the build `RUN`s; those
+    /// ride `extra_commands` and render LAST, after the context is available.
+    /// DEPLOY-only (the RUN path leaves this `None`).
+    pub fn with_context_mount(mut self, mount_id: impl Into<String>) -> Self {
+        self.context_mount_id = Some(mount_id.into());
+        self
+    }
+
     /// Render the full `dockerfile_commands` list: `FROM`, pre-bake commands (e.g.
     /// apt), optional pip line, the wrapper bakes, then extra commands.
     ///
@@ -168,9 +194,23 @@ impl ImageSpec {
 
     /// The `Image` proto message for this spec. `base_images` is empty because we
     /// base on a registry `FROM <tag>` line (only layered builds populate it).
+    ///
+    /// For the DEPLOY path, `context_mount_id` (field 15) carries the uploaded
+    /// source mount as the build context and `context_files` (field 7) any inline
+    /// files; both default to empty/unset for the RUN path, so RUN images stay
+    /// byte-identical.
     fn to_proto(&self) -> Image {
         Image {
             dockerfile_commands: self.dockerfile_commands(),
+            context_mount_id: self.context_mount_id.clone().unwrap_or_default(),
+            context_files: self
+                .context_files
+                .iter()
+                .map(|(filename, data)| ImageContextFile {
+                    filename: filename.clone(),
+                    data: data.clone(),
+                })
+                .collect(),
             ..Default::default()
         }
     }
@@ -384,6 +424,65 @@ mod tests {
         assert!(bake_idx > pip_idx, "pip must precede the wrapper bake");
         // ENTRYPOINT [] is last (extra command).
         assert_eq!(cmds.last().unwrap(), "ENTRYPOINT []");
+    }
+
+    #[test]
+    fn context_mount_emits_in_proto_only_when_set() {
+        // RUN-shape spec: no context mount → empty proto string (proto default),
+        // empty context_files → empty repeated (RUN images stay byte-identical).
+        let run = ImageSpec::from_registry("rust:1-slim")
+            .with_wrapper_module("m", "x = 1\n")
+            .to_proto();
+        assert_eq!(run.context_mount_id, "");
+        assert!(run.context_files.is_empty());
+
+        // DEPLOY-shape spec: context mount id surfaces on proto field 15.
+        let deploy = ImageSpec::from_registry("rust:1-slim")
+            .with_context_mount("mo-deploy-src")
+            .to_proto();
+        assert_eq!(deploy.context_mount_id, "mo-deploy-src");
+    }
+
+    #[test]
+    fn deploy_dockerfile_orders_copy_then_cargo_build_then_bake_after_apt_pip() {
+        // The deploy recipe: apt + pip provision python BEFORE the COPY/cargo/cp
+        // RUN steps (which ride extra_commands and render LAST), so the context is
+        // available and the toolchain exists when cargo compiles AT build time.
+        let cmds = ImageSpec::from_registry("rust:1-slim")
+            .with_apt(&["python3", "python3-pip", "python-is-python3"])
+            .with_pip_install_modal()
+            .with_wrapper_module(
+                "modal_rust_deploy_wrapper",
+                "def handler(e, i):\n    return i\n",
+            )
+            .with_context_mount("mo-deploy-src")
+            .with_command("COPY . /")
+            .with_command(
+                "RUN cd /app/src && cargo build --release -p example-add --bin modal_runner",
+            )
+            .with_command(
+                "RUN cp /app/src/target/release/modal_runner /app/modal_runner \
+                 && chmod +x /app/modal_runner",
+            )
+            .with_command("ENTRYPOINT []")
+            .dockerfile_commands();
+
+        let pos = |needle: &str| {
+            cmds.iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("missing dockerfile command containing {needle:?}"))
+        };
+        let apt = pos("apt-get update");
+        let pip = pos("python3 -m pip install");
+        let copy = pos("COPY . /");
+        let cargo = pos("cargo build --release -p example-add --bin modal_runner");
+        let cp_bake = pos("cp /app/src/target/release/modal_runner /app/modal_runner");
+
+        // apt < pip < COPY < cargo build < cp-bake (load-bearing order).
+        assert!(apt < pip, "apt must precede pip");
+        assert!(pip < copy, "pip must precede COPY");
+        assert!(copy < cargo, "COPY must precede the cargo build");
+        assert!(cargo < cp_bake, "cargo build must precede the cp/bake");
     }
 
     #[test]

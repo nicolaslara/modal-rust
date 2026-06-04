@@ -62,10 +62,12 @@ pub use modal_rust_runtime::typed;
 pub use modal_rust_macros::function;
 
 mod app;
+mod deploy;
 mod error;
 mod function;
 mod remote;
 
 pub use app::App;
+pub use deploy::{DeployConfig, DeployedApp};
 pub use error::{Error, Result};
 pub use function::{Function, FunctionCall};

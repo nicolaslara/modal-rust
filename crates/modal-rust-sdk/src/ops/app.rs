@@ -91,28 +91,41 @@ impl ModalClient {
         Ok(resp.app_id)
     }
 
-    /// Deploy via `AppPublish` (api.proto:4147) ONLY — **fix #2**.
+    /// Publish an app's functions via `AppPublish` (api.proto:4147) — **fix #2**.
     ///
     /// - `function_ids`: `function_name` → `function_id`.
     /// - `definition_ids`: `function_id` → `definition_id`
     ///   (from `FunctionCreateResponse.handle_metadata.definition_id`).
+    /// - `app_state`: the state the published app enters.
     ///
-    /// Publishes the app into `APP_STATE_DEPLOYED` so `FunctionGet`/`from_name`
-    /// resolves it. We never issue the legacy `AppSetObjects` RPC.
+    /// AppPublish is REQUIRED to make a created function INVOKABLE (without it,
+    /// `FunctionMap` fails "function ... not found" — live-verified 2026-06-04).
+    /// The `app_state` decides persistence, mirroring Modal Python's `runner.py`
+    /// (which publishes BOTH ephemeral runs and deploys, differing only in state):
+    ///
+    /// - [`AppState::Ephemeral`] — the RUN path. The app is "discharged when the
+    ///   client disconnects" (proto), so `.remote()` leaves NO lingering deploy.
+    /// - [`AppState::Deployed`] — the DEPLOY path. Persistent; `from_name` resolves
+    ///   it; re-deploys REPLACE under the same name.
+    ///
+    /// Prefer the intent-named wrappers [`ModalClient::app_publish_ephemeral`] /
+    /// [`ModalClient::app_publish_deployed`]. We never issue the legacy
+    /// `AppSetObjects` RPC.
     pub async fn app_publish(
         &mut self,
         app_id: &str,
         app_name: &str,
+        app_state: AppState,
         function_ids: HashMap<String, String>,
         definition_ids: HashMap<String, String>,
     ) -> Result<PublishedApp> {
-        // AppPublish is a set-state deploy (not an append): re-publishing the same
+        // AppPublish is a set-state publish (not an append): re-publishing the same
         // function_ids/definition_ids is idempotent, so retrying on a transient
         // reset is safe.
         let req = AppPublishRequest {
             app_id: app_id.to_string(),
             name: app_name.to_string(),
-            app_state: AppState::Deployed as i32,
+            app_state: app_state as i32,
             function_ids,
             definition_ids,
             ..Default::default()
@@ -134,5 +147,44 @@ impl ModalClient {
                 .map(|w| w.message.clone())
                 .collect(),
         })
+    }
+
+    /// Publish into [`AppState::Ephemeral`] — the RUN path. Makes the created
+    /// function INVOKABLE while keeping the app throwaway (GC'd when the client
+    /// disconnects), so `.remote()` leaves no lingering deploy.
+    pub async fn app_publish_ephemeral(
+        &mut self,
+        app_id: &str,
+        app_name: &str,
+        function_ids: HashMap<String, String>,
+        definition_ids: HashMap<String, String>,
+    ) -> Result<PublishedApp> {
+        self.app_publish(
+            app_id,
+            app_name,
+            AppState::Ephemeral,
+            function_ids,
+            definition_ids,
+        )
+        .await
+    }
+
+    /// Publish into [`AppState::Deployed`] — the DEPLOY path. Persistent;
+    /// `from_name` resolves it and re-deploys REPLACE under the same name.
+    pub async fn app_publish_deployed(
+        &mut self,
+        app_id: &str,
+        app_name: &str,
+        function_ids: HashMap<String, String>,
+        definition_ids: HashMap<String, String>,
+    ) -> Result<PublishedApp> {
+        self.app_publish(
+            app_id,
+            app_name,
+            AppState::Deployed,
+            function_ids,
+            definition_ids,
+        )
+        .await
     }
 }
