@@ -2,7 +2,7 @@
 name = "example-burn-add"
 version = "0.0.0"
 edition = "2021"
-description = "M13: a Burn tensor smoke — a minimal burn-cuda (CubeCL) tensor add on the CUDA backend (Tier 1, CUDA-runtime image; CubeCL JIT-compiles via NVRTC at runtime; needs libnvrtc + libcudart)."
+description = "M13: a Burn tensor smoke — a minimal burn-cuda (CubeCL) tensor add on the CUDA backend (Tier 1, CUDA-devel image; CubeCL JIT-compiles via NVRTC at runtime and #include <cuda_runtime.h>, so the devel image's headers + libnvrtc + libcudart are required)."
 publish = false
 
 [lib]

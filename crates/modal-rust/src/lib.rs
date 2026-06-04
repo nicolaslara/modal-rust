@@ -75,3 +75,12 @@ pub use function::{Function, FunctionCall};
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly.
 pub use remote::RemoteConfig;
+
+/// Shared lock serializing the unit tests that mutate the SHARED process env
+/// (`MODAL_RUST_*`). `cargo test` runs a binary's tests in parallel threads, so two
+/// tests touching `MODAL_RUST_INSTALL_RUST` / `MODAL_RUST_BASE_IMAGE` (a writer in
+/// `remote::tests` and a reader in `deploy::tests`) would otherwise race. Each such
+/// test takes this lock for the duration of its env reads/writes. `std::sync::Mutex`
+/// (no extra dep); poisoning is fine — a panicked test already failed.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

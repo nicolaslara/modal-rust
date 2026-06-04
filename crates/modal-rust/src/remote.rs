@@ -175,6 +175,13 @@ pub struct RemoteConfig {
     /// Per-entrypoint timeout override (decorator `FunctionConfig.timeout_secs`).
     /// When `Some`, REPLACES the path default [`timeout_secs`](RemoteConfig::timeout_secs).
     pub timeout_override_secs: Option<u32>,
+    /// Install the Rust toolchain (rustup) + the CUDA build/run env into the run
+    /// image. Set when [`base_image`](RemoteConfig::base_image) is a non-Rust base
+    /// (e.g. a `nvidia/cuda:<ver>-devel` Tier-1 base; boundaries.md §9) so the
+    /// in-body `cargo build` finds a toolchain on PATH. Default `false` (the
+    /// `rust:1-slim` base already carries Rust). Env override:
+    /// `MODAL_RUST_INSTALL_RUST` (`1`/`true`/`yes`/`on`).
+    pub install_rust: bool,
 }
 
 impl Default for RemoteConfig {
@@ -185,10 +192,11 @@ impl Default for RemoteConfig {
             remote_src: REMOTE_SRC.to_string(),
             use_cargo_scoping: true,
             modalignore_name: modal_rust_sdk::DEFAULT_MODALIGNORE_NAME.to_string(),
-            base_image: format!("rust:{RUST_VER}-slim"),
+            base_image: discover_base_image(),
             timeout_secs: REMOTE_TIMEOUT_SECS,
             gpu: None,
             timeout_override_secs: None,
+            install_rust: discover_install_rust(),
         }
     }
 }
@@ -225,6 +233,27 @@ fn discover_local_root() -> PathBuf {
 /// default `"example-add"`. Registry-derived package selection is a later milestone.
 fn discover_package() -> String {
     std::env::var("MODAL_RUST_PACKAGE").unwrap_or_else(|_| "example-add".to_string())
+}
+
+/// Discover the run base image: `MODAL_RUST_BASE_IMAGE` if set, else the default
+/// `rust:{RUST_VER}-slim`. An env-driven run path can point at the CUDA-devel base
+/// (e.g. `nvidia/cuda:12.6.3-devel-ubuntu22.04`) without touching code — parity with
+/// `MODAL_RUST_SOURCE_DIR` / `MODAL_RUST_PACKAGE`.
+fn discover_base_image() -> String {
+    std::env::var("MODAL_RUST_BASE_IMAGE").unwrap_or_else(|_| format!("rust:{RUST_VER}-slim"))
+}
+
+/// Discover whether to install the Rust toolchain into the run image:
+/// `MODAL_RUST_INSTALL_RUST` truthy (`1`/`true`/`yes`/`on`, case-insensitive) ⇒
+/// `true`, else `false`. Paired with `MODAL_RUST_BASE_IMAGE` for an env-driven CUDA
+/// run path (the CUDA base has no Rust).
+fn discover_install_rust() -> bool {
+    std::env::var("MODAL_RUST_INSTALL_RUST")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 /// Ensure the run function exists on Modal and return its invokable `function_id`.
@@ -312,9 +341,17 @@ pub(crate) async fn ensure_function(
     // (FunctionSpec defaults `mount_client_dependencies = true`) — so there is NO apt
     // layer and NO `pip install modal`. (apt+pip is retained as a documented fallback
     // in the SDK, selected only when `add_python` is unset.)
-    let spec = ImageSpec::from_registry(config.base_image.clone())
+    // When the base image carries NO Rust (a CUDA-devel Tier-1 base set via
+    // `MODAL_RUST_BASE_IMAGE` + `MODAL_RUST_INSTALL_RUST`), add the rustup + CUDA-env
+    // step so the in-body `cargo build` finds a toolchain on PATH. The default
+    // `rust:1-slim` base never sets this (byte-identical default render).
+    let mut spec = ImageSpec::from_registry(config.base_image.clone())
         .with_add_python(PYTHON_SERIES)
-        .with_python_standalone_mount_id(py_mount_id)
+        .with_python_standalone_mount_id(py_mount_id);
+    if config.install_rust {
+        spec = spec.with_rust_toolchain();
+    }
+    let spec = spec
         .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src(&config.package))
         .with_command("ENV RUST_BACKTRACE=1")
         .with_command("ENTRYPOINT []");
@@ -532,12 +569,38 @@ mod tests {
         // hardcoded ignore list is gone — ignore resolution now layers .modalignore >
         // .gitignore > built-in defaults (so e.g. references/ is excluded via the
         // repo .gitignore, no hardcoded entry needed).
+        //
+        // Serialized against other env-mutating tests (this body both reads default
+        // env AND sets MODAL_RUST_* below); see `crate::ENV_TEST_LOCK`.
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("MODAL_RUST_PACKAGE");
+        std::env::remove_var("MODAL_RUST_BASE_IMAGE");
+        std::env::remove_var("MODAL_RUST_INSTALL_RUST");
         let cfg = RemoteConfig::default();
         assert_eq!(cfg.remote_src, "/src");
         assert_eq!(cfg.base_image, "rust:1-slim");
         assert_eq!(cfg.timeout_secs, 1800);
         assert!(cfg.use_cargo_scoping, "cargo scoping is the default");
         assert_eq!(cfg.modalignore_name, ".modalignore");
+        // The CUDA Tier-1 knob defaults OFF, so the default rust:1-slim path stays
+        // byte-identical (no rustup, no CUDA env).
+        assert!(!cfg.install_rust, "install_rust defaults off");
+
+        // Same test (one process-env mutation site, no cross-test race): the env
+        // overrides flip the CUDA Tier-1 knob + base image. `MODAL_RUST_INSTALL_RUST`
+        // is parsed truthily; `MODAL_RUST_BASE_IMAGE` points at the CUDA-devel base
+        // (parity with MODAL_RUST_SOURCE_DIR / MODAL_RUST_PACKAGE).
+        std::env::set_var("MODAL_RUST_INSTALL_RUST", "1");
+        std::env::set_var(
+            "MODAL_RUST_BASE_IMAGE",
+            "nvidia/cuda:12.6.3-devel-ubuntu22.04",
+        );
+        let cuda = RemoteConfig::default();
+        assert!(cuda.install_rust, "truthy MODAL_RUST_INSTALL_RUST => true");
+        assert_eq!(cuda.base_image, "nvidia/cuda:12.6.3-devel-ubuntu22.04");
+        std::env::remove_var("MODAL_RUST_INSTALL_RUST");
+        std::env::remove_var("MODAL_RUST_BASE_IMAGE");
     }
 }

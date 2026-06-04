@@ -133,6 +133,14 @@ pub struct DeployConfig {
     /// Per-entrypoint timeout override (decorator `FunctionConfig.timeout_secs`).
     /// When `Some`, REPLACES [`timeout_secs`](DeployConfig::timeout_secs).
     pub timeout_override_secs: Option<u32>,
+    /// Install the Rust toolchain (rustup) + the CUDA build/run env into the deploy
+    /// BASE layer. Set when [`base_image`](DeployConfig::base_image) is a non-Rust
+    /// base (e.g. a `nvidia/cuda:<ver>-devel` Tier-1 base; boundaries.md §9) so the
+    /// TOP layer's image-build-time `cargo build` inherits a toolchain + the CUDA
+    /// headers. Default `false`. Inherited from [`RemoteConfig::default()`] in
+    /// [`for_app`](DeployConfig::for_app), so the `MODAL_RUST_INSTALL_RUST` env default
+    /// flows through automatically (parity with `base_image`).
+    pub install_rust: bool,
 }
 
 impl DeployConfig {
@@ -151,6 +159,7 @@ impl DeployConfig {
             timeout_secs: 300,
             gpu: None,
             timeout_override_secs: None,
+            install_rust: base.install_rust,
         }
     }
 }
@@ -188,10 +197,21 @@ pub struct DeployedApp {
 /// Two layers are REQUIRED because an `Image` has ONE `context_mount_id`: the source
 /// (top layer) and the standalone (base layer) each need their own. This mirrors the
 /// official client's image layering (`base_images={"base": self}`).
-fn deploy_base_layer_spec(python_standalone_mount_id: &str, base_image: &str) -> ImageSpec {
-    ImageSpec::from_registry(base_image.to_string())
+fn deploy_base_layer_spec(
+    python_standalone_mount_id: &str,
+    base_image: &str,
+    install_rust: bool,
+) -> ImageSpec {
+    // The rust toolchain + CUDA env ride the BASE layer (which already owns
+    // add_python) so the toolchain + CUDA headers are present BEFORE the TOP layer's
+    // `cargo build` runs. Default base never sets this (byte-identical default render).
+    let mut spec = ImageSpec::from_registry(base_image.to_string())
         .with_add_python(PYTHON_SERIES)
-        .with_python_standalone_mount_id(python_standalone_mount_id)
+        .with_python_standalone_mount_id(python_standalone_mount_id);
+    if install_rust {
+        spec = spec.with_rust_toolchain();
+    }
+    spec
 }
 
 /// Render the DEPLOY TOP layer (layer 2): bases on the add_python layer via
@@ -286,7 +306,7 @@ pub(crate) async fn deploy_function(
     //    context_mount_id: layer 1 (add_python) owns the standalone mount; layer 2
     //    (source + cargo build) owns the source mount. This mirrors the official
     //    client's image layering and provisions Python via add_python, NOT apt/pip.
-    let base_spec = deploy_base_layer_spec(&py_mount_id, &config.base_image);
+    let base_spec = deploy_base_layer_spec(&py_mount_id, &config.base_image, config.install_rust);
     let base_image_id = client.image_get_or_create(&app_id, &base_spec).await?;
     let spec = deploy_top_layer_spec(&base_image_id, &source_mount_id, &config.package);
     let image_id = client.image_get_or_create(&app_id, &spec).await?;
@@ -417,7 +437,7 @@ mod tests {
     fn deploy_base_layer_provisions_python_via_add_python() {
         // Layer 1: add_python(3.12) on the rust base, with the standalone mount as
         // the build context. NO apt, NO pip — Python comes from the standalone mount.
-        let base = deploy_base_layer_spec("mo-py-standalone", "rust:1-slim");
+        let base = deploy_base_layer_spec("mo-py-standalone", "rust:1-slim", false);
         assert_eq!(base.base_image, "rust:1-slim");
         assert_eq!(base.add_python.as_deref(), Some("3.12"));
         assert_eq!(
@@ -427,6 +447,32 @@ mod tests {
         // No apt/pip fallback on the base layer.
         assert!(base.pre_bake_commands.is_empty());
         assert!(!base.pip_install_modal);
+        // Default base layer (install_rust=false) carries no rust install. The actual
+        // rendered-command suppression is asserted SDK-side
+        // (image::tests::default_path_renders_none_of_the_rust_toolchain_steps), since
+        // `dockerfile_commands` is private to the SDK crate; here we assert the public
+        // field the facade controls.
+        assert!(!base.install_rust, "default base layer has no rust install");
+    }
+
+    #[test]
+    fn deploy_base_layer_installs_rust_for_cuda_base() {
+        // CUDA Tier-1 deploy: a `nvidia/cuda:<ver>-devel` base + add_python +
+        // with_rust_toolchain on the BASE layer, so the rust toolchain + CUDA headers
+        // are present before the TOP layer's `cargo build`. The base layer owns
+        // add_python (its standalone mount as build context), so the rustup + CUDA env
+        // render before any top-layer cargo build. The rendered ordering (add_python
+        // COPY < rustup < PATH/CUDA_PATH ENV < bake) is asserted SDK-side
+        // (image::tests::rust_toolchain_renders_after_add_python_and_before_bakes);
+        // here we assert the public fields the facade controls.
+        let base = deploy_base_layer_spec(
+            "mo-py-standalone",
+            "nvidia/cuda:12.6.3-devel-ubuntu22.04",
+            true,
+        );
+        assert_eq!(base.base_image, "nvidia/cuda:12.6.3-devel-ubuntu22.04");
+        assert_eq!(base.add_python.as_deref(), Some("3.12"));
+        assert!(base.install_rust, "CUDA base layer installs rust");
     }
 
     #[test]
@@ -457,12 +503,22 @@ mod tests {
 
     #[test]
     fn deploy_config_default_has_stable_app_name() {
+        // Serialized against other env-mutating tests (reads default MODAL_RUST_*);
+        // see `crate::ENV_TEST_LOCK`.
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("MODAL_RUST_DEPLOY_APP");
+        std::env::remove_var("MODAL_RUST_BASE_IMAGE");
+        std::env::remove_var("MODAL_RUST_INSTALL_RUST");
         let cfg = DeployConfig::default();
         assert_eq!(cfg.app_name, "modal-rust-add-deploy");
         assert_eq!(cfg.base_image, "rust:1-slim");
         // The deploy context upload reuses the RUN-path scoping/ignore defaults.
         assert!(cfg.use_cargo_scoping, "cargo scoping is the default");
         assert_eq!(cfg.modalignore_name, ".modalignore");
+        // install_rust is inherited from RemoteConfig::default() (env-aware) and
+        // defaults OFF, so the default deploy path stays byte-identical.
+        assert!(!cfg.install_rust, "install_rust defaults off");
     }
 }

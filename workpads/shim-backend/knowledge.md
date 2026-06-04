@@ -940,3 +940,33 @@ emits `add_gpu → {gpu:"T4", timeout_secs:1800, cache:false}` — P4 config flo
 checks stay. `templates.rs` + the `modal`-CLI path are **retained behind `--use-shim`** (verified still renders
 `dev_app.py` + execs `modal run`) — a clean fallback; **P10** deletes them. New CLI module `programmatic.rs`; old
 bodies preserved verbatim as `cmd_*_shim`. README + examples/orchestrate untouched.
+
+---
+
+### ✅ CAPSTONE — a real Burn/CubeCL ML workload on a CUDA GPU, through the facade (2026-06-04)
+
+The "does it work under real weight" proof. `examples/burn-add` (a Burn/CubeCL tensor add — a genuine ML
+framework, heavy build) ran **live on a Tesla T4 via the facade** (deploy+call):
+`burn_add(n=256) valid=true backend="burn-cuda (CubeCL CUDA / cudarc)" samples=[(0,0,0),(128,384,384),
+(255,765,765)]` — the GPU result matches the CPU reference `c[i]=3i`. NVRTC/cudart resolved on the loader
+path; scheduled on a T4 via `#[modal_rust::function(gpu="T4")]` → `Resources.gpu_config`. 214s end-to-end.
+
+**New capability — CUDA-devel base + rust-toolchain provisioning in the image** (additive; the default
+`rust:1-slim` + add_python path is byte-identical, tested): `ImageSpec::with_rust_toolchain()` (field
+`install_rust`) + `RemoteConfig`/`DeployConfig.install_rust` (env overrides `MODAL_RUST_BASE_IMAGE` /
+`MODAL_RUST_INSTALL_RUST`). It ports the M13 `gpu_app.py` recipe byte-for-byte: apt prereqs + rustup
+(`--default-toolchain stable --profile minimal`) + baked `ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:…`
++ `ENV CUDA_PATH=/usr/local/cuda` (load-bearing for CubeCL's NVRTC `--include-path`), rendered after
+add_python and before the wrapper bakes. **CUDA base: `nvidia/cuda:12.6.3-devel-ubuntu22.04`** — no CUDA-13
+escalation needed (cudarc 0.19.7 dynamic-loading links no CUDA at build time; the devel image supplies the
+NVRTC/cudart headers+libs CubeCL JIT needs).
+
+**Build boundary proven (deploy):** two image layers built AT image-build time — base
+(`im-MtcdTQIoWxxbPpXYPNVdga`, 116s: add_python + rustup) + top (`im-YxjMh8yBXh0eQ4jABQfFSh`, 84s:
+`cargo build --release -p example-burn-add` → release in 1m16s → `cp` to `/app/modal_runner`). The call phase
+ran NO cargo (deployed body execs only the prebuilt binary). Stable app `modal-rust-burn-deploy`.
+
+burn-add stays CUDA-only + OUT of default-members (offline gates don't build it; `cargo metadata`
+`workspace_default_members` confirms exclusion). Offline gates green (155 tests); 2/2 reviews PASS. **The
+through-line is complete: write Rust → `.remote()`/`deploy` a real GPU ML workload on Modal, via our own
+client — CLI or facade, CPU or GPU, trivial or heavy.**

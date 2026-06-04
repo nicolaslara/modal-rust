@@ -124,6 +124,19 @@ pub struct ImageSpec {
     /// `context_mount_id`) and the standalone mount (layer 1's `context_mount_id`)
     /// each get their own build context. See [`ImageSpec::with_base_image`].
     pub base_image_id: Option<String>,
+    /// Off by default: install the Rust toolchain (rustup) + the CUDA build/run env
+    /// into the image. REQUIRED when the base image carries NO Rust (e.g. a
+    /// `nvidia/cuda:<ver>-devel` Tier-1 base; boundaries.md §9), so the in-body /
+    /// image-build-time `cargo build` has a toolchain on PATH. Ports the PROVEN
+    /// `gpu_app.py` recipe (M13): an apt prereq + rustup single-RUN, then a baked
+    /// `PATH` (with `/root/.cargo/bin` + `/usr/local/cuda/bin`) and
+    /// `CUDA_PATH=/usr/local/cuda` (load-bearing — tells CubeCL where the runtime
+    /// NVRTC include path `$CUDA_PATH/include` is). Rendered AFTER the add_python
+    /// if/else and BEFORE the wrapper bakes, so it composes with `add_python`
+    /// (python/modal) WITHOUT touching the mutually-exclusive add_python/apt branches.
+    /// See [`ImageSpec::with_rust_toolchain`]. Default `false` ⇒ NO rendered-command
+    /// drift on the default `rust:1-slim` + add_python path.
+    pub install_rust: bool,
 }
 
 impl ImageSpec {
@@ -140,6 +153,7 @@ impl ImageSpec {
             add_python: None,
             python_standalone_mount_id: None,
             base_image_id: None,
+            install_rust: false,
         }
     }
 
@@ -237,6 +251,25 @@ impl ImageSpec {
         self
     }
 
+    /// Install the Rust toolchain (rustup) + bake the CUDA build/run env into the
+    /// image. Use when the base image carries NO Rust — e.g. a
+    /// `nvidia/cuda:<ver>-devel` Tier-1 base (boundaries.md §9) — so the
+    /// `cargo build` (in-body for the RUN path, at image-build time for the DEPLOY
+    /// base layer) finds `cargo` on PATH. Ports the PROVEN `gpu_app.py` recipe (M13):
+    /// an apt prereq + rustup single-RUN, then a baked `PATH`
+    /// (`/root/.cargo/bin:/usr/local/cuda/bin:…`) and `CUDA_PATH=/usr/local/cuda`
+    /// (so CubeCL resolves the runtime NVRTC include path `$CUDA_PATH/include`).
+    /// Renders AFTER the add_python if/else and BEFORE the wrapper bakes, so it
+    /// composes with `add_python` (the project's PRIMARY python provisioning) without
+    /// touching the mutually-exclusive add_python/apt branches. The default base never
+    /// sets this, so the default path stays byte-identical. See [`install_rust`].
+    ///
+    /// [`install_rust`]: ImageSpec::install_rust
+    pub fn with_rust_toolchain(mut self) -> Self {
+        self.install_rust = true;
+        self
+    }
+
     /// Render the full `dockerfile_commands` list.
     ///
     /// The opening line is `FROM base` for a LAYERED build ([`base_image_id`] set,
@@ -301,6 +334,38 @@ impl ImageSpec {
                         .to_string(),
                 );
             }
+        }
+
+        if self.install_rust {
+            // PROVEN `gpu_app.py` (M13) recipe, rendered AFTER the add_python if/else
+            // (python/modal) and BEFORE the wrapper bakes. The CUDA base needs BOTH
+            // add_python AND apt+rustup, but the add_python and apt branches above are
+            // mutually exclusive (apt's `pre_bake_commands` are suppressed once
+            // `add_python` is set), so the rustup steps live in this dedicated block
+            // instead of `with_apt`. rustup does not need python, so the order is fine.
+            //
+            // Single combined RUN (minimal layers): apt prereqs for rustup, then the
+            // exact rustup one-liner from `gpu_app.py`.
+            cmds.push(
+                "RUN apt-get update && apt-get install -y --no-install-recommends \
+                 curl ca-certificates build-essential pkg-config \
+                 && rm -rf /var/lib/apt/lists/* \
+                 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                 | sh -s -- -y --default-toolchain stable --profile minimal"
+                    .to_string(),
+            );
+            // Bake PATH (cargo + the CUDA bin dir) and CUDA_PATH as image ENV so they
+            // hold at BOTH image-build time (the DEPLOY top layer's `cargo build`) AND
+            // runtime (the RUN-path in-body build + CubeCL's NVRTC include resolution).
+            // LD_LIBRARY_PATH is intentionally NOT set: the `-devel` image's
+            // /etc/ld.so.conf.d already puts /usr/local/cuda/lib64 on the loader path,
+            // and M13 passed without it.
+            cmds.push(
+                "ENV PATH=/root/.cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:\
+                 /usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                    .to_string(),
+            );
+            cmds.push("ENV CUDA_PATH=/usr/local/cuda".to_string());
         }
 
         for (module_name, source) in &self.wrapper_modules {
@@ -654,6 +719,101 @@ mod tests {
         assert_eq!(img.base_images[0].docker_tag, "base");
         assert_eq!(img.base_images[0].image_id, "im-layer1");
         assert_eq!(img.context_mount_id, "mo-deploy-src");
+    }
+
+    #[test]
+    fn rust_toolchain_renders_after_add_python_and_before_bakes() {
+        // The CUDA Tier-1 recipe: a `nvidia/cuda:<ver>-devel` base + add_python
+        // (python/modal) + with_rust_toolchain (apt+rustup + CUDA env), then the
+        // wrapper bake. The rustup RUN + the PATH/CUDA_PATH ENVs render AFTER the
+        // add_python COPY and BEFORE the wrapper bake.
+        let cmds = ImageSpec::from_registry("nvidia/cuda:12.6.3-devel-ubuntu22.04")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py-standalone")
+            .with_rust_toolchain()
+            .with_wrapper_module(
+                "modal_rust_run_wrapper",
+                "def handler(e, i):\n    return i\n",
+            )
+            .with_command("ENTRYPOINT []")
+            .dockerfile_commands();
+
+        assert_eq!(cmds[0], "FROM nvidia/cuda:12.6.3-devel-ubuntu22.04");
+
+        // (a) the apt + rustup combined RUN is present.
+        let rustup = cmds
+            .iter()
+            .position(|c| c.contains("sh.rustup.rs") && c.contains("apt-get install"))
+            .expect("apt+rustup RUN present");
+        // The apt prereqs the rustup install needs are all named.
+        let rustup_line = &cmds[rustup];
+        for pkg in ["curl", "ca-certificates", "build-essential", "pkg-config"] {
+            assert!(rustup_line.contains(pkg), "rustup apt prereq {pkg} present");
+        }
+        assert!(
+            rustup_line.contains("--default-toolchain stable --profile minimal"),
+            "rustup uses stable + minimal profile (gpu_app.py)"
+        );
+
+        // (b) `/root/.cargo/bin` is on the baked PATH.
+        let path_env = cmds
+            .iter()
+            .position(|c| c.starts_with("ENV PATH=") && c.contains("/root/.cargo/bin"))
+            .expect("PATH ENV with /root/.cargo/bin present");
+        assert!(
+            cmds[path_env].contains("/usr/local/cuda/bin"),
+            "CUDA bin dir also on PATH"
+        );
+
+        // (c) CUDA_PATH=/usr/local/cuda ENV is present (CubeCL NVRTC include path).
+        let cuda_path = cmds
+            .iter()
+            .position(|c| c == "ENV CUDA_PATH=/usr/local/cuda")
+            .expect("CUDA_PATH ENV present");
+
+        // Ordering: add_python COPY < rustup RUN < PATH ENV < CUDA_PATH ENV < bake.
+        let copy = cmds
+            .iter()
+            .position(|c| c == "COPY /python/. /usr/local")
+            .expect("add_python COPY present");
+        let bake = cmds
+            .iter()
+            .position(|c| c.contains("/root/modal_rust_run_wrapper.py"))
+            .expect("wrapper bake present");
+        assert!(copy < rustup, "add_python COPY precedes rustup");
+        assert!(rustup < path_env, "rustup precedes the PATH ENV");
+        assert!(path_env < cuda_path, "PATH ENV precedes CUDA_PATH ENV");
+        assert!(cuda_path < bake, "CUDA env precedes the wrapper bake");
+    }
+
+    #[test]
+    fn default_path_renders_none_of_the_rust_toolchain_steps() {
+        // (d) WITHOUT with_rust_toolchain the default rust:1-slim + add_python path is
+        // byte-identical to before this addition: NO rustup, NO /root/.cargo/bin PATH,
+        // NO CUDA_PATH.
+        let cmds = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py-standalone")
+            .with_wrapper_module(
+                "modal_rust_run_wrapper",
+                "def handler(e, i):\n    return i\n",
+            )
+            .with_command("ENV RUST_BACKTRACE=1")
+            .with_command("ENTRYPOINT []")
+            .dockerfile_commands();
+
+        assert!(
+            !cmds.iter().any(|c| c.contains("sh.rustup.rs")),
+            "no rustup install on the default path"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("/root/.cargo/bin")),
+            "no /root/.cargo/bin PATH on the default path"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("CUDA_PATH")),
+            "no CUDA_PATH on the default path"
+        );
     }
 
     #[test]

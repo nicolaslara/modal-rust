@@ -78,8 +78,17 @@ tripwire showing zero `modal` invocations; `run/deploy/call add → {sum:42}`). 
 --describe` (entrypoints + P4 decorator config as JSON) → a headless `App::from_manifest` drives create/invoke.
 `doctor` drops the `modal`-CLI hard requirement on the default path; `templates.rs` + the shim path kept behind
 `--use-shim` (P10 deletes). Runner protocol frozen (`--describe` additive). Built via `p9-cli-migration`; 3/3
-reviews PASS; gates green (152 tests). **Next: P10 (delete the codegen/shims), `.spawn()`/`.map()` + cargo
-cache (P6), user-facing secrets/volumes, and a real heavy/Burn GPU workload as the capstone.**
+reviews PASS; gates green (152 tests).
+
+**[2026-06-04] ✅ CAPSTONE — real Burn/CubeCL ML workload on a CUDA GPU via the facade.** `burn_add` ran
+**live on a T4** (deploy+call): `valid=true backend="burn-cuda (CubeCL CUDA / cudarc)"`, GPU result matches
+`c[i]=3i`. New additive capability: a configurable **CUDA-devel base + rust-toolchain install** in the image
+(`with_rust_toolchain`/`install_rust`; env `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`), ported
+byte-for-byte from the M13 `gpu_app.py` recipe; base `nvidia/cuda:12.6.3-devel`. Heavy `cargo build -p
+example-burn-add` ran at **image-build time** (proven: no cargo at call). burn-add stays CUDA-only + out of
+default-members. Built via `burn-gpu-capstone`; 2/2 reviews PASS; gates green (155 tests). **The through-line
+is complete** (write Rust → run/deploy a real GPU ML workload via our own client). **Remaining (optional):
+P10 cleanup (delete codegen/shims), `.spawn()`/`.map()` + cargo cache (P6), user-facing secrets/volumes.**
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/
