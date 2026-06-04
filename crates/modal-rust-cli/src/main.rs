@@ -69,11 +69,6 @@ enum Commands {
         /// Function timeout in seconds (informational; the shim pins timeout=1800).
         #[arg(long)]
         timeout: Option<u64>,
-        /// GPU spec passed through VERBATIM to the shim's `@app.function(gpu=..)`
-        /// (e.g. `T4`, `A100`, `H100:8`, a fallback list). NOT validated — Modal
-        /// surfaces any error (boundaries.md §9). Omit for CPU.
-        #[arg(long)]
-        gpu: Option<String>,
     },
     /// Generate the deploy shim and deploy with a BUILD-TIME build (baked binary).
     Deploy {
@@ -85,11 +80,6 @@ enum Commands {
         /// The persistent Modal app name to deploy under.
         #[arg(long, default_value = DEFAULT_DEPLOY_APP)]
         app: String,
-        /// GPU spec passed through VERBATIM to the shim's `@app.function(gpu=..)`
-        /// (e.g. `T4`, `A100`, `H100:8`, a fallback list). NOT validated — Modal
-        /// surfaces any error (boundaries.md §9). Omit for CPU.
-        #[arg(long)]
-        gpu: Option<String>,
     },
     /// Generate the call shim and invoke the deployed Function (no build).
     Call {
@@ -154,20 +144,12 @@ fn run(cli: Cli) -> Result<i32> {
             project,
             input,
             timeout,
-            gpu,
-        } => cmd_run(
-            &entrypoint,
-            &project,
-            &input.resolve()?,
-            timeout,
-            gpu.as_deref(),
-        ),
+        } => cmd_run(&entrypoint, &project, &input.resolve()?, timeout),
         Commands::Deploy {
             entrypoint,
             project,
             app,
-            gpu,
-        } => cmd_deploy(&entrypoint, &project, &app, gpu.as_deref()),
+        } => cmd_deploy(&entrypoint, &project, &app),
         Commands::Call {
             entrypoint,
             app,
@@ -194,14 +176,14 @@ fn write_shim(workspace_root: &Path, name: &str, contents: &str) -> Result<PathB
 
 /// Build the shim params for a given workspace root and app names. `package` is the
 /// cargo `[package].name` injected as `-p <pkg>` (disambiguating the shared
-/// `modal_runner` bin); `gpu` is the optional verbatim `gpu=` passthrough.
+/// `modal_runner` bin). Per-function config (gpu/timeout/cache) is sourced from the
+/// Rust `#[modal_rust::function(...)]` decorator via the facade, NOT the CLI.
 fn shim_params(
     workspace_root: &Path,
     dev_app: &str,
     deploy_app: &str,
     call_app: &str,
     package: &str,
-    gpu: Option<&str>,
 ) -> ShimParams {
     ShimParams {
         dev_app_name: dev_app.to_string(),
@@ -210,7 +192,6 @@ fn shim_params(
         rust_ver: RUST_VER.to_string(),
         local_src: workspace_root.display().to_string(),
         package: package.to_string(),
-        gpu: gpu.map(|s| s.to_string()),
     }
 }
 
@@ -230,7 +211,6 @@ fn cmd_run(
     project: &Path,
     input_json: &str,
     timeout: Option<u64>,
-    gpu: Option<&str>,
 ) -> Result<i32> {
     let root = workspace::workspace_root(project)?;
     // Derive the cargo package from `--project`'s `[package].name`: the build must
@@ -243,7 +223,6 @@ fn cmd_run(
         DEFAULT_DEPLOY_APP,
         DEFAULT_CALL_APP,
         &package,
-        gpu,
     );
     let shim = templates::dev_app(&params);
     let path = write_shim(&root, "dev_app.py", &shim)?;
@@ -267,12 +246,12 @@ fn cmd_run(
     run_modal(&args)
 }
 
-fn cmd_deploy(entrypoint: &str, project: &Path, app: &str, gpu: Option<&str>) -> Result<i32> {
+fn cmd_deploy(entrypoint: &str, project: &Path, app: &str) -> Result<i32> {
     let root = workspace::workspace_root(project)?;
     // Same package-qualified build as `run` (boundaries.md §8): derive `-p <pkg>`
     // from `--project`'s `[package].name`.
     let package = workspace::package_name(project)?;
-    let params = shim_params(&root, DEFAULT_DEV_APP, app, DEFAULT_CALL_APP, &package, gpu);
+    let params = shim_params(&root, DEFAULT_DEV_APP, app, DEFAULT_CALL_APP, &package);
     let shim = templates::deploy_app(&params);
     let path = write_shim(&root, "deploy_app.py", &shim)?;
     eprintln!("modal-rust: generated deploy shim: {}", path.display());
@@ -289,8 +268,8 @@ fn cmd_call(entrypoint: &str, app: &str, input_json: &str) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not read current dir")?;
     let root = workspace::workspace_root(&cwd).unwrap_or(cwd);
     // The call shim builds nothing and looks up the deployed Function by name, so
-    // the package/gpu params are unused by call_app.py (passed empty/None).
-    let params = shim_params(&root, DEFAULT_DEV_APP, app, DEFAULT_CALL_APP, "", None);
+    // the package param is unused by call_app.py (passed empty).
+    let params = shim_params(&root, DEFAULT_DEV_APP, app, DEFAULT_CALL_APP, "");
     let shim = templates::call_app(&params);
     let path = write_shim(&root, "call_app.py", &shim)?;
     eprintln!("modal-rust: generated call shim: {}", path.display());
@@ -312,8 +291,9 @@ mod tests {
 
     fn proto_params() -> (ShimParams, ShimParams, ShimParams) {
         // The exact prototype injected-param values. The prototype project is
-        // examples/add (package `example-add`) and CPU (no gpu=), so the rendered
-        // shim must match the package-qualified, no-gpu prototype reference.
+        // examples/add (package `example-add`); the CLI no longer injects gpu (P4:
+        // config is sourced from the Rust decorator), so the rendered shim must match
+        // the package-qualified, no-gpu prototype reference.
         let local = "/Users/nicolas/devel/modal-rust".to_string();
         (
             ShimParams {
@@ -323,7 +303,6 @@ mod tests {
                 rust_ver: "1".to_string(),
                 local_src: local.clone(),
                 package: "example-add".to_string(),
-                gpu: None,
             },
             ShimParams {
                 dev_app_name: DEFAULT_DEV_APP.to_string(),
@@ -332,7 +311,6 @@ mod tests {
                 rust_ver: "1".to_string(),
                 local_src: local.clone(),
                 package: "example-add".to_string(),
-                gpu: None,
             },
             ShimParams {
                 dev_app_name: DEFAULT_DEV_APP.to_string(),
@@ -341,7 +319,6 @@ mod tests {
                 rust_ver: "1".to_string(),
                 local_src: local,
                 package: "example-add".to_string(),
-                gpu: None,
             },
         )
     }
@@ -408,45 +385,29 @@ mod tests {
     }
 
     #[test]
-    fn dev_shim_no_gpu_kwarg_when_absent() {
+    fn dev_shim_never_emits_gpu_kwarg() {
+        // P4: per-function config (gpu/timeout/cache) is sourced from the Rust
+        // `#[modal_rust::function(...)]` decorator via the facade, NOT the CLI. The
+        // legacy `--gpu` flag and its `gpu=` passthrough are dropped, so the shim
+        // never carries a `gpu=` kwarg.
         let (dev, _, _) = proto_params();
         let shim = templates::dev_app(&dev);
         assert!(
             !shim.contains("gpu="),
-            "CPU dev shim must have no gpu= kwarg"
+            "CLI dev shim must have no gpu= kwarg"
         );
         assert!(shim.contains("@app.function(image=mounted_image, timeout=1800)"));
     }
 
     #[test]
-    fn dev_shim_injects_gpu_kwarg_verbatim() {
-        // §9 verbatim passthrough: --gpu T4 must land as gpu="T4" in the work
-        // function's @app.function decorator (and a fallback list passes through too).
-        let mut p = proto_params().0;
-        p.gpu = Some("T4".to_string());
-        let shim = templates::dev_app(&p);
+    fn deploy_shim_never_emits_gpu_kwarg() {
+        let (_, deploy, _) = proto_params();
+        let shim = templates::deploy_app(&deploy);
         assert!(
-            shim.contains(r#"@app.function(image=mounted_image, timeout=1800, gpu="T4")"#),
-            "dev shim must inject gpu=\"T4\" into @app.function"
+            !shim.contains("gpu="),
+            "CLI deploy shim must have no gpu= kwarg"
         );
-
-        p.gpu = Some("H100:8".to_string());
-        let shim = templates::dev_app(&p);
-        assert!(
-            shim.contains(r#"gpu="H100:8""#),
-            "dev shim must pass through gpu spec verbatim (incl. count)"
-        );
-    }
-
-    #[test]
-    fn deploy_shim_injects_gpu_kwarg_verbatim() {
-        let mut p = proto_params().1;
-        p.gpu = Some("A100".to_string());
-        let shim = templates::deploy_app(&p);
-        assert!(
-            shim.contains(r#"@app.function(image=image, gpu="A100")"#),
-            "deploy shim must inject gpu=\"A100\" into @app.function"
-        );
+        assert!(shim.contains("@app.function(image=image)"));
     }
 
     #[test]

@@ -885,3 +885,34 @@ Two MORE real bugs fixed live (durable findings):
 
 New deps: `ignore` 0.4 (SDK), `toml_edit` 0.22 (facade). Gates green (130 tests). Modal app state clean: only
 `modal-rust-add-deploy` + legacy `modal-rust-add-poc` deployed; run/test apps are ephemeral/stopped.
+
+---
+
+### ✅ P4 — the decorator IS the config (gpu/timeout/cache) + live GPU on a T4 (2026-06-04)
+
+`#[modal_rust::function(gpu="T4", timeout=1800, cache=false)]` now flows, at runtime, into `FunctionCreate`.
+**Proven live on a Tesla T4**: `vector_add(gpu="T4").remote()` → `valid=true gpu_name="Tesla T4" driver=13000`
+(a CPU container has no GPU, so a real cudarc Driver-API kernel returning "Tesla T4" is server-side proof the
+decorator's `gpu_config` rode into the create request). CPU `.remote()` unchanged (`add(40,2)=={sum:42}`).
+
+The chain (3/3 reviews PASS):
+- **Macro** (`modal-rust-macros`): optional `gpu`/`timeout`/`cache` args; bare `#[modal_rust::function]` expands
+  byte-identically (test: `bare_macro_config_is_default`). Emits the config into the `inventory::submit!`.
+- **Registration** (`modal-rust-runtime`): ADDITIVE `FunctionConfig { gpu: Option<&'static str>, timeout_secs:
+  Option<u32>, cache: Option<bool> }` on `Registration` (+ `FunctionConfig::new()` + `from_inventory_with_configs`).
+  The runner stays FROZEN: `Registry::from_inventory` dispatch, `HandlerFn`, `typed!`, `run_cli` byte-identical
+  (the runner ignores config; only the control-plane reads it). Proven by `macro_path_byte_identical_to_manual`.
+- **SDK** (`ops/function.rs`): `parse_gpu_config` mirrors Modal's `_utils/function_utils.py` exactly — split on the
+  FIRST `:` (count default 1, must be int), `gpu_type = value.to_uppercase()`, memory variants like `A100-80GB`
+  ride through as the string (no `-MEM` split), and the deprecated `GPUType type` enum is NEVER set (only
+  `gpu_type` string field 4 + `count` field 2). `FunctionResources.gpu` + `FunctionSpec::with_gpu` populate
+  `Resources.gpu_config`; resources stays ALWAYS-set. (A GPU *list* → `ranked_functions` is the documented
+  single-GPU-only-for-now stretch.)
+- **Facade** (`app.rs`/`remote.rs`/`deploy.rs`): `App::from_inventory`/`connect` capture a per-name config map;
+  `ensure_function`/`deploy_function` set `FunctionSpec::with_gpu(...)` + the timeout from it. Manual
+  `App::new(registry)` has no decorator config → defaults (wire-identical to pre-GPU).
+- **CLI**: the legacy `--gpu` flag + `{{GPU_KWARG}}` template machinery are DROPPED (config is dynamic from the
+  decorator now); prototype-shim byte-equivalence restored.
+
+Live used ephemeral RUN apps (no lingering deploy). Gates green (fmt/clippy `-D warnings`/build/test, incl.
+`--features live`). cuda-vector-add still builds locally without CUDA (dynamic-loading intact).

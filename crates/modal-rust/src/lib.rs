@@ -51,7 +51,7 @@ pub use modal_rust_sdk as sdk;
 // (2) Runtime essentials that appear in the facade's public API / error paths.
 //     Selective — NOT a glob — so `__macro_support`/`codec` stay out of the
 //     facade's stable surface.
-pub use modal_rust_runtime::{HandlerFn, Registration, Registry, RunnerError};
+pub use modal_rust_runtime::{FunctionConfig, HandlerFn, Registration, Registry, RunnerError};
 // `typed!` is #[macro_export] at the runtime crate root; re-export it for users who
 // build a Registry by hand through the facade.
 pub use modal_rust_runtime::typed;

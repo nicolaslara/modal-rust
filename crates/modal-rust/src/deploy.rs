@@ -126,6 +126,13 @@ pub struct DeployConfig {
     pub base_image: String,
     /// Function timeout (seconds). No in-body build, so a modest default is fine.
     pub timeout_secs: u32,
+    /// GPU spec for the deployed entrypoint (from the decorator [`FunctionConfig`]).
+    /// `None` = CPU. Set by `App::deploy_with` from the decorated entrypoint's
+    /// config before [`deploy_function`].
+    pub gpu: Option<String>,
+    /// Per-entrypoint timeout override (decorator `FunctionConfig.timeout_secs`).
+    /// When `Some`, REPLACES [`timeout_secs`](DeployConfig::timeout_secs).
+    pub timeout_override_secs: Option<u32>,
 }
 
 impl DeployConfig {
@@ -142,6 +149,8 @@ impl DeployConfig {
             modalignore_name: base.modalignore_name,
             base_image: base.base_image,
             timeout_secs: 300,
+            gpu: None,
+            timeout_override_secs: None,
         }
     }
 }
@@ -291,10 +300,15 @@ pub(crate) async fn deploy_function(
     //    binary is baked in the image layer). This absence IS the deploy invariant.
     //    `mount_client_dependencies = true` (default, explicit) so the worker injects
     //    the modal client dep closure at start — the add_python image has no pip layer.
+    // Decorator config: gpu rides into Resources.gpu_config; a `timeout` decorator
+    // overrides the deploy default. Deploy has no in-body build, so its timeout is
+    // purely the function's. `with_gpu(None)` is a CPU no-op (wire bytes identical).
+    let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
     let fn_spec = FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
         .with_mount_ids(vec![client_mount_id])
         .with_mount_client_dependencies(true)
-        .with_timeout_secs(config.timeout_secs);
+        .with_timeout_secs(timeout)
+        .with_gpu(config.gpu.clone())?;
     let created = client
         .function_create(&app_id, &precreate_id, &fn_spec)
         .await?;

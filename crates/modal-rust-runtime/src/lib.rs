@@ -269,6 +269,49 @@ pub struct Registration {
     pub name: &'static str,
     /// The monomorphized [`typed!`] wrapper `fn` pointer.
     pub handler: HandlerFn,
+    /// Per-function deploy/run config sourced from the decorator
+    /// (`#[modal_rust::function(gpu=…, timeout=…, cache=…)]`). METADATA ONLY — the
+    /// runner ignores it (see [`FunctionConfig`]). Default = all `None`.
+    pub config: FunctionConfig,
+}
+
+/// Per-function deploy/run CONFIG sourced from
+/// `#[modal_rust::function(gpu=…, timeout=…, cache=…)]`.
+///
+/// METADATA ONLY. The runner IGNORES every field — `run_cli`/`run_handler`/dispatch
+/// and [`Registry::from_inventory`] never read it. Only the control-plane facade
+/// (`modal-rust`) reads it when CREATING the Modal function (`Resources.gpu_config`,
+/// `timeout_secs`). The bare `#[modal_rust::function]` yields
+/// `FunctionConfig::default()` (all `None` => server/facade defaults), so adding
+/// this field changes nothing about how functions RUN (boundaries.md anticipated
+/// this additive extension).
+///
+/// `gpu` is `Option<&'static str>` (not `String`): `inventory::submit!` builds a
+/// `static` initializer, so only `const`-constructible values are allowed; a string
+/// literal is `&'static str` (matches [`Registration::name`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionConfig {
+    /// GPU spec string, Modal-format (`"T4"`, `"A100"`, `"A100-80GB"`, `"H100:4"`).
+    /// `None` => CPU.
+    pub gpu: Option<&'static str>,
+    /// Function timeout (seconds). `None` => facade default.
+    pub timeout_secs: Option<u32>,
+    /// Cache hint. `None` => default. Reserved/inert for P4 (no proto target yet).
+    pub cache: Option<bool>,
+}
+
+impl FunctionConfig {
+    /// A `const` all-`None` config (the bare-decorator default). Usable in a
+    /// `static` `inventory::submit!` initializer, where the non-`const`
+    /// `Default::default()` is not allowed. The bare `#[modal_rust::function]`
+    /// macro emits the equivalent struct literal directly.
+    pub const fn new() -> Self {
+        FunctionConfig {
+            gpu: None,
+            timeout_secs: None,
+            cache: None,
+        }
+    }
 }
 
 inventory::collect!(Registration);
@@ -333,6 +376,30 @@ impl Registry {
     pub fn names(&self) -> impl Iterator<Item = &&'static str> {
         self.handlers.keys()
     }
+}
+
+/// Like [`Registry::from_inventory`] but ALSO returns the per-name
+/// [`FunctionConfig`] captured from the SAME inventory pass.
+///
+/// The returned [`Registry`] is byte-identical to one built by
+/// [`Registry::from_inventory`] (same insertion order through
+/// [`Registry::function`], same duplicate-name panic). The facade reads the
+/// per-name configs to set `Resources.gpu_config` / `timeout_secs` when CREATING
+/// the Modal function. The runner never calls this — it stays on
+/// `Registry::from_inventory()` (frozen), which reads only `name` + `handler`.
+///
+/// # Panics
+/// Panics (the SAME hard startup error as [`Registry::from_inventory`]) if two
+/// submissions share a name.
+pub fn from_inventory_with_configs() -> (Registry, Vec<(&'static str, FunctionConfig)>) {
+    let mut registry = Registry::new();
+    let mut configs = Vec::new();
+    for registration in inventory::iter::<Registration> {
+        // SAME insertion + duplicate-name panic as `Registry::from_inventory`.
+        registry = registry.function(registration.name, registration.handler);
+        configs.push((registration.name, registration.config.clone()));
+    }
+    (registry, configs)
 }
 
 thread_local! {

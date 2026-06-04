@@ -2938,6 +2938,8 @@ name = "modal-rust"
 version = "0.1.0"
 dependencies = [
  "example-add",
+ "example-add-macro",
+ "inventory",
  "modal-rust-macros",
  "modal-rust-runtime",
  "modal-rust-sdk",

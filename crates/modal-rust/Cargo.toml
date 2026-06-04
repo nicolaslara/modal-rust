@@ -33,3 +33,14 @@ tokio = { version = "1", features = ["sync", "rt", "macros"] }
 # The real .local() proof: example-add::modal_registry() gives a frozen Registry.
 # Acyclic — example-add depends only on modal-rust-runtime, never on modal-rust.
 example-add = { path = "../../examples/add" }
+# The decorator/inventory path proof for `App::from_inventory().config_for(..)`:
+# example-add-macro's `#[modal_rust::function(gpu="T4", ..)]` submissions are linked
+# into the test binary so the inventory pass surfaces their FunctionConfig. Acyclic
+# — example-add-macro depends only on the runtime/macros/inventory, never modal-rust.
+example-add-macro = { path = "../../examples/add-macro" }
+# Live GPU proof (tests/live_gpu.rs, behind `live` + `#[ignore]`): a decorated
+# `#[modal_rust::function(gpu="T4", name="vector_add")]` in the test binary drives
+# `App::from_inventory().remote(..)` so the decorator-sourced gpu_config rides into
+# FunctionCreate against the cuda-vector-add package on a real T4.
+modal-rust-macros = { path = "../modal-rust-macros" }
+inventory = "0.3"

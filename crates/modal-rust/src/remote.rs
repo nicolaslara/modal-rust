@@ -168,6 +168,13 @@ pub struct RemoteConfig {
     pub base_image: String,
     /// Function timeout (seconds) — covers the in-body cargo build.
     pub timeout_secs: u32,
+    /// GPU spec for this run's entrypoint (from the decorator [`FunctionConfig`]).
+    /// `None` = CPU. Set by `App::remote_invoke` from `config_for(entrypoint)`
+    /// before [`ensure_function`].
+    pub gpu: Option<String>,
+    /// Per-entrypoint timeout override (decorator `FunctionConfig.timeout_secs`).
+    /// When `Some`, REPLACES the path default [`timeout_secs`](RemoteConfig::timeout_secs).
+    pub timeout_override_secs: Option<u32>,
 }
 
 impl Default for RemoteConfig {
@@ -180,6 +187,8 @@ impl Default for RemoteConfig {
             modalignore_name: modal_rust_sdk::DEFAULT_MODALIGNORE_NAME.to_string(),
             base_image: format!("rust:{RUST_VER}-slim"),
             timeout_secs: REMOTE_TIMEOUT_SECS,
+            gpu: None,
+            timeout_override_secs: None,
         }
     }
 }
@@ -318,10 +327,17 @@ pub(crate) async fn ensure_function(
     //    `mount_client_dependencies` defaults true (set explicitly here) so the
     //    worker injects the modal client's dep closure at container start — the
     //    add_python image carries no `pip install modal` layer.
+    // Decorator config: a `timeout` decorator OVERRIDES the path default literally
+    // (Python honors it literally too). DOC: RUN-path timeouts must budget for the
+    // cold in-body `cargo build`; a too-small decorator timeout can starve the first
+    // cold build (no floor is imposed). `with_gpu(None)` is a CPU no-op (gpu_config
+    // stays unset → CPU wire bytes identical).
+    let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
     let fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
         .with_mount_ids(vec![client_mount_id, source_mount_id])
         .with_mount_client_dependencies(true)
-        .with_timeout_secs(config.timeout_secs);
+        .with_timeout_secs(timeout)
+        .with_gpu(config.gpu.clone())?;
     let created = client
         .function_create(app_id, &precreate_id, &fn_spec)
         .await?;

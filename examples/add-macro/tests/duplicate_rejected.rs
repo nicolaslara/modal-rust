@@ -8,18 +8,18 @@
 //! `#[modal_rust::function]` macro emits) twice under the same name and assert
 //! `from_inventory()` panics with the frozen "duplicate entrypoint" message.
 
-use modal_rust_runtime::{HandlerFn, Registration, Registry, RunnerError};
+use modal_rust_runtime::{FunctionConfig, HandlerFn, Registration, Registry, RunnerError};
 
 fn dup_handler(_input: &[u8]) -> Result<Vec<u8>, RunnerError> {
     Ok(b"null".to_vec())
 }
 
 inventory::submit! {
-    Registration { name: "dup", handler: dup_handler as HandlerFn }
+    Registration { name: "dup", handler: dup_handler as HandlerFn, config: FunctionConfig::new() }
 }
 
 inventory::submit! {
-    Registration { name: "dup", handler: dup_handler as HandlerFn }
+    Registration { name: "dup", handler: dup_handler as HandlerFn, config: FunctionConfig::new() }
 }
 
 #[test]

@@ -18,25 +18,65 @@ use crate::error::{Error, Result};
 use crate::proto::api::function::{DefinitionType, FunctionType};
 use crate::proto::api::{
     DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
-    Resources,
+    GpuConfig, Resources,
 };
 use crate::retry::retry_unary;
 
-/// CPU/memory request for a created function. FILE-mode CPU functions can use the
-/// zero default (`Resources::default()`); set modest values to be explicit.
+/// Parse a Modal GPU spec into a [`GpuConfig`], mirroring `parse_gpu_config`
+/// (modal `_utils/function_utils.py:628`). Format: `"TYPE"` or `"TYPE:count"`.
+///
+/// The MEM suffix (`"A100-80GB"`) is NOT split — it stays inside `gpu_type`
+/// verbatim. `gpu_type` is uppercased; `count` defaults to `1`; the deprecated
+/// `type` field (proto field 1, `GPUType`) stays `0` (Python never sets it). A
+/// non-integer count maps to [`Error::build`], mirroring Python's `InvalidError`.
+fn parse_gpu_config(spec: &str) -> Result<GpuConfig> {
+    // `split_once(':')` = Python's `value.split(":", 1)`.
+    let (type_part, count) = match spec.split_once(':') {
+        Some((lhs, rhs)) => {
+            let count: u32 = rhs.trim().parse().map_err(|_| {
+                Error::build(format!(
+                    "Invalid GPU count: {rhs}. Value must be an integer."
+                ))
+            })?;
+            (lhs, count)
+        }
+        None => (spec, 1),
+    };
+    Ok(GpuConfig {
+        gpu_type: type_part.to_uppercase(), // `.upper()`
+        count,
+        ..Default::default() // r#type (deprecated GPUType, field 1) stays 0
+    })
+}
+
+/// CPU/memory/GPU request for a created function. FILE-mode CPU functions can use
+/// the zero default (`Resources::default()`); set modest values to be explicit.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionResources {
     /// Requested memory (MiB). `0` = server default.
     pub memory_mb: u32,
     /// Requested CPU (milli-cores). `0` = server default.
     pub milli_cpu: u32,
+    /// Optional GPU spec (`"T4"`, `"A100"`, `"A100-80GB"`, `"H100:4"`). `None` =
+    /// CPU-only (empty `gpu_config`, mirroring `parse_gpu_config(None)`). Validated
+    /// up front by [`FunctionSpec::with_gpu`], so [`Self::to_proto`] re-parses
+    /// infallibly.
+    pub gpu: Option<String>,
 }
 
 impl FunctionResources {
     fn to_proto(&self) -> Resources {
+        // CPU path keeps `gpu_config: None` (proto field 4 unset) — wire-equivalent
+        // to today. The GPU string was validated at set time (`with_gpu`), so the
+        // re-parse here is infallible (`unwrap_or_default` for total safety).
+        let gpu_config = self
+            .gpu
+            .as_deref()
+            .map(|s| parse_gpu_config(s).unwrap_or_default());
         Resources {
             memory_mb: self.memory_mb,
             milli_cpu: self.milli_cpu,
+            gpu_config,
             ..Default::default()
         }
     }
@@ -114,6 +154,22 @@ impl FunctionSpec {
     pub fn with_resources(mut self, resources: FunctionResources) -> Self {
         self.resources = resources;
         self
+    }
+
+    /// Set the GPU spec on the function's resources (validated NOW so
+    /// [`FunctionResources::to_proto`] stays infallible). `None` = CPU-only (no
+    /// `gpu_config`, byte-identical to today).
+    ///
+    /// Mirrors `parse_gpu_config`: `"TYPE"`, `"TYPE:count"`, or `"TYPE-MEM"` (the
+    /// mem suffix rides inside `gpu_type`); uppercased; `count` defaults to `1`. A
+    /// bad (non-integer) count returns [`Error::build`].
+    pub fn with_gpu(mut self, gpu: Option<impl Into<String>>) -> Result<Self> {
+        let gpu = gpu.map(Into::into);
+        if let Some(spec) = gpu.as_deref() {
+            parse_gpu_config(spec)?; // validate up front
+        }
+        self.resources.gpu = gpu;
+        Ok(self)
     }
 
     /// Override whether the worker injects the modal client's dependency closure at
@@ -329,5 +385,81 @@ mod tests {
         let r = FunctionResources::default().to_proto();
         assert_eq!(r.memory_mb, 0);
         assert_eq!(r.milli_cpu, 0);
+        // CPU-only default: gpu_config (proto field 4) stays UNSET — wire-identical
+        // to before the GPU addition.
+        assert!(
+            r.gpu_config.is_none(),
+            "CPU default must leave gpu_config unset"
+        );
+    }
+
+    #[test]
+    fn parse_gpu_config_mirrors_python() {
+        // "TYPE" -> gpu_type uppercased, count 1, deprecated type field 0.
+        let g = parse_gpu_config("T4").unwrap();
+        assert_eq!(g.gpu_type, "T4");
+        assert_eq!(g.count, 1);
+        assert_eq!(g.r#type, 0);
+
+        // Lowercase is uppercased (`.upper()`).
+        assert_eq!(parse_gpu_config("t4").unwrap().gpu_type, "T4");
+
+        // "TYPE:count" -> count parsed; default split on FIRST ':'.
+        let h = parse_gpu_config("H100:4").unwrap();
+        assert_eq!(h.gpu_type, "H100");
+        assert_eq!(h.count, 4);
+
+        // MEM suffix is NOT split — rides inside gpu_type verbatim (uppercased).
+        let a = parse_gpu_config("A100-80GB").unwrap();
+        assert_eq!(a.gpu_type, "A100-80GB");
+        assert_eq!(a.count, 1);
+
+        // MEM suffix + count.
+        let a2 = parse_gpu_config("A100-80GB:2").unwrap();
+        assert_eq!(a2.gpu_type, "A100-80GB");
+        assert_eq!(a2.count, 2);
+
+        // Non-integer count -> Err (mirrors Python InvalidError).
+        assert!(parse_gpu_config("T4:x").is_err());
+    }
+
+    #[test]
+    fn to_proto_populates_gpu_config_when_set() {
+        let r = FunctionResources {
+            gpu: Some("T4".to_string()),
+            ..Default::default()
+        }
+        .to_proto();
+        let g = r
+            .gpu_config
+            .expect("gpu_config must be set when gpu is Some");
+        assert_eq!(g.gpu_type, "T4");
+        assert_eq!(g.count, 1);
+    }
+
+    #[test]
+    fn with_gpu_populates_field_4_and_validates() {
+        // `with_gpu(Some("T4"))` populates the nested GPUConfig (proto field 4).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_gpu(Some("T4"))
+            .unwrap();
+        let g = spec
+            .resources
+            .to_proto()
+            .gpu_config
+            .expect("gpu_config must be set");
+        assert_eq!(g.gpu_type, "T4");
+        assert_eq!(g.count, 1);
+
+        // `with_gpu(None)` is CPU (no gpu_config).
+        let cpu = FunctionSpec::new("m", "handler", "im-1")
+            .with_gpu(None::<String>)
+            .unwrap();
+        assert!(cpu.resources.to_proto().gpu_config.is_none());
+
+        // A bad count is rejected UP FRONT at set time.
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_gpu(Some("T4:nope"))
+            .is_err());
     }
 }

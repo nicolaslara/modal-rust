@@ -161,7 +161,7 @@ def toolchain_probe():
 #   - CARGO_HOME=/tmp/cargo, CARGO_TARGET_DIR=/tmp/target  (NOT a Volume).
 #   - If the mount is read-only, cp -a /src -> /tmp/build and build there; else
 #     build in-place in /src. Either way the run-vs-deploy split is unchanged.
-@app.function(image=mounted_image, timeout=1800{{GPU_KWARG}})
+@app.function(image=mounted_image, timeout=1800)
 def run_entrypoint(entrypoint: str, input_json: str) -> str:
     import os
     import shutil
@@ -268,7 +268,7 @@ CACHE_MOUNT = "/cache"  # STABLE mount path (held constant across cold + warm ru
 
 @app.function(
     image=mounted_image,
-    timeout=1800{{GPU_KWARG}},
+    timeout=1800,
     volumes={CACHE_MOUNT: CARGO_CACHE_VOLUME},
 )
 def run_entrypoint_cached(entrypoint: str, input_json: str) -> str:

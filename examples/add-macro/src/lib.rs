@@ -53,10 +53,30 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
     })
 }
 
+/// The macro-path twin WITH PER-FUNCTION CONFIG (P4): the
+/// `#[modal_rust::function(gpu=…, timeout=…, cache=…)]` decorator records a
+/// [`modal_rust_runtime::FunctionConfig`] alongside the registration. This is
+/// METADATA ONLY — the emitted handler and the runner dispatch are byte-identical
+/// to the bare path; only the facade reads the config when CREATING the Modal
+/// function. The compute is the same `a + b`, proving the config is additive sugar.
+#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false)]
+pub fn add_gpu(input: AddInput) -> anyhow::Result<AddOutput> {
+    Ok(AddOutput {
+        sum: input.a + input.b,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modal_rust_runtime::Registry;
+    use modal_rust_runtime::{FunctionConfig, Registration, Registry};
+
+    /// Look up a `Registration` by entrypoint name from the inventory pass.
+    fn registration(name: &str) -> Option<&'static Registration> {
+        inventory::iter::<Registration>
+            .into_iter()
+            .find(|r| r.name == name)
+    }
 
     #[test]
     fn add_works() {
@@ -106,5 +126,47 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"]["kind"], "unknown_entrypoint");
         assert_eq!(v["error"]["details"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn bare_macro_config_is_default() {
+        // P4 backward-compat proof: the BARE `#[modal_rust::function]` records
+        // `FunctionConfig::default()` (all `None`) — runtime-observable behavior is
+        // byte-identical (same name, same handler, same `{sum:42}`; runner ignores
+        // config). The `macro_path_byte_identical_to_manual` test above proves the
+        // envelope is unchanged; this asserts the recorded config is the default.
+        let reg = registration("add").expect("macro must register `add`");
+        assert_eq!(reg.config, FunctionConfig::default());
+        assert_eq!(reg.config.gpu, None);
+        assert_eq!(reg.config.timeout_secs, None);
+        assert_eq!(reg.config.cache, None);
+    }
+
+    #[test]
+    fn configured_macro_populates_function_config() {
+        // P4: `#[modal_rust::function(gpu="T4", timeout=1800, cache=false)]` records
+        // the parsed config into the inventory registration.
+        let reg = registration("add_gpu").expect("macro must register `add_gpu`");
+        assert_eq!(reg.config.gpu, Some("T4"));
+        assert_eq!(reg.config.timeout_secs, Some(1800));
+        assert_eq!(reg.config.cache, Some(false));
+        // The handler still dispatches the same compute through the unchanged runner.
+        let argv: Vec<String> = [
+            "--entrypoint",
+            "add_gpu",
+            "--input-json",
+            r#"{"a":40,"b":2}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut buf = Vec::new();
+        let code =
+            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "{\"ok\":true,\"value\":{\"sum\":42}}\n"
+        );
     }
 }

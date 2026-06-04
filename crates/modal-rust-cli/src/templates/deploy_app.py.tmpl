@@ -74,7 +74,7 @@ image = (
 # The deployed runtime invariant in action: NO cargo, NO source mount, NO cache
 # Volume. It writes the input to /tmp/in.json and execs ONLY the baked binary via the
 # M0 runner protocol (§2.2), returning the single stdout JSON envelope line.
-@app.function(image=image{{GPU_KWARG}})
+@app.function(image=image)
 def call_entrypoint(entrypoint: str, input_json: str) -> str:
     import subprocess
 
