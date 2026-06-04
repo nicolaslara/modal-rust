@@ -3,6 +3,10 @@
 tmp/
 .research/
 
+# Cloned third-party sources kept for reference/inspiration only
+# Never a build dependency — we just use it as reference for building what we need
+references/
+
 # Secrets / Modal credentials
 .env
 .env.*

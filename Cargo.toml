@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/modal-rust-sdk",
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",
@@ -18,6 +19,7 @@ members = [
 # on a CUDA host or on Modal. (`example-cuda-vector-add` uses cudarc dynamic-loading,
 # which links with no CUDA at build time, so it stays in the default set.)
 default-members = [
+    "crates/modal-rust-sdk",
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",

@@ -1,0 +1,38 @@
+[package]
+name = "modal-rust-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "First-party lean Rust gRPC client for Modal's control plane (modal_rust::sdk)"
+build = "build.rs"
+
+[lib]
+name = "modal_rust_sdk"
+
+[features]
+# Opt-in live Modal round-trip tests (auth handshake + AppGetOrCreate). Gated so
+# the no-CUDA CI box NEVER runs them; enable locally with `--features live`.
+live = []
+
+[dependencies]
+# gRPC stack — versions MATCH the proven modal-rs stack so the vendored proto compiles cleanly.
+# default-features = false + explicit client features DROPS the axum (server) dependency.
+tonic = { version = "0.14.3", default-features = false, features = ["channel", "transport", "tls-native-roots", "tls-ring", "codegen"] }
+tonic-prost = "0.14.3"
+prost = "0.14.3"
+prost-types = "0.14.3"
+# Runtime + serialization
+tokio = { version = "1.49", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_cbor = "0.11"            # MATCH modal-rs cbor.rs codec
+toml = "0.9"                   # parse ~/.modal.toml
+base64 = "0.22"               # bake wrapper source into dockerfile_commands
+sha2 = "0.10"                 # content hashing for mounts/images
+anyhow = "1"                  # ops-level error context (NOT the public error type — see error.rs)
+
+[build-dependencies]
+tonic-prost-build = "0.14.3"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["full", "test-util"] }

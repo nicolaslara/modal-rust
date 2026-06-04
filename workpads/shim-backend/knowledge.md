@@ -642,8 +642,28 @@ wrapper baked into the image via a `run_commands` heredoc — NOT local COPY) an
 **`with_existing_function_id(precreate_id)`** to bypass the empty-serialized guard via the public
 API) → **AppPublish only** (function_ids+definition_ids) → from_name → `.remote((args,))`.
 
-**Image MUST carry the `modal` pip package + the wrapper module** — FILE-mode containers boot via
+**Image MUST carry the `modal` client + the wrapper module** — FILE-mode containers boot via
 `python -m modal._container_entrypoint`. (Python stays in the image, invisible to the user.)
+
+> **CORRECTION (2026-06-04): the client is MOUNTED, not pip-installed.** The spike's
+> `pip install modal` in `run_commands` was a crude shortcut — it bakes the client into an image
+> layer because the spike hand-rolled `ImageGetOrCreate` and skipped the SDK's automatic
+> client-mount injection. Normal Modal users never install `modal`, and it is NOT in their image:
+> the Python SDK attaches a **client mount** to EVERY function automatically. `_functions.py:730-734`
+> prepends `_get_client_mount()` to `all_mounts`; `_get_client_mount()` (`mount.py:729-734`) resolves
+> `_Mount.from_name("modal-client-mount-{version}", namespace=GLOBAL)` — a Modal-hosted, version-keyed
+> global mount of the client package (`client_mount_name()`, `mount.py:63-70`); dev mode builds it
+> locally via `_create_client_mount()` (`mount.py:696-723`) copying the `modal` packages to `/pkg/{pkg}`
+> (+ synchronicity), with `/pkg` on PYTHONPATH. **Modal-native approach for our crate:** attach the
+> hosted client mount via `MountGetOrCreate`/from_name `modal-client-mount-{version}` (GLOBAL) → put its
+> `mount_id` in `Function.mount_ids` (`api.proto` line 1649), exactly like the Python SDK — no pip, no
+> image rebuild, version-correct. `pip install modal` is the documented FALLBACK only.
+
+**Second reference clone (2026-06-04, user):** `references/modal-client` = the official Modal Python SDK
+(`github.com/modal-labs/modal-client`, gitignored, reference only). Polyglot repo: **canonical proto** at
+`references/modal-client/modal_proto/api.proto`, Python client at `references/modal-client/py/modal/`
+(`mount.py`, `_functions.py`, `image.py`, `_serialization.py`, …). Prefer this canonical proto for
+vendoring (cross-check modal-rs's already-tonic-proven copy as a fallback).
 
 **modal-rs 0.1.3 is close but needs 3 fixes (the "infra" failures were really these):**
 1. **FunctionCreate** — modal-rs sends BOTH `function` and `function_data`; Modal expects exactly
@@ -662,3 +682,59 @@ Scratch (ephemeral): `/tmp/modal-rust-spike` (crate+notes), `/tmp/modal-rs-fork`
 SDK does (the spike already reverse-engineered the 3 deltas) — clean, fully controlled, matches the
 user's "do it the way their SDK does", more upfront work. Recommendation: (b) for the durable
 foundation; optionally bootstrap from the fork to keep momentum.
+
+---
+
+### DECISION RESOLVED — (b) own lean first-party gRPC client crate (2026-06-04, user)
+
+The user chose **(b)**: build a lean layer that talks to Modal directly, with **`modal-rs` removed as
+a dependency**. modal-rs is cloned into a **gitignored `references/` folder** (`references/modal-rs`,
+upstream `github.com/thehumanworks/modal-rs`, MIT, v0.1.3 — proto at
+`references/modal-rs/crates/modal-rs/src/api.proto`, 3925 lines) for **inspiration only, never a
+build dependency**. The client lives in its **own crate** so it can later grow into **full Modal
+client-SDK compatibility** — `modal_rust::sdk` in the user's phrasing.
+
+**Locked specifics:**
+- Crate: **`crates/modal-rust-sdk`** (lib `modal_rust_sdk`). Future: an umbrella `modal_rust` facade
+  may `pub use modal_rust_sdk as sdk;` — not built yet.
+- We **vendor `api.proto` into the crate** (copy, not reference the gitignored clone) and compile it
+  with `tonic-prost-build` + `protoc-bin-vendored` (mirroring modal-rs's `build.rs`).
+- We **re-implement** auth (`~/.modal.toml`/`MODAL_TOKEN_*` → authenticated TLS tonic channel), the
+  CBOR arg/result codec, and the proven control-plane ops (AppGetOrCreate, ImageGetOrCreate +
+  ImageJoinStreaming, FunctionPrecreate, FunctionCreate FILE-mode, AppPublish, FunctionGet,
+  FunctionMap + FunctionPutInputs-fallback + FunctionGetOutputs) **natively**, baking in the **3
+  spike fixes** so we never inherit modal-rs's bugs. Attribute modal-rs (MIT) in the crate.
+- This is the durable foundation for P1/P3/P5/P7. Frozen invariants (runner protocol, inventory
+  registry, `typed!`/`#[modal_rust::function]`, run-vs-deploy build boundary) are **unchanged** —
+  this adds only the control-plane crate. Built via the `build-modal-rust-sdk` workflow.
+
+---
+
+### SDK CRATE LANDED + a live-verified correction to the client-mount note (2026-06-04)
+
+`crates/modal-rust-sdk` (lib `modal_rust_sdk`) is built, offline-green, and **proven live end-to-end**:
+our own first-party client created + invoked a Modal FILE-mode function and decoded
+`{"ok":true,"source":"rust_sdk_live_wrapper.handler","echoed":{"n":42,"hi":1}}` — **no `modal` CLI, no
+per-project `.py`, no `modal-rs` dependency**. FunctionCreate sent: `definition_type=FILE`, empty
+`function_serialized`, `module_name`+`function_name`, `mount_ids=[<client mount>]`, `resources` set.
+The 3 fixes, CBOR `(args,kwargs)` tuple, and client-mount resolution were all correct as designed and
+adversarially re-verified against the canonical proto + Python SDK (3/3 review lenses PASS). Offline:
+fmt/clippy `-D warnings`/build/test green on default-members (23 sdk unit tests; live tests gated behind
+`#[ignore]` + a `live` feature so CI never runs them). Auth proved separately (AppGetOrCreate).
+
+> **CORRECTION to the client-mount note (live-verified; supersedes "no pip needed").** The client mount
+> injects only the modal/synchronicity **source** at `/pkg` — it does **not** carry the client's
+> third-party **pip dependency closure** (`typing_extensions`, etc.). On a bare `python:3-slim` base the
+> container crash-loops at boot: `ModuleNotFoundError: No module named 'typing_extensions'` from
+> `/pkg/modal/__init__.py`. So the earlier "attach the mount ⇒ no pip" was too strong. Accurate model:
+> the **mount is still the source-injection mechanism** (what makes user code importable — the
+> Modal-native path), but the modal client's **runtime deps must also be present** — supplied either by a
+> dependency-carrying base image (what real Modal users derive from; `debian_slim` / Modal's image
+> builder install them) or, on a bare base, by `ImageSpec::with_pip_install_modal()` (the mount's `/pkg`
+> still wins on PYTHONPATH, so mounted source stays authoritative). Recorded in
+> `crates/modal-rust-sdk/src/ops/image.rs`; exercised by the gated `tests/live_create_invoke.rs`.
+
+This advances the staged plan: **P1 (auth + invoke) DONE**, and a large slice of **P3 (programmatic
+FunctionCreate, FILE mode)** proven at the SDK-primitive level. Next: wire the SDK into the
+`App`/`Function` `.remote()`/`.local()` ergonomics + migrate the CLI off codegen (P3→P9), then deploy
+(P5), dynamic config from the registry (P4), cache (P6), local orchestration (P7).

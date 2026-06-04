@@ -9,6 +9,28 @@ mid-phase.
 
 ## Active Now
 
+**[2026-06-04] `crates/modal-rust-sdk` landed + proven live.** The control-plane
+client decision is resolved to **(b)**: our own lean first-party Modal gRPC client,
+**no `modal-rs` dependency** (both `modal-rs` and the official `modal-client` cloned
+into gitignored `references/` for inspiration). The crate vendors the canonical Modal
+proto, re-implements auth/channel/CBOR + the proven FILE-mode ops natively (with the 3
+spike fixes + Modal-native client-mount injection), and **proved end-to-end live**: our
+client created + invoked a Modal function →
+`{"ok":true,"source":"rust_sdk_live_wrapper.handler","echoed":{"n":42,"hi":1}}` with no
+`modal` CLI and no per-project `.py`. Offline gates green (fmt/clippy `-D warnings`/build/
+test on default-members; 23 sdk unit tests; live tests `#[ignore]`+`live`-feature gated).
+3/3 adversarial reviews PASS. Built via the `build-modal-rust-sdk` workflow. This is **P1
+done + a large slice of P3** (see `workpads/shim-backend/{knowledge.md,tasks.md}`).
+
+> **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
+> `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/
+> call` off Python codegen (P3→P9), then deploy path (P5), dynamic config from the registry
+> (P4, drops the `--gpu` flag), cache-on-by-default (P6), local orchestration (P7). One
+> live-verified caveat folded into the design: the client mount carries modal *source* only,
+> so a bare base also needs the client's pip dep closure (`with_pip_install_modal()`).
+
+<details><summary>Superseded: paused-for-input note (2026-06-03 night)</summary>
+
 **Paused for user input (2026-06-03 night).** The validated core is DONE and
 committed: prototype **M0–M9**, GPU **M10–M13** (T4: nvidia-smi → cudarc vector-add
 → Burn), ergonomics **E1** (`#[modal_rust::function]` proc-macro), the **M0-R**
@@ -28,6 +50,11 @@ autonomous overnight run paused here rather than churn fragile work:
 - **shim-backend** — your exploratory design workpad; left for you to drive.
 - **M6b-wire** — implement `--cache` (OFF by default) + the local-SCCACHE_DIR +
   Volume-snapshot-sync strategy; low value until a dependency-heavy example exists.
+
+> Note: E2's "invoke-mode decision" is now resolved — the `modal-rust-sdk` (option b,
+> own client, no `modal-rs`) is the in-process invoke path; E2 builds on it.
+
+</details>
 
 > **Architecture gate passed (design-complete) 2026-06-03.** `boundaries.md` is
 > complete, internally consistent, and derived from the adversarially-reviewed
@@ -76,10 +103,12 @@ autonomous overnight run paused here rather than churn fragile work:
   + `Registry::from_inventory()`, byte-identical to manual `typed!`). E2 (remote-call
   stubs) + E3 (PyO3/maturin, optional) remain — E2 needs the invoke-mode decision
   (see Active Now). Gate: macros produce the validated runner shape (met for E1).
-- [ ] **shim-backend** — Exploratory follow-up: compare generated templates vs
-  static/data-driven Python shims, env/path config, hidden cache/module
-  materialization, image-baked shims, and deeper Modal authoring backends. Gate: a
-  decision-ready design matrix + spike plan; does not change the active GPU path.
+- [~] **shim-backend** — Pivoted from "compare shim backends" to **building a
+  programmatic Modal control plane in Rust** (decision (b), own client). Done:
+  design matrix + spike (FILE-mode create+invoke proven), control-plane decision
+  locked, and **`crates/modal-rust-sdk` landed + proven live** (P1 + a slice of P3).
+  Remaining staged tasks P3→P10 in `workpads/shim-backend/tasks.md`: App/Function
+  ergonomics, CLI off-codegen, deploy, dynamic config, cache, local orchestration.
 
 ## Notes
 

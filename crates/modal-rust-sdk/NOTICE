@@ -1,0 +1,28 @@
+modal-rust-sdk
+==============
+
+This crate (`modal-rust-sdk`, lib `modal_rust_sdk`) is a first-party Rust gRPC
+client for Modal's control plane. It is licensed under "MIT OR Apache-2.0".
+
+It does NOT depend on either project listed below at build time or run time.
+Both are read-only references used only during development. The items credited
+here are the vendored proto file and the implementation patterns it follows.
+
+------------------------------------------------------------------------------
+modal-client — the official Modal Python SDK
+  https://github.com/modal-labs/modal-client
+  License: Apache-2.0 / MIT
+
+  - proto/api.proto is copied VERBATIM from modal-client's
+    modal_proto/api.proto (the canonical Modal API definition,
+    `package modal.client`). It is vendored, not referenced.
+
+------------------------------------------------------------------------------
+modal-rs — the unofficial Rust SDK for Modal
+  https://github.com/thehumanworks/modal-rs
+  License: MIT
+
+  - The build-script recipe (tonic-prost-build + protoc-bin-vendored), the
+    auth / channel / interceptor structure, and the CBOR (args, kwargs) codec
+    follow modal-rs as the closest Rust precedent.
+------------------------------------------------------------------------------
