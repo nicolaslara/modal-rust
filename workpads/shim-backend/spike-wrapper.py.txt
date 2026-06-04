@@ -1,0 +1,23 @@
+"""Embedded Modal FILE-mode wrapper module for the modal-rust feasibility spike.
+
+This module is baked into the Modal image's filesystem at an importable path
+(/root/spike_wrapper.py, where /root is on sys.path inside Modal containers).
+
+The Modal container runtime, for a FILE-mode function, does:
+    module = importlib.import_module("spike_wrapper")
+    f = getattr(module, "handler")
+and then invokes f(*args, **kwargs).
+
+`handler` here is a PLAIN undecorated callable. Modal's
+user_code_imports.import_single_function_service() supports this case
+(function defined in global scope but not decorated as a modal.Function):
+it uses the raw callable directly.
+
+No `modal` import, no decorator, no app object. Pure Python.
+"""
+
+
+def handler(payload):
+    # Trivial non-GPU body: echo the payload back plus a marker, to prove the
+    # Rust -> gRPC authoring + invoke round-trip end to end.
+    return {"echoed": payload, "ok": True, "source": "spike_wrapper.handler"}

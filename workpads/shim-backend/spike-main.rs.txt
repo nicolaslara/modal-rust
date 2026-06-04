@@ -1,0 +1,376 @@
+//! FILE-mode feasibility spike: programmatically create + invoke a Modal function
+//! from Rust, with NO `modal` CLI and NO generated .py file in a user project.
+//!
+//! Unlike the SERIALIZED (cloudpickle) approach, here:
+//!   - definition_type = FILE, function_serialized = b"" (empty)
+//!   - the function is identified purely by module_name + function_name
+//!   - the wrapper module is BAKED INTO THE IMAGE via a `RUN` heredoc (no local COPY)
+//!   - the Modal container does importlib.import_module("spike_wrapper") + getattr(m,"handler")
+//!
+//! Flow (mirrors Modal Python `_deploy_app`):
+//!   connect (auth ~/.modal.toml) -> get_or_create_app
+//!   -> Image::from_registry + run_commands(write /root/spike_wrapper.py) -> build -> image_id
+//!   -> FunctionPrecreate(handler) -> FunctionCreate(FILE, module=spike_wrapper, fn=handler,
+//!        empty serialized, with_existing_function_id => bypasses empty-serialized guard)
+//!   -> set_objects + publish(Deployed) -> from_name -> remote((payload,)) -> result
+//!
+//! The empty-`function_serialized` guard in modal-rs to_proto_function is skipped when
+//! existing_function_id is set (allow_sparse_base = true), so FILE mode is reachable via the
+//! public API with no fork.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use modal_rs::{
+    AppOptions, AppPublishOptions, AppState, FunctionCreateSpec, FunctionDataFormat,
+    FunctionDefinition, FunctionDefinitionType, FunctionFromNameOptions, FunctionKind,
+    FunctionPrecreateSpec, Image, ImageDockerfileCommandsOptions, ModalClient,
+};
+
+const APP_NAME: &str = "modal-rust-spike-file2";
+const FN_NAME: &str = "handler";
+const MODULE_NAME: &str = "spike_wrapper";
+const ENVIRONMENT: &str = "main";
+// FILE mode carries NO pickled bytecode, so the base Python version is irrelevant to
+// correctness; pick a small, fast-pulling stock image.
+const BASE_IMAGE: &str = "python:3.12-slim";
+
+// The wrapper module source, baked into the image at /root/spike_wrapper.py (/root is on
+// sys.path inside Modal containers). Plain undecorated callable; FILE mode resolves it via
+// importlib + getattr. NO `modal` import, NO cloudpickle.
+const WRAPPER_SRC: &str = r#"def handler(payload):
+    return {"echoed": payload, "ok": True, "source": "spike_wrapper.handler"}
+"#;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 1. connect (auth from ~/.modal.toml), with retries past transient socket flakes.
+    let mut client = {
+        let mut c = None;
+        let mut last = String::new();
+        for i in 1..=5u32 {
+            match tokio::time::timeout(Duration::from_secs(30), ModalClient::connect()).await {
+                Ok(Ok(v)) => {
+                    c = Some(v);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last = format!("{e}");
+                    eprintln!("[connect] attempt {i}/5 error: {last}");
+                }
+                Err(_) => {
+                    last = "timeout".into();
+                    eprintln!("[connect] attempt {i}/5 TIMED OUT");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2 * i as u64)).await;
+        }
+        c.ok_or_else(|| anyhow::anyhow!("connect failed: {last}"))?
+    };
+    eprintln!(
+        "MILESTONE auth ok; builder_version = {}",
+        client.image_builder_version()
+    );
+    checkpoint("auth ok (connect + builder_version read)");
+
+    // 2. get_or_create_app (idempotent for resume)
+    let app = client
+        .get_or_create_app(APP_NAME, ENVIRONMENT, AppOptions::create_if_missing())
+        .await?;
+    eprintln!("MILESTONE app_id = {}", app.id);
+
+    // 3. build image: bake /root/spike_wrapper.py via a RUN heredoc (no local COPY).
+    // Base64-encode the source so no quoting/heredoc-escaping issues reach the Dockerfile.
+    let b64 = base64_encode(WRAPPER_SRC.as_bytes());
+    let bake_cmd = format!(
+        "RUN python3 -c \"import base64,pathlib; pathlib.Path('/root/{MODULE_NAME}.py').write_bytes(base64.b64decode('{b64}'))\""
+    );
+    eprintln!("bake command: {bake_cmd}");
+
+    // FILE-mode containers boot via `python -m modal._container_entrypoint`, so the IMAGE must
+    // contain the `modal` client package (the worker bootstrap that does importlib+getattr on the
+    // user module). Install it, then bake the wrapper module at /root/spike_wrapper.py.
+    let install_cmd = "RUN pip install --no-cache-dir modal".to_string();
+
+    let mut image = Image::from_registry(BASE_IMAGE).dockerfile_commands(
+        vec![install_cmd, bake_cmd],
+        ImageDockerfileCommandsOptions::default(),
+    )?;
+
+    // build with retries (ImageGetOrCreate is idempotent-ish; re-issuing returns cached image)
+    {
+        let mut built = false;
+        for i in 1..=6u32 {
+            match tokio::time::timeout(Duration::from_secs(420), image.build(&mut client, &app))
+                .await
+            {
+                Ok(Ok(())) => {
+                    built = true;
+                    break;
+                }
+                Ok(Err(e)) => eprintln!("[image_build] attempt {i}/6 error: {e}"),
+                Err(_) => eprintln!("[image_build] attempt {i}/6 TIMED OUT"),
+            }
+            tokio::time::sleep(Duration::from_secs(3 * i as u64)).await;
+        }
+        if !built {
+            anyhow::bail!("image build failed");
+        }
+    }
+    let image_id = image.id()?.to_string();
+    eprintln!("MILESTONE image_id = {image_id}");
+    checkpoint(&format!("image_id obtained: {image_id}"));
+
+    // 4. FunctionPrecreate (with retries)
+    let precreate = {
+        let mut res = None;
+        let mut last = String::new();
+        for i in 1..=5u32 {
+            let spec = FunctionPrecreateSpec::new(app.id.clone(), FN_NAME, FunctionKind::Function)
+                .with_supported_input_formats(vec![
+                    FunctionDataFormat::Pickle,
+                    FunctionDataFormat::Cbor,
+                ])
+                .with_supported_output_formats(vec![
+                    FunctionDataFormat::Pickle,
+                    FunctionDataFormat::Cbor,
+                ]);
+            match tokio::time::timeout(Duration::from_secs(60), client.functions().precreate(spec))
+                .await
+            {
+                Ok(Ok(v)) => {
+                    res = Some(v);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last = format!("{e}");
+                    eprintln!("[precreate] attempt {i}/5 error: {last}");
+                }
+                Err(_) => {
+                    last = "timeout".into();
+                    eprintln!("[precreate] attempt {i}/5 TIMED OUT");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2 * i as u64)).await;
+        }
+        res.ok_or_else(|| anyhow::anyhow!("precreate failed: {last}"))?
+    };
+    eprintln!("MILESTONE precreate function_id = {}", precreate.function_id);
+    checkpoint(&format!("precreate function_id: {}", precreate.function_id));
+
+    // 5. FunctionCreate in FILE mode: module=spike_wrapper, fn=handler, empty serialized.
+    // with_existing_function_id(precreate_id) sets allow_sparse_base=true, which skips the
+    // empty-`function_serialized` guard => true FILE mode through the public API.
+    let create = {
+        let mut res = None;
+        let mut last = String::new();
+        for i in 1..=5u32 {
+            let def = FunctionDefinition::new(MODULE_NAME, FN_NAME)
+                .with_image_id(image_id.clone())
+                .with_definition_type(FunctionDefinitionType::File)
+                // NOTE: no with_function_serialized => stays empty (FILE mode).
+                .with_timeout_secs(300)
+                .with_supported_input_formats(vec![
+                    FunctionDataFormat::Pickle,
+                    FunctionDataFormat::Cbor,
+                ])
+                .with_supported_output_formats(vec![
+                    FunctionDataFormat::Pickle,
+                    FunctionDataFormat::Cbor,
+                ]);
+            let spec = FunctionCreateSpec::new(app.id.clone(), def)
+                .with_existing_function_id(precreate.function_id.clone());
+            match tokio::time::timeout(Duration::from_secs(60), client.functions().create(spec))
+                .await
+            {
+                Ok(Ok(v)) => {
+                    res = Some(v);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last = format!("{e}");
+                    eprintln!("[create] attempt {i}/5 error: {last}");
+                }
+                Err(_) => {
+                    last = "timeout".into();
+                    eprintln!("[create] attempt {i}/5 TIMED OUT");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2 * i as u64)).await;
+        }
+        res.ok_or_else(|| anyhow::anyhow!("create failed: {last}"))?
+    };
+    eprintln!("MILESTONE create function_id = {}", create.function_id);
+    for w in &create.warnings {
+        eprintln!("create warning: {w:?}");
+    }
+    checkpoint(&format!("FILE-mode function_id created: {}", create.function_id));
+
+    // 6. publish (deploy) so from_name resolves.
+    // NOTE: Modal's modern Python deploy path (runner._publish_app) calls ONLY AppPublish with
+    // function_ids + definition_ids; it does NOT call the legacy AppSetObjects RPC (whose server
+    // handler currently throws "module 'grpc' has no attribute 'experimental'"). So we skip
+    // set_objects and rely on AppPublish alone, matching the Python client.
+    let mut fn_ids = HashMap::new();
+    fn_ids.insert(FN_NAME.to_string(), create.function_id.clone());
+
+    let mut def_ids = HashMap::new();
+    if let Some(def_id) = create
+        .handle_info
+        .as_ref()
+        .and_then(|h| h.definition_id.clone())
+    {
+        eprintln!("definition_id = {def_id}");
+        def_ids.insert(create.function_id.clone(), def_id);
+    }
+
+    let mut publish_opts = AppPublishOptions::default()
+        .with_name(APP_NAME)
+        .with_state(AppState::Deployed)
+        .with_function_ids(fn_ids);
+    if !def_ids.is_empty() {
+        publish_opts = publish_opts.with_definition_ids(def_ids);
+    }
+
+    let publish = {
+        let mut res = None;
+        let mut last = String::new();
+        for i in 1..=5u32 {
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                client.apps().publish(&app, publish_opts.clone()),
+            )
+            .await
+            {
+                Ok(Ok(v)) => {
+                    res = Some(v);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last = format!("{e}");
+                    eprintln!("[publish] attempt {i}/5 error: {last}");
+                }
+                Err(_) => {
+                    last = "timeout".into();
+                    eprintln!("[publish] attempt {i}/5 TIMED OUT");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2 * i as u64)).await;
+        }
+        res.ok_or_else(|| anyhow::anyhow!("publish failed: {last}"))?
+    };
+    eprintln!("MILESTONE published: {publish:?}");
+    checkpoint("app published (Deployed) via AppPublish only");
+
+    // 7. from_name -> remote((payload,))
+    let function = {
+        let mut res = None;
+        let mut last = String::new();
+        for i in 1..=6u32 {
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                client.functions().from_name(
+                    APP_NAME,
+                    FN_NAME,
+                    FunctionFromNameOptions::default(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(v)) => {
+                    res = Some(v);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last = format!("{e}");
+                    eprintln!("[from_name] attempt {i}/6 error: {last}");
+                }
+                Err(_) => {
+                    last = "timeout".into();
+                    eprintln!("[from_name] attempt {i}/6 TIMED OUT");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2 * i as u64)).await;
+        }
+        res.ok_or_else(|| anyhow::anyhow!("from_name failed: {last}"))?
+    };
+    eprintln!("resolved function id = {}", function.id());
+
+    // payload = {"hi": 1, "spike": "file-mode"} ; invoke as positional tuple (payload,)
+    let mut payload = HashMap::new();
+    payload.insert("hi".to_string(), 1i64);
+    payload.insert("n".to_string(), 42i64);
+
+    let mut last_err = String::new();
+    for i in 1..=8u32 {
+        match tokio::time::timeout(
+            Duration::from_secs(240),
+            function.remote::<_, serde_json::Value>(&mut client, (payload.clone(),)),
+        )
+        .await
+        {
+            Ok(Ok(v)) => {
+                println!("RESULT VALUE = {v}");
+                checkpoint(&format!("INVOKE OK result: {v}"));
+                eprintln!("MILESTONE invoke result obtained: {v}");
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                last_err = format!("{e}");
+                eprintln!("[remote] attempt {i}/8 error: {last_err}");
+            }
+            Err(_) => {
+                last_err = "timeout".into();
+                eprintln!("[remote] attempt {i}/8 TIMED OUT");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3 * i as u64)).await;
+    }
+    checkpoint(&format!("INVOKE FAILED: {last_err}"));
+    anyhow::bail!("remote invocation failed after retries: {last_err}");
+}
+
+fn checkpoint(line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/modal-rust-spike/SPIKE_NOTES.md")
+    {
+        let _ = writeln!(f, "- RUNTIME {}: {line}", now());
+    }
+}
+
+fn now() -> String {
+    // crude UTC-ish timestamp without extra deps
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("epoch={secs}")
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}

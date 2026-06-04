@@ -1,135 +1,249 @@
-# Shim Backend Tasks
+# Programmatic Backend Tasks — staged milestone plan (pivot)
 
-Explore how `modal-rust` should represent and drive the Modal Python control
-plane as apps grow beyond the `add` POC. This is an exploratory workpad: it does
-not change the active GPU/prototype gates, and it must not weaken the hard
-run-vs-deploy build boundary in `../architecture/boundaries.md`.
+Re-architect the Modal AUTHORING/control layer: drive Modal **programmatically** from
+Rust (forked modal-rs / vendored gRPC) instead of generating per-project Python shims +
+shelling out to the `modal` CLI. See `knowledge.md` →
+"Programmatic backend — grounded findings + plan (2026-06-04)" for the verified facts.
 
-## Objective
+## Frozen invariants (must NOT change)
 
-Define the design space for replacing "generated Python source" with a cleaner
-shim backend. The current CLI renders mostly-static Python templates into
-`.modal-rust/generated/` and invokes the official `modal` CLI. As apps grow to
-many functions and many deployments, decide whether the Python files should stay
-parameterized templates, become fully static data-driven shims, move to an
-installed/cache module, be baked into an image, or eventually be replaced by a
-different Modal authoring backend. Keep the work open to other designs.
+- The **runner CLI protocol** (`modal_runner --entrypoint … --input-file …`, ONE JSON
+  envelope on stdout, five error kinds) — `../architecture/research-synthesis.md` §2.2.
+- The **inventory `Registry`** + `typed!()` / `#[modal_rust::function/app(...)]` macros —
+  §2.3. The decorator IS the config (gpu/cache/timeout).
+- The **run-vs-deploy build boundary** (`../architecture/boundaries.md`):
+  `run` = build at function-execution time (`copy=False`); `deploy` = build at image-build
+  time (`copy=True` + `run_commands`), deployed runtime never invokes `cargo`; `call` =
+  lookup/invoke only.
 
-The preferred hypothesis to examine first is: **static Python shim source +
-config as data**. Entrypoint/input already flow as runtime data; app name, source
-root, image/build knobs, GPU, volumes, secrets, and deploy target may also be
-data available at module import time via env or a config path. Rust can embed the
-static shim bytes (`include_str!`/`include_bytes!`), hash/version them, and
-materialize them only when the official Modal CLI needs an importable file or
-module.
+## Method
+
+**Validate one boundary per task.** Each task crosses exactly ONE new boundary, has a
+single failure reason, and ends with captured evidence. Build stages are strictly ordered;
+do not start a stage until its `depends_on` are green. The forward path is the programmatic
+control plane; the **fallback** (static-shim Option 2) is preserved as a clean revert at
+every stage (it changes only the control layer).
 
 ## Gate
 
-This workpad passes when `knowledge.md` records a decision-ready design note with
-at least: (1) the design space and alternatives; (2) pros/cons and failure modes;
-(3) which values must be available at Python module-import time versus
-`@app.local_entrypoint()` runtime; (4) how the choice handles many functions,
-many apps, debug dumps, and deterministic Rust-owned shim bytes; and (5) what
-small spike, if any, is needed before changing the current CLI.
+This workpad's build phase passes when a local Rust `main()` can `app.function("add")
+.remote(cfg).await? == {"sum":42}` on Modal with **no `modal` CLI and no per-project Python
+file**, per-function gpu/cache/timeout flowing dynamically from the registry, cache ON by
+default, and `.local()` running the same handler in-process — with the runner/registry/macros
+unchanged.
 
-The gate does **not** require implementing the chosen backend. If implementation
-is recommended, open follow-up tasks in the appropriate phase.
+---
 
-## S1 - Design matrix for shim representation and materialization
+## P-research — primary-source research (DONE)
 
-Status: pending
+Status: done
 
-Acceptance:
-- Catalog the alternatives below, plus any better ideas found during review:
-  - status quo: parameterized Python source templates under `.modal-rust/generated/`;
-  - fully static shims with config in `MODAL_RUST_CONFIG_JSON`;
-  - fully static shims with `MODAL_RUST_CONFIG_PATH`;
-  - static shims as an installed/importable Python package/module;
-  - static shims materialized in an OS temp/cache directory;
-  - static shims baked into a Modal image or base image;
-  - Python SDK subprocess/backend that avoids `modal run <file>` as the primary
-    authoring path;
-  - lower-level `modal-rs`/protobuf authoring backend with no Python shim source;
-  - hybrid: static embedded bytes plus optional debug dump.
-- For each option, record pros/cons across: Modal CLI compatibility, import-time
-  config availability, many-functions scaling, many-apps/deployments scaling,
-  debug ergonomics, reproducibility/hashability, security/secrets handling,
-  packaging/install complexity, and risk of becoming a second control path.
-- Distinguish "no generated Python source", "no local shim file", and "no Python
-  control plane at all"; do not collapse them.
-- Record whether a template language is still needed if config moves to data.
+- Modal 1.3.2 serialization + FunctionCreate (FILE vs SERIALIZED, CBOR boundary, resources/
+  gpu CopyFrom, volume_mounts); modal-rs 0.1.3 surface + GPU gap + `inner_mut()` dead-end;
+  native Volume copy/snapshot answer; local-orchestration semantics.
+- **Evidence:** four research passes folded into `knowledge.md` (2026-06-04 section), with
+  file:line citations re-verified against the installed 1.3.2 source.
 
-Evidence:
-- A completed design matrix in `knowledge.md`.
-- Local references in `references.md` to the current template renderer, generated
-  templates, CLI invocation sites, and architecture contracts.
+## P-spike — executable feasibility spike (DONE-on-paper; live run OUTSTANDING)
 
-## S2 - Static-shim config contract sketch
+Status: done (paper) / **BLOCKED (executable)** — must re-run before P1+
 
-Status: pending
+- Goal: prove Rust programmatically creates + invokes a Modal function → `{"sum":42}` with
+  NO `modal` CLI and NO generated per-project file (FILE mode + CBOR + forked modal-rs).
+- **Outcome:** paper-feasibility = FEASIBLE (all facts source-verified). The **live spike was
+  blocked by an infra error** ("API Error: socket connection closed unexpectedly"), NOT a
+  Modal/Rust limitation — no `{"sum":42}` round-trip was produced.
+- Acceptance (for the re-run): a throwaway Rust binary creates an app, builds an image
+  carrying a hand-written wrapper module, `FunctionCreate(FILE, function_serialized=b"")`,
+  invokes with CBOR `(args,kwargs)`, prints the decoded result `== {"sum":42}`.
+- **Evidence:** captured stdout of the round-trip + the gRPC request fields; OR, if blocked
+  again, the exact error + retry plan. **This re-run gates P1.**
+- depends_on: [P-research]
+- fallback: if the executable spike fails for a *design* reason (not infra), STOP the pivot
+  and adopt static-shim Option 2 (record the blocking reason here).
 
-Acceptance:
-- Sketch a versioned config shape for static shims, including at minimum:
-  `mode`, `app_name`, `deploy_app_name`/lookup target, `rust_image`,
-  `python_version`, `local_src`, `remote_src`, `copy`, `ignore`, build commands,
-  remote env, timeout, optional GPU, optional volumes, optional secrets, and
-  optional cache policy.
-- Mark every field as import-time, local-entrypoint runtime, or remote-function
-  runtime.
-- Decide whether small configs should use `MODAL_RUST_CONFIG_JSON`, large configs
-  should use `MODAL_RUST_CONFIG_PATH`, or both should be supported.
-- Explain how Rust embeds, hashes, versions, materializes, and optionally dumps
-  the static shim source and config for debugging.
-- Preserve the run-vs-deploy boundary explicitly:
-  - `run`: `copy=False`, runtime build in the Function body or documented
-    Sandbox fallback;
-  - `deploy`: `copy=True`, `run_commands(cargo build)`, deployed body never
-    invokes `cargo`;
-  - `call`: lookup/call only, no source/build.
+---
 
-Evidence:
-- A config contract section in `knowledge.md` with example JSON for `run`,
-  `deploy`, and `call`.
-- A note identifying which fields cannot safely be passed only as
-  `main(...)` CLI flags because Modal constructs `app`, `image`, and functions at
-  Python module import time.
-
-## S3 - Minimal static-shim spike plan
+## P1 — Programmatic control-plane client (auth + a real FunctionGet/invoke)
 
 Status: pending
 
-Acceptance:
-- Propose the smallest spike that could prove or disprove static shims without
-  disrupting M10+ GPU work. Prefer an offline/local smoke first, then one cheap
-  `modal run` only if needed.
-- The spike should test that a static file can construct `modal.App`,
-  `modal.Image.add_local_dir(...)`, and `@app.function` from env/config available
-  at module import time, then still accept `--entrypoint`/`--input-json` at
-  local-entrypoint runtime.
-- Include test/evidence expectations and how to compare output to the current
-  generated templates.
-- Keep the spike behind a separate command/feature or scratch path; do not replace
-  the current generated-template CLI path until the spike is reviewed.
+- **Boundary crossed:** Rust authenticates to Modal and performs ONE real RPC round-trip
+  against the live API (read path), proving the channel + auth + proto wiring before any
+  authoring.
+- **acceptance:** a `modal-rust-client` module wraps a forked/vendored modal-rs `ModalClient`
+  (auth from `~/.modal.toml`/`MODAL_TOKEN_*`); `App::connect(name)` does `AppGetOrCreate`;
+  `function(name).from_name(...)` does `FunctionGet`; invoking an **already-deployed** `add`
+  function via `.remote((cfg,))` returns `{"sum":42}` decoded from CBOR. No `modal` CLI used.
+- **evidence:** captured decoded result + the resolved auth source; the deployed fixture used.
+- depends_on: [P-spike (live re-run green)]
+- fallback: static-shim Option 2 (modal-rs confined to `call`, as in §2.7).
 
-Evidence:
-- Spike plan recorded in `knowledge.md`.
-- If run, exact command(s), output, and any Modal cost/risk notes recorded.
-
-## S4 - Recommendation and follow-up issue/task split
+## P2 — Embedded-wrapper serialization decision (FILE-mode module; cbor-or-cloudpickle)
 
 Status: pending
 
-Acceptance:
-- Recommend one default path and one fallback path, or explicitly leave the
-  decision open with blockers.
-- State whether to:
-  - keep current template generation for v0;
-  - refactor to static shims + config before more app complexity;
-  - add `--shim-dir`, `--keep-shim`, or `--dump-shim` debug controls;
-  - add an installed Python package/module path;
-  - defer direct `modal-rs`/protobuf authoring.
-- Break any implementation into small follow-up tasks with acceptance criteria.
+- **Boundary crossed:** the ONE embedded Python wrapper module exists in THIS crate and is
+  proven importable + correct as a Modal function body, with the function-body
+  representation chosen (FILE mode is the decision; SERIALIZED/cloudpickle is the stretch).
+- **acceptance:** a single `modal_rust_wrapper.py` (in-crate, `include_str!`-embedded) with a
+  top-level entry fn that receives the CBOR/JSON input, execs the frozen runner
+  (`modal_runner --entrypoint <name> --input-file /tmp/in.json`), and returns the one-line
+  JSON envelope string. Locally: `python -c "import modal_rust_wrapper; print(...)"` round-
+  trips a sample envelope. Decision recorded: **FILE mode** (`function_serialized=b""` +
+  `module_name`/`function_name`); cloudpickle-proto-4-from-Rust is the `dump`-tool stretch.
+- **evidence:** the wrapper source + a local import/exec round-trip; the recorded decision +
+  why FILE mode (cites `user_code_imports.py:475,488`).
+- depends_on: [P-research]
+- fallback: the same wrapper doubles as the static-shim's runner-exec body (no waste).
 
-Evidence:
-- Final recommendation in `knowledge.md`.
-- Any follow-up tasks added to the relevant workpad or explicitly deferred.
+## P3 — Programmatic FunctionCreate (run path; no CLI, no file)
+
+Status: pending
+
+- **Boundary crossed:** Rust **creates** a function on Modal end-to-end (image build with the
+  embedded wrapper baked in → precreate → FunctionCreate FILE mode → invoke), with NO `modal`
+  CLI and NO per-project Python file — the `run` path, `copy=False` source mount preserved.
+- **acceptance:** `app.function("add").remote(cfg).await? == {"sum":42}` where the function
+  was created this run: `ImageGetOrCreate` (dockerfile adds the wrapper module + source),
+  `FunctionPrecreate`, `FunctionCreate{definition_type=FILE, function_serialized=b"",
+  module_name, function_name, image_id, supported_input_formats=[…,CBOR]}`. Build still
+  happens in the function body at execution time (boundary intact).
+- **evidence:** captured `{"sum":42}`; the FunctionCreate request fields; confirmation no
+  `modal` CLI / no `.py` written to the user project.
+- depends_on: [P1, P2]
+- fallback: static-shim Option 2 (generate one static shim + `modal run`).
+
+## P4 — Dynamic config from the registry (gpu/cache/timeout into FunctionCreate)
+
+Status: pending
+
+- **Boundary crossed:** per-function config sourced from the **Rust registry** (populated by
+  `#[modal_rust::function/app(...)]`) flows into FunctionCreate at runtime — and the old
+  static path is removed (drop the `--gpu` flag + the CLI static attribute-parse /
+  `--describe`-before-build).
+- **acceptance:** `#[modal_rust::function(gpu="A100", timeout=1800)]` → the registry's
+  `FunctionConfig` → `FunctionCreate.resources.gpu_config` + `timeout_secs` (requires the
+  **forked modal-rs GPU/resources setter**, since 0.1.3 leaves `resources` default and
+  `inner_mut()` can't reach private proto). A GPU **list** routes through `ranked_functions`.
+  Config is read dynamically — NO pre-build parse, NO `--describe`, NO `--gpu` CLI flag.
+- **evidence:** a function created with `gpu_config` set verified server-side (or in the
+  request bytes); the deleted `--gpu` flag / static-parse code; a non-GPU fn (timeout/volumes
+  via as-is modal-rs) and a GPU fn (forked path) both created.
+- depends_on: [P3]
+- fallback: static-shim Option 2 reads config into the static shim's env (`MODAL_RUST_CONFIG_JSON`).
+
+## P5 — Deploy path (programmatic AppPublish; build at image-build time)
+
+Status: pending
+
+- **Boundary crossed:** the **deploy** boundary — a persistent app published programmatically,
+  with Rust built at IMAGE-BUILD time (`copy=True` + `run_commands(cargo build)`), the
+  deployed runtime execing only the baked binary (never `cargo`).
+- **acceptance:** `modal-rust deploy add` (or `App::deploy`) builds an image with the source
+  COPIED + `cargo build --release` in a build step, `FunctionCreate` against a published app
+  (`AppPublish`), then `call`/`.remote()` invokes the deployed function → `{"sum":42}` with no
+  source mount and no build at call time. Boundary asserted: deployed body has no `cargo`.
+- **evidence:** captured deploy output + a subsequent cold `call` result; proof the runtime
+  image execs the prebuilt binary (no cargo in the run step).
+- depends_on: [P3]
+- fallback: static-shim `deploy_app.py` + `modal deploy`.
+
+## P6 — Cache ON by default (V2 Volume, archive-as-single-object)
+
+Status: pending
+
+- **Boundary crossed:** the cargo cache is attached + warmed automatically on the `run` path
+  (default ON), using the chosen mechanism — NO native snapshot exists, so an archive object
+  on a V2 Volume.
+- **acceptance:** `run` attaches `Volume.from_name("modal-rust-cargo-cache",
+  create_if_missing=True, version=2)` via `FunctionVolumeMount.with_allow_background_commits
+  (true)` from the registry config; the wrapper unpacks `cache.tar.zst` → `/tmp` on start and
+  repacks on exit; build on `/tmp` (`CARGO_TARGET_DIR=/tmp/target`), never on the mount; a
+  second `run` is measurably faster (cache hit). `--no-cache` + `modal volume rm` reset works.
+  No `vol.reload()` on the hot path.
+- **evidence:** two timed runs (cold vs warm) showing speedup; the volume_mount fields; the
+  `--no-cache` escape verified. (Best-effort — not a dependency of deploy.)
+- depends_on: [P4]
+- fallback: cache OFF (null-result escape hatch), per M6.
+
+## P7 — Local orchestration (`.remote().await` + `.local()`, feature-gated CUDA)
+
+Status: pending
+
+- **Boundary crossed:** a local Rust `main()` orchestrates Modal like
+  `@app.local_entrypoint()` — and `.local()` runs the same handler IN-PROCESS with no Modal,
+  on a dev machine with no CUDA installed.
+- **acceptance:** `App::connect` + `function(name).remote(cfg).await?` (remote) and
+  `.local(cfg)?` (in-process Registry dispatch → `{"sum":42}`) both work from one `main()`.
+  The crate compiles on a Mac with NO CUDA: GPU bodies behind `#[cfg(feature="cuda")]`,
+  cudarc `dynamic-loading`; the burn-add default-members workspace exclusion is removed and
+  `cargo build --workspace` is clean. Add `.spawn()`/`.map()` if cheap.
+- **evidence:** one `main()` exercising `.remote()` + `.local()`; clean `cargo build
+  --workspace` without CUDA; the removed default-members exclusion.
+- depends_on: [P3]
+- fallback: `.local()` works standalone (zero Modal) even if `.remote()` reverts to static shim.
+
+## P8 — `dump`/debug tool
+
+Status: pending
+
+- **Boundary crossed:** the escape hatch — users can emit + inspect the exact embedded
+  wrapper, the image dockerfile commands, and the FunctionCreate request that Rust would send.
+- **acceptance:** `modal-rust dump [run|deploy|call] <entrypoint>` writes the wrapper module,
+  the resolved config, and a human-readable FunctionCreate summary to `.modal-rust/debug/`
+  without contacting Modal. Doubles as the proof-of-correctness for the SERIALIZED-mode
+  stretch (it can emit a candidate cloudpickle blob for inspection).
+- **evidence:** the dumped artifacts for the `add` example.
+- depends_on: [P3]
+- fallback: trivially compatible with static-shim (dump the static shim + config instead).
+
+## P9 — Migrate the CLI off codegen
+
+Status: pending
+
+- **Boundary crossed:** the `modal-rust run/deploy/call` commands route through the
+  programmatic client by default; the Python template renderer + `modal` CLI shell-out are
+  removed from the default path.
+- **acceptance:** `modal-rust run/deploy/call` produce identical results to the previous
+  generated-shim path (same `{"sum":42}`, same envelope) but emit NO `.modal-rust/generated/
+  *.py` and invoke NO `modal` CLI. `doctor` updated (drops `modal` CLI on `$PATH` as a hard
+  requirement for the default path; keeps auth check).
+- **evidence:** before/after parity on `run`/`deploy`/`call`; confirmation no generated `.py`
+  and no `modal` subprocess; updated `doctor`.
+- depends_on: [P3, P4, P5]
+- fallback: keep `templates.rs` + `modal` CLI behind a `--use-shim` flag as the documented
+  fallback control path (clean revert).
+
+## P10 — Remove the per-project shim
+
+Status: pending
+
+- **Boundary crossed:** the final cleanup — no per-project Python file is materialized
+  anywhere on the default path; the embedded wrapper lives only in this crate / the image.
+- **acceptance:** a clean `examples/add` run/deploy/call leaves zero generated `.py` in the
+  user project; `templates.rs`'s per-project templates are deleted (or moved behind the
+  `--use-shim` fallback only). "No Python file visible anywhere" (Rust-emitted cloudpickle,
+  SERIALIZED mode) remains a documented stretch validated by `dump`, not required here.
+- **evidence:** a clean tree after a full run/deploy/call cycle; the removed templates.
+- depends_on: [P9]
+- fallback: retain the static shim materialized to an OS cache dir (Option 5E) — not the user
+  project — if a per-project file proves unavoidable.
+
+---
+
+## DAG
+
+```
+P-research → P-spike → P1 ─┐
+P-research → P2 ───────────┤
+                           ├→ P3 → P4 → {P6}
+                           │    P3 → P5
+                           │    P3 → P7
+                           │    P3 → P8
+                  {P3,P4,P5} → P9 → P10
+```
+
+P6 (cache) and P7 (local orchestration) are independent leaves off P3/P4 and are not
+dependencies of the deploy/cleanup chain. P-spike's **live re-run gates the entire build
+phase** — if it fails for a design reason, adopt static-shim Option 2 and re-scope P1–P10.
