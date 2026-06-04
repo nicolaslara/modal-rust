@@ -1,19 +1,48 @@
 //! Local-directory UPLOAD → ephemeral Modal mount (`add_local_dir(copy=False)`).
 //!
-//! This is the RUN-path source upload: walk a local directory (pruning build
-//! artifacts), hash every surviving file, push the file bytes to the control
-//! plane (inline for small files, blob for large), and finalize one ephemeral
-//! `Mount` whose `mount_id` is attached to a `Function` via `Function.mount_ids`.
-//! The mounted files land at `<remote_path>/<rel-as-posix>` so the in-container
-//! `cargo build` in `/src` sees the same layout as the local crate.
+//! This is the source upload for BOTH the RUN path (mount at `/src`, build in the
+//! function body) and the DEPLOY path (image build context at `/app/src`). It walks
+//! a set of local directories (pruning build artifacts and ignored paths), hashes
+//! every surviving file, pushes the bytes to the control plane (inline for small
+//! files, blob for large), and finalizes one ephemeral `Mount` whose `mount_id` is
+//! attached to a `Function` via `Function.mount_ids`. Each file lands at
+//! `<remote_path>/<rel-as-posix>` so the in-container `cargo build` sees the same
+//! layout as the local crate.
 //!
-//! Ported from Modal's `_MountDir.get_files_to_upload` / `mount.py` and the
-//! modal-rs `mount.rs` precedent, narrowed to the 4-pattern ignore subset the
-//! proven `dev_app.py` recipe uses (no full gitignore engine — keeps CI lean).
+//! ## What gets uploaded (file selection)
+//!
+//! Two entrypoints, two selection strategies that share the same upload core:
+//!
+//! - [`ModalClient::mount_workspace_closure`] (PRIMARY): upload ONLY a caller-chosen
+//!   set of crate directories (the cargo dependency closure of the target package)
+//!   plus explicit extra files (the workspace `Cargo.toml`/`Cargo.lock`). The caller
+//!   (the facade's `scope` module) computes the closure from `cargo metadata`. This
+//!   is correct-by-construction: `cargo build` of the target needs exactly the
+//!   closure, so nothing else is uploaded.
+//! - [`ModalClient::mount_local_dir`] (FALLBACK): walk the whole source root. Used
+//!   when `cargo metadata` is unavailable (no `Cargo.toml`, non-cargo project, etc.).
+//!
+//! ## Ignore-file resolution (pruning WITHIN the uploaded dirs)
+//!
+//! Both strategies prune via a real gitignore engine ([`ignore::gitignore`]), rooted
+//! at the workspace root, layered by precedence (highest → lowest):
+//!
+//! 1. `.modalignore` at the workspace root (gitignore syntax incl. `!` negation),
+//! 2. `.gitignore` at the workspace root,
+//! 3. built-in defaults (`target/`, `.git/`, `**/*.rlib`).
+//!
+//! The workspace `Cargo.toml`/`Cargo.lock` are added explicitly and are EXEMPT from
+//! ignore matching (never-ignorable build inputs).
+//!
+//! ## Non-source assets are NOT uploaded
+//!
+//! The source upload carries source only. Datasets, model weights, and other large
+//! assets must be attached via **Modal Volumes**, not the source mount.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sha2::{Digest, Sha256};
 use tokio::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -34,6 +63,14 @@ use crate::retry::retry_unary;
 /// (matches Modal's `MOUNT_PUT_FILE_CLIENT_TIMEOUT` / modal-rs `mount.rs:16`).
 const MOUNT_PUT_FILE_CLIENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// Built-in default ignore patterns — the FLOOR for a project with no
+/// `.gitignore`/`.modalignore`. Gitignore syntax. Build artifacts and VCS only;
+/// everything else is decided by the project's own ignore files.
+pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &["target/", ".git/", "**/*.rlib"];
+
+/// Default filename for the highest-precedence ignore file (gitignore syntax).
+pub const DEFAULT_MODALIGNORE_NAME: &str = ".modalignore";
+
 /// A file selected for upload: its on-disk bytes plus the POSIX path it will hold
 /// inside the mount (`<remote_path>/<rel>`), and its Unix mode if available.
 struct LocalFile {
@@ -45,20 +82,74 @@ struct LocalFile {
     mode: Option<u32>,
 }
 
+/// The file-selection inputs for [`ModalClient::mount_workspace_closure`], bundled
+/// so the upload call site stays readable (and within clippy's arg budget).
+///
+/// All paths are anchored at [`workspace_root`](Self::workspace_root): the matcher
+/// is rooted there, and every uploaded file preserves its path relative to it under
+/// `remote_path`, so the in-container layout matches the local workspace.
+pub struct WorkspaceClosureSpec<'a> {
+    /// Workspace root (the cargo-metadata root + the ignore-matcher anchor).
+    pub workspace_root: &'a Path,
+    /// Cargo dependency-closure crate directories of the target package (computed by
+    /// the facade from `cargo metadata`); each is walked and pruned by the matcher.
+    pub crate_dirs: &'a [PathBuf],
+    /// Extra files uploaded verbatim FROM DISK (e.g. the workspace `Cargo.lock`),
+    /// EXEMPT from ignore matching.
+    pub extra_files: &'a [PathBuf],
+    /// Extra files uploaded from IN-MEMORY bytes as `(workspace-relative POSIX path,
+    /// bytes)` — the REWRITTEN workspace `Cargo.toml` whose members are scoped to the
+    /// closure (the on-disk manifest lists ALL members, which would not load against a
+    /// subset upload). Takes precedence over a same-path disk/walked file.
+    pub extra_inline_files: &'a [(String, Vec<u8>)],
+    /// Highest-precedence ignore filename (default [`DEFAULT_MODALIGNORE_NAME`]).
+    pub modalignore_name: &'a str,
+}
+
 impl ModalClient {
-    /// Upload a local directory as an EPHEMERAL Modal mount; return its `mount_id`.
-    ///
-    /// Files map to `"<remote_path>/<rel-as-posix>"`. `ignore` is the small pattern
-    /// subset (bare segments pruned anywhere in the path; `*.<ext>` / `**/*.<ext>`
-    /// by extension) matched against the path RELATIVE to `local_dir`. `target/`,
-    /// `.git/`, etc. are pruned EARLY so we never descend into huge artifact trees.
+    /// Upload ONLY the closure crate directories (plus the explicit extra files) as
+    /// an EPHEMERAL Modal mount under `remote_path`; return its `mount_id`. PRIMARY
+    /// upload path. See [`WorkspaceClosureSpec`] for the selection inputs.
     ///
     /// `environment` defaults to the configured environment (or `"main"`).
+    pub async fn mount_workspace_closure(
+        &mut self,
+        spec: &WorkspaceClosureSpec<'_>,
+        remote_path: &str,
+        environment: Option<&str>,
+    ) -> Result<String> {
+        if !spec.workspace_root.is_dir() {
+            return Err(Error::invalid(format!(
+                "mount_workspace_closure: workspace root '{}' is not a directory",
+                spec.workspace_root.display()
+            )));
+        }
+        let matcher = build_matcher(spec.workspace_root, spec.modalignore_name)?;
+        let files = collect_files_for_dirs(
+            spec.workspace_root,
+            spec.crate_dirs,
+            spec.extra_files,
+            spec.extra_inline_files,
+            remote_path,
+            &matcher,
+        )?;
+        self.finalize_mount(files, spec.workspace_root, environment)
+            .await
+    }
+
+    /// Upload a whole local directory as an EPHEMERAL Modal mount; return its
+    /// `mount_id`. FALLBACK upload path (used when `cargo metadata` is unavailable).
+    ///
+    /// Walks `local_dir` and prunes via the resolved ignore matcher, with precedence
+    /// `.modalignore` then `.gitignore` then built-in defaults, rooted at `local_dir`.
+    /// Files map to `"<remote_path>/<rel-as-posix>"`. `modalignore_name` is the
+    /// highest-precedence ignore filename. `environment` defaults to the configured
+    /// environment.
     pub async fn mount_local_dir(
         &mut self,
         local_dir: impl AsRef<Path>,
         remote_path: &str,
-        ignore: &[&str],
+        modalignore_name: &str,
         environment: Option<&str>,
     ) -> Result<String> {
         let local_dir = local_dir.as_ref();
@@ -68,15 +159,39 @@ impl ModalClient {
                 local_dir.display()
             )));
         }
-        let environment_name = self.env_or_default(environment);
-        let matcher = IgnoreMatcher::new(ignore);
-
+        let matcher = build_matcher(local_dir, modalignore_name)?;
         let files = collect_files(local_dir, remote_path, &matcher)?;
+        self.finalize_mount(files, local_dir, environment).await
+    }
+
+    /// Shared upload + `MountGetOrCreate` finalize for both selection strategies.
+    async fn finalize_mount(
+        &mut self,
+        files: Vec<LocalFile>,
+        source_root: &Path,
+        environment: Option<&str>,
+    ) -> Result<String> {
         if files.is_empty() {
             return Err(Error::invalid(format!(
-                "mount_local_dir: no files to upload under '{}' after applying ignore patterns",
-                local_dir.display()
+                "no files to upload under '{}' after applying ignore files",
+                source_root.display()
             )));
+        }
+        let environment_name = self.env_or_default(environment);
+
+        // Log the exact uploaded file set (paths + total bytes) so the scoped
+        // upload is observable: which crate dirs the cargo closure selected and
+        // which files the ignore files (`.modalignore` > `.gitignore` > defaults)
+        // pruned. Cheap, durable evidence; goes to stderr (never stdout).
+        let total_bytes: u64 = files.iter().map(|f| f.data.len() as u64).sum();
+        eprintln!(
+            "[modal-rust] source upload: {} files, {} bytes from '{}'",
+            files.len(),
+            total_bytes,
+            source_root.display()
+        );
+        for f in &files {
+            eprintln!("[modal-rust]   upload {}", f.mount_filename);
         }
 
         let mount_files = self.upload_files(files).await?;
@@ -215,34 +330,198 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
     out
 }
 
+/// Build the layered ignore matcher rooted at `workspace_root`, with precedence
+/// (highest → lowest): `<modalignore_name>` > `.gitignore` > built-in defaults.
+///
+/// The matcher is rooted at `workspace_root`, so callers query it with paths
+/// RELATIVE to `workspace_root` (the in-container layout root). Layers are added in
+/// LOWEST→HIGHEST order because `ignore`'s matcher resolves "last match wins": the
+/// defaults go in first, then `.gitignore`, then `<modalignore_name>` LAST so its
+/// rules (and its `!` negations) win over both.
+///
+/// Only the workspace-root ignore files are consulted (no per-directory `.gitignore`
+/// discovery, no `~/.config/git/ignore`, no parent-dir walk) — a single, predictable,
+/// documented set of sources.
+fn build_matcher(workspace_root: &Path, modalignore_name: &str) -> Result<Gitignore> {
+    let mut builder = GitignoreBuilder::new(workspace_root);
+
+    // 1. Built-in defaults (lowest precedence — the floor).
+    for pat in DEFAULT_IGNORE_PATTERNS {
+        builder
+            .add_line(None, pat)
+            .map_err(|e| Error::build(format!("invalid default ignore pattern '{pat}': {e}")))?;
+    }
+    // 2. .gitignore (if present). `add` returns Some(err) only on a real problem;
+    //    a missing file surfaces as an Io error we treat as "absent" (skip).
+    let gitignore = workspace_root.join(".gitignore");
+    if gitignore.is_file() {
+        if let Some(err) = builder.add(&gitignore) {
+            return Err(Error::build(format!(
+                "failed to parse '{}': {err}",
+                gitignore.display()
+            )));
+        }
+    }
+    // 3. .modalignore (highest precedence — added LAST so it wins).
+    let modalignore = workspace_root.join(modalignore_name);
+    if modalignore.is_file() {
+        if let Some(err) = builder.add(&modalignore) {
+            return Err(Error::build(format!(
+                "failed to parse '{}': {err}",
+                modalignore.display()
+            )));
+        }
+    }
+
+    builder
+        .build()
+        .map_err(|e| Error::build(format!("failed to build ignore matcher: {e}")))
+}
+
+/// Is the path (RELATIVE to the matcher's `workspace_root`) ignored? Honors `!`
+/// negations (a whitelist match re-includes). Directory pruning uses `is_dir=true`.
+fn is_ignored(matcher: &Gitignore, rel: &Path, is_dir: bool) -> bool {
+    // Empty rel = the workspace root itself; never ignore it.
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    matcher.matched_path_or_any_parents(rel, is_dir).is_ignore()
+}
+
 /// Normalize the remote mount prefix: strip a trailing `/` so joins never produce
 /// a `//`. A bare `/` (mount at root) normalizes to the empty string.
 fn normalize_remote_prefix(remote_path: &str) -> String {
-    let trimmed = remote_path.trim_end_matches('/');
-    trimmed.to_string()
+    remote_path.trim_end_matches('/').to_string()
 }
 
-/// Walk `local_dir`, prune ignored directories early, and collect the surviving
-/// files as [`LocalFile`] with `<remote_prefix>/<rel-as-posix>` paths.
-///
-/// `remote_prefix` is normalized defensively (trailing slashes stripped) so a
-/// root mount passed as `"/"` yields `/<rel>` rather than `//<rel>`, regardless
-/// of whether the caller pre-normalized.
+/// Join a normalized `remote_prefix` with a POSIX relative path into a mount path.
+fn mount_path(remote_prefix: &str, rel_posix: &str) -> String {
+    if remote_prefix.is_empty() {
+        format!("/{rel_posix}")
+    } else {
+        format!("{remote_prefix}/{rel_posix}")
+    }
+}
+
+/// PRIMARY collector: walk each crate dir in `crate_dirs`, emitting files at
+/// `<remote_prefix>/<rel-to-workspace_root>` and pruning via `matcher` (queried with
+/// the path relative to `workspace_root`). Then append `extra_files` (read from disk)
+/// and `extra_inline_files` (in-memory bytes) verbatim — both EXEMPT from ignore
+/// matching (these are never-ignorable workspace manifests).
+fn collect_files_for_dirs(
+    workspace_root: &Path,
+    crate_dirs: &[PathBuf],
+    extra_files: &[PathBuf],
+    extra_inline_files: &[(String, Vec<u8>)],
+    remote_prefix: &str,
+    matcher: &Gitignore,
+) -> Result<Vec<LocalFile>> {
+    let remote_prefix = normalize_remote_prefix(remote_prefix);
+    let remote_prefix = remote_prefix.as_str();
+    let mut files = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for dir in crate_dirs {
+        if !dir.is_dir() {
+            return Err(Error::build(format!(
+                "closure crate dir '{}' is not a directory",
+                dir.display()
+            )));
+        }
+        // Walk the crate dir; prune ignored subtrees early. We compute the path
+        // RELATIVE to workspace_root so the matcher (rooted there) and the mount
+        // layout both see the same in-workspace path.
+        let walker = WalkDir::new(dir).into_iter().filter_entry(|entry| {
+            match entry.path().strip_prefix(workspace_root) {
+                Ok(rel) => !is_ignored(matcher, rel, entry.file_type().is_dir()),
+                // The crate dir might be a sibling outside workspace_root (a path
+                // dep elsewhere); keep it (matcher can't anchor it anyway).
+                Err(_) => true,
+            }
+        });
+
+        for entry in walker {
+            let entry = entry
+                .map_err(|e| Error::build(format!("walking closure crate dir failed: {e}")))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(workspace_root).map_err(|e| {
+                Error::build(format!(
+                    "closure crate dir '{}' is outside the workspace root '{}': {e}",
+                    entry.path().display(),
+                    workspace_root.display()
+                ))
+            })?;
+            let rel_posix = to_posix(rel);
+            let mount_filename = mount_path(remote_prefix, &rel_posix);
+            if !seen.insert(mount_filename.clone()) {
+                // Overlapping crate dirs (one nested in another) — keep first.
+                continue;
+            }
+            files.push(read_local_file(entry.path(), mount_filename)?);
+        }
+    }
+
+    // Extra files (workspace Cargo.toml/Cargo.lock): added verbatim, no ignore check.
+    for path in extra_files {
+        if !path.is_file() {
+            // A workspace may legitimately lack Cargo.lock (e.g. a lib-only ws); skip.
+            continue;
+        }
+        let rel = path.strip_prefix(workspace_root).map_err(|e| {
+            Error::build(format!(
+                "extra file '{}' is outside the workspace root '{}': {e}",
+                path.display(),
+                workspace_root.display()
+            ))
+        })?;
+        let rel_posix = to_posix(rel);
+        let mount_filename = mount_path(remote_prefix, &rel_posix);
+        if !seen.insert(mount_filename.clone()) {
+            continue;
+        }
+        files.push(read_local_file(path, mount_filename)?);
+    }
+
+    // Inline extra files (the rewritten workspace Cargo.toml): bytes provided
+    // directly, mounted at `<remote_prefix>/<rel-posix>`, no ignore check. These take
+    // PRECEDENCE over a same-path walked/extra file (e.g. a Cargo.toml inside a
+    // closure crate dir at the workspace root) because they are inserted last with an
+    // explicit overwrite of any prior same-path entry.
+    for (rel_posix, data) in extra_inline_files {
+        let rel_posix = rel_posix.trim_start_matches('/');
+        let mount_filename = mount_path(remote_prefix, rel_posix);
+        // Overwrite any prior entry at this mount path (the rewritten manifest wins
+        // over the verbatim one a crate-dir walk might have emitted).
+        files.retain(|f| f.mount_filename != mount_filename);
+        seen.insert(mount_filename.clone());
+        files.push(LocalFile {
+            mount_filename,
+            data: data.clone(),
+            mode: Some(0o644),
+        });
+    }
+
+    Ok(files)
+}
+
+/// FALLBACK collector: walk the whole `local_dir`, prune ignored directories early
+/// (directory pruning stops descent — critical for `target/`), and collect the
+/// surviving files as [`LocalFile`] with `<remote_prefix>/<rel-as-posix>` paths.
 fn collect_files(
     local_dir: &Path,
     remote_prefix: &str,
-    matcher: &IgnoreMatcher,
+    matcher: &Gitignore,
 ) -> Result<Vec<LocalFile>> {
     let remote_prefix = normalize_remote_prefix(remote_prefix);
     let remote_prefix = remote_prefix.as_str();
     let mut files = Vec::new();
     let walker = WalkDir::new(local_dir).into_iter().filter_entry(|entry| {
-        // Always keep the root itself; prune any descendant dir/file whose
-        // RELATIVE path is ignored (directory pruning stops descent — critical
-        // for `target/`, which can hold tens of thousands of files).
+        // Always keep the root itself; prune any descendant dir/file whose RELATIVE
+        // path is ignored (directory pruning stops descent into huge trees).
         match entry.path().strip_prefix(local_dir) {
-            Ok(rel) if rel.as_os_str().is_empty() => true,
-            Ok(rel) => !matcher.is_ignored(rel),
+            Ok(rel) => !is_ignored(matcher, rel, entry.file_type().is_dir()),
             Err(_) => true,
         }
     });
@@ -257,27 +536,24 @@ fn collect_files(
             .path()
             .strip_prefix(local_dir)
             .map_err(|e| Error::build(format!("path prefix error during walk: {e}")))?;
-
         let rel_posix = to_posix(rel);
-        let mount_filename = if remote_prefix.is_empty() {
-            format!("/{rel_posix}")
-        } else {
-            format!("{remote_prefix}/{rel_posix}")
-        };
-
-        let data = std::fs::read(entry.path()).map_err(|e| {
-            Error::build(format!("reading '{}' failed: {e}", entry.path().display()))
-        })?;
-        let mode = file_mode(entry.path());
-
-        files.push(LocalFile {
-            mount_filename,
-            data,
-            mode,
-        });
+        let mount_filename = mount_path(remote_prefix, &rel_posix);
+        files.push(read_local_file(entry.path(), mount_filename)?);
     }
 
     Ok(files)
+}
+
+/// Read a file's bytes + mode into a [`LocalFile`] bound for `mount_filename`.
+fn read_local_file(path: &Path, mount_filename: String) -> Result<LocalFile> {
+    let data = std::fs::read(path)
+        .map_err(|e| Error::build(format!("reading '{}' failed: {e}", path.display())))?;
+    let mode = file_mode(path);
+    Ok(LocalFile {
+        mount_filename,
+        data,
+        mode,
+    })
 }
 
 /// Convert a relative path to a POSIX (`/`-separated) string. On Windows the
@@ -302,67 +578,9 @@ fn file_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-/// The narrow ignore-pattern matcher: bare path segments (pruned anywhere in the
-/// path) and extension globs (`*.rlib`, `**/*.rlib`). NOT a full gitignore engine.
-struct IgnoreMatcher {
-    /// Bare segments like `target`, `.git`, `.modal-rust` — ignore any path whose
-    /// components contain one of these.
-    segments: Vec<String>,
-    /// Extensions like `rlib` (from `*.rlib` / `**/*.rlib`) — ignore any file
-    /// whose name ends in `.<ext>`.
-    extensions: Vec<String>,
-}
-
-impl IgnoreMatcher {
-    fn new(patterns: &[&str]) -> Self {
-        let mut segments = Vec::new();
-        let mut extensions = Vec::new();
-        for &pat in patterns {
-            if let Some(ext) = pat.strip_prefix("**/*.").or_else(|| pat.strip_prefix("*.")) {
-                extensions.push(ext.to_string());
-            } else {
-                // Bare segment (possibly with surrounding slashes trimmed).
-                let seg = pat.trim_matches('/');
-                if !seg.is_empty() {
-                    segments.push(seg.to_string());
-                }
-            }
-        }
-        Self {
-            segments,
-            extensions,
-        }
-    }
-
-    /// Is the path RELATIVE to the mount root ignored?
-    fn is_ignored(&self, rel: &Path) -> bool {
-        // Bare-segment match: any component equal to a configured segment.
-        for component in rel.components() {
-            if let Some(name) = component.as_os_str().to_str() {
-                if self.segments.iter().any(|s| s == name) {
-                    return true;
-                }
-            }
-        }
-        // Extension match against the final component (the file name).
-        if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
-            for ext in &self.extensions {
-                if name.len() > ext.len() + 1
-                    && name.ends_with(ext.as_str())
-                    && name.as_bytes()[name.len() - ext.len() - 1] == b'.'
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -377,72 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn ignore_matcher_prunes_bare_segments() {
-        let m = IgnoreMatcher::new(&["target", ".git", ".modal-rust", "**/*.rlib"]);
-        assert!(m.is_ignored(&p("target")));
-        assert!(m.is_ignored(&p("target/release/foo")));
-        assert!(m.is_ignored(&p("crates/x/target/debug")));
-        assert!(m.is_ignored(&p(".git/config")));
-        assert!(m.is_ignored(&p(".modal-rust/cache")));
-    }
-
-    #[test]
-    fn ignore_matcher_drops_extension_globs() {
-        let m = IgnoreMatcher::new(&["**/*.rlib"]);
-        assert!(m.is_ignored(&p("deps/libfoo.rlib")));
-        assert!(m.is_ignored(&p("libfoo.rlib")));
-        // Bare `*.ext` form also works.
-        let m2 = IgnoreMatcher::new(&["*.tmp"]);
-        assert!(m2.is_ignored(&p("scratch/a.tmp")));
-    }
-
-    #[test]
-    fn ignore_matcher_keeps_sources() {
-        let m = IgnoreMatcher::new(&["target", ".git", ".modal-rust", "**/*.rlib"]);
-        assert!(!m.is_ignored(&p("src/lib.rs")));
-        assert!(!m.is_ignored(&p("Cargo.toml")));
-        assert!(!m.is_ignored(&p("examples/add/src/bin/modal_runner.rs")));
-        // A file literally named like a partial extension must not false-match.
-        assert!(!m.is_ignored(&p("rlib")));
-        assert!(!m.is_ignored(&p(".rlib")));
-    }
-
-    #[test]
-    fn ignore_matcher_prunes_references_keeps_workspace() {
-        // Mirrors RemoteConfig::default().ignore (the upload-ignore fix): the
-        // vendored reference clones and other non-source dirs are pruned, while the
-        // real workspace source (manifests + crates + examples) is KEPT so the
-        // in-container `cargo build` still resolves the workspace.
-        let m = IgnoreMatcher::new(&[
-            "target",
-            ".git",
-            ".modal-rust",
-            "references",
-            "workpads",
-            ".github",
-            ".claude",
-            ".cursor",
-            ".opencode",
-            "tmp",
-            ".research",
-            "**/*.rlib",
-        ]);
-        // Pruned: vendored clones + planning/agent dirs.
-        assert!(m.is_ignored(&p("references")));
-        assert!(m.is_ignored(&p("references/modal-rs/Cargo.toml")));
-        assert!(m.is_ignored(&p("references/modal-client/py/modal/x.py")));
-        assert!(m.is_ignored(&p("workpads/shim-backend/knowledge.md")));
-        assert!(m.is_ignored(&p(".github/workflows/ci.yml")));
-        assert!(m.is_ignored(&p(".claude/settings.json")));
-        // Kept: the whole real workspace the container needs to build.
-        assert!(!m.is_ignored(&p("Cargo.toml")));
-        assert!(!m.is_ignored(&p("Cargo.lock")));
-        assert!(!m.is_ignored(&p("crates/modal-rust-sdk/src/lib.rs")));
-        assert!(!m.is_ignored(&p("examples/add/Cargo.toml")));
-        assert!(!m.is_ignored(&p("examples/burn-add/Cargo.toml")));
-    }
-
-    #[test]
     fn remote_prefix_normalizes_trailing_slash() {
         assert_eq!(normalize_remote_prefix("/src"), "/src");
         assert_eq!(normalize_remote_prefix("/src/"), "/src");
@@ -450,9 +602,174 @@ mod tests {
     }
 
     #[test]
-    fn collect_files_maps_to_posix_remote_paths() {
+    fn defaults_prune_target_git_and_rlib() {
+        // No .gitignore / .modalignore: just the built-in defaults floor.
+        let dir = TempTree::new();
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        assert!(is_ignored(&m, &p("target"), true));
+        assert!(is_ignored(&m, &p("target/release/foo"), false));
+        assert!(is_ignored(&m, &p("crates/x/target"), true));
+        assert!(is_ignored(&m, &p(".git/config"), false));
+        assert!(is_ignored(&m, &p("deps/libfoo.rlib"), false));
+        // Kept: real source.
+        assert!(!is_ignored(&m, &p("src/lib.rs"), false));
+        assert!(!is_ignored(&m, &p("Cargo.toml"), false));
+        assert!(!is_ignored(
+            &m,
+            &p("examples/add/src/bin/modal_runner.rs"),
+            false
+        ));
+    }
+
+    #[test]
+    fn gitignore_layer_prunes_its_entries() {
+        // .gitignore adds `references/` and `workpads/` on top of the defaults —
+        // the exact scenario that previously required the hardcoded list.
+        let dir = TempTree::new();
+        dir.write(".gitignore", "references/\nworkpads/\n");
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        // From .gitignore:
+        assert!(is_ignored(&m, &p("references"), true));
+        assert!(is_ignored(&m, &p("references/modal-rs/Cargo.toml"), false));
+        assert!(is_ignored(
+            &m,
+            &p("workpads/shim-backend/knowledge.md"),
+            false
+        ));
+        // Defaults still apply.
+        assert!(is_ignored(&m, &p("target/debug/x"), false));
+        // Kept.
+        assert!(!is_ignored(&m, &p("Cargo.toml"), false));
+        assert!(!is_ignored(
+            &m,
+            &p("crates/modal-rust-sdk/src/lib.rs"),
+            false
+        ));
+    }
+
+    #[test]
+    fn modalignore_overrides_gitignore_with_negation() {
+        // .modalignore (highest) re-includes a path .gitignore excluded, and adds a
+        // new exclusion. Precedence: .modalignore > .gitignore > defaults.
+        let dir = TempTree::new();
+        dir.write(".gitignore", "secret/\nkeep_me/\n");
+        // Re-include keep_me/ (negation wins), and newly exclude scratch/.
+        dir.write(".modalignore", "!keep_me/\nscratch/\n");
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        // .gitignore still hides secret/.
+        assert!(is_ignored(&m, &p("secret/data"), false));
+        // .modalignore negation re-includes keep_me/.
+        assert!(!is_ignored(&m, &p("keep_me/data.txt"), false));
+        // .modalignore newly excludes scratch/.
+        assert!(is_ignored(&m, &p("scratch/tmp"), false));
+        // Defaults still apply under .modalignore.
+        assert!(is_ignored(&m, &p("target/x"), false));
+    }
+
+    #[test]
+    fn custom_modalignore_name_is_honored() {
+        let dir = TempTree::new();
+        dir.write(".myignore", "blocked/\n");
+        let m = build_matcher(dir.path(), ".myignore").unwrap();
+        assert!(is_ignored(&m, &p("blocked/x"), false));
+        assert!(!is_ignored(&m, &p("kept/x"), false));
+    }
+
+    #[test]
+    fn collect_files_for_dirs_scopes_to_closure() {
+        // Workspace layout: two crate dirs in the closure (a, b), one NOT (c), and a
+        // target/ inside a crate. extra = root Cargo.toml/Cargo.lock.
+        let dir = TempTree::new();
+        dir.write("Cargo.toml", "[workspace]\n");
+        dir.write("Cargo.lock", "# lock\n");
+        dir.write("a/Cargo.toml", "[package]\n");
+        dir.write("a/src/lib.rs", "fn a() {}\n");
+        dir.write("a/target/junk", "junk"); // pruned by defaults
+        dir.write("b/Cargo.toml", "[package]\n");
+        dir.write("b/src/lib.rs", "fn b() {}\n");
+        dir.write("c/Cargo.toml", "[package]\n"); // NOT in closure → not uploaded
+        dir.write("c/src/lib.rs", "fn c() {}\n");
+
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let crate_dirs = vec![dir.path().join("a"), dir.path().join("b")];
+        let extras = vec![dir.path().join("Cargo.toml"), dir.path().join("Cargo.lock")];
+        let mut files =
+            collect_files_for_dirs(dir.path(), &crate_dirs, &extras, &[], "/src", &m).unwrap();
+        files.sort_by(|x, y| x.mount_filename.cmp(&y.mount_filename));
+        let names: Vec<&str> = files.iter().map(|f| f.mount_filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "/src/Cargo.lock",
+                "/src/Cargo.toml",
+                "/src/a/Cargo.toml",
+                "/src/a/src/lib.rs",
+                "/src/b/Cargo.toml",
+                "/src/b/src/lib.rs",
+            ],
+            "only closure crate dirs (a, b) + root manifests; c/ and target/ excluded"
+        );
+    }
+
+    #[test]
+    fn collect_files_for_dirs_extras_exempt_from_ignore() {
+        // Even if a .gitignore would match Cargo.lock, the explicit extra is kept.
+        let dir = TempTree::new();
+        dir.write("Cargo.toml", "[workspace]\n");
+        dir.write("Cargo.lock", "# lock\n");
+        dir.write(".gitignore", "Cargo.lock\n"); // would normally hide it
+        dir.write("a/Cargo.toml", "[package]\n");
+        dir.write("a/src/lib.rs", "fn a() {}\n");
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let crate_dirs = vec![dir.path().join("a")];
+        let extras = vec![dir.path().join("Cargo.toml"), dir.path().join("Cargo.lock")];
+        let files =
+            collect_files_for_dirs(dir.path(), &crate_dirs, &extras, &[], "/src", &m).unwrap();
+        assert!(
+            files.iter().any(|f| f.mount_filename == "/src/Cargo.lock"),
+            "explicit extra files are exempt from ignore matching"
+        );
+    }
+
+    #[test]
+    fn collect_files_for_dirs_inline_manifest_overrides_disk() {
+        // The rewritten workspace Cargo.toml (inline bytes) must WIN over the verbatim
+        // on-disk one a crate-dir walk might emit at the same mount path.
+        let dir = TempTree::new();
+        dir.write("Cargo.toml", "[workspace]\nmembers=[\"a\",\"b\",\"c\"]\n");
+        dir.write("a/Cargo.toml", "[package]\n");
+        dir.write("a/src/lib.rs", "fn a() {}\n");
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let crate_dirs = vec![dir.path().join("a")];
+        // No on-disk extra; the rewritten manifest is inline.
+        let inline = vec![(
+            "Cargo.toml".to_string(),
+            b"[workspace]\nmembers=[\"a\"]\n".to_vec(),
+        )];
+        let files =
+            collect_files_for_dirs(dir.path(), &crate_dirs, &[], &inline, "/src", &m).unwrap();
+        let manifest = files
+            .iter()
+            .find(|f| f.mount_filename == "/src/Cargo.toml")
+            .expect("workspace Cargo.toml present");
+        assert_eq!(
+            manifest.data, b"[workspace]\nmembers=[\"a\"]\n",
+            "inline rewritten manifest must win over the on-disk verbatim one"
+        );
+        // Exactly one entry at that path (no duplicate).
+        assert_eq!(
+            files
+                .iter()
+                .filter(|f| f.mount_filename == "/src/Cargo.toml")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn collect_files_fallback_prunes_and_maps_posix() {
         let dir = tempdir_with_files();
-        let m = IgnoreMatcher::new(&["target", ".git", "**/*.rlib"]);
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
         let mut files = collect_files(dir.path(), "/src", &m).unwrap();
         files.sort_by(|a, b| a.mount_filename.cmp(&b.mount_filename));
         let names: Vec<&str> = files.iter().map(|f| f.mount_filename.as_str()).collect();
@@ -464,43 +781,52 @@ mod tests {
     }
 
     #[test]
-    fn collect_files_handles_root_mount_prefix() {
+    fn collect_files_fallback_handles_root_mount_prefix() {
         let dir = tempdir_with_files();
-        let m = IgnoreMatcher::new(&["target", "**/*.rlib"]);
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
         let files = collect_files(dir.path(), "/", &m).unwrap();
         assert!(files.iter().any(|f| f.mount_filename == "/Cargo.toml"));
         assert!(files.iter().all(|f| !f.mount_filename.starts_with("//")));
     }
 
     /// Build a small temp tree: Cargo.toml, sub/main.rs, target/junk (ignored),
-    /// deps/foo.rlib (ignored). Returned guard removes it on drop. The name is
-    /// unique per call (PID + atomic counter) so concurrently-run tests never
-    /// share a directory and clobber each other's contents on drop.
+    /// deps/foo.rlib (ignored).
     fn tempdir_with_files() -> TempTree {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "modal_rust_local_dir_test_{}_{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("sub")).unwrap();
-        std::fs::create_dir_all(base.join("target/release")).unwrap();
-        std::fs::create_dir_all(base.join("deps")).unwrap();
-        std::fs::write(base.join("Cargo.toml"), b"[package]\n").unwrap();
-        std::fs::write(base.join("sub/main.rs"), b"fn main() {}\n").unwrap();
-        std::fs::write(base.join("target/release/junk"), b"junk").unwrap();
-        std::fs::write(base.join("deps/foo.rlib"), b"rlib").unwrap();
-        TempTree { path: base }
+        let t = TempTree::new();
+        t.write("Cargo.toml", "[package]\n");
+        t.write("sub/main.rs", "fn main() {}\n");
+        t.write("target/release/junk", "junk");
+        t.write("deps/foo.rlib", "rlib");
+        t
     }
 
+    /// A unique temp dir (PID + atomic counter) removed on drop. Unique per call so
+    /// concurrently-run tests never share a directory.
     struct TempTree {
         path: PathBuf,
     }
     impl TempTree {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let base = std::env::temp_dir().join(format!(
+                "modal_rust_local_dir_test_{}_{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            TempTree { path: base }
+        }
         fn path(&self) -> &Path {
             &self.path
+        }
+        fn write(&self, rel: &str, contents: &str) {
+            let full = self.path.join(rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(full, contents).unwrap();
         }
     }
     impl Drop for TempTree {

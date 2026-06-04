@@ -843,3 +843,45 @@ path. Live-verified: after `.remote()`, `modal app list` shows the run app as `e
 Offline gates green (fmt/clippy `-D warnings`/build/test on default-members). One adversarial reviewer died on
 an infra socket error; the boundary is independently covered by the live logs + the runtime-pure-wrapper test,
 and the hygiene reviewer passed all 4 gates. **The run/deploy/call triad is now fully programmatic + live.**
+
+---
+
+### ✅ HARDEN pass — image matches the official client + upload is cargo-scoped (2026-06-04)
+
+The robustness pass (user-requested) replaced the brittle hacks with what the official Modal client actually
+does. Both tracks proven live; 3/3 reviews PASS (verified against `references/modal-client/py/modal/{_image,
+mount,_functions}.py`).
+
+**Track A — image = `add_python` (the 3 hacks are gone).** Python is now provisioned via Modal's **hosted
+python-standalone mount** (`python-standalone-mount-{version}`, resolved by name like the client mount), with
+the client's add_python dockerfile branch replicated byte-for-byte: `COPY /python/. /usr/local` + `ln -s
+python3 python` (series < 3.13) + `ENV TERMINFO_DIRS=…`. A standalone interpreter HAS `python` and is NOT
+PEP-668-managed, so it dissolves `python-is-python3` AND `--break-system-packages`; and the bare
+`pip install modal` is gone. The modal client's third-party **dep closure** is injected by the worker at
+container start when `mount_client_dependencies=true` (proto Function field 82) — which Modal only honors for
+`image_builder_version > "2024.10"` (`_functions.py:936-939`). apt+pip kept only as a documented fallback
+(selected when `add_python` is unset). Deploy uses a **two-layer** image (add_python base + a `FROM base` top
+layer that COPYs source + `cargo build` at image-build time). Live: RUN + DEPLOY both `{sum:42}`, 0 hack-lines,
+builds in ~20s / ~9.8s.
+
+**Track B — upload is cargo-scoped (the hardcoded ignore list is gone).** `crates/modal-rust/src/scope.rs`
+shells `cargo metadata --format-version 1 --no-deps` and computes the target package's **workspace-member
+path-dep closure** (DFS, skipping dev/build/registry deps); the upload ships ONLY those crate dirs + the
+workspace `Cargo.lock` + a **rewritten `Cargo.toml`** (members/default-members trimmed to the closure,
+format-preserving via `toml_edit`, `panic="unwind"` kept). Ignore resolution is **`.modalignore` (highest) >
+`.gitignore` > built-in defaults** via ripgrep's `ignore` crate. `references/` is excluded for free (outside
+the closure AND in `.gitignore`). Non-source extras (data/models) attach via **volumes**, not the upload.
+Fallback to whole-root-minus-ignore when cargo metadata is unavailable. Live: `example-add` uploaded **7 files
+/ 187 KB** (was 14 MB+); a `.modalignore` entry was honored (a scratch file pruned).
+
+Two MORE real bugs fixed live (durable findings):
+1. **`image_builder_version` must be set (> "2024.10")** or the worker does NOT mount the client dep closure →
+   container TERMINATED at boot (no modal deps). The SDK now auto-resolves it from the environment
+   (`EnvironmentGetOrCreate` → e.g. `2025.06`, cached) in `client.rs::resolved_image_builder_version`. This is
+   the proper "do what Modal does" deps mechanism — NOT pip-install.
+2. **A cargo-scoped upload must rewrite the workspace `Cargo.toml`** members/default-members to the uploaded
+   closure subset, else `cargo build` aborts with "failed to load manifest for workspace member" (the verbatim
+   manifest lists members whose dirs weren't uploaded). `scope.rs::rewrite_workspace_members` (toml_edit).
+
+New deps: `ignore` 0.4 (SDK), `toml_edit` 0.22 (facade). Gates green (130 tests). Modal app state clean: only
+`modal-rust-add-deploy` + legacy `modal-rust-add-poc` deployed; run/test apps are ephemeral/stopped.

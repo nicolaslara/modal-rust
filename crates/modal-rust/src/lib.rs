@@ -66,6 +66,7 @@ mod deploy;
 mod error;
 mod function;
 mod remote;
+mod scope;
 
 pub use app::App;
 pub use deploy::{DeployConfig, DeployedApp};

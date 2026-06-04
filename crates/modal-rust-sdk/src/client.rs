@@ -39,6 +39,10 @@ pub type ModalClientStub = ModalClientClient<InterceptedService<Channel, AuthInt
 pub struct ModalClient {
     inner: ModalClientStub,
     config: ModalConfig,
+    /// Lazily-resolved image builder version (see
+    /// [`ModalClient::resolved_image_builder_version`]). Cached after the first
+    /// `EnvironmentGetOrCreate` so repeated image builds don't re-fetch it.
+    resolved_builder_version: Option<String>,
 }
 
 impl ModalClient {
@@ -60,7 +64,11 @@ impl ModalClient {
         let channel = build_channel(&config.server_url).await?;
         let interceptor = AuthInterceptor::new(&config.token_id, &config.token_secret)?;
         let inner = ModalClientClient::with_interceptor(channel, interceptor);
-        let mut client = Self { inner, config };
+        let mut client = Self {
+            inner,
+            config,
+            resolved_builder_version: None,
+        };
         client.client_hello().await?;
         Ok(client)
     }
@@ -79,9 +87,69 @@ impl ModalClient {
             .unwrap_or_else(|| self.config.environment_or_default().to_string())
     }
 
-    /// The configured image builder version, if any (used by `ImageGetOrCreate`).
-    pub(crate) fn image_builder_version(&self) -> Option<&str> {
-        self.config.image_builder_version.as_deref()
+    /// Resolve the image builder version to send with `ImageGetOrCreate`, mirroring
+    /// the official client's `_get_image_builder_version` (`_image.py:247`): an
+    /// explicit config / `MODAL_IMAGE_BUILDER_VERSION` value wins; otherwise it comes
+    /// from the ENVIRONMENT's settings (`EnvironmentGetOrCreate` →
+    /// `EnvironmentSettings.image_builder_version`, e.g. `"2025.06"`).
+    ///
+    /// This matters beyond image rendering: the worker mounts the modal client's dep
+    /// closure at container start ONLY for a builder version `> "2024.10"` (the
+    /// `mount_client_dependencies` gate, `_functions.py:936-939`). Sending an empty
+    /// builder version built an image whose `python -m modal._container_entrypoint`
+    /// had no deps and was TERMINATED at boot (live-observed 2026-06-04). Resolving the
+    /// environment's modern version makes our `add_python` image + the
+    /// `mount_client_dependencies = true` claim mutually consistent.
+    ///
+    /// The result is cached on `self` after the first lookup. A lookup failure (or an
+    /// empty server value) caches the EMPTY string, falling back to letting the server
+    /// pick — the prior behavior — rather than failing the build.
+    pub(crate) async fn resolved_image_builder_version(&mut self) -> String {
+        if let Some(v) = &self.resolved_builder_version {
+            return v.clone();
+        }
+        // 1. Explicit config / env override wins (matches the Python client).
+        if let Some(v) = self.config.image_builder_version.as_deref() {
+            if !v.is_empty() {
+                self.resolved_builder_version = Some(v.to_string());
+                return v.to_string();
+            }
+        }
+        // 2. Otherwise resolve from the environment's settings.
+        let resolved = self
+            .fetch_environment_builder_version()
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "[modal-rust] could not resolve image builder version from the environment \
+                 ({e}); letting the server choose (set MODAL_IMAGE_BUILDER_VERSION to pin)"
+                );
+                String::new()
+            });
+        self.resolved_builder_version = Some(resolved.clone());
+        resolved
+    }
+
+    /// Fetch `EnvironmentSettings.image_builder_version` for the configured
+    /// environment via `EnvironmentGetOrCreate` (idempotent lookup).
+    async fn fetch_environment_builder_version(&mut self) -> Result<String> {
+        use crate::proto::api::EnvironmentGetOrCreateRequest;
+        let req = EnvironmentGetOrCreateRequest {
+            deployment_name: self.config.environment_or_default().to_string(),
+            object_creation_type: ObjectCreationType::Unspecified as i32,
+        };
+        let stub = self.stub();
+        let resp = retry_unary("environment_get_or_create", || {
+            let mut stub = stub.clone();
+            let req = req.clone();
+            async move { Ok(stub.environment_get_or_create(req).await?.into_inner()) }
+        })
+        .await?;
+        Ok(resp
+            .metadata
+            .and_then(|m| m.settings)
+            .map(|s| s.image_builder_version)
+            .unwrap_or_default())
     }
 
     /// Low-level escape hatch: the underlying generated gRPC stub. Used by the

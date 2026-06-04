@@ -101,11 +101,18 @@ async fn round_trip() -> Result<String, Error> {
     let mut client = retry!("connect", 5, ModalClient::connect())?;
     eprintln!("MILESTONE auth ok (connect + ClientHello)");
 
-    let ignore = ["target", ".git", ".modal-rust", "**/*.rlib"];
+    // The temp tree's target/ and *.rlib are pruned by the built-in defaults
+    // (DEFAULT_IGNORE_PATTERNS) resolved inside mount_local_dir; the tree has no
+    // .gitignore/.modalignore, so the defaults are the only active layer.
     let mount_id = retry!(
         "mount_local_dir",
         4,
-        client.mount_local_dir(dir.path(), "/src", &ignore, None)
+        client.mount_local_dir(
+            dir.path(),
+            "/src",
+            modal_rust_sdk::DEFAULT_MODALIGNORE_NAME,
+            None
+        )
     )?;
     eprintln!("MILESTONE mount_id = {mount_id}");
     Ok(mount_id)

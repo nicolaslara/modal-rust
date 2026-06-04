@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use modal_rust_sdk::{FunctionSpec, ImageSpec, ModalClient};
 
-use crate::remote::RemoteConfig;
+use crate::remote::{RemoteConfig, PYTHON_SERIES};
 use crate::{Error, Result};
 
 /// Fixed importable module name for the baked DEPLOY wrapper
@@ -96,6 +96,12 @@ def handler(entrypoint, input_json):
 /// All knobs for the DEPLOY path. Mirrors [`RemoteConfig`] but adds the STABLE
 /// `app_name` and drops the runtime source-mount knobs (the deploy image COPYs the
 /// source into a layer at the fixed [`DEPLOY_SRC`]).
+///
+/// The deploy context upload uses the SAME scoping + ignore resolution as the RUN
+/// path (see [`RemoteConfig`]): cargo-metadata scoping to the target package's
+/// dependency closure + the workspace `Cargo.toml`/`Cargo.lock`, pruned by
+/// `.modalignore` > `.gitignore` > built-in defaults. Non-source assets belong in
+/// **Modal Volumes**, not the deploy context.
 #[derive(Debug, Clone)]
 pub struct DeployConfig {
     /// STABLE deploy app name; re-deploys REPLACE under this name (so re-runs do
@@ -103,14 +109,19 @@ pub struct DeployConfig {
     /// `MODAL_RUST_DEPLOY_APP`.
     pub app_name: String,
     /// Directory uploaded as the image build CONTEXT (defaults to the cargo
-    /// workspace root; override with `MODAL_RUST_SOURCE_DIR`).
+    /// workspace root; override with `MODAL_RUST_SOURCE_DIR`). Also the workspace
+    /// root for cargo-metadata scoping and ignore-file resolution.
     pub local_root: PathBuf,
-    /// Cargo package owning the entrypoints (`cargo -p <package>`). Override with
-    /// `MODAL_RUST_PACKAGE`.
+    /// Cargo package owning the entrypoints (`cargo -p <package>`). Also the
+    /// cargo-metadata scoping target. Override with `MODAL_RUST_PACKAGE`.
     pub package: String,
-    /// Ignore patterns for the source-dir walk (build artifacts, VCS, vendored
-    /// reference clones).
-    pub ignore: Vec<String>,
+    /// Whether to scope the upload to the target package's cargo dependency closure
+    /// via `cargo metadata` (default `true`). `false` forces the whole-`local_root`
+    /// upload (still pruned by the resolved ignore files).
+    pub use_cargo_scoping: bool,
+    /// Highest-precedence ignore filename, read from the workspace root (default
+    /// `.modalignore`). Falls through to `.gitignore` then the built-in defaults.
+    pub modalignore_name: String,
     /// Base registry tag for the deploy image.
     pub base_image: String,
     /// Function timeout (seconds). No in-body build, so a modest default is fine.
@@ -119,7 +130,7 @@ pub struct DeployConfig {
 
 impl DeployConfig {
     /// Build a [`DeployConfig`] with the given STABLE app name, reusing the proven
-    /// [`RemoteConfig`] defaults for `local_root` / `package` / `ignore` /
+    /// [`RemoteConfig`] defaults for `local_root` / `package` / scoping / ignore /
     /// `base_image` (so the deploy context upload matches the RUN-path upload).
     pub fn for_app(app_name: impl Into<String>) -> Self {
         let base = RemoteConfig::default();
@@ -127,7 +138,8 @@ impl DeployConfig {
             app_name: app_name.into(),
             local_root: base.local_root,
             package: base.package,
-            ignore: base.ignore,
+            use_cargo_scoping: base.use_cargo_scoping,
+            modalignore_name: base.modalignore_name,
             base_image: base.base_image,
             timeout_secs: 300,
         }
@@ -159,17 +171,32 @@ pub struct DeployedApp {
     pub url: String,
 }
 
-/// Render the deploy [`ImageSpec`]: rust base + python3/pip + the baked deploy
-/// wrapper, then the source as the build CONTEXT (`COPY . /`) and the cargo build +
-/// `cp`/bake `RUN`s. cargo runs AT image-build time; the deployed runtime never
-/// repeats it.
+/// Render the DEPLOY BASE layer (layer 1): `rust:1-slim` + `add_python` (the hosted
+/// python-build-standalone mount). This layer owns the standalone mount as its build
+/// CONTEXT so its `COPY /python/. /usr/local` has a source; it carries no wrapper and
+/// no source. The TOP layer ([`deploy_top_layer_spec`]) bases on it via `FROM base`.
 ///
-/// `python-is-python3` is REQUIRED (same crash-loop fix as the RUN path): Modal's
-/// container entrypoint execs bare `python`.
-fn deploy_image_spec(source_mount_id: &str, package: &str, base_image: &str) -> ImageSpec {
+/// Two layers are REQUIRED because an `Image` has ONE `context_mount_id`: the source
+/// (top layer) and the standalone (base layer) each need their own. This mirrors the
+/// official client's image layering (`base_images={"base": self}`).
+fn deploy_base_layer_spec(python_standalone_mount_id: &str, base_image: &str) -> ImageSpec {
     ImageSpec::from_registry(base_image.to_string())
-        .with_apt(&["python3", "python3-pip", "python-is-python3"])
-        .with_pip_install_modal()
+        .with_add_python(PYTHON_SERIES)
+        .with_python_standalone_mount_id(python_standalone_mount_id)
+}
+
+/// Render the DEPLOY TOP layer (layer 2): bases on the add_python layer via
+/// `FROM base` ([`ImageSpec::with_base_image`]), bakes the deploy wrapper, then COPYs
+/// the SOURCE (this layer's build CONTEXT) and runs the cargo build + `cp`/bake. cargo
+/// runs AT image-build time against the rust+python from layer 1; the deployed runtime
+/// never repeats it.
+///
+/// Python comes from layer 1 (`add_python`), NOT apt — same provisioning as the RUN
+/// path. The auto `ln -s python3 python` (series < 3.13, emitted in layer 1) satisfies
+/// Modal's bare `python` entrypoint.
+fn deploy_top_layer_spec(base_image_id: &str, source_mount_id: &str, package: &str) -> ImageSpec {
+    ImageSpec::from_registry(String::new()) // FROM is replaced by `FROM base` (layered).
+        .with_base_image(base_image_id)
         .with_wrapper_module(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC)
         .with_context_mount(source_mount_id)
         // Context root → /, so the /app/src-prefixed tree lands at /app/src (§A4 Primary).
@@ -203,18 +230,56 @@ pub(crate) async fn deploy_function(
     let client_mount_id = client.client_mount_id(None).await?;
 
     // 2. Source mount — UPLOAD the user's crate as the image BUILD CONTEXT (lands
-    //    at /app/src/<rel>; the COPY . / drops it at /app/src).
-    let ignore: Vec<&str> = config.ignore.iter().map(String::as_str).collect();
-    let source_mount_id = client
-        .mount_local_dir(&config.local_root, DEPLOY_SRC, &ignore, None)
+    //    at /app/src/<rel>; the COPY . / drops it at /app/src). Same scoping as the
+    //    RUN path: PRIMARY = cargo-metadata closure of the target package + the
+    //    workspace Cargo.toml/Cargo.lock; FALLBACK = whole local_root minus ignored
+    //    files. Both prune via `.modalignore` > `.gitignore` > built-in defaults.
+    let source_mount_id = match (
+        config.use_cargo_scoping,
+        crate::scope::workspace_closure(&config.local_root, &config.package),
+    ) {
+        (true, Some(closure)) => {
+            let spec = modal_rust_sdk::WorkspaceClosureSpec {
+                workspace_root: &config.local_root,
+                crate_dirs: &closure.dirs,
+                extra_files: &closure.extra_files,
+                extra_inline_files: &closure.inline_files,
+                modalignore_name: &config.modalignore_name,
+            };
+            client
+                .mount_workspace_closure(&spec, DEPLOY_SRC, None)
+                .await?
+        }
+        _ => {
+            client
+                .mount_local_dir(
+                    &config.local_root,
+                    DEPLOY_SRC,
+                    &config.modalignore_name,
+                    None,
+                )
+                .await?
+        }
+    };
+
+    // 2b. Python-standalone mount (HOSTED, resolved by name) → the BASE layer's
+    //     build context for `add_python`.
+    let py_mount_id = client
+        .python_standalone_mount_id(PYTHON_SERIES, None)
         .await?;
 
     // 3. PERSISTENT named app id (deploy-only; re-deploys REPLACE under this name).
     let app_id = client.app_get_or_create_id(&config.app_name, None).await?;
 
-    // 4. Build the deploy image — cargo runs HERE, AT image-build time (the build
-    //    logs stream `Compiling`/`cargo build --release` via ImageJoinStreaming).
-    let spec = deploy_image_spec(&source_mount_id, &config.package, &config.base_image);
+    // 4. Build the deploy image as TWO LAYERS — cargo runs HERE, AT image-build time
+    //    (the build logs stream `Compiling`/`cargo build --release` via
+    //    ImageJoinStreaming). Two layers are required because an Image has ONE
+    //    context_mount_id: layer 1 (add_python) owns the standalone mount; layer 2
+    //    (source + cargo build) owns the source mount. This mirrors the official
+    //    client's image layering and provisions Python via add_python, NOT apt/pip.
+    let base_spec = deploy_base_layer_spec(&py_mount_id, &config.base_image);
+    let base_image_id = client.image_get_or_create(&app_id, &base_spec).await?;
+    let spec = deploy_top_layer_spec(&base_image_id, &source_mount_id, &config.package);
     let image_id = client.image_get_or_create(&app_id, &spec).await?;
 
     // 5. Precreate the function (name = the wrapper callable, "handler").
@@ -224,8 +289,11 @@ pub(crate) async fn deploy_function(
 
     // 6. FunctionCreate (FILE mode): CLIENT mount ONLY — NO source mount (the
     //    binary is baked in the image layer). This absence IS the deploy invariant.
+    //    `mount_client_dependencies = true` (default, explicit) so the worker injects
+    //    the modal client dep closure at start — the add_python image has no pip layer.
     let fn_spec = FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
         .with_mount_ids(vec![client_mount_id])
+        .with_mount_client_dependencies(true)
         .with_timeout_secs(config.timeout_secs);
     let created = client
         .function_create(&app_id, &precreate_id, &fn_spec)
@@ -332,15 +400,30 @@ mod tests {
     }
 
     #[test]
-    fn deploy_image_spec_rides_source_on_the_build_context() {
-        // The uploaded source rides the image build CONTEXT (proto field 15) so
-        // cargo can compile it AT image-build time. The COPY/cargo/cp dockerfile
-        // ordering is asserted in the SDK-side image.rs test (dockerfile_commands
-        // is private to that crate); here we assert the public field the facade
-        // controls plus the base/package wiring.
-        let spec = deploy_image_spec("mo-deploy-src", "example-add", "rust:1-slim");
+    fn deploy_base_layer_provisions_python_via_add_python() {
+        // Layer 1: add_python(3.12) on the rust base, with the standalone mount as
+        // the build context. NO apt, NO pip — Python comes from the standalone mount.
+        let base = deploy_base_layer_spec("mo-py-standalone", "rust:1-slim");
+        assert_eq!(base.base_image, "rust:1-slim");
+        assert_eq!(base.add_python.as_deref(), Some("3.12"));
+        assert_eq!(
+            base.python_standalone_mount_id.as_deref(),
+            Some("mo-py-standalone")
+        );
+        // No apt/pip fallback on the base layer.
+        assert!(base.pre_bake_commands.is_empty());
+        assert!(!base.pip_install_modal);
+    }
+
+    #[test]
+    fn deploy_top_layer_rides_source_on_the_build_context() {
+        // Layer 2: bases on layer 1 (FROM base), the source rides this layer's build
+        // CONTEXT (proto field 15) so cargo compiles it AT image-build time. The
+        // COPY/cargo/cp dockerfile ordering is asserted in the SDK-side image.rs
+        // test; here we assert the public fields the facade controls.
+        let spec = deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add");
+        assert_eq!(spec.base_image_id.as_deref(), Some("im-layer1"));
         assert_eq!(spec.context_mount_id.as_deref(), Some("mo-deploy-src"));
-        assert_eq!(spec.base_image, "rust:1-slim");
         // The cargo-build RUN (an extra command) names the package and target bin.
         assert!(spec
             .extra_commands
@@ -353,6 +436,9 @@ mod tests {
             .any(|c| c.contains("cp /app/src/target/release/modal_runner /app/modal_runner")));
         // The COPY brings the context into a layer.
         assert!(spec.extra_commands.iter().any(|c| c.contains("COPY . /")));
+        // No apt/pip on the top layer either (Python is inherited from layer 1).
+        assert!(spec.pre_bake_commands.is_empty());
+        assert!(!spec.pip_install_modal);
     }
 
     #[test]
@@ -361,8 +447,8 @@ mod tests {
         let cfg = DeployConfig::default();
         assert_eq!(cfg.app_name, "modal-rust-add-deploy");
         assert_eq!(cfg.base_image, "rust:1-slim");
-        // The deploy context upload reuses the RUN-path ignore set (no references/).
-        assert!(cfg.ignore.iter().any(|p| p == "references"));
-        assert!(cfg.ignore.iter().any(|p| p == "target"));
+        // The deploy context upload reuses the RUN-path scoping/ignore defaults.
+        assert!(cfg.use_cargo_scoping, "cargo scoping is the default");
+        assert_eq!(cfg.modalignore_name, ".modalignore");
     }
 }

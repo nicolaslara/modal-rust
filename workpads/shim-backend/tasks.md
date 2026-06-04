@@ -230,6 +230,30 @@ Status: pending
 - fallback: retain the static shim materialized to an OS cache dir (Option 5E) — not the user
   project — if a per-project file proves unavoidable.
 
+## P-harden — image + upload robustness pass (2026-06-04, user-requested)
+
+Status: ✅ DONE (workflow `harden-image-upload`) — both tracks proven live; 3/3 reviews PASS.
+Image = `add_python` (python-standalone mount, byte-for-byte the client's recipe), 3 hacks removed;
+upload = `cargo metadata` closure scoping + `.modalignore`>`.gitignore`>defaults (`ignore` crate). Also
+fixed: auto-resolve `image_builder_version` (>2024.10, else no dep mount → boot crash) + rewrite the
+uploaded workspace `Cargo.toml` to the closure subset (`toml_edit`). Live upload: 7 files/187 KB (was 14 MB).
+
+- **Boundary crossed:** the run/deploy images and the source upload stop relying on brittle hacks.
+- **A — image:** do what the official modal client does — provision Python via **add_python** (the hosted
+  python-standalone mount, resolved by name like the client mount) + the client mount, REMOVING the three
+  hacks the live runs forced in: `python-is-python3`, `--break-system-packages`, and the bare
+  `apt+pip install modal` (all symptoms of provisioning Python the crude way on a Debian `rust:slim` base).
+  Faster, reset-resistant image build. apt+pip kept only as a documented fallback.
+- **B — upload:** replace the hardcoded ignore list with **(1)** `cargo metadata` scoping — upload only the
+  target package's workspace-member dependency closure + workspace `Cargo.toml`/`Cargo.lock` (correct by
+  construction; the `references/` bug class disappears); **(2)** ignore resolution **`.modalignore` (highest)
+  > `.gitignore` > defaults** via the ripgrep `ignore` crate. Non-source extras (data/models) attach via
+  **volumes**, never the source upload.
+- **acceptance:** `.remote()` + `deploy`/`call` re-prove `{sum:42}` live on the add_python image with NONE of
+  the 3 hacks and a faster build; the upload ships only the dep-closure crates; `.modalignore`/`.gitignore`
+  are honored.
+- depends_on: [P3, P5] (both done + live).
+
 ---
 
 ## DAG

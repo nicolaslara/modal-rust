@@ -7,26 +7,47 @@
 //! Modal-native way to make the `modal` **source** importable is the **client
 //! mount** ([`crate::ops::mount`]) attached via `Function.mount_ids`.
 //!
-//! ## Client mount supplies source; the base image must supply the deps
+//! ## How Python + the modal client are provisioned (PRIMARY: `add_python`)
 //!
-//! LIVE FINDING (2026-06-04, this crate's first mount-only round-trip): the hosted
-//! client mount carries only the `modal` + `synchronicity` *source* packages
-//! (mounted at `/pkg`), NOT their third-party pip dependencies (`typing_extensions`,
-//! `grpclib`, `protobuf`, `aiohttp`, `cbor2`, `rich`, `toml`, `watchfiles`, …).
-//! Booting `python -m modal._container_entrypoint` on a bare `python:3-slim` base
-//! therefore crash-loops with `ModuleNotFoundError: No module named
-//! 'typing_extensions'` and the function produces no output. Real Modal users never
-//! hit this because their images derive from a base that already carries the
-//! client's dependency closure.
+//! We replicate the official Python client. Two pieces land independently:
 //!
-//! So the base image must provide the client's pip dependencies. The robust,
-//! version-correct way to materialize exactly that closure is [`pip install
-//! modal`](ImageSpec::with_pip_install_modal) (pip resolves the deps for the mounted
-//! client version; the mount's `/pkg` still wins on `PYTHONPATH`, so the mounted
-//! source remains authoritative). This is no longer a "crude shortcut" — for a bare
-//! registry base it is REQUIRED alongside the mount. It is still OFF by default
-//! because a dependency-provisioned base (e.g. a Modal-style slim image) does not
-//! need it.
+//! 1. **The Python interpreter** comes from the HOSTED python-build-standalone mount
+//!    ([`ModalClient::python_standalone_mount_id`]), resolved by NAME exactly like
+//!    the client mount — NO apt, NO build step. It is attached as the image build
+//!    CONTEXT (`Image.context_mount_id`); the rendered Dockerfile then emits the
+//!    client-blessed `_registry_setup_commands` add_python branch
+//!    (_image.py:2041-2059): `COPY /python/. /usr/local`, an auto
+//!    `RUN ln -s /usr/local/bin/python3 /usr/local/bin/python` for series < 3.13
+//!    (the client-equivalent of `python-is-python3`, but a symlink against the
+//!    standalone install — NOT an apt package), and `ENV TERMINFO_DIRS=…`. A
+//!    standalone interpreter is relocatable and is NOT PEP-668 externally-managed,
+//!    so `--break-system-packages` is moot.
+//! 2. **The modal client source** rides the separate client mount (mounted at
+//!    `/pkg`), attached via `Function.mount_ids` ([`crate::ops::mount`]).
+//! 3. **The modal client's third-party dep closure** (`typing_extensions`,
+//!    `grpclib`, `protobuf`, `aiohttp`, `cbor2`, `rich`, …) is injected by the worker
+//!    AT CONTAINER START on the modern image builder (> "2024.10"), requested via
+//!    `Function.mount_client_dependencies = true`
+//!    ([`crate::ops::function::FunctionSpec`], proto field 82). Real Modal images on
+//!    the current builder therefore do NOT `pip install modal`; the worker mounts
+//!    both the source (client mount) and the deps (server-side). See
+//!    `_image.py:2061-2074` ("past 2024.10, client dependencies are mounted at
+//!    runtime") and `_functions.py:936-939`.
+//!
+//! Net: a `from_registry(<base>).with_add_python("3.12")` image has NO apt layer and
+//! NO pip layer — just `COPY`/`ln`/`ENV` + the wrapper bake — so the build is a short
+//! `ImageJoinStreaming` stream with far fewer transport resets.
+//!
+//! ## Documented fallback: apt + `pip install modal`
+//!
+//! The legacy provisioning ([`ImageSpec::with_apt`] + [`pip install
+//! modal`](ImageSpec::with_pip_install_modal)) is retained ONLY as a documented
+//! fallback for a base that already carries the deps, or an environment where
+//! runtime dep-mounting is unavailable. It is selected ONLY when `add_python` is
+//! unset. On a bare apt-provisioned Debian Python, `pip install` requires
+//! `--break-system-packages` (PEP-668 externally-managed) and the entrypoint's bare
+//! `python` requires the `python-is-python3` apt package — the three hacks
+//! `add_python` dissolves.
 
 use std::time::Duration;
 
@@ -36,7 +57,7 @@ use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::ops::{describe_failure, result_status, ResultState, DEFAULT_BASE_IMAGE};
 use crate::proto::api::{
-    Image, ImageContextFile, ImageGetOrCreateRequest, ImageJoinStreamingRequest,
+    BaseImage, Image, ImageContextFile, ImageGetOrCreateRequest, ImageJoinStreamingRequest,
 };
 use crate::retry::retry_unary;
 
@@ -81,6 +102,28 @@ pub struct ImageSpec {
     /// by the Rust deploy recipe (the source rides the context mount, not inline
     /// files); kept for proto parity. Default empty.
     pub context_files: Vec<(String, Vec<u8>)>,
+    /// PRIMARY Python provisioning: the python-build-standalone series to add (e.g.
+    /// `"3.12"`). When `Some`, the rendered Dockerfile emits the client's add_python
+    /// branch (`COPY /python/. /usr/local`, the `ln -s python3 python` for series <
+    /// 3.13, and the `TERMINFO_DIRS` ENV) and SUPPRESSES the apt/pip fallback lines.
+    /// See [`ImageSpec::with_add_python`] and the module docs. `None` ⇒ the apt+pip
+    /// fallback render branch.
+    pub add_python: Option<String>,
+    /// The HOSTED python-build-standalone mount id (from
+    /// [`ModalClient::python_standalone_mount_id`]) that supplies `/python` to the
+    /// `COPY /python/. /usr/local` add_python step. Emitted as
+    /// `Image.context_mount_id` (proto field 15) when `context_mount_id` is not
+    /// otherwise occupied by a source mount — see [`ImageSpec::with_add_python`] and
+    /// the layered DEPLOY path ([`ImageSpec::with_base_image`]).
+    pub python_standalone_mount_id: Option<String>,
+    /// Base image id for a LAYERED build (`Image.base_images`, proto field 5). When
+    /// `Some`, the image is layer N on top of a previously-built layer: the rendered
+    /// Dockerfile starts with `FROM base` (NOT `FROM <registry tag>`) and the proto
+    /// carries `base_images = [BaseImage { docker_tag: "base", image_id }]`. Used by
+    /// the DEPLOY two-layer image so the source mount (this layer's
+    /// `context_mount_id`) and the standalone mount (layer 1's `context_mount_id`)
+    /// each get their own build context. See [`ImageSpec::with_base_image`].
+    pub base_image_id: Option<String>,
 }
 
 impl ImageSpec {
@@ -94,6 +137,9 @@ impl ImageSpec {
             pip_install_modal: false,
             context_mount_id: None,
             context_files: Vec::new(),
+            add_python: None,
+            python_standalone_mount_id: None,
+            base_image_id: None,
         }
     }
 
@@ -157,34 +203,106 @@ impl ImageSpec {
         self
     }
 
-    /// Render the full `dockerfile_commands` list: `FROM`, pre-bake commands (e.g.
-    /// apt), optional pip line, the wrapper bakes, then extra commands.
+    /// PRIMARY Python provisioning: add the python-build-standalone `series` (e.g.
+    /// `"3.12"`) the way the official client does. Renders the add_python branch
+    /// (`COPY /python/. /usr/local` + `ln -s` for series < 3.13 + `TERMINFO_DIRS`)
+    /// and suppresses the apt/pip fallback. Pair with
+    /// [`ImageSpec::with_python_standalone_mount_id`] (supplies `/python` as the
+    /// build context) and, on the function, `mount_client_dependencies = true` (the
+    /// worker injects the client's dep closure at container start). See the module
+    /// docs.
+    pub fn with_add_python(mut self, series: impl Into<String>) -> Self {
+        self.add_python = Some(series.into());
+        self
+    }
+
+    /// Set the HOSTED python-build-standalone mount id (from
+    /// [`ModalClient::python_standalone_mount_id`]) that supplies `/python` to the
+    /// add_python `COPY`. For the RUN path this becomes the image's
+    /// `context_mount_id`; for the layered DEPLOY path the source owns this layer's
+    /// `context_mount_id`, so the standalone mount belongs on the BASE layer (also
+    /// set there via this method). See [`ImageSpec::with_base_image`].
+    pub fn with_python_standalone_mount_id(mut self, mount_id: impl Into<String>) -> Self {
+        self.python_standalone_mount_id = Some(mount_id.into());
+        self
+    }
+
+    /// Make this spec a LAYER on top of a previously-built image (`base_image_id`).
+    /// The rendered Dockerfile starts with `FROM base` instead of `FROM <tag>`, and
+    /// the proto carries `base_images = [BaseImage { docker_tag: "base", image_id }]`
+    /// (proto field 5). Used by the DEPLOY two-layer image so the source mount and
+    /// the python-standalone mount each occupy their own layer's `context_mount_id`.
+    pub fn with_base_image(mut self, base_image_id: impl Into<String>) -> Self {
+        self.base_image_id = Some(base_image_id.into());
+        self
+    }
+
+    /// Render the full `dockerfile_commands` list.
     ///
-    /// Order is load-bearing: pre-bake commands MUST precede both the pip line and
-    /// the bakes, because on a bare base they provision the runtime (`python3`)
-    /// those later steps invoke.
+    /// The opening line is `FROM base` for a LAYERED build ([`base_image_id`] set,
+    /// referencing the prior layer via `base_images[0].docker_tag = "base"`,
+    /// mirroring the client's `base_images={"base": self}` + `"FROM base"` pattern,
+    /// _image.py:725-727) or `FROM <base_image>` for a registry base.
+    ///
+    /// PRIMARY ([`add_python`] set): emit the client's add_python branch
+    /// (`COPY /python/. /usr/local`, the `ln -s python3 python` for series < 3.13,
+    /// `ENV TERMINFO_DIRS=…`; _image.py:2041-2059) and SUPPRESS the apt/pip fallback.
+    /// FALLBACK ([`add_python`] unset): the apt pre-bake commands then the optional
+    /// pip line (order is load-bearing — both provision the runtime the bake invokes).
+    /// Then the wrapper bakes, then the extra commands.
+    ///
+    /// [`base_image_id`]: ImageSpec::base_image_id
+    /// [`add_python`]: ImageSpec::add_python
     fn dockerfile_commands(&self) -> Vec<String> {
-        let mut cmds = vec![format!("FROM {}", self.base_image)];
-        cmds.extend(self.pre_bake_commands.iter().cloned());
-        if self.pip_install_modal {
-            // `python3 -m pip` is universal: it works on a slim apt-provisioned
-            // python (which may expose no bare `pip` shim) AND on stock `python:`
-            // bases. Replaces the bare `pip install` form.
-            //
-            // `--break-system-packages` is required on modern Debian bases
-            // (bookworm/trixie, e.g. `rust:1-slim` → Python 3.13) whose apt python
-            // is PEP-668 externally-managed: without it, `pip install` aborts with
-            // `error: externally-managed-environment` and the image build fails
-            // (live-verified 2026-06-04). The flag is a benign no-op on stock
-            // `python:` bases that are not externally-managed, so it is safe to
-            // always emit. We install into the system site-packages deliberately:
-            // this is a throwaway build image, and the mounted client `/pkg` still
-            // wins on `PYTHONPATH`, so the mounted modal source stays authoritative.
+        let from_line = if self.base_image_id.is_some() {
+            // Layered build: reference the prior layer by the conventional tag.
+            "FROM base".to_string()
+        } else {
+            format!("FROM {}", self.base_image)
+        };
+        let mut cmds = vec![from_line];
+
+        if let Some(series) = &self.add_python {
+            // Replicate `_registry_setup_commands` add_python branch
+            // (_image.py:2041-2059): COPY the standalone tree onto PATH, symlink
+            // `python` for series < 3.13 (the client-equivalent of python-is-python3
+            // — a symlink, not an apt package), then the TERMINFO ENV. The standalone
+            // mount supplies `/python` via this layer's `context_mount_id`.
+            cmds.push("COPY /python/. /usr/local".to_string());
+            if python_series_lt_13(series) {
+                cmds.push("RUN ln -s /usr/local/bin/python3 /usr/local/bin/python".to_string());
+            }
             cmds.push(
-                "RUN python3 -m pip install --no-cache-dir --break-system-packages modal"
+                "ENV TERMINFO_DIRS=/etc/terminfo:/lib/terminfo:/usr/share/terminfo:/usr/lib/terminfo"
                     .to_string(),
             );
+            // No apt, no pip: the client's dep closure is injected at container start
+            // via Function.mount_client_dependencies (see the module docs).
+        } else {
+            // FALLBACK provisioning: apt pre-bake commands, then the optional pip line.
+            cmds.extend(self.pre_bake_commands.iter().cloned());
+            if self.pip_install_modal {
+                // `python3 -m pip` is universal: it works on a slim apt-provisioned
+                // python (which may expose no bare `pip` shim) AND on stock `python:`
+                // bases. Replaces the bare `pip install` form.
+                //
+                // `--break-system-packages` is required on modern Debian bases
+                // (bookworm/trixie, e.g. `rust:1-slim` → Python 3.13) whose apt
+                // python is PEP-668 externally-managed: without it, `pip install`
+                // aborts with `error: externally-managed-environment` and the image
+                // build fails (live-verified 2026-06-04). The flag is a benign no-op
+                // on stock `python:` bases that are not externally-managed, so it is
+                // safe to always emit. We install into the system site-packages
+                // deliberately: this is a throwaway build image, and the mounted
+                // client `/pkg` still wins on `PYTHONPATH`, so the mounted modal
+                // source stays authoritative.
+                cmds.push(
+                    "RUN python3 -m pip install --no-cache-dir --break-system-packages modal"
+                        .to_string(),
+                );
+            }
         }
+
         for (module_name, source) in &self.wrapper_modules {
             cmds.push(bake_command(module_name, source));
         }
@@ -192,17 +310,44 @@ impl ImageSpec {
         cmds
     }
 
-    /// The `Image` proto message for this spec. `base_images` is empty because we
-    /// base on a registry `FROM <tag>` line (only layered builds populate it).
+    /// The build-context mount id this image's `Image.context_mount_id` (proto field
+    /// 15) should carry. An explicit source context mount ([`context_mount_id`],
+    /// the DEPLOY top layer's `COPY . /` source) takes precedence; otherwise, when
+    /// `add_python` is set on a NON-layered image (the RUN path / the DEPLOY base
+    /// layer), the python-standalone mount supplies `/python`.
     ///
-    /// For the DEPLOY path, `context_mount_id` (field 15) carries the uploaded
-    /// source mount as the build context and `context_files` (field 7) any inline
-    /// files; both default to empty/unset for the RUN path, so RUN images stay
-    /// byte-identical.
+    /// [`context_mount_id`]: ImageSpec::context_mount_id
+    fn resolved_context_mount_id(&self) -> Option<String> {
+        if let Some(id) = &self.context_mount_id {
+            return Some(id.clone());
+        }
+        if self.add_python.is_some() {
+            return self.python_standalone_mount_id.clone();
+        }
+        None
+    }
+
+    /// The `Image` proto message for this spec.
+    ///
+    /// `base_images` (field 5) is populated ONLY for a layered build
+    /// ([`ImageSpec::with_base_image`]); a registry base leaves it empty and renders
+    /// `FROM <tag>` instead. `context_mount_id` (field 15) carries this layer's build
+    /// context — the source mount (DEPLOY top layer / RUN fallback's source), or the
+    /// python-standalone mount when `add_python` is set with no source context (RUN
+    /// path / DEPLOY base layer). `context_files` (field 7) carries any inline files;
+    /// it defaults empty so RUN images stay byte-identical when unused.
     fn to_proto(&self) -> Image {
+        let base_images = match &self.base_image_id {
+            Some(id) => vec![BaseImage {
+                docker_tag: "base".to_string(),
+                image_id: id.clone(),
+            }],
+            None => Vec::new(),
+        };
         Image {
+            base_images,
             dockerfile_commands: self.dockerfile_commands(),
-            context_mount_id: self.context_mount_id.clone().unwrap_or_default(),
+            context_mount_id: self.resolved_context_mount_id().unwrap_or_default(),
             context_files: self
                 .context_files
                 .iter()
@@ -214,6 +359,21 @@ impl ImageSpec {
             ..Default::default()
         }
     }
+}
+
+/// True when a python-standalone `series` (e.g. `"3.12"`, `"3.14t"`) has minor < 13.
+/// Mirrors the client's check (_image.py:2052-2059): the `python` binary symlink is
+/// only needed for older standalone dists. A malformed series defaults to `false`
+/// (no symlink) — the supported-series guard lives in
+/// [`crate::ops::mount::python_standalone_mount_name`].
+fn python_series_lt_13(series: &str) -> bool {
+    series
+        .split('.')
+        .nth(1)
+        .map(|minor| minor.trim_end_matches('t'))
+        .and_then(|minor| minor.parse::<u32>().ok())
+        .map(|minor| minor < 13)
+        .unwrap_or(false)
 }
 
 /// A `RUN` command that base64-decodes `source` into `/root/<module_name>.py`.
@@ -241,7 +401,12 @@ impl ModalClient {
     /// `environment` is unused by `ImageGetOrCreate` directly (the image is scoped
     /// to `app_id`); the parameter is accepted for call-site symmetry.
     pub async fn image_get_or_create(&mut self, app_id: &str, spec: &ImageSpec) -> Result<String> {
-        let builder_version = self.image_builder_version().unwrap_or_default().to_string();
+        // Resolve the builder version (config override > environment setting). The
+        // worker only mounts the client dep closure at container start for a builder
+        // > "2024.10", so the add_python image needs a modern version pinned here — an
+        // empty version TERMINATES the container at boot (no modal deps). See
+        // [`ModalClient::resolved_image_builder_version`].
+        let builder_version = self.resolved_image_builder_version().await;
 
         // Modal dedups images by content hash: re-issuing the initial
         // get-or-create returns the same image_id/build, so it is safe to retry on
@@ -382,6 +547,113 @@ mod tests {
         assert!(cmds[1].contains("/root/spike_wrapper.py"));
         // No pip fallback by default (client mount is the native path).
         assert!(!cmds.iter().any(|c| c.contains("pip install")));
+    }
+
+    #[test]
+    fn add_python_renders_client_branch_and_no_hacks() {
+        // PRIMARY path: rust base + add_python("3.12"). Emits the client's
+        // add_python branch (COPY/ln/ENV) and NONE of the three hacks.
+        let cmds = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py-standalone")
+            .with_wrapper_module(
+                "modal_rust_run_wrapper",
+                "def handler(e, i):\n    return i\n",
+            )
+            .with_command("ENTRYPOINT []")
+            .dockerfile_commands();
+
+        assert_eq!(cmds[0], "FROM rust:1-slim");
+        let copy = cmds
+            .iter()
+            .position(|c| c == "COPY /python/. /usr/local")
+            .expect("add_python COPY present");
+        let ln = cmds
+            .iter()
+            .position(|c| c == "RUN ln -s /usr/local/bin/python3 /usr/local/bin/python")
+            .expect("ln -s present for series < 3.13");
+        let env = cmds
+            .iter()
+            .position(|c| c.starts_with("ENV TERMINFO_DIRS="))
+            .expect("TERMINFO_DIRS ENV present");
+        // Order matches the client's insert(1, ln): COPY, ln, ENV.
+        assert!(copy < ln && ln < env, "COPY < ln -s < ENV");
+
+        // The three hacks are GONE from the default add_python path.
+        assert!(!cmds.iter().any(|c| c.contains("apt-get")), "no apt layer");
+        assert!(
+            !cmds.iter().any(|c| c.contains("pip install")),
+            "no pip layer"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("python-is-python3")),
+            "no python-is-python3 apt package"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("--break-system-packages")),
+            "no --break-system-packages"
+        );
+    }
+
+    #[test]
+    fn add_python_3_13_omits_python_symlink() {
+        // Standalone series >= 3.13 ship the `python` binary already; no symlink.
+        let cmds = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.13")
+            .with_python_standalone_mount_id("mo-py")
+            .dockerfile_commands();
+        assert!(cmds.iter().any(|c| c == "COPY /python/. /usr/local"));
+        assert!(
+            !cmds.iter().any(|c| c.contains("ln -s")),
+            "no symlink for 3.13"
+        );
+    }
+
+    #[test]
+    fn add_python_sets_standalone_mount_as_context_when_no_source() {
+        // RUN path / DEPLOY base layer: the standalone mount becomes the build
+        // context (proto field 15) so `COPY /python/. /usr/local` has a source.
+        let img = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py-standalone")
+            .to_proto();
+        assert_eq!(img.context_mount_id, "mo-py-standalone");
+        assert!(
+            img.base_images.is_empty(),
+            "registry base has no base_images"
+        );
+    }
+
+    #[test]
+    fn explicit_source_context_wins_over_standalone_mount() {
+        // DEPLOY top layer: the source mount owns context_mount_id; the standalone
+        // mount belongs on the base layer instead.
+        let img = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py-standalone")
+            .with_context_mount("mo-deploy-src")
+            .to_proto();
+        assert_eq!(img.context_mount_id, "mo-deploy-src");
+    }
+
+    #[test]
+    fn base_image_renders_from_base_and_populates_base_images() {
+        // Layered build: FROM base + base_images[0] = {docker_tag:"base", image_id}.
+        let spec = ImageSpec::from_registry("rust:1-slim")
+            .with_base_image("im-layer1")
+            .with_context_mount("mo-deploy-src")
+            .with_wrapper_module("m", "x = 1\n");
+        let cmds = spec.dockerfile_commands();
+        assert_eq!(
+            cmds[0], "FROM base",
+            "layered build references the prior layer"
+        );
+
+        let img = spec.to_proto();
+        assert_eq!(img.base_images.len(), 1);
+        assert_eq!(img.base_images[0].docker_tag, "base");
+        assert_eq!(img.base_images[0].image_id, "im-layer1");
+        assert_eq!(img.context_mount_id, "mo-deploy-src");
     }
 
     #[test]

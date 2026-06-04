@@ -31,6 +31,10 @@ pub(crate) const WRAPPER_CALLABLE: &str = "handler";
 pub(crate) const REMOTE_SRC: &str = "/src";
 /// Rust base image major version tag (`rust:{ver}-slim`).
 pub(crate) const RUST_VER: &str = "1";
+/// Python series to provision via `add_python` (the hosted python-build-standalone
+/// mount). `< 3.13`, so the image gets the auto `ln -s python3 python` the bare
+/// `python` entrypoint needs. Shared by the RUN and DEPLOY images.
+pub(crate) const PYTHON_SERIES: &str = "3.12";
 /// In-body `cargo build` needs far longer than the SDK's 300s invoke default.
 pub(crate) const REMOTE_TIMEOUT_SECS: u32 = 1800;
 
@@ -126,19 +130,40 @@ pub(crate) fn run_wrapper_src(package: &str) -> String {
 }
 
 /// All knobs for the RUN path. One struct, no per-project file.
+///
+/// ## Source-upload scoping & ignore resolution
+///
+/// The source upload carries ONLY the cargo dependency closure of the target
+/// [`package`](RemoteConfig::package) — its workspace-member normal path deps — plus
+/// the workspace `Cargo.toml`/`Cargo.lock` (when [`use_cargo_scoping`] is `true` and
+/// `cargo metadata` is available; otherwise the whole [`local_root`] is uploaded
+/// minus ignored files). Non-source assets (datasets, model weights, fixtures) are
+/// NOT uploaded with the source — attach them via **Modal Volumes**.
+///
+/// Within the uploaded directories, files are pruned by ignore-file precedence
+/// (highest → lowest): [`modalignore_name`](RemoteConfig::modalignore_name) (default
+/// `.modalignore`) → `.gitignore` → built-in defaults (`target/`, `.git/`,
+/// `**/*.rlib`). Both ignore files are read from the workspace root.
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
     /// Directory uploaded as the source mount (defaults to the cargo workspace
-    /// root; override with `MODAL_RUST_SOURCE_DIR`).
+    /// root; override with `MODAL_RUST_SOURCE_DIR`). Also the workspace root for
+    /// cargo-metadata scoping and ignore-file resolution.
     pub local_root: PathBuf,
     /// Cargo package owning the entrypoints (`cargo -p <package>`). The
     /// `modal_runner` bin name is shared across workspace members, so this
-    /// disambiguates. Override with `MODAL_RUST_PACKAGE`.
+    /// disambiguates. Also the cargo-metadata scoping target. Override with
+    /// `MODAL_RUST_PACKAGE`.
     pub package: String,
     /// Where the source mount lands in-container.
     pub remote_src: String,
-    /// Ignore patterns for the source-dir walk (build artifacts, VCS).
-    pub ignore: Vec<String>,
+    /// Whether to scope the upload to the target package's cargo dependency closure
+    /// via `cargo metadata` (default `true`). `false` forces the whole-`local_root`
+    /// upload (still pruned by the resolved ignore files).
+    pub use_cargo_scoping: bool,
+    /// Highest-precedence ignore filename, read from the workspace root (default
+    /// `.modalignore`). Falls through to `.gitignore` then the built-in defaults.
+    pub modalignore_name: String,
     /// Base registry tag for the run image.
     pub base_image: String,
     /// Function timeout (seconds) — covers the in-body cargo build.
@@ -151,20 +176,8 @@ impl Default for RemoteConfig {
             local_root: discover_local_root(),
             package: discover_package(),
             remote_src: REMOTE_SRC.to_string(),
-            ignore: vec![
-                "target".to_string(),      // build artifacts (already pruned early)
-                ".git".to_string(),        // VCS
-                ".modal-rust".to_string(), // generated scratch / shims
-                "references".to_string(), // FIX: vendored modal-rs + modal-client clones (~14 MB, gitignored)
-                "workpads".to_string(),   // planning docs — not build input
-                ".github".to_string(),    // CI config — not build input
-                ".claude".to_string(),    // agent config — not build input
-                ".cursor".to_string(),    // editor config
-                ".opencode".to_string(),  // agent config
-                "tmp".to_string(),        // .gitignore scratch
-                ".research".to_string(),  // .gitignore scratch
-                "**/*.rlib".to_string(),  // stray rust libs
-            ],
+            use_cargo_scoping: true,
+            modalignore_name: modal_rust_sdk::DEFAULT_MODALIGNORE_NAME.to_string(),
             base_image: format!("rust:{RUST_VER}-slim"),
             timeout_secs: REMOTE_TIMEOUT_SECS,
         }
@@ -236,21 +249,63 @@ pub(crate) async fn ensure_function(
     let client_mount_id = client.client_mount_id(None).await?;
 
     // 3. Source mount (UPLOAD the user's crate; `cargo build` reads it at /src).
-    let ignore: Vec<&str> = config.ignore.iter().map(String::as_str).collect();
-    let source_mount_id = client
-        .mount_local_dir(&config.local_root, &config.remote_src, &ignore, None)
+    //    PRIMARY: cargo-metadata scoping uploads only the target package's
+    //    workspace-member dependency-closure crate dirs + the workspace
+    //    Cargo.toml/Cargo.lock. FALLBACK (cargo metadata unavailable): the whole
+    //    `local_root` minus ignored files. Both prune via `.modalignore` >
+    //    `.gitignore` > built-in defaults (resolved in the SDK).
+    let source_mount_id = match (
+        config.use_cargo_scoping,
+        crate::scope::workspace_closure(&config.local_root, &config.package),
+    ) {
+        (true, Some(closure)) => {
+            let spec = modal_rust_sdk::WorkspaceClosureSpec {
+                workspace_root: &config.local_root,
+                crate_dirs: &closure.dirs,
+                extra_files: &closure.extra_files,
+                extra_inline_files: &closure.inline_files,
+                modalignore_name: &config.modalignore_name,
+            };
+            client
+                .mount_workspace_closure(&spec, &config.remote_src, None)
+                .await?
+        }
+        _ => {
+            client
+                .mount_local_dir(
+                    &config.local_root,
+                    &config.remote_src,
+                    &config.modalignore_name,
+                    None,
+                )
+                .await?
+        }
+    };
+
+    // 3b. Python-standalone mount (the HOSTED python-build-standalone, resolved by
+    //     name exactly like the client mount). Supplies `/python` to the image's
+    //     `COPY /python/. /usr/local`.
+    let py_mount_id = client
+        .python_standalone_mount_id(PYTHON_SERIES, None)
         .await?;
 
-    // 4. Run image: rust base + python3/pip + modal deps + the baked wrapper.
+    // 4. Run image: rust base + add_python(standalone) + the baked wrapper.
     //
-    // `python-is-python3` is REQUIRED, not cosmetic: Modal's container entrypoint
-    // (dumb-init) execs bare `python`, but `rust:slim` + apt `python3` provides
-    // only `python3` — so without the `/usr/bin/python -> python3` symlink the
-    // container crash-loops at startup with "[dumb-init] python: No such file or
-    // directory" (live-verified 2026-06-04) and the function never produces output.
+    // We provision Python the way the official client does — via the python-build-
+    // standalone mount (`add_python`), NOT apt. The rendered image emits
+    // `COPY /python/. /usr/local`, an auto `RUN ln -s /usr/local/bin/python3
+    // /usr/local/bin/python` for series < 3.13 (the client-equivalent of
+    // `python-is-python3`: a symlink against the standalone install, not an apt
+    // package — so Modal's bare `python` entrypoint resolves), and the TERMINFO ENV.
+    // The standalone interpreter is relocatable and NOT PEP-668 externally-managed,
+    // so `--break-system-packages` is moot. The modal client SOURCE rides the client
+    // mount; its dep closure is injected by the worker at container start
+    // (FunctionSpec defaults `mount_client_dependencies = true`) — so there is NO apt
+    // layer and NO `pip install modal`. (apt+pip is retained as a documented fallback
+    // in the SDK, selected only when `add_python` is unset.)
     let spec = ImageSpec::from_registry(config.base_image.clone())
-        .with_apt(&["python3", "python3-pip", "python-is-python3"])
-        .with_pip_install_modal()
+        .with_add_python(PYTHON_SERIES)
+        .with_python_standalone_mount_id(py_mount_id)
         .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src(&config.package))
         .with_command("ENV RUST_BACKTRACE=1")
         .with_command("ENTRYPOINT []");
@@ -260,8 +315,12 @@ pub(crate) async fn ensure_function(
     let precreate_id = client.function_precreate(app_id, WRAPPER_CALLABLE).await?;
 
     // 6. FunctionCreate (FILE mode): both mounts attach via Function.mount_ids.
+    //    `mount_client_dependencies` defaults true (set explicitly here) so the
+    //    worker injects the modal client's dep closure at container start — the
+    //    add_python image carries no `pip install modal` layer.
     let fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
         .with_mount_ids(vec![client_mount_id, source_mount_id])
+        .with_mount_client_dependencies(true)
         .with_timeout_secs(config.timeout_secs);
     let created = client
         .function_create(app_id, &precreate_id, &fn_spec)
@@ -452,26 +511,17 @@ mod tests {
 
     #[test]
     fn default_config_has_expected_shape() {
-        // package default and ignore set are load-bearing (the source-mount walk).
+        // The scoping defaults are load-bearing for the source upload: cargo-metadata
+        // scoping ON, .modalignore as the highest-precedence ignore file. The old
+        // hardcoded ignore list is gone — ignore resolution now layers .modalignore >
+        // .gitignore > built-in defaults (so e.g. references/ is excluded via the
+        // repo .gitignore, no hardcoded entry needed).
         std::env::remove_var("MODAL_RUST_PACKAGE");
         let cfg = RemoteConfig::default();
         assert_eq!(cfg.remote_src, "/src");
         assert_eq!(cfg.base_image, "rust:1-slim");
         assert_eq!(cfg.timeout_secs, 1800);
-        assert!(cfg.ignore.iter().any(|p| p == "target"));
-        assert!(cfg.ignore.iter().any(|p| p == "**/*.rlib"));
-        // The load-bearing upload fix: references/ (the 14 MB vendored clones) must
-        // be excluded so .remote() never uploads them.
-        assert!(
-            cfg.ignore.iter().any(|p| p == "references"),
-            "references/ MUST be in the default ignore list"
-        );
-        // Other non-source dirs are belt-and-suspenders excluded too.
-        for seg in ["workpads", ".github", ".claude"] {
-            assert!(
-                cfg.ignore.iter().any(|p| p == seg),
-                "{seg} should be ignored"
-            );
-        }
+        assert!(cfg.use_cargo_scoping, "cargo scoping is the default");
+        assert_eq!(cfg.modalignore_name, ".modalignore");
     }
 }

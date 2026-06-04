@@ -50,8 +50,17 @@ as build context); new `crates/modal-rust/src/deploy.rs` (deploy wrapper + `App:
 the crash-loop accumulation: `.remote()` now publishes `APP_STATE_EPHEMERAL` + invokes `function_id` directly
 (GCs on disconnect); only `App::deploy` persists. Live-verified run apps are `ephemeral`/`stopped`. Built via
 `deploy-path`; gates green (one reviewer died on an infra socket, boundary independently covered by live logs
-+ a runtime-pure-wrapper test). **Next: dynamic config from the registry (P4, drop `--gpu`), migrate the CLI
-off codegen + refresh the stale README (P9), `.spawn()`/`.map()` + cache (P6).**
++ a runtime-pure-wrapper test).
+
+**[2026-06-04] ✅ HARDEN pass — image matches the official client + upload cargo-scoped.** Image now uses
+`add_python` (hosted python-standalone mount, byte-for-byte the client's recipe) + the worker-injected client
+dep closure (`mount_client_dependencies` on a pinned `image_builder_version`) — the 3 Debian hacks
+(`python-is-python3`/`--break-system-packages`/`pip install modal`) are gone from the default path. Upload is
+`cargo metadata` closure-scoped (example-add → 7 files/187 KB, was 14 MB) with `.modalignore`>`.gitignore`>
+defaults via the `ignore` crate; extras go via volumes. Both tracks proven live (`{sum:42}`, 0 hack-lines);
+3/3 reviews PASS; gates green (130 tests). Built via `harden-image-upload`. See `workpads/shim-backend/
+{knowledge.md,tasks.md → P-harden}`. **Next: dynamic config from the registry (P4, drop `--gpu`), migrate the
+CLI off codegen + refresh the stale README (P9), `.spawn()`/`.map()` + cache (P6).**
 
 > **Next (programmatic backend, `shim-backend` workpad):** wire the SDK into the
 > `App`/`Function` `.remote()`/`.local()` ergonomics and migrate `modal-rust run/deploy/

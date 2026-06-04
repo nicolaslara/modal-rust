@@ -67,5 +67,6 @@ pub use ops::app::PublishedApp;
 pub use ops::function::{CreatedFunction, FunctionResources, FunctionSpec};
 pub use ops::image::ImageSpec;
 pub use ops::invoke::Invocation;
-pub use ops::mount::client_mount_name;
+pub use ops::local_dir::{WorkspaceClosureSpec, DEFAULT_IGNORE_PATTERNS, DEFAULT_MODALIGNORE_NAME};
+pub use ops::mount::{client_mount_name, python_standalone_mount_name};
 pub use ops::DEFAULT_BASE_IMAGE;

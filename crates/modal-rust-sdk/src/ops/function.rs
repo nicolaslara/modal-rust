@@ -62,6 +62,15 @@ pub struct FunctionSpec {
     pub timeout_secs: u32,
     /// Resource request (always sent — fix #1).
     pub resources: FunctionResources,
+    /// Request the worker to inject the modal client's third-party dependency
+    /// closure (`typing_extensions`, `grpclib`, `protobuf`, `aiohttp`, …) into the
+    /// container AT START (proto field 82, `mount_client_dependencies`). REQUIRED on
+    /// the modern image builder (> "2024.10") when the image is provisioned via
+    /// `add_python` rather than `pip install modal`: the client mount carries only
+    /// the modal SOURCE, so without this the entrypoint crash-loops with
+    /// `ModuleNotFoundError`. Mirrors `_functions.py:936-939`/`:1014`. Defaults to
+    /// `true`.
+    pub mount_client_dependencies: bool,
 }
 
 impl FunctionSpec {
@@ -79,6 +88,7 @@ impl FunctionSpec {
             mount_ids: Vec::new(),
             timeout_secs: 300,
             resources: FunctionResources::default(),
+            mount_client_dependencies: true,
         }
     }
 
@@ -103,6 +113,15 @@ impl FunctionSpec {
     /// Set the resource request.
     pub fn with_resources(mut self, resources: FunctionResources) -> Self {
         self.resources = resources;
+        self
+    }
+
+    /// Override whether the worker injects the modal client's dependency closure at
+    /// container start (proto field 82). Defaults to `true`; set `false` only for an
+    /// image that already carries the deps (e.g. the legacy `pip install modal`
+    /// fallback) or where runtime dep-mounting is unavailable.
+    pub fn with_mount_client_dependencies(mut self, enabled: bool) -> Self {
+        self.mount_client_dependencies = enabled;
         self
     }
 }
@@ -187,6 +206,9 @@ impl ModalClient {
             timeout_secs: spec.timeout_secs,
             supported_input_formats: supported_formats(),
             supported_output_formats: supported_formats(),
+            // Worker injects the client dep closure at container start (modern
+            // builder), so the add_python image needs no `pip install modal` layer.
+            mount_client_dependencies: spec.mount_client_dependencies,
             ..Default::default()
         };
 
@@ -282,6 +304,16 @@ mod tests {
         assert_eq!(spec.image_id, "im-123");
         assert_eq!(spec.mount_ids, vec!["mo-client".to_string()]);
         assert_eq!(spec.timeout_secs, 120);
+        // add_python images rely on worker-injected client deps by default.
+        assert!(spec.mount_client_dependencies);
+    }
+
+    #[test]
+    fn mount_client_dependencies_defaults_true_and_is_overridable() {
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(spec.mount_client_dependencies);
+        let off = spec.with_mount_client_dependencies(false);
+        assert!(!off.mount_client_dependencies);
     }
 
     #[test]
