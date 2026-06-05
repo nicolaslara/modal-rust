@@ -25,3 +25,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Workflow scripts are local-only (kept on disk, not tracked — they are bulky one-shots)
+.claude/workflows/
