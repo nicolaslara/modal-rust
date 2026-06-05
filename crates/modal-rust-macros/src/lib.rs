@@ -53,19 +53,71 @@
 //! unaffected. When `typed_async!` lands, this arm switches from a diagnostic to
 //! emitting `typed_async!(..)` with the same `HandlerFn` shape.
 //!
-//! ## Multi-arg (reserved, boundaries.md §3)
+//! ## Two signature styles (auto-I/O ergonomics)
 //!
-//! The frozen argument shape is a single named JSON object. A single-argument
-//! handler takes its `In` directly (the common case, used by `examples/add`). A
-//! future multi-arg expansion will synthesize a private `#[derive(Deserialize)]`
-//! named-field args struct + a shim registered via `typed!(shim)` — never a
-//! positional array. Multi-arg is rejected today with a clear `compile_error!`
-//! rather than silently mis-registering.
+//! The frozen wire argument is ONE named JSON object (boundaries.md §3). The macro
+//! supports the user writing EITHER style of handler signature:
+//!
+//! - **Mode A — EXPLICIT (byte-identical to before):** a single param whose type is
+//!   a bare user struct path — `fn add(input: AddInput) -> Result<AddOutput>`. The
+//!   user's struct IS the wire input. Emission is unchanged: the original fn plus an
+//!   `inventory::submit!` of `typed!(add)`.
+//! - **Mode B — PLAIN signature (auto-generated I/O):** anything else — multiple
+//!   params, a single primitive/standalone param, or a no-arg fn:
+//!   `fn add(a: i64, b: i64) -> anyhow::Result<i64>`. The macro GENERATES a named
+//!   input type from the params (`pub mod add { pub struct Input { a, b }; pub type
+//!   Output = i64; }`, both `Serialize + Deserialize`), a private SPREAD shim
+//!   `fn(add::Input) -> _ { add(in.a, in.b) }` registered via the UNCHANGED
+//!   `typed!(shim)`, and a typed positional `App` extension method
+//!   `app.add(2, 3).local()/.remote()/.spawn()/.map()` (an `AddCall` trait
+//!   implemented for the facade `App`). The wire input is the generated `Input`
+//!   (still a named JSON object `{"a":2,"b":3}`); the wire output is the return
+//!   type's inner `Ok` (`{"value":5}`). NOTHING about the runner protocol /
+//!   `HandlerFn` / `typed!` changes — only the REGISTERED fn is the generated shim.
+//!
+//! The classifier is purely syntactic (a proc-macro cannot resolve types): a single
+//! param is Mode A iff its type is a bare `Type::Path` (no generics) whose last
+//! segment is NOT a primitive scalar (`i64`, `String`, …). See the inline classifier
+//! for the exact rule.
+//!
+//! ### Mode B emitted-path requirements (downstream `Cargo.toml`)
+//!
+//! Mode B emits two more absolute paths beyond the runtime/`inventory` deps every
+//! macro-using crate already carries (see the crate-level dep caveat above):
+//! - `::serde::{Serialize, Deserialize}` for the generated `Input` derives — every
+//!   macro-using crate already has `serde` with `derive`, so this is no new dep.
+//! - `::modal_rust_facade::{App, TypedCall}` for the typed `app.<fn>(..)` methods.
+//!   Because a macro-using crate often aliases the MACRO crate as `modal_rust`
+//!   (`extern crate modal_rust_macros as modal_rust;` so `#[modal_rust::function]`
+//!   is spellable), the macro must NOT emit `::modal_rust` for the FACADE — it would
+//!   resolve to the shadowing alias. Instead it emits `::modal_rust_facade`, which
+//!   the downstream crate guarantees with a RENAMED dependency:
+//!   `modal_rust_facade = { path = "...", package = "modal-rust" }`. (A crate that
+//!   does NOT alias the macro can drop the rename and spell the attribute as
+//!   `#[modal_rust_macros::function]`; then `::modal_rust` is unshadowed — but the
+//!   canonical `examples/add-macro` keeps the alias + adds the rename.)
+//!
+//! ### Bringing the typed methods into scope
+//!
+//! The `app.<fn>(..)` methods live on a per-fn extension trait (`<Pascal>Call`, e.g.
+//! `AddCall`) implemented for the facade `App` (one trait per fn keeps coherence
+//! trivial). The trait must be in scope at the call site; the ergonomic one-import
+//! path is a glob over the user crate:
+//!
+//! ```ignore
+//! use my_crate::*;             // brings every `<Pascal>Call` into scope (one use)
+//! // or, per-fn:
+//! use my_crate::AddCall;
+//! app.add(2, 3).remote().await?;
+//! ```
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
-use syn::{parse_macro_input, ItemFn, LitBool, LitInt, LitStr, Token};
+use syn::{
+    parse_macro_input, FnArg, GenericArgument, ItemFn, LitBool, LitInt, LitStr, PatType,
+    PathArguments, ReturnType, Token, Type,
+};
 
 /// Attribute macro that registers a handler with the modal-rust runner via
 /// `inventory`, producing the SAME registry shape as the manual `typed!` path.
@@ -73,10 +125,16 @@ use syn::{parse_macro_input, ItemFn, LitBool, LitInt, LitStr, Token};
 /// See the crate-level docs for the full contract. Usage:
 ///
 /// ```ignore
+/// // Mode A — EXPLICIT (single user-struct param; byte-identical to before):
 /// #[modal_rust::function]                  // name defaults to "add"
 /// pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { /* ... */ }
 ///
-/// #[modal_rust::function(name = "add")]    // explicit name override
+/// // Mode B — PLAIN signature (auto-generated `add::Input`/`add::Output` + typed
+/// // `app.add(2, 3).remote()`):
+/// #[modal_rust::function]
+/// pub fn add(a: i64, b: i64) -> anyhow::Result<i64> { Ok(a + b) }
+///
+/// #[modal_rust::function(name = "add")]    // explicit name override (either mode)
 /// pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { /* ... */ }
 /// ```
 #[proc_macro_attribute]
@@ -180,20 +238,16 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Frozen argument shape: a single named JSON object. v0 supports exactly one
-    // argument (the handler's `In`), exactly like the manual `typed!(add)` path.
-    // Multi-arg expansion (private args struct + shim) is reserved (boundaries.md
-    // §3) but not implemented here; reject clearly rather than mis-register.
-    let arg_count = func.sig.inputs.len();
-    if arg_count != 1 {
-        let msg = format!(
-            "#[modal_rust::function] currently supports exactly one argument (the \
-             handler's `In`), but `{fn_ident}` has {arg_count}. Multi-argument \
-             expansion (a private named-field args struct + shim, boundaries.md \
-             §3) is reserved but not yet implemented; wrap the parameters in a \
-             single `#[derive(Deserialize)]` input struct for now."
-        );
-        let err = syn::Error::new_spanned(&func.sig.inputs, msg).to_compile_error();
+    // Reject any `self` receiver up front (free `fn` only) in BOTH modes: the
+    // registered handler is a free function, and a method on a type cannot be a
+    // `HandlerFn`.
+    if let Some(FnArg::Receiver(recv)) = func.sig.inputs.first() {
+        let err = syn::Error::new_spanned(
+            recv,
+            "#[modal_rust::function] applies to free functions only; a `self` \
+             receiver cannot be a runner entrypoint",
+        )
+        .to_compile_error();
         return quote! {
             #func
             #err
@@ -201,20 +255,219 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Additive expansion: keep the original fn verbatim, then submit a
-    // `Registration` whose handler is the SAME monomorphized `typed!` wrapper the
-    // manual builder uses. `inventory::submit!` places this in a link section that
-    // `Registry::from_inventory()` collects at runner startup. The `typed!` macro
-    // expands to a block that defines a local `fn` and coerces it to a
-    // `HandlerFn` pointer — a const-evaluable expression valid in the `static`
-    // initializer `inventory::submit!` generates.
-    // The decorator config flows into the registration as a `FunctionConfig`. The
-    // `gpu` literal is a `&'static str` (so the `static` `inventory::submit!`
-    // initializer stays `const`-valid, matching `name: &'static str`); `timeout` is
-    // narrowed `u64 -> u32` here. The bare form sets all three to `None` =>
-    // `FunctionConfig::default()`, which the runner ignores (so behavior is
-    // byte-identical; only the facade reads `config`).
-    let gpu_tok = match &gpu {
+    // Collect the typed params (every non-receiver arg). The receiver is already
+    // rejected above, so an `unwrap`-free filter suffices.
+    let params: Vec<&PatType> = func
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            FnArg::Typed(pt) => Some(pt),
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+
+    // Classify the signature style (auto-I/O ergonomics; see the crate docs / spec
+    // §1). Mode A (EXPLICIT, byte-identical to before): exactly one param whose type
+    // is a bare non-scalar `Type::Path`. Mode B (GENERATE): everything else.
+    let mode_a = params.len() == 1 && is_mode_a_param_type(params[0].ty.as_ref());
+
+    if mode_a {
+        // Mode A: byte-identical to before — emit the unchanged fn + `typed!(fn)`
+        // registration. No generated module/shim/typed methods.
+        return emit_registration(
+            &func,
+            &entry_name,
+            quote! { ::modal_rust_runtime::typed!(#fn_ident) },
+            &gpu,
+            timeout_secs,
+            cache,
+            &secrets,
+            &volumes,
+        );
+    }
+
+    // Mode B: generate the named input type, the spread shim, the typed App methods,
+    // and register the SHIM. First, validate every param is a plain owned
+    // `ident: Type` (no `self`, already excluded above) and the handler carries no
+    // generics/lifetimes/where-clause (the generated Input/shim can't be
+    // monomorphized generically).
+    if let Some(err) = mode_b_signature_error(&func, &params) {
+        return quote! {
+            #func
+            #err
+        }
+        .into();
+    }
+
+    // The named-field list `(ident, type)` for the generated `Input` struct + spread,
+    // in declaration order.
+    let field_idents: Vec<&syn::Ident> = params
+        .iter()
+        .map(|pt| match pt.pat.as_ref() {
+            syn::Pat::Ident(pi) => &pi.ident,
+            // `mode_b_signature_error` already rejected non-ident patterns; this arm
+            // is unreachable in practice.
+            _ => unreachable!("non-ident param survived mode_b validation"),
+        })
+        .collect();
+    let field_types: Vec<&Type> = params.iter().map(|pt| pt.ty.as_ref()).collect();
+
+    // The return type's inner `Ok` type, used as `pub type Output = T;`. If the
+    // return is not a recognizable `Result<T, ..>` we fall back to the whole return
+    // type token; a non-`Result` handler is already a compile error inside `typed!`
+    // (it matches `Ok/Err`), so no extra diagnostic is needed here.
+    let output_ty = result_ok_type(&func.sig.output);
+
+    // The shim copies the ORIGINAL return type token-for-token (keeps `E` intact so
+    // the `typed!` autoref specialization still selects the right `details` path).
+    let orig_output = &func.sig.output;
+    let shim_ident = format_ident!("__modal_rust_shim_{}", fn_ident);
+
+    // The per-fn extension trait name: `<Pascal>Call`.
+    let trait_ident = format_ident!("{}Call", to_pascal_case(&fn_ident.to_string()));
+
+    // The generated I/O module + spread shim + typed App extension trait.
+    let generated = quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        pub mod #fn_ident {
+            // Param types written in the fn's own scope (e.g. user structs) resolve
+            // here via the parent glob.
+            #[allow(unused_imports)]
+            use super::*;
+
+            /// Auto-generated named input for this `#[modal_rust::function]` handler:
+            /// one `pub` field per parameter (field name = param ident, in declared
+            /// order). Serializes to the frozen named JSON object the runner decodes;
+            /// `Serialize` is consumed at the call site, `Deserialize` on the wire.
+            #[derive(::serde::Serialize, ::serde::Deserialize)]
+            pub struct Input {
+                #( pub #field_idents : #field_types ),*
+            }
+
+            /// Auto-generated output alias = the handler's return `Ok` type (the
+            /// value the success envelope carries).
+            pub type Output = #output_ty;
+        }
+
+        /// Private SPREAD shim: decodes the generated `Input`, spreads its fields as
+        /// positional args to the user fn, and returns the user fn's result verbatim.
+        /// Registered via the UNCHANGED `typed!` so the frozen decode/call/encode +
+        /// five-error taxonomy is byte-identical; only the registered fn differs.
+        #[doc(hidden)]
+        fn #shim_ident(__modal_rust_in: self::#fn_ident::Input) #orig_output {
+            #fn_ident( #( __modal_rust_in.#field_idents ),* )
+        }
+
+        /// Auto-generated typed positional CALL trait for this handler, implemented
+        /// for the facade `App`. Brings `app.#fn_ident(args)` into scope; chains into
+        /// `.local()/.remote()/.spawn()/.map()`. Pure sugar over the string-keyed
+        /// `App::function(name)` path.
+        pub trait #trait_ident {
+            /// Build a typed positional call to this entrypoint.
+            #[allow(clippy::too_many_arguments)]
+            fn #fn_ident<'__modal_rust_a>(
+                &'__modal_rust_a self,
+                #( #field_idents : #field_types ),*
+            ) -> ::modal_rust_facade::TypedCall<
+                '__modal_rust_a,
+                self::#fn_ident::Input,
+                self::#fn_ident::Output,
+            >;
+        }
+
+        impl #trait_ident for ::modal_rust_facade::App {
+            fn #fn_ident<'__modal_rust_a>(
+                &'__modal_rust_a self,
+                #( #field_idents : #field_types ),*
+            ) -> ::modal_rust_facade::TypedCall<
+                '__modal_rust_a,
+                self::#fn_ident::Input,
+                self::#fn_ident::Output,
+            > {
+                ::modal_rust_facade::TypedCall::new(
+                    self,
+                    #entry_name,
+                    self::#fn_ident::Input { #( #field_idents ),* },
+                )
+            }
+        }
+    };
+
+    let registration = build_registration(
+        &entry_name,
+        quote! { ::modal_rust_runtime::typed!(#shim_ident) },
+        &gpu,
+        timeout_secs,
+        cache,
+        &secrets,
+        &volumes,
+    );
+
+    quote! {
+        #func
+        #generated
+        #registration
+    }
+    .into()
+}
+
+/// Mode-A emission helper: keep the original fn verbatim and submit a
+/// `Registration` whose handler is `#handler_expr` (here `typed!(#fn_ident)`), with
+/// the decorator config — byte-identical to the pre-auto-I/O path.
+#[allow(clippy::too_many_arguments)]
+fn emit_registration(
+    func: &ItemFn,
+    entry_name: &str,
+    handler_expr: proc_macro2::TokenStream,
+    gpu: &Option<LitStr>,
+    timeout_secs: Option<u64>,
+    cache: Option<bool>,
+    secrets: &[String],
+    volumes: &[(String, String)],
+) -> TokenStream {
+    let registration = build_registration(
+        entry_name,
+        handler_expr,
+        gpu,
+        timeout_secs,
+        cache,
+        secrets,
+        volumes,
+    );
+    quote! {
+        #func
+        #registration
+    }
+    .into()
+}
+
+/// Build the `inventory::submit! { Registration { .. } }` token stream registering
+/// `#handler_expr` under `entry_name` with the decorator `FunctionConfig`.
+///
+/// `inventory::submit!` places this in a link section that
+/// `Registry::from_inventory()` collects at runner startup. The `typed!` macro
+/// expands to a block that defines a local `fn` and coerces it to a `HandlerFn`
+/// pointer — a const-evaluable expression valid in the `static` initializer
+/// `inventory::submit!` generates.
+///
+/// The decorator config flows into the registration as a `FunctionConfig`. The
+/// `gpu` literal is a `&'static str` (so the `static` `inventory::submit!`
+/// initializer stays `const`-valid, matching `name: &'static str`); `timeout` is
+/// narrowed `u64 -> u32` here. The bare form sets all three to `None` =>
+/// `FunctionConfig::default()`, which the runner ignores (so behavior is
+/// byte-identical; only the facade reads `config`).
+fn build_registration(
+    entry_name: &str,
+    handler_expr: proc_macro2::TokenStream,
+    gpu: &Option<LitStr>,
+    timeout_secs: Option<u64>,
+    cache: Option<bool>,
+    secrets: &[String],
+    volumes: &[(String, String)],
+) -> proc_macro2::TokenStream {
+    let gpu_tok = match gpu {
         Some(s) => quote! { ::core::option::Option::Some(#s) }, // &'static str literal
         None => quote! { ::core::option::Option::None },
     };
@@ -243,13 +496,11 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { &[ #( #items ),* ] }
     };
 
-    let expanded = quote! {
-        #func
-
+    quote! {
         ::inventory::submit! {
             ::modal_rust_runtime::Registration {
                 name: #entry_name,
-                handler: ::modal_rust_runtime::typed!(#fn_ident),
+                handler: #handler_expr,
                 config: ::modal_rust_runtime::FunctionConfig {
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
@@ -259,9 +510,129 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
             }
         }
-    };
+    }
+}
 
-    expanded.into()
+/// The scalar denylist (spec §1): a single param of one of these primitive/standard
+/// types forces Mode B (auto-I/O), even though it is a bare path. Anything not here
+/// AND a bare non-generic `Type::Path` is treated as a user struct (Mode A).
+const SCALAR_DENYLIST: &[&str] = &[
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32",
+    "f64", "bool", "char", "str", "String",
+];
+
+/// Classify a SINGLE param's type for Mode A vs Mode B (spec §1). Returns `true` iff
+/// the type is a bare `Type::Path` with NO generic arguments whose last path segment
+/// ident is NOT in [`SCALAR_DENYLIST`] (i.e. a user struct used as-is — Mode A).
+/// Anything else (`&T`, `(A, B)`, `[T; N]`, a generic path like `Vec<u8>`, or a
+/// denylisted scalar) is Mode B.
+fn is_mode_a_param_type(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else {
+        return false;
+    };
+    // A leading `::` or a qualified self type is fine — only the last segment's
+    // generics + ident matter for the syntactic rule.
+    let Some(last) = tp.path.segments.last() else {
+        return false;
+    };
+    if !matches!(last.arguments, PathArguments::None) {
+        return false; // generic path (Vec<u8>, Option<i64>, …) -> Mode B
+    }
+    let ident = last.ident.to_string();
+    !SCALAR_DENYLIST.contains(&ident.as_str())
+}
+
+/// Validate a Mode-B handler signature (spec §1). Returns `Some(compile_error)` on
+/// the first violation, else `None`. Enforces: every param is a plain `ident: Type`
+/// (no destructuring, no `mut`), owned (no `&T`/reference), and the handler carries
+/// no generics/lifetimes/where-clause.
+fn mode_b_signature_error(func: &ItemFn, params: &[&PatType]) -> Option<proc_macro2::TokenStream> {
+    // No generics / lifetimes / where-clauses on the handler: the generated Input /
+    // shim cannot be monomorphized generically.
+    if !func.sig.generics.params.is_empty() || func.sig.generics.where_clause.is_some() {
+        return Some(
+            syn::Error::new_spanned(
+                &func.sig.generics,
+                "plain #[modal_rust::function] handlers cannot be generic (no type/\
+                 lifetime params or where-clauses): the generated input type cannot \
+                 be monomorphized. Use concrete owned param types.",
+            )
+            .to_compile_error(),
+        );
+    }
+
+    for pt in params {
+        // Each param must be a plain identifier pattern (no `(a, b)`, no `mut`).
+        match pt.pat.as_ref() {
+            syn::Pat::Ident(pi) if pi.subpat.is_none() => {}
+            _ => {
+                return Some(
+                    syn::Error::new_spanned(
+                        pt,
+                        "name each parameter so its name can become an input field \
+                         (a plain `ident: Type`, no destructuring)",
+                    )
+                    .to_compile_error(),
+                );
+            }
+        }
+        // Owned only: reject references / borrowed params.
+        if matches!(pt.ty.as_ref(), Type::Reference(_)) {
+            return Some(
+                syn::Error::new_spanned(
+                    pt,
+                    "plain #[modal_rust::function] params must be owned; use String / \
+                     Vec<u8> instead of a borrowed `&str` / `&[u8]`",
+                )
+                .to_compile_error(),
+            );
+        }
+    }
+    None
+}
+
+/// Extract the inner `Ok` type `T` from a handler return type `-> Result<T, E>` /
+/// `-> anyhow::Result<T>` (spec §4). Returns the first generic TYPE argument of the
+/// last path segment whose ident is `Result`. Falls back to the whole return type
+/// token when the shape is unrecognized (a non-`Result` return is already a compile
+/// error inside `typed!`, so no extra diagnostic is needed).
+fn result_ok_type(output: &ReturnType) -> proc_macro2::TokenStream {
+    let ReturnType::Type(_, ty) = output else {
+        return quote! { () };
+    };
+    if let Type::Path(tp) = ty.as_ref() {
+        if let Some(seg) = tp.path.segments.last() {
+            if seg.ident == "Result" {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(inner) = arg {
+                            return quote! { #inner };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    quote! { #ty }
+}
+
+/// Convert a snake_case fn ident to PascalCase for the `<Pascal>Call` trait name
+/// (`add` -> `Add`, `add_gpu` -> `AddGpu`). Underscores are separators; each
+/// following segment is capitalized.
+fn to_pascal_case(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    let mut capitalize = true;
+    for ch in snake.chars() {
+        if ch == '_' {
+            capitalize = true;
+        } else if capitalize {
+            out.extend(ch.to_uppercase());
+            capitalize = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Parse a bracketed list of string literals from a `meta.value()` parse stream:
@@ -273,4 +644,67 @@ fn parse_str_list(input: syn::parse::ParseStream) -> syn::Result<Vec<LitStr>> {
     syn::bracketed!(content in input);
     let items: Punctuated<LitStr, Token![,]> = Punctuated::parse_terminated(&content)?;
     Ok(items.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ty(src: &str) -> Type {
+        syn::parse_str(src).expect("valid type")
+    }
+
+    #[test]
+    fn mode_a_selects_bare_user_struct_paths() {
+        // A single bare non-scalar path is the EXPLICIT form (Mode A): used as-is,
+        // byte-identical to before. Covers plain, qualified, and leading-`::` paths.
+        assert!(is_mode_a_param_type(&ty("AddInput")));
+        assert!(is_mode_a_param_type(&ty("crate::AddInput")));
+        assert!(is_mode_a_param_type(&ty("mymod::Req")));
+        assert!(is_mode_a_param_type(&ty("::foo::Bar")));
+    }
+
+    #[test]
+    fn mode_b_selects_scalars_generics_refs_tuples_arrays() {
+        // Denylisted scalars -> Mode B (generate), even as a single param.
+        for s in SCALAR_DENYLIST {
+            assert!(
+                !is_mode_a_param_type(&ty(s)),
+                "scalar {s} must force Mode B (generate)"
+            );
+        }
+        // Generic paths, references, tuples, arrays -> Mode B.
+        assert!(!is_mode_a_param_type(&ty("Vec<u8>")));
+        assert!(!is_mode_a_param_type(&ty("Option<i64>")));
+        assert!(!is_mode_a_param_type(&ty(
+            "std::collections::HashMap<String, i64>"
+        )));
+        assert!(!is_mode_a_param_type(&ty("&str")));
+        assert!(!is_mode_a_param_type(&ty("&[u8]")));
+        assert!(!is_mode_a_param_type(&ty("(i64, i64)")));
+        assert!(!is_mode_a_param_type(&ty("[u8; 4]")));
+    }
+
+    #[test]
+    fn result_ok_type_extracts_inner_ok() {
+        let parse_out = |src: &str| -> String {
+            let sig: syn::Signature = syn::parse_str(&format!("fn f() {src}")).unwrap();
+            result_ok_type(&sig.output).to_string()
+        };
+        assert_eq!(parse_out("-> anyhow::Result<i64>"), "i64");
+        assert_eq!(parse_out("-> Result<i64, MyErr>"), "i64");
+        assert_eq!(parse_out("-> Result<Vec<u8>, E>"), "Vec < u8 >");
+        // No return -> unit fallback (a non-Result handler is a `typed!` compile
+        // error anyway, so this fallback is never registered).
+        assert_eq!(parse_out(""), "()");
+    }
+
+    #[test]
+    fn pascal_case_handles_underscores() {
+        assert_eq!(to_pascal_case("add"), "Add");
+        assert_eq!(to_pascal_case("add_plain"), "AddPlain");
+        assert_eq!(to_pascal_case("add_gpu"), "AddGpu");
+        assert_eq!(to_pascal_case("a_b_c"), "ABC");
+        assert_eq!(to_pascal_case("already"), "Already");
+    }
 }

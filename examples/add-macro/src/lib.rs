@@ -53,6 +53,27 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
     })
 }
 
+/// The PLAIN-SIGNATURE twin (auto-I/O ergonomics): the user writes positional
+/// primitive params and a bare return type, NEVER naming an input/output struct.
+///
+/// `#[modal_rust::function]` detects this is NOT a single user-struct param (two
+/// `i64`s), so Mode B GENERATES:
+///   - a named input module `add_plain::{Input, Output}` (`Input { a, b }` deriving
+///     `Serialize + Deserialize`; `Output = i64`),
+///   - a private spread shim `fn(add_plain::Input) -> _ { add_plain(in.a, in.b) }`
+///     registered via the UNCHANGED `typed!` (wire input `{"a":2,"b":3}`, wire
+///     output `{"value":5}` — frozen runner protocol),
+///   - and a typed positional `App` method via the `AddPlainCall` trait, so
+///     `app.add_plain(2, 3).local()? == 5` / `.remote().await?` / `.spawn()` /
+///     `.map(..)` — no type ever named.
+///
+/// The generated `add_plain::Input` stays nameable, so the explicit string-keyed
+/// path also works: `app.function("add_plain").remote(add_plain::Input { a: 2, b: 3 })`.
+#[modal_rust::function]
+pub fn add_plain(a: i64, b: i64) -> anyhow::Result<i64> {
+    Ok(a + b)
+}
+
 /// The macro-path twin WITH PER-FUNCTION CONFIG (P4): the
 /// `#[modal_rust::function(gpu=…, timeout=…, cache=…)]` decorator records a
 /// [`modal_rust_runtime::FunctionConfig`] alongside the registration. This is
@@ -165,6 +186,86 @@ mod tests {
     fn add_works() {
         let out = add(AddInput { a: 40, b: 2 }).unwrap();
         assert_eq!(out.sum, 42);
+    }
+
+    #[test]
+    fn add_plain_works_as_plain_fn() {
+        // The user fn keeps its plain positional signature (the macro emits it
+        // verbatim), so it is callable directly.
+        assert_eq!(add_plain(2, 3).unwrap(), 5);
+    }
+
+    #[test]
+    fn add_plain_generates_named_input_and_output() {
+        // Mode B generated a NAMEABLE input/output: `add_plain::Input` (Serialize +
+        // Deserialize) and `add_plain::Output` (= i64). The input serializes to the
+        // frozen named JSON object `{"a":2,"b":3}`.
+        let input = add_plain::Input { a: 2, b: 3 };
+        let json = serde_json::to_string(&input).unwrap();
+        assert_eq!(json, r#"{"a":2,"b":3}"#);
+        let back: add_plain::Input = serde_json::from_str(r#"{"a":40,"b":2}"#).unwrap();
+        assert_eq!(back.a, 40);
+        assert_eq!(back.b, 2);
+        // `Output` is the return type's inner Ok (`i64`).
+        let _out: add_plain::Output = 5i64;
+    }
+
+    #[test]
+    fn add_plain_registered_via_inventory() {
+        // The generated SPREAD shim is registered under `add_plain` and dispatches
+        // through the UNCHANGED runner: wire input `{"a":2,"b":3}` -> envelope
+        // `{"ok":true,"value":5}` (the return value is a bare `5`).
+        let reg = Registry::from_inventory();
+        assert!(
+            reg.get("add_plain").is_some(),
+            "macro did not register `add_plain`"
+        );
+        let argv: Vec<String> = [
+            "--entrypoint",
+            "add_plain",
+            "--input-json",
+            r#"{"a":2,"b":3}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut buf = Vec::new();
+        let code =
+            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "{\"ok\":true,\"value\":5}\n"
+        );
+    }
+
+    #[test]
+    fn add_plain_typed_app_method_local() {
+        // The auto-I/O ergonomics path: bring the generated `AddPlainCall` trait into
+        // scope, then call the typed positional method on the facade `App`. The args
+        // are typed from the signature; the result decodes to the return type. The
+        // user NEVER names an input/output type.
+        use crate::AddPlainCall;
+        use modal_rust_facade::App;
+
+        let app = App::from_inventory();
+        let sum: i64 = app.add_plain(2, 3).local().unwrap();
+        assert_eq!(sum, 5, "app.add_plain(2,3).local() must compute 5");
+    }
+
+    #[test]
+    fn add_plain_explicit_input_path_local() {
+        // Constraint #3: the generated input stays callable explicitly via the
+        // string-keyed path, serializing to the SAME `{"a":2,"b":3}` and decoding the
+        // SAME `{"value":5}` -> `5`.
+        use modal_rust_facade::App;
+
+        let app = App::from_inventory();
+        let sum: i64 = app
+            .function("add_plain")
+            .local(add_plain::Input { a: 2, b: 3 })
+            .unwrap();
+        assert_eq!(sum, 5);
     }
 
     #[test]

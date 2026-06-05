@@ -192,12 +192,24 @@ def _build(env):
         return
     print(f"[cache] {_unpack_cache()}", file=sys.stderr)  # warm CARGO_HOME if archive present
     build_dir = _build_dir()
+    # Capture combined cargo output so a build FAILURE surfaces its CAUSE in the
+    # raised error (rides back through the envelope), not just an opaque exit code.
+    # Output is also echoed to Modal logs verbatim for the full transcript.
     b = subprocess.run(
         ["cargo", "build", "--release", "-p", PACKAGE, "--bin", "modal_runner"],
-        cwd=build_dir, env=env, stdout=sys.stderr, stderr=sys.stderr,
+        cwd=build_dir, env=env, capture_output=True, text=True,
     )
+    if b.stdout:
+        print(b.stdout, file=sys.stderr)
+    if b.stderr:
+        print(b.stderr, file=sys.stderr)
     if b.returncode != 0:
-        raise RuntimeError(f"cargo build failed with exit code {b.returncode}")
+        # The last lines of cargo's stderr carry the actual rustc/linker error; a
+        # tail keeps the message bounded while still naming the failing crate/error.
+        tail = (b.stderr or b.stdout or "")[-1500:]
+        raise RuntimeError(
+            f"cargo build failed with exit code {b.returncode}; stderr tail:\n{tail}"
+        )
     open(_MARKER, "w").close()
     _BUILT = True
     _pack_cache()  # cold path only; persist the enriched archive (best-effort)

@@ -73,7 +73,7 @@ mod scope;
 pub use app::App;
 pub use deploy::{DeployConfig, DeployedApp};
 pub use error::{Error, Result};
-pub use function::{Function, FunctionCall};
+pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly.
 pub use remote::RemoteConfig;

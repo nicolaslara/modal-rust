@@ -168,6 +168,114 @@ impl std::fmt::Debug for FunctionCall<'_> {
     }
 }
 
+/// A typed, positional CALL BUILDER produced by the `#[modal_rust::function]`
+/// macro's generated `app.<fn>(args)` extension method (the auto-I/O ergonomics
+/// path). Pure SUGAR over [`App::function`](crate::App::function) +
+/// [`Function`]: it owns the macro-built named-input value (`In`, built from the
+/// positional args) and pins the typed output (`Out`, the handler's return type),
+/// so the caller chains into `.local()/.remote()/.spawn()/.map()` WITHOUT ever
+/// naming a type.
+///
+/// The constructor takes `(&App, &'static str, In)`: the macro knows the
+/// entrypoint `name` as a compile-time `&'static str` (the registry key) and the
+/// already-built `In`, so the handle is construct-cheap and borrows the [`App`]
+/// like [`Function`] does. Every method forwards verbatim to the matching
+/// [`Function`] method, so the frozen serialize → registry/RUN path → decode
+/// pipeline (and `retry_transient`/build-boundary/config, which live BELOW
+/// `Function`) is unchanged.
+pub struct TypedCall<'a, In, Out> {
+    app: &'a crate::App,
+    /// The frozen entrypoint key (registry name); a compile-time literal from the
+    /// macro (the fn name, or the `name = "..."` override).
+    name: &'static str,
+    /// The generated named-input value, already built from the positional args.
+    input: In,
+    /// Pins the typed output without storing one.
+    _out: std::marker::PhantomData<Out>,
+}
+
+impl<'a, In, Out> TypedCall<'a, In, Out>
+where
+    In: serde::Serialize,
+    Out: serde::de::DeserializeOwned,
+{
+    /// Build a typed call over the entrypoint `name` with a pre-built `input`.
+    /// Called by the macro-generated `app.<fn>(args)` method; rarely constructed
+    /// by hand.
+    pub fn new(app: &'a crate::App, name: &'static str, input: In) -> Self {
+        TypedCall {
+            app,
+            name,
+            input,
+            _out: std::marker::PhantomData,
+        }
+    }
+
+    /// Run IN-PROCESS via the frozen [`Registry`](crate::Registry), sugar over
+    /// [`App::function(name).local`](Function::local). Returns the typed `Out`.
+    pub fn local(self) -> Result<Out> {
+        self.app.function(self.name).local::<In, Out>(self.input)
+    }
+
+    /// Run REMOTELY on Modal (the RUN path), sugar over
+    /// [`App::function(name).remote`](Function::remote). Returns the typed `Out`.
+    pub async fn remote(self) -> Result<Out> {
+        self.app
+            .function(self.name)
+            .remote::<In, Out>(self.input)
+            .await
+    }
+
+    /// Fire-and-forget spawn (the RUN path), sugar over
+    /// [`App::function(name).spawn`](Function::spawn). Returns a typed
+    /// [`TypedFunctionCall`] whose `.get().await?` decodes to `Out` without the
+    /// caller naming a type.
+    pub async fn spawn(self) -> Result<TypedFunctionCall<'a, Out>> {
+        let call = self.app.function(self.name).spawn::<In>(self.input).await?;
+        Ok(TypedFunctionCall {
+            call,
+            _out: std::marker::PhantomData,
+        })
+    }
+
+    /// Fan-out over many inputs (the RUN path), sugar over
+    /// [`App::function(name).map`](Function::map). The leading positional args only
+    /// fixed the entrypoint + types; this handle's own `input` is DISCARDED and
+    /// `map` runs the supplied iterator of `In` instead. Returns `Vec<Out>` in
+    /// input order.
+    pub async fn map<I>(self, inputs: I) -> Result<Vec<Out>>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        self.app.function(self.name).map::<In, Out, I>(inputs).await
+    }
+}
+
+/// A typed wrapper around [`FunctionCall`] returned by [`TypedCall::spawn`]: pins
+/// the output type so `.get(timeout).await?` decodes to `Out` (= the handler's
+/// return type) without the caller naming a type. Pure sugar over
+/// [`FunctionCall::get`].
+pub struct TypedFunctionCall<'a, Out> {
+    call: FunctionCall<'a>,
+    _out: std::marker::PhantomData<Out>,
+}
+
+impl<Out> TypedFunctionCall<'_, Out>
+where
+    Out: serde::de::DeserializeOwned,
+{
+    /// The spawned call's `function_call_id` (Modal's handle for the queued call).
+    pub fn function_call_id(&self) -> &str {
+        self.call.function_call_id()
+    }
+
+    /// Await the spawned call's result, sugar over [`FunctionCall::get`]. Decodes
+    /// to the pinned `Out` type.
+    pub async fn get(&self, timeout: Option<std::time::Duration>) -> Result<Out> {
+        self.call.get::<Out>(timeout).await
+    }
+}
+
 impl FunctionCall<'_> {
     /// The spawned call's `function_call_id` (Modal's handle for the queued call).
     pub fn function_call_id(&self) -> &str {

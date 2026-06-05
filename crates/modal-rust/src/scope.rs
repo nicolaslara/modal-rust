@@ -145,11 +145,93 @@ pub(crate) fn workspace_closure(workspace_root: &Path, package: &str) -> Option<
         .filter(|p| p.is_file())
         .collect();
 
+    // The rewritten workspace manifest is the first inline override.
+    let mut inline_files: Vec<(String, Vec<u8>)> =
+        vec![("Cargo.toml".to_string(), rewritten.into_bytes())];
+
+    // Strip `[dev-dependencies]` from each uploaded MEMBER manifest. The remote build
+    // is `cargo build --bin modal_runner` (never tests/benches), so dev-deps are never
+    // needed — and a member's dev-dep that path-points OUTSIDE the uploaded closure
+    // (e.g. the facade `modal-rust` dev-deps on `examples/add`, which is NOT in the
+    // closure) makes cargo ABORT loading the trimmed workspace with
+    // "failed to read .../Cargo.toml: No such file or directory". Emitting a
+    // dev-dep-stripped manifest as an inline override (which wins over the verbatim
+    // on-disk one) keeps the uploaded workspace self-consistent. Build-only deps stay:
+    // they are needed to build the runner.
+    for dir in &dirs {
+        let member_manifest = dir.join("Cargo.toml");
+        let Ok(rel) = dir.strip_prefix(ws_root) else {
+            continue; // a closure dir outside the ws root cannot be emitted inline
+        };
+        if rel.as_os_str().is_empty() {
+            continue; // the root manifest is already handled by the workspace rewrite
+        }
+        let Ok(original) = std::fs::read_to_string(&member_manifest) else {
+            continue; // unreadable -> fall back to the verbatim upload (no override)
+        };
+        match strip_dev_dependencies(&original) {
+            Ok(Some(stripped)) => {
+                let rel_posix = rel
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                inline_files.push((format!("{rel_posix}/Cargo.toml"), stripped.into_bytes()));
+            }
+            // No dev-deps to strip (`None`) -> keep the verbatim upload.
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "[modal-rust] could not strip dev-dependencies from {} ({e}); \
+                     uploading it verbatim (a build may fail if it dev-deps an \
+                     un-uploaded path)",
+                    member_manifest.display()
+                );
+            }
+        }
+    }
+
     Some(ClosureUpload {
         dirs,
         extra_files,
-        inline_files: vec![("Cargo.toml".to_string(), rewritten.into_bytes())],
+        inline_files,
     })
+}
+
+/// Remove `[dev-dependencies]` (and any `[target.<cfg>.dev-dependencies]`) tables from
+/// a member `Cargo.toml`, preserving everything else (normal/build deps, `[lib]`,
+/// `[[bin]]`, comments, formatting) byte-for-byte via `toml_edit`.
+///
+/// Returns `Ok(Some(rewritten))` when at least one dev-dependencies table was removed,
+/// `Ok(None)` when the manifest declares none (so the caller keeps the verbatim
+/// upload), or `Err` on a parse failure (the caller logs + falls back to verbatim).
+///
+/// Why: the remote in-body build runs only `cargo build --bin modal_runner`, so
+/// dev-dependencies are never compiled — but a member whose dev-dep path-points
+/// OUTSIDE the uploaded closure makes cargo fail to LOAD the workspace (it reads every
+/// member manifest's dev-deps). Stripping them keeps the trimmed upload loadable.
+fn strip_dev_dependencies(original: &str) -> Result<Option<String>, String> {
+    use toml_edit::{DocumentMut, Item};
+
+    let mut doc: DocumentMut = original
+        .parse()
+        .map_err(|e| format!("parse Cargo.toml: {e}"))?;
+    let mut removed = doc.remove("dev-dependencies").is_some();
+
+    // `[target.<cfg>.dev-dependencies]` lives under `target.<cfg>`; clear each.
+    if let Some(target) = doc.get_mut("target").and_then(Item::as_table_like_mut) {
+        // Collect cfg keys first to avoid borrowing `target` mutably while iterating.
+        let cfgs: Vec<String> = target.iter().map(|(k, _)| k.to_string()).collect();
+        for cfg in cfgs {
+            if let Some(cfg_tbl) = target.get_mut(&cfg).and_then(Item::as_table_like_mut) {
+                if cfg_tbl.remove("dev-dependencies").is_some() {
+                    removed = true;
+                }
+            }
+        }
+    }
+
+    Ok(removed.then(|| doc.to_string()))
 }
 
 /// Rewrite the workspace manifest's `[workspace] members` and `default-members`
@@ -518,5 +600,62 @@ panic = "unwind"
         assert_eq!(members, vec!["a"]);
         // No default-members originally → none added.
         assert!(doc["workspace"].get("default-members").is_none());
+    }
+
+    #[test]
+    fn strip_dev_dependencies_removes_table_and_keeps_the_rest() {
+        // Mirrors the facade `crates/modal-rust/Cargo.toml`: a `[dev-dependencies]`
+        // with an OUT-OF-CLOSURE path-dep that would break the trimmed workspace load.
+        let original = "\
+[package]
+name = \"modal-rust\"
+
+[dependencies]
+modal-rust-runtime = { path = \"../modal-rust-runtime\" }
+
+[dev-dependencies]
+example-add = { path = \"../../examples/add\" }
+inventory = \"0.3\"
+
+[build-dependencies]
+some-build-dep = \"1\"
+";
+        let out = strip_dev_dependencies(original)
+            .unwrap()
+            .expect("dev-deps removed");
+        let doc: toml_edit::DocumentMut = out.parse().unwrap();
+        // dev-dependencies gone; the offending out-of-closure path is no longer present.
+        assert!(doc.get("dev-dependencies").is_none());
+        assert!(!out.contains("examples/add"));
+        // Normal + build deps preserved (build deps ARE needed to build the runner).
+        assert!(doc.get("dependencies").is_some());
+        assert!(out.contains("modal-rust-runtime"));
+        assert!(out.contains("[build-dependencies]"));
+        assert!(out.contains("some-build-dep"));
+    }
+
+    #[test]
+    fn strip_dev_dependencies_none_when_absent() {
+        // A manifest with no dev-deps yields `None` so the caller keeps the verbatim
+        // on-disk upload (no inline override emitted).
+        let original = "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n";
+        assert!(strip_dev_dependencies(original).unwrap().is_none());
+    }
+
+    #[test]
+    fn strip_dev_dependencies_handles_target_cfg_table() {
+        // `[target.'cfg(...)'.dev-dependencies]` must also be removed.
+        let original = "\
+[package]
+name = \"x\"
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = \"0.27\"
+";
+        let out = strip_dev_dependencies(original)
+            .unwrap()
+            .expect("target dev-deps removed");
+        assert!(!out.contains("dev-dependencies"));
+        assert!(!out.contains("nix"));
     }
 }
