@@ -104,7 +104,17 @@ or `@path/to/input.json`.
 
 ## Library API
 
-Define a Rust function with serializable input and output types:
+There are two ways to register a function: the `#[modal_rust::function]`
+attribute macro (the default, ergonomic path) and a manual `Registry` builder.
+Both compile down to the same typed handler shape, so the calling API
+(`App`/`Function`, `.local()`/`.remote()`/`deploy`+`call`, `.map`/`.spawn`) is
+identical for both.
+
+### Authoring with `#[modal_rust::function]` (the macro path)
+
+Annotate a normal Rust function with serializable input and output types. The
+macro registers it through `inventory`, so there is no `modal_registry()` builder
+to maintain — `App::from_inventory()` collects every annotated function:
 
 ```rust
 use modal_rust::function;
@@ -129,7 +139,38 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
 }
 ```
 
-Then call it through `App`:
+The decorator is the config. Everything Modal needs to create the function lives
+on the attribute — `gpu`, `timeout`, `cache`, `secrets`, and `volumes` — and is
+read from the registry at call time (there are no extra CLI flags):
+
+```rust
+# use modal_rust::function;
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Serialize, Deserialize)] pub struct TrainInput { pub epochs: u32 }
+# #[derive(Debug, Serialize, Deserialize)] pub struct TrainOutput { pub ok: bool }
+#[function(
+    gpu = "T4",                     // also: "A100", "A100-80GB", "H100:4", ...
+    timeout = 1800,                 // wall-clock seconds
+    cache = false,                  // opt out of the cargo build cache (default: on)
+    secrets = ["my-api-key"],       // named Modal secrets, injected as env vars
+    volumes = ["/data=my-dataset"], // a Modal Volume `my-dataset` mounted at /data
+)]
+pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
+    let _key = std::env::var("API_KEY")?;             // from the secret
+    std::fs::write("/data/checkpoint", b"...")?;      // persisted on the volume
+    Ok(TrainOutput { ok: true })
+}
+```
+
+> **Dependency note.** The macro expands to absolute `::modal_rust_runtime::...`
+> and `::inventory::submit!` paths that Rust resolves against your crate's own
+> extern prelude. A crate using `#[modal_rust::function]` must therefore add
+> `modal-rust-runtime` and `inventory` as direct dependencies alongside
+> `modal-rust` (see the [Install](#install) section above). The manual path below
+> needs only `modal-rust`.
+
+Resolve a `Function` handle by name from the inventory registry and call it three
+ways:
 
 ```rust
 use modal_rust::{App, DeployConfig};
@@ -142,12 +183,14 @@ use modal_rust::{App, DeployConfig};
 # async fn example() -> anyhow::Result<()> {
 let app = App::from_inventory();
 
+// `.local()` runs the handler in-process — no Modal, no network.
 let out: AddOutput = app
     .function("add")
     .local(AddInput { a: 40, b: 2 })?;
 
 assert_eq!(out.sum, 42);
 
+// `.remote()` uploads the crate and builds it in the Modal function body.
 let app = App::connect("my-rust-app").await?;
 
 let out: AddOutput = app
@@ -157,6 +200,7 @@ let out: AddOutput = app
 
 assert_eq!(out.sum, 42);
 
+// `deploy` builds once into a persistent app; `call` invokes with no rebuild.
 let deployed = app
     .deploy_with(DeployConfig::for_app("my-rust-app-prod"))
     .await?;
@@ -190,51 +234,34 @@ let out: AddOutput = call.get().await?; // -> {sum:42}
 # }
 ```
 
-The manual registration path is also supported if you do not want to use the
-attribute macro:
+### Authoring with a manual `Registry` (the library path)
+
+If you do not want the attribute macro, build a `Registry` by hand with `typed!`.
+This needs only the `modal-rust` dependency. The `typed!` wrapper this produces is
+byte-for-byte identical to what the macro emits:
 
 ```rust
 use modal_rust::{typed, Registry};
 
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Serialize, Deserialize)] pub struct AddInput { pub a: i64, pub b: i64 }
+# #[derive(Debug, Serialize, Deserialize)] pub struct AddOutput { pub sum: i64 }
+# pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { Ok(AddOutput { sum: input.a + input.b }) }
 pub fn modal_registry() -> Registry {
     Registry::new().function("add", typed!(add))
 }
 ```
 
-Use `App::new(modal_registry())` for local calls or
-`App::connect_with_registry("my-rust-app", modal_registry()).await?` for live
-Modal calls.
+Then hand the registry to `App` instead of using `from_inventory()`:
 
-## Run The Examples
+- `App::new(modal_registry())` for offline `.local()` calls, and
+- `App::connect_with_registry("my-rust-app", modal_registry()).await?` for live
+  `.remote()` / deploy / call.
 
-Clone the repo and run the local tour:
-
-```bash
-git clone https://github.com/nicolaslara/modal-rust
-cd modal-rust
-cargo run -p example-orchestrate --bin orchestrate
-```
-
-That executes the registered `add` function in-process and prints:
-
-```text
-local: add(40, 2) -> {sum: 42}
-```
-
-With Modal credentials configured, run the live remote and deploy/call paths:
-
-```bash
-RUN_REMOTE=1 cargo run -p example-orchestrate --bin orchestrate
-```
-
-Expected flow:
-
-```text
-local:  add(40, 2) -> {sum: 42}
-remote: add(40, 2) -> {sum: 42}
-deployed app 'modal-rust-orchestrate-demo' (...)
-call:   add(40, 2) -> {sum: 42}
-```
+Everything else — `.local()`/`.remote()`/`deploy`+`call` and `.map`/`.spawn` — is
+exactly as shown for the macro path. Non-macro users set the same per-function
+config (`gpu`, `timeout`, `cache`, `secrets`, `volumes`) on `RemoteConfig` /
+`DeployConfig` instead of on the decorator.
 
 ## How It Works
 
@@ -377,6 +404,45 @@ Live tests are feature-gated and require Modal credentials:
 cargo test -p modal-rust --features live --test live_remote -- --ignored
 cargo test -p modal-rust --features live --test live_deploy -- --ignored
 ```
+
+## Examples
+
+The `examples/` directory holds runnable, live-proven crates:
+
+| Example | What it shows |
+| --- | --- |
+| `examples/add` | The walking skeleton: a manual `modal_registry()` with `typed!(add)`, plus named entrypoints exercising every runner error kind. |
+| `examples/add-macro` | The same `add` authored with `#[modal_rust::function]`, including the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
+| `examples/orchestrate` | A tour of the facade: drives one registered `add` through `.local()`, `.remote()`, and `deploy`+`call`. |
+| `examples/cuda-vector-add` | A real GPU compute kernel — `cudarc` Driver API + a precompiled PTX kernel (driver-only image), run on a T4 via `.remote()`. |
+| `examples/burn-add` | A real ML workload — a Burn/CubeCL tensor op on the CUDA backend (NVRTC at runtime), deployed and called on a T4. |
+
+Run the local tour (no Modal credentials needed); it runs `add` in-process and
+prints `local: add(40, 2) -> {sum: 42}`:
+
+```bash
+git clone https://github.com/nicolaslara/modal-rust
+cd modal-rust
+cargo run -p example-orchestrate --bin orchestrate
+```
+
+With Modal credentials configured, set `RUN_REMOTE=1` to also run the live
+`.remote()` and deploy/call round-trips:
+
+```bash
+RUN_REMOTE=1 cargo run -p example-orchestrate --bin orchestrate
+```
+
+```text
+local:  add(40, 2) -> {sum: 42}
+remote: add(40, 2) -> {sum: 42}
+deployed app 'modal-rust-orchestrate-demo' (...)
+call:   add(40, 2) -> {sum: 42}
+```
+
+The GPU examples (`cuda-vector-add`, `burn-add`) need a real GPU and Modal
+credentials; run them via the CLI or their live tests as described in the
+[GPU](#gpu) section above.
 
 ## License
 
