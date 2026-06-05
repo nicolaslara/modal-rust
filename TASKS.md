@@ -24,12 +24,15 @@ mid-phase.
 
 > **QUEUED — run AFTER the `macro-auto-io` workflow lands + is committed** (both touch the
 > macro crate / examples, so they must NOT run concurrently with it):
-> 1. **Macro-hygiene fix** — eliminate the `modal-rust-runtime` + `inventory` direct-dep wart:
->    re-export them from the `modal-rust` facade under `__private` and make the macro emit
->    `::modal_rust::__private::{runtime,inventory}::…` (use the `proc-macro-crate` crate so a
->    renamed `modal-rust` still resolves; verify `inventory::submit!` works through the
->    re-export, else keep `inventory` direct but still drop `modal-rust-runtime`). Then the
->    user needs only `modal-rust`; drop the README "Dependency note".
+> 1. **Macro-hygiene fix** — ⏳ PLANNED + READY: the workflow is written at
+>    `.claude/workflows/macro-hygiene.js`. **AUTO-LAUNCH it the instant `macro-auto-io` is
+>    committed** (resume the loop: verify+commit macro-auto-io, then
+>    `Workflow({scriptPath: ".claude/workflows/macro-hygiene.js"})`). It re-exports
+>    `modal_rust_runtime` + `inventory` from the facade under `__private`, routes ALL macro-emitted
+>    paths via `::modal_rust::__private::…` (with `proc-macro-crate` for rename-safety; verifies
+>    `inventory::submit!` through the re-export, fallback documented), drops the direct deps from
+>    macro-using examples, and removes the README "Dependency note" — so a macro user needs only
+>    `modal-rust`.
 > 2. **Examples use the macro** — update examples to showcase the ergonomic macro form (the
 >    auto-I/O `#[function] fn add(a,b)->i64` + typed `app.add(2,3)` once that lands), so the
 >    ergonomics are visible. Keep SOME examples on the manual `modal_registry()`/`typed!`
