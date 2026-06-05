@@ -125,6 +125,10 @@ const spec = await agent(SHARED + '\n\n' + [
 
 phase('Implement')
 const impl = await agent(SHARED + '\n\n' + [
+  'RESUME NOTE (attempt 2): the previous run DIED on a transient socket error BEFORE applying ANY edits — the working tree',
+  'is still fully UNCONVERTED (burn-add + cuda-vector-add are untouched manual crates; orchestrate + README unchanged). The',
+  'Design spec was written successfully. Start the conversion FRESH from the spec now; do not assume any prior partial work.',
+  '',
   'The spec is at ' + ROOT + '/workpads/shim-backend/examples-use-macro-spec.md — READ IT FIRST.',
   '',
   'YOUR TASK (Implement the conversion — HARD GATE). Per the spec: convert burn-add + cuda-vector-add to the',

@@ -17,8 +17,9 @@
 //!
 //! The LOCAL `vector_add` stub below is never executed remotely — `.remote()`
 //! dispatches by entrypoint NAME against the uploaded cuda crate's runner (which
-//! registers the REAL `vector_add` via its own `modal_registry()`). The stub exists
-//! only so the decorator records the config and the name matches.
+//! registers the REAL `vector_add` via its own `#[modal_rust::function(gpu = "T4",
+//! name = "vector_add")]` decorator → inventory). The stub exists only so the decorator
+//! records the config and the name matches.
 //!
 //! Gated behind BOTH the `live` cargo feature AND `#[ignore]` so the no-CUDA CI box
 //! never runs it. Run locally with:
@@ -80,6 +81,13 @@ struct GpuOut {
 /// never executed remotely (the uploaded cuda crate runs the real kernel), so its
 /// body just errors. The `String` error is `Display + Serialize`, satisfying the
 /// `typed!` wrapper without pulling in `anyhow`.
+///
+/// The converted `example-cuda-vector-add` crate now carries its OWN
+/// `#[modal_rust::function(gpu = "T4", name = "vector_add")]` decorator (consumed
+/// REMOTELY by the uploaded runner). This test binary deliberately does NOT depend on
+/// that crate, so its inventory is not linked here and there is no duplicate-name panic
+/// (`from_inventory_with_configs` panics on duplicate names); this local stub remains
+/// the test binary's create-time source of the same `gpu = "T4"` config.
 #[modal_rust::function(gpu = "T4", name = "vector_add")]
 fn vector_add(_input: GpuIn) -> Result<GpuOut, String> {
     Err("local stub: vector_add runs on Modal (T4), not in-process".to_string())

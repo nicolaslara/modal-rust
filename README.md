@@ -435,14 +435,36 @@ The `examples/` directory holds runnable, live-proven crates:
 
 | Example | What it shows |
 | --- | --- |
-| `examples/add` | The walking skeleton: a manual `modal_registry()` with `typed!(add)`, plus named entrypoints exercising every runner error kind. |
-| `examples/add-macro` | The same `add` authored with `#[modal_rust::function]`, including the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
-| `examples/orchestrate` | A tour of the facade: drives one registered `add` through `.local()`, `.remote()`, and `deploy`+`call`. |
-| `examples/cuda-vector-add` | A real GPU compute kernel — `cudarc` Driver API + a precompiled PTX kernel (driver-only image), run on a T4 via `.remote()`. |
-| `examples/burn-add` | A real ML workload — a Burn/CubeCL tensor op on the CUDA backend (NVRTC at runtime), deployed and called on a T4. |
+| `examples/add` | **(manual / no-macro)** The walking skeleton: a hand-written `modal_registry()` with `typed!(add)`, plus named entrypoints exercising every runner error kind. The teaching reference for the no-macro path. |
+| `examples/add-macro` | **(macro)** The same `add` authored with `#[modal_rust::function]` — plus the auto-I/O plain-signature twin `add_plain(a, b)` callable as `app.add_plain(2, 3).local()/.remote()`, and the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
+| `examples/orchestrate` | A tour of the facade driving `add` via `.local()`, `.remote()`, and `deploy`+`call` — through BOTH the manual `App::new(modal_registry())` and the macro `App::from_inventory()` + typed `app.add_plain(2, 3)` paths. |
+| `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
+| `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 
-Run the local tour (no Modal credentials needed); it runs `add` in-process and
-prints `local: add(40, 2) -> {sum: 42}`:
+The macro path is the ergonomic one — decorate a plain function and call it as a
+typed method, no input/output struct named:
+
+```rust
+#[modal_rust::function]                       // auto-I/O from the plain signature
+pub fn add_plain(a: i64, b: i64) -> anyhow::Result<i64> { Ok(a + b) }
+
+#[modal_rust::function(gpu = "T4")]           // the decorator IS the config
+pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> { /* … */ }
+
+// …then, against an inventory-built App:
+let app = modal_rust::App::from_inventory();
+let five: i64 = app.add_plain(2, 3).local()?;             // offline, zero Modal
+let out = app.add_plain(2, 3).remote().await?;            // on Modal
+```
+
+Run the local tour (no Modal credentials needed); it runs `add` in-process through
+BOTH the manual registry and the macro/inventory path, printing:
+
+```text
+local: add(40, 2) -> {sum: 42}
+local (macro/inventory): add(40, 2) -> {sum: 42}
+local (macro auto-I/O):  add_plain(2, 3) -> 5
+```
 
 ```bash
 git clone https://github.com/nicolaslara/modal-rust
@@ -466,7 +488,15 @@ call:   add(40, 2) -> {sum: 42}
 
 The GPU examples (`cuda-vector-add`, `burn-add`) need a real GPU and Modal
 credentials; run them via the CLI or their live tests as described in the
-[GPU](#gpu) section above.
+[GPU](#gpu) section above. You can prove the decorator's gpu rides through inventory
+OFFLINE (no GPU, no Modal) with the runner's additive `--describe` manifest:
+
+```bash
+# Offline proof that the decorator IS the config (no GPU, no Modal):
+cargo run -p example-cuda-vector-add --bin modal_runner -- --describe
+# -> {"schema":"modal-rust/describe@1","entrypoints":[{"name":"vector_add",
+#     "config":{"gpu":"T4","timeout_secs":null,"cache":null,"secrets":[],"volumes":[]}}]}
+```
 
 ## License
 

@@ -15,7 +15,12 @@
 //! actual GPU arch (T4 = sm_75) at module-load time — so it is NOT NVRTC-compiled
 //! at runtime and NOT a fixed-arch cubin.
 
-use modal_rust_runtime::{typed, Registry};
+// Alias the FACADE crate (`modal-rust`, renamed `modal_rust_facade` in Cargo.toml) so
+// the attribute is spelled `#[modal_rust::function]`; the macro routes every emitted
+// runtime/inventory path through `modal_rust::__private::…`, so this crate's only modal
+// dependency is the `modal-rust` facade — no direct `modal-rust-runtime` / `inventory`.
+extern crate modal_rust_facade as modal_rust;
+
 use serde::{Deserialize, Serialize};
 
 /// The precompiled, checked-in PTX vector-add kernel, embedded at build time.
@@ -133,6 +138,15 @@ fn capture_ptx_jit_error_log(
 /// `vector_add` (M12): compute `c[i] = a[i] + b[i]` for `n` elements on the GPU
 /// via the CUDA Driver API + a precompiled PTX kernel, then verify the result
 /// element-wise against a CPU reference.
+///
+/// The `#[modal_rust::function(gpu = "T4", name = "vector_add")]` decorator IS the
+/// config: the macro emits this unchanged fn PLUS `typed!(vector_add)` + an
+/// `inventory::submit!` carrying `FunctionConfig { gpu: Some("T4"), .. }` (a single
+/// bare user-struct param → Mode A, byte-identical to the manual `typed!` path). The
+/// facade reads that config when CREATING the Modal function, so the function lands on
+/// a T4 with no caller-side `with_gpu`. Run `modal_runner --describe` to see the gpu
+/// ride through inventory; the runner dispatch itself ignores the config.
+#[modal_rust::function(gpu = "T4", name = "vector_add")]
 pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
@@ -240,12 +254,6 @@ pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> {
     })
 }
 
-/// The manual v0 registry (boundaries.md §3). Registers the single GPU
-/// `vector_add` entrypoint.
-pub fn modal_registry() -> Registry {
-    Registry::new().function("vector_add", typed!(vector_add))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +291,12 @@ mod tests {
 
     #[test]
     fn registry_has_vector_add() {
-        let reg = modal_registry();
+        // The `#[modal_rust::function]` decorator submits `vector_add` to inventory;
+        // `Registry::from_inventory()` collects it into the SAME lookup the manual
+        // builder produced. `Registry` resolves through the facade re-export (the
+        // `extern crate … as modal_rust` alias above).
+        use modal_rust::Registry;
+        let reg = Registry::from_inventory();
         assert!(reg.get("vector_add").is_some());
         assert!(reg.get("nope").is_none());
     }

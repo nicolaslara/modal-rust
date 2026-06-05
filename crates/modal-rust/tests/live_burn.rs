@@ -18,12 +18,14 @@
 //!   -p example-burn-add --bin modal_runner` AT IMAGE-BUILD time → Modal schedules the
 //!   deployed wrapper on a **T4** (the decorator gpu rode into `Resources.gpu_config`)
 //!   → `app.call(..)` execs the prebuilt `/app/modal_runner`, which registers the REAL
-//!   `burn_add` via its own `modal_registry()` and runs a CubeCL CUDA kernel.
+//!   `burn_add` via its own `#[modal_rust::function(gpu = "T4", name = "burn_add")]`
+//!   decorator → inventory and runs a CubeCL CUDA kernel.
 //!
 //! The LOCAL `burn_add` stub below is NEVER executed remotely — `call` dispatches by
 //! entrypoint NAME against the uploaded burn crate's runner (which registers the REAL
-//! `burn_add`). The stub exists only so the decorator records `gpu="T4"` and the name
-//! matches the uploaded entrypoint.
+//! `burn_add` via its own `#[modal_rust::function(gpu = "T4", name = "burn_add")]`
+//! decorator → inventory). The stub exists only so the decorator records `gpu="T4"` and
+//! the name matches the uploaded entrypoint.
 //!
 //! ## Build-cost strategy: DEPLOY (build once)
 //! The CUDA image pull + rustup + cubecl/burn compile is MANY minutes. The DEPLOY
@@ -103,6 +105,14 @@ struct BurnAddOut {
 /// errors. The `String` error is `Display + Serialize`, satisfying the `typed!` wrapper
 /// without pulling in `anyhow`. `name = "burn_add"` MUST match the entrypoint the
 /// uploaded runner registers.
+///
+/// The converted `example-burn-add` crate now carries its OWN
+/// `#[modal_rust::function(gpu = "T4", name = "burn_add")]` decorator (consumed
+/// REMOTELY by the uploaded runner). This test binary deliberately does NOT depend on
+/// that crate — pulling in `burn-cuda`/`cubecl-cuda` would drag the heavy CUDA-adjacent
+/// tree into the core facade's test build — so its inventory is not linked here and
+/// there is no duplicate-name panic; this local stub remains the test binary's
+/// create-time source of the same `gpu = "T4"` config.
 #[modal_rust::function(gpu = "T4", name = "burn_add")]
 fn burn_add(_input: BurnAddIn) -> Result<BurnAddOut, String> {
     Err("local stub: burn_add runs on Modal (T4), not in-process".to_string())
