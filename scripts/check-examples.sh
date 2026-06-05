@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 # Validate the README examples by running each one and checking its output.
 #
-# These are the exact OFFLINE commands shown in README.md's "Examples" section —
-# run them one by one and assert stdout. No Modal credentials, no network.
-# The Modal-requiring commands (.remote() / deploy / GPU) are listed but NOT run.
+# Three tiers, each gated on what the host can actually do:
 #
-#   bash scripts/check-examples.sh
+#   1. OFFLINE   — always run. The in-process `.local()` / `--describe` commands
+#                  from README.md's "Examples" section. No credentials, no network.
+#   2. LIVE      — run automatically WHEN Modal credentials are present
+#                  (`~/.modal.toml` or MODAL_TOKEN_ID + MODAL_TOKEN_SECRET). The
+#                  CPU `.remote()` + deploy + call round-trips. Cheap and fast.
+#   3. GPU       — run when credentials are present AND `RUN_GPU=1`. Real T4 runs
+#                  (cuda-vector-add via `run`, burn-add via deploy+call). These cost
+#                  a little and the first burn build is slow, so they are opt-in.
+#
+# Escape hatches: `SKIP_LIVE=1` forces offline-only even with credentials;
+# `RUN_GPU=1` adds the GPU tier.
+#
+#   bash scripts/check-examples.sh           # offline (+ live if creds present)
+#   RUN_GPU=1 bash scripts/check-examples.sh # also the real T4 runs
+#   SKIP_LIVE=1 bash scripts/check-examples.sh
 #
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -30,6 +42,41 @@ run() {
   echo
 }
 
+# live "<description>" "<bash command>" "<expected substr>" ["<expected substr>" …]
+# Runs a real Modal command (timeout-wrapped against transient capacity blips) and
+# asserts every expected substring appears in its combined stdout+stderr.
+live() {
+  local desc="$1" cmd="$2"; shift 2
+  echo "── $desc"
+  echo "   \$ $cmd"
+  local out ok=1
+  out="$(timeout 1800 bash -c "$cmd" 2>&1)"
+  local expect
+  for expect in "$@"; do
+    if [[ "$out" == *"$expect"* ]]; then
+      echo "   ✓ $expect"
+    else
+      echo "   ✗ expected to contain: $expect"
+      ok=0
+    fi
+  done
+  if [[ "$ok" -eq 1 ]]; then
+    pass=$((pass + 1))
+  else
+    echo "     --- output ---"
+    echo "$out" | sed 's/^/     /'
+    fail=$((fail + 1))
+  fi
+  echo
+}
+
+# Credentials present? (~/.modal.toml or the token env pair.)
+has_creds() {
+  [[ -f "${HOME}/.modal.toml" ]] || { [[ -n "${MODAL_TOKEN_ID:-}" ]] && [[ -n "${MODAL_TOKEN_SECRET:-}" ]]; }
+}
+
+# ───────────────────────── 1. OFFLINE (always) ─────────────────────────
+
 # quickstart — the headline (auto-I/O add)
 run "quickstart: add(2, 3)" '{"ok":true,"value":5}' \
   "cd examples/quickstart && cargo run -q --bin modal_runner -- --entrypoint add --input-json '{\"a\":2,\"b\":3}'"
@@ -53,9 +100,44 @@ run "orchestrate: local tour" 'add(2, 3) -> 5' \
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
 
-echo "── Modal-required (NOT run here — need credentials + a GPU):"
-echo "     quickstart  .remote()      RUN_REMOTE=1 cargo run -p example-orchestrate"
-echo "     cuda-vector-add / burn-add  on a T4 via .remote() / deploy+call"
-echo
+# ───────────────────────── 2 & 3. LIVE / GPU ─────────────────────────
+
+if [[ "${SKIP_LIVE:-}" == "1" ]]; then
+  echo "── Live tiers skipped (SKIP_LIVE=1)."
+  echo
+elif ! has_creds; then
+  echo "── Live tiers skipped — no Modal credentials (~/.modal.toml or"
+  echo "   MODAL_TOKEN_ID + MODAL_TOKEN_SECRET). With credentials they run"
+  echo "   automatically. The commands they would run:"
+  echo "     orchestrate     RUN_REMOTE=1 cargo run -p example-orchestrate"
+  echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
+  echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
+  echo
+else
+  # LIVE (CPU): one orchestrate run drives .remote() + deploy + call.
+  live "orchestrate: live .remote() + deploy + call (CPU)" \
+    "RUN_REMOTE=1 cargo run -q -p example-orchestrate --bin orchestrate" \
+    'remote: add(40, 2) -> {sum: 42}' \
+    'call: add(40, 2) -> {sum: 42}'
+
+  if [[ "${RUN_GPU:-}" == "1" ]]; then
+    # GPU: cuda-vector-add on a T4 via the RUN path (in-body build, Tier 0).
+    live "cuda-vector-add: run on a T4 (.remote())" \
+      "cargo run -q -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'" \
+      '"valid":true'
+
+    # GPU: burn-add deployed + called on a T4 (CUDA-devel image, Tier 1). The
+    # first deploy build is slow; re-deploys reuse the cached image.
+    live "burn-add: deploy + call on a T4" \
+      "MODAL_RUST_BASE_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04 MODAL_RUST_INSTALL_RUST=1 cargo run -q -p modal-rust-cli -- deploy burn_add --project examples/burn-add --app modal-rust-burn-add-example && cargo run -q -p modal-rust-cli -- call burn_add --app modal-rust-burn-add-example --input '{\"n\":256}'" \
+      '"valid":true'
+  else
+    echo "── GPU tier skipped (set RUN_GPU=1 to run the real T4 examples):"
+    echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
+    echo "     burn-add        deploy + call on a T4 (CUDA-devel image)"
+    echo
+  fi
+fi
+
 echo "RESULT: ${pass} passed, ${fail} failed"
 [ "${fail}" -eq 0 ]
