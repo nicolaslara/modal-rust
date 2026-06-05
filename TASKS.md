@@ -22,12 +22,15 @@ mid-phase.
 > read this note + the latest commits + `workpads/shim-backend/knowledge.md`, then
 > continue. (Never log/commit Modal tokens; GPU stays on cheap T4; ephemeral run apps.)
 
+> **macro-auto-io: ✅ DONE** — landed BUILD_GREEN + live-proven, committed `a4fceaa`
+> (auto-generated Input/Output + typed `app.add(2,3).local/remote/spawn/map` from a plain
+> signature; explicit struct form byte-identical; also fixed a real upload-scoping bug —
+> strip `[dev-dependencies]` from uploaded member manifests — in `scope.rs`).
+>
 > **QUEUED — run AFTER the `macro-auto-io` workflow lands + is committed** (both touch the
 > macro crate / examples, so they must NOT run concurrently with it):
-> 1. **Macro-hygiene fix** — ⏳ PLANNED + READY: the workflow is written at
->    `.claude/workflows/macro-hygiene.js`. **AUTO-LAUNCH it the instant `macro-auto-io` is
->    committed** (resume the loop: verify+commit macro-auto-io, then
->    `Workflow({scriptPath: ".claude/workflows/macro-hygiene.js"})`). It re-exports
+> 1. **Macro-hygiene fix** — 🚀 RUNNING (`wf_67d8a794-d26`), auto-launched after `a4fceaa`.
+>    The workflow at `.claude/workflows/macro-hygiene.js` re-exports
 >    `modal_rust_runtime` + `inventory` from the facade under `__private`, routes ALL macro-emitted
 >    paths via `::modal_rust::__private::…` (with `proc-macro-crate` for rename-safety; verifies
 >    `inventory::submit!` through the re-export, fallback documented), drops the direct deps from
