@@ -144,10 +144,19 @@ on the attribute — `gpu`, `timeout`, `cache`, `secrets`, and `volumes` — and
 read from the registry at call time (there are no extra CLI flags):
 
 ```rust
-# use modal_rust::function;
-# use serde::{Deserialize, Serialize};
-# #[derive(Debug, Serialize, Deserialize)] pub struct TrainInput { pub epochs: u32 }
-# #[derive(Debug, Serialize, Deserialize)] pub struct TrainOutput { pub ok: bool }
+use modal_rust::function;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrainInput {
+    pub epochs: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrainOutput {
+    pub ok: bool,
+}
+
 #[function(
     gpu = "T4",                     // also: "A100", "A100-80GB", "H100:4", ...
     timeout = 1800,                 // wall-clock seconds
@@ -156,8 +165,8 @@ read from the registry at call time (there are no extra CLI flags):
     volumes = ["/data=my-dataset"], // a Modal Volume `my-dataset` mounted at /data
 )]
 pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
-    let _key = std::env::var("API_KEY")?;             // from the secret
-    std::fs::write("/data/checkpoint", b"...")?;      // persisted on the volume
+    let _key = std::env::var("API_KEY")?;        // from the secret
+    std::fs::write("/data/checkpoint", b"...")?; // persisted on the volume
     Ok(TrainOutput { ok: true })
 }
 ```
@@ -174,64 +183,81 @@ ways:
 
 ```rust
 use modal_rust::{App, DeployConfig};
+use serde::{Deserialize, Serialize};
 
-# use serde::{Deserialize, Serialize};
-# #[derive(Debug, Serialize, Deserialize)]
-# pub struct AddInput { pub a: i64, pub b: i64 }
-# #[derive(Debug, Serialize, Deserialize)]
-# pub struct AddOutput { pub sum: i64 }
-# async fn example() -> anyhow::Result<()> {
-let app = App::from_inventory();
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddInput {
+    pub a: i64,
+    pub b: i64,
+}
 
-// `.local()` runs the handler in-process — no Modal, no network.
-let out: AddOutput = app
-    .function("add")
-    .local(AddInput { a: 40, b: 2 })?;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddOutput {
+    pub sum: i64,
+}
 
-assert_eq!(out.sum, 42);
+async fn example() -> anyhow::Result<()> {
+    let app = App::from_inventory();
 
-// `.remote()` uploads the crate and builds it in the Modal function body.
-let app = App::connect("my-rust-app").await?;
+    // `.local()` runs the handler in-process — no Modal, no network.
+    let out: AddOutput = app
+        .function("add")
+        .local(AddInput { a: 40, b: 2 })?;
 
-let out: AddOutput = app
-    .function("add")
-    .remote(AddInput { a: 40, b: 2 })
-    .await?;
+    assert_eq!(out.sum, 42);
 
-assert_eq!(out.sum, 42);
+    // `.remote()` uploads the crate and builds it in the Modal function body.
+    let app = App::connect("my-rust-app").await?;
 
-// `deploy` builds once into a persistent app; `call` invokes with no rebuild.
-let deployed = app
-    .deploy_with(DeployConfig::for_app("my-rust-app-prod"))
-    .await?;
+    let out: AddOutput = app
+        .function("add")
+        .remote(AddInput { a: 40, b: 2 })
+        .await?;
 
-let out: AddOutput = app
-    .call(&deployed.name, "add", AddInput { a: 40, b: 2 })
-    .await?;
+    assert_eq!(out.sum, 42);
 
-assert_eq!(out.sum, 42);
-# Ok(())
-# }
+    // `deploy` builds once into a persistent app; `call` invokes with no rebuild.
+    let deployed = app
+        .deploy_with(DeployConfig::for_app("my-rust-app-prod"))
+        .await?;
+
+    let out: AddOutput = app
+        .call(&deployed.name, "add", AddInput { a: 40, b: 2 })
+        .await?;
+
+    assert_eq!(out.sum, 42);
+    Ok(())
+}
 ```
 
 `map` fans out across many inputs (results come back in input order), and
 `spawn` is fire-and-forget — it returns a handle immediately that you poll later:
 
 ```rust
-# use modal_rust::App;
-# use serde::{Deserialize, Serialize};
-# #[derive(Debug, Serialize, Deserialize)] pub struct AddInput { pub a: i64, pub b: i64 }
-# #[derive(Debug, Serialize, Deserialize)] pub struct AddOutput { pub sum: i64 }
-# async fn example(app: &App) -> anyhow::Result<()> {
-let sums: Vec<AddOutput> = app
-    .function("add")
-    .map(vec![AddInput { a: 1, b: 1 }, AddInput { a: 40, b: 2 }])
-    .await?; // -> [{sum:2}, {sum:42}], in input order
+use modal_rust::App;
+use serde::{Deserialize, Serialize};
 
-let call = app.function("add").spawn(AddInput { a: 40, b: 2 }).await?; // returns immediately
-let out: AddOutput = call.get().await?; // -> {sum:42}
-# Ok(())
-# }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddInput {
+    pub a: i64,
+    pub b: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddOutput {
+    pub sum: i64,
+}
+
+async fn example(app: &App) -> anyhow::Result<()> {
+    let sums: Vec<AddOutput> = app
+        .function("add")
+        .map(vec![AddInput { a: 1, b: 1 }, AddInput { a: 40, b: 2 }])
+        .await?; // -> [{sum:2}, {sum:42}], in input order
+
+    let call = app.function("add").spawn(AddInput { a: 40, b: 2 }).await?; // returns immediately
+    let out: AddOutput = call.get().await?; // -> {sum:42}
+    Ok(())
+}
 ```
 
 ### Authoring with a manual `Registry` (the library path)
@@ -242,11 +268,25 @@ byte-for-byte identical to what the macro emits:
 
 ```rust
 use modal_rust::{typed, Registry};
+use serde::{Deserialize, Serialize};
 
-# use serde::{Deserialize, Serialize};
-# #[derive(Debug, Serialize, Deserialize)] pub struct AddInput { pub a: i64, pub b: i64 }
-# #[derive(Debug, Serialize, Deserialize)] pub struct AddOutput { pub sum: i64 }
-# pub fn add(input: AddInput) -> anyhow::Result<AddOutput> { Ok(AddOutput { sum: input.a + input.b }) }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddInput {
+    pub a: i64,
+    pub b: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddOutput {
+    pub sum: i64,
+}
+
+pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
+    Ok(AddOutput {
+        sum: input.a + input.b,
+    })
+}
+
 pub fn modal_registry() -> Registry {
     Registry::new().function("add", typed!(add))
 }

@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>modal-rust — Architecture</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1e21; --muted:#5c6470; --rule:#e3e5e8;
+    --accent:#7a3cff; --accent2:#0a7d52; --code-bg:#f4f5f7; --code-fg:#2b2f36;
+    --kw:#9a26b8; --str:#0a7d52; --com:#8a909a; --num:#b5640a; --fn:#1f5fd0;
+    --box:#ffffff; --box-rule:#d6dae0; --warn:#b5640a; --tocw:280px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  /* layout */
+  #toc{
+    position:fixed; top:0; left:0; width:var(--tocw); height:100vh; overflow-y:auto;
+    border-right:1px solid var(--rule); background:#fff; padding:22px 18px 60px;
+  }
+  #toc .brand{font-weight:700; font-size:18px; letter-spacing:-.2px; margin:0 0 2px}
+  #toc .sub{color:var(--muted); font-size:12.5px; margin:0 0 16px}
+  #toc ol{list-style:none; margin:0; padding:0; counter-reset:s}
+  #toc>ol>li{margin:1px 0}
+  #toc a{display:block; color:#39414c; font-size:13.5px; padding:3px 8px; border-radius:6px; line-height:1.35}
+  #toc a:hover{background:var(--code-bg); text-decoration:none}
+  #toc a.top{font-weight:600; color:#22262c}
+  #toc a.sub2{padding-left:22px; font-size:12.5px; color:var(--muted)}
+  #toc a.active{background:#f0e9ff; color:var(--accent)}
+  main{margin-left:var(--tocw); padding:46px 52px 120px; max-width:1000px}
+  h1{font-size:30px; letter-spacing:-.5px; margin:0 0 6px}
+  h1 + .tagline{color:var(--muted); font-size:16px; margin:0 0 30px}
+  h2{font-size:23px; letter-spacing:-.3px; margin:54px 0 14px; padding-top:10px; border-top:2px solid var(--rule)}
+  h3{font-size:18px; margin:30px 0 8px; color:#2a2f37}
+  h4{font-size:15px; margin:20px 0 6px; color:var(--accent2); text-transform:uppercase; letter-spacing:.4px}
+  p{margin:11px 0}
+  ul,ol{margin:11px 0; padding-left:24px}
+  li{margin:5px 0}
+  code{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:13px;
+    background:var(--code-bg); color:var(--code-fg); padding:1.5px 5px; border-radius:4px}
+  .path{color:#2b2f36; background:#eef0f3; white-space:nowrap}
+  pre{
+    background:var(--code-bg); border:1px solid var(--box-rule); border-radius:8px;
+    padding:14px 16px; overflow-x:auto; margin:14px 0; line-height:1.5;
+  }
+  pre code{background:none; padding:0; font-size:12.6px; color:var(--code-fg)}
+  pre .c{color:var(--com); font-style:italic}
+  pre .k{color:var(--kw)}
+  pre .s{color:var(--str)}
+  pre .n{color:var(--num)}
+  pre .f{color:var(--fn)}
+  .lead{font-size:17px; color:#2c3138}
+  .mental{background:#f6f2ff; border:1px solid #e2d6ff; border-left:4px solid var(--accent);
+    padding:16px 20px; border-radius:8px; margin:18px 0}
+  .mental p{margin:6px 0}
+  .note{background:#fff8ed; border:1px solid #f0dcb8; border-left:4px solid var(--warn);
+    padding:12px 16px; border-radius:8px; margin:16px 0; font-size:14.5px}
+  .note .lbl{font-weight:700; color:var(--warn)}
+  .seam{background:#eefcf4; border:1px solid #bfe8d4; border-left:4px solid var(--accent2);
+    padding:12px 16px; border-radius:8px; margin:16px 0; font-size:14.5px}
+  .seam .lbl{font-weight:700; color:var(--accent2)}
+  table{border-collapse:collapse; width:100%; margin:16px 0; font-size:13.5px}
+  th,td{border:1px solid var(--box-rule); padding:7px 11px; text-align:left; vertical-align:top}
+  th{background:var(--code-bg); font-weight:600}
+  td code{font-size:12px}
+  .ref{color:var(--muted); font-size:12.5px}
+  .ref code{font-size:11.5px; background:#eef0f3}
+  figure{margin:22px 0}
+  figcaption{color:var(--muted); font-size:12.5px; text-align:center; margin-top:7px}
+  svg{display:block; margin:0 auto; max-width:100%}
+  .steps{counter-reset:step; list-style:none; padding-left:0}
+  .steps>li{position:relative; padding:6px 0 6px 44px; margin:8px 0; border-left:2px solid var(--rule); margin-left:14px; padding-left:30px}
+  .steps>li::before{
+    counter-increment:step; content:counter(step);
+    position:absolute; left:-15px; top:5px; width:28px; height:28px; border-radius:50%;
+    background:var(--accent); color:#fff; font-size:13px; font-weight:700;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .steps>li b{color:#1c1e21}
+  .kbd{font-size:12px; color:var(--muted)}
+  hr{border:none; border-top:1px solid var(--rule); margin:30px 0}
+  .pill{display:inline-block; font-size:11px; font-weight:700; padding:1px 8px; border-radius:20px; vertical-align:middle}
+  .pill.run{background:#e8f0ff; color:#1f5fd0}
+  .pill.deploy{background:#eefcf4; color:var(--accent2)}
+  .pill.frozen{background:#f0e9ff; color:var(--accent)}
+  .crate-grid{display:grid; grid-template-columns:1fr; gap:10px; margin:16px 0}
+  .crate{border:1px solid var(--box-rule); border-radius:8px; padding:12px 16px; background:#fff}
+  .crate h4{margin:0 0 4px; color:#22262c; text-transform:none; font-size:15px; letter-spacing:0}
+  .crate .resp{font-size:14px; color:#3a4049}
+  .crate .files{font-size:12px; color:var(--muted); margin-top:5px}
+  .small{font-size:13.5px}
+  @media(max-width:880px){
+    #toc{display:none}
+    main{margin-left:0; padding:28px 18px 80px}
+  }
+</style>
+</head>
+<body>
+
+<nav id="toc">
+  <p class="brand">modal-rust</p>
+  <p class="sub">Architecture &amp; data flows</p>
+  <ol>
+    <li><a class="top" href="#vision">1. Vision &amp; mental model</a></li>
+    <li><a class="top" href="#crates">2. Crate map</a></li>
+    <li><a class="top" href="#abstractions">3. Core abstractions</a>
+      <a class="sub2" href="#a-registry">3.1 Registry / HandlerFn / typed!</a>
+      <a class="sub2" href="#a-error">3.2 RunnerError &amp; the envelope</a>
+      <a class="sub2" href="#a-config">3.3 FunctionConfig — decorator-is-config</a>
+      <a class="sub2" href="#a-sdk">3.4 SDK client, ops &amp; the 3 fixes</a>
+      <a class="sub2" href="#a-specs">3.5 ImageSpec / FunctionSpec</a>
+      <a class="sub2" href="#a-facade">3.6 App / Function / configs</a>
+    </li>
+    <li><a class="top" href="#flows">4. The data flows</a>
+      <a class="sub2" href="#f-authoring">4.1 Authoring → Registry</a>
+      <a class="sub2" href="#f-local">4.2 .local() dispatch</a>
+      <a class="sub2" href="#f-remote">4.3 .remote() run path</a>
+      <a class="sub2" href="#f-wrapper">4.4 Wrapper &amp; container boot</a>
+      <a class="sub2" href="#f-deploy">4.5 deploy + call</a>
+      <a class="sub2" href="#f-spawnmap">4.6 .spawn() / .map()</a>
+      <a class="sub2" href="#f-cache">4.7 Build cache</a>
+      <a class="sub2" href="#f-secrets">4.8 Secrets &amp; volumes</a>
+      <a class="sub2" href="#f-cli">4.9 The CLI path</a>
+    </li>
+    <li><a class="top" href="#seams">5. The frozen seams</a></li>
+    <li><a class="top" href="#contribute">6. How to contribute</a></li>
+  </ol>
+</nav>
+
+<main>
+  <h1>modal-rust — Architecture</h1>
+  <p class="tagline">Write an ordinary Rust <code>fn</code>, run / deploy / call it on Modal — through a first-party gRPC client. No <code>modal</code> CLI, no <code>modal-rs</code>, no per-project Python.</p>
+
+  <!-- ============================================================= -->
+  <section id="vision">
+    <h2>1. Vision &amp; the one-paragraph mental model</h2>
+    <p class="lead">modal-rust lets a user write a normal Rust function, annotate it (or register it by hand), and then run it three ways: in-process (<code>.local()</code>), remotely with a build-at-run-time (<code>.remote()</code>), or deployed once and called many times (<code>deploy</code> + <code>call</code>) — for CPU or GPU, trivial code or a real Burn/CUDA ML workload — all driven by our own lean Modal gRPC client.</p>
+
+    <div class="mental">
+      <p><b>The mental model.</b> There are exactly two halves to the system, joined at one stable interface.</p>
+      <p><b>(1) The runner.</b> A frozen contract: a user function is erased to a bare <code>fn</code> pointer in a <code>Registry</code>, and a tiny CLI binary (<code>modal_runner</code>) takes <code>--entrypoint NAME --input-…</code>, runs exactly one handler, and prints <em>exactly one</em> JSON envelope to stdout. This is the only thing that ever touches user code, and it never changes shape.</p>
+      <p><b>(2) The control plane.</b> Everything that gets that runner onto Modal and invokes it: a first-party gRPC client (<code>modal-rust-sdk</code>) that authors a Modal <em>FILE-mode</em> function whose body is a tiny embedded Python wrapper. The wrapper builds the user's crate (in the function body for <span class="pill run">run</span>, at image-build time for <span class="pill deploy">deploy</span>) and execs <code>modal_runner</code>. Inputs/outputs cross as CBOR; the runner's JSON envelope rides back inside.</p>
+      <p>The seam between them — the runner CLI protocol — and the <b>run-vs-deploy build boundary</b> are the two invariants the whole project is organized to protect.</p>
+    </div>
+
+    <p>This document focuses on <b>data flows</b> and <b>internal abstractions</b>, and points at the real code. Every <code>file:line</code> below was read from the sources in this repo; the long-form milestone history lives in <code class="path">workpads/shim-backend/knowledge.md</code> and the original frozen contract in <code class="path">workpads/architecture/boundaries.md</code> (note: that contract doc predates the programmatic SDK; where it describes a generated-Python CLI it has been superseded — see §5).</p>
+  </section>
+
+  <!-- ============================================================= -->
+  <section id="crates">
+    <h2>2. Crate map — one responsibility each</h2>
+    <p>A single virtual cargo workspace (<code class="path">Cargo.toml</code>) with five library/binary crates and five examples. Edges are acyclic; the runtime crate sits at the bottom with zero Modal/network/Python dependencies.</p>
+
+    <figure>
+    <svg viewBox="0 0 720 430" width="720" height="430" role="img" aria-label="Crate dependency diagram">
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#7a3cff"/>
+        </marker>
+      </defs>
+      <style>
+        .b{fill:#fff;stroke:#c9ccd2;stroke-width:1.3;rx:9}
+        .t{font:600 13px -apple-system,sans-serif;fill:#22262c}
+        .d{font:11px -apple-system,sans-serif;fill:#6b727d}
+        .e{stroke:#7a3cff;stroke-width:1.6;fill:none;marker-end:url(#arr)}
+        .frz{fill:#f6f2ff;stroke:#cdbcff}
+      </style>
+      <!-- facade -->
+      <rect class="b" x="250" y="14" width="230" height="52" rx="9"/>
+      <text class="t" x="365" y="34" text-anchor="middle">modal-rust  (the facade)</text>
+      <text class="d" x="365" y="52" text-anchor="middle">App / Function · .local/.remote/deploy/call</text>
+      <!-- cli -->
+      <rect class="b" x="520" y="14" width="180" height="52" rx="9"/>
+      <text class="t" x="610" y="34" text-anchor="middle">modal-rust-cli</text>
+      <text class="d" x="610" y="52" text-anchor="middle">the `modal-rust` binary</text>
+      <!-- sdk -->
+      <rect class="b" x="250" y="120" width="230" height="60" rx="9"/>
+      <text class="t" x="365" y="142" text-anchor="middle">modal-rust-sdk</text>
+      <text class="d" x="365" y="160" text-anchor="middle">first-party gRPC client</text>
+      <text class="d" x="365" y="174" text-anchor="middle">auth · channel · CBOR · ops/*</text>
+      <!-- macros -->
+      <rect class="b" x="40" y="120" width="160" height="52" rx="9"/>
+      <text class="t" x="120" y="142" text-anchor="middle">modal-rust-macros</text>
+      <text class="d" x="120" y="160" text-anchor="middle">#[function(...)]</text>
+      <!-- runtime -->
+      <rect class="b frz" x="200" y="250" width="320" height="66" rx="9"/>
+      <text class="t" x="360" y="274" text-anchor="middle">modal-rust-runtime  ·  FROZEN</text>
+      <text class="d" x="360" y="292" text-anchor="middle">Registry · HandlerFn · typed! · RunnerError</text>
+      <text class="d" x="360" y="306" text-anchor="middle">FunctionConfig · run_cli + runner protocol</text>
+      <!-- user crate -->
+      <rect class="b" x="200" y="356" width="320" height="50" rx="9"/>
+      <text class="t" x="360" y="378" text-anchor="middle">user / example crate  (lib.rs + modal_runner.rs)</text>
+      <text class="d" x="360" y="394" text-anchor="middle">the only place user code lives</text>
+      <!-- edges -->
+      <path class="e" d="M340,66 L340,118"/>           <!-- facade->sdk -->
+      <path class="e" d="M520,52 Q420,90 410,118"/>     <!-- cli->facade/sdk -->
+      <path class="e" d="M610,66 Q610,210 480,258"/>    <!-- cli->runtime(describe) -->
+      <path class="e" d="M150,172 Q170,210 250,256"/>   <!-- macros->runtime -->
+      <path class="e" d="M320,180 Q300,215 320,248"/>   <!-- sdk->runtime(types) -->
+      <path class="e" d="M390,66 Q470,160 430,248"/>    <!-- facade->runtime -->
+      <path class="e" d="M360,356 L360,318"/>           <!-- user->runtime -->
+    </svg>
+    <figcaption>Arrows point from dependent → dependency. The runtime crate is the frozen core everything builds on; it depends on nothing in the workspace.</figcaption>
+    </figure>
+
+    <div class="crate-grid">
+      <div class="crate">
+        <h4>modal-rust-runtime <span class="pill frozen">FROZEN</span></h4>
+        <div class="resp">The runner contract. The <code>Registry</code> (<code>BTreeMap&lt;&amp;str, HandlerFn&gt;</code>), <code>typed!</code>, <code>RunnerError</code> (5 kinds), <code>FunctionConfig</code>, <code>run_cli</code> + the file-mode runner CLI protocol, and <code>inventory</code> collection. Deps: only <code>serde</code>, <code>serde_json</code>, <code>anyhow</code>, <code>inventory</code> + a hand-rolled arg parser — <b>no Modal, network, or Python</b>, because it is recompiled on every run and baked into every deploy image.</div>
+        <div class="files"><code class="path">crates/modal-rust-runtime/src/lib.rs</code> (1113 lines)</div>
+      </div>
+      <div class="crate">
+        <h4>modal-rust-macros</h4>
+        <div class="resp">The <code>#[modal_rust::function(...)]</code> attribute. Purely additive sugar: it emits the unchanged user fn plus an <code>inventory::submit!</code> of a <code>Registration</code> whose handler is the same <code>typed!(f)</code> wrapper the manual builder produces, carrying the decorator's <code>gpu/timeout/cache/secrets/volumes</code> as a <code>FunctionConfig</code>.</div>
+        <div class="files"><code class="path">crates/modal-rust-macros/src/lib.rs</code></div>
+      </div>
+      <div class="crate">
+        <h4>modal-rust-sdk (<code>modal_rust::sdk</code>)</h4>
+        <div class="resp">The lean first-party Modal gRPC client. Auth interceptor + TLS channel + CBOR codec + <code>retry_transient</code>, plus the typed <code>ops/*</code> surface (App, Image, Function authoring &amp; invocation, Mount, local-dir upload + Blob, Volume, Secret). Vendors Modal's <code>api.proto</code> and compiles it with tonic-prost-build; depends on <em>neither</em> <code>modal-rs</code> nor the <code>modal</code> CLI.</div>
+        <div class="files"><code class="path">crates/modal-rust-sdk/src/{client,auth,channel,codec,retry,error,config}.rs</code> + <code class="path">ops/*</code></div>
+      </div>
+      <div class="crate">
+        <h4>modal-rust (the facade)</h4>
+        <div class="resp">The user-facing API. <code>App</code> / <code>Function</code> with <code>.local()</code> / <code>.remote()</code> / <code>.spawn()</code> / <code>.map()</code> / <code>deploy</code> / <code>call</code>; <code>RemoteConfig</code> / <code>DeployConfig</code>; the embedded run/deploy Python wrappers (as Rust strings); cargo-metadata upload scoping. Re-exports <code>sdk</code>, the runtime essentials, and the <code>function</code> macro.</div>
+        <div class="files"><code class="path">crates/modal-rust/src/{lib,app,function,remote,deploy,scope,error}.rs</code></div>
+      </div>
+      <div class="crate">
+        <h4>modal-rust-cli</h4>
+        <div class="resp">The <code>modal-rust</code> binary. Cannot link the user crate, so it builds the user's <code>modal_runner</code>, reads <code>modal_runner --describe</code> to learn the entrypoints + per-fn config, then drives a <b>headless</b> <code>App</code> through the same facade ops. <code>clap</code>/<code>tokio</code> live here only.</div>
+        <div class="files"><code class="path">crates/modal-rust-cli/src/{main,programmatic,doctor,workspace}.rs</code></div>
+      </div>
+      <div class="crate">
+        <h4>examples/</h4>
+        <div class="resp"><code>add</code> (manual registry), <code>add-macro</code> (the <code>#[function]</code> twin), <code>cuda-vector-add</code> (cudarc, dynamic-loading), <code>burn-add</code> (a real Burn/CubeCL GPU workload — CUDA-only, excluded from default-members), and <code>orchestrate</code> (a runnable tour of the facade).</div>
+        <div class="files"><code class="path">examples/{add,add-macro,cuda-vector-add,burn-add,orchestrate}</code></div>
+      </div>
+    </div>
+
+    <p class="ref">The workspace pins <code>panic = "unwind"</code> for both <code>dev</code> and <code>release</code> profiles (<code class="path">Cargo.toml</code>), because the runner upgrades panics into structured envelopes via <code>catch_unwind</code> — <code>panic = "abort"</code> would silently degrade that to a raw process abort.</p>
+  </section>
+
+  <!-- ============================================================= -->
+  <section id="abstractions">
+    <h2>3. Core abstractions</h2>
+
+    <h3 id="a-registry">3.1 The Registry, HandlerFn &amp; <code>typed!</code> — static dispatch, no <code>dyn</code></h3>
+    <p>A handler is erased to a bare function pointer. There is no <code>Box&lt;dyn Handler&gt;</code> and no vtable anywhere; the registry is the project's one "open set", and it is closed over <code>fn</code> pointers.</p>
+    <pre><code><span class="c">// crates/modal-rust-runtime/src/lib.rs:33</span>
+<span class="k">pub type</span> HandlerFn = <span class="k">fn</span>(&amp;[<span class="k">u8</span>]) -&gt; Result&lt;Vec&lt;<span class="k">u8</span>&gt;, RunnerError&gt;;
+
+<span class="c">// :340  — keys are &amp;'static str, values are fn pointers: no alloc, no dyn</span>
+<span class="k">pub struct</span> Registry { handlers: BTreeMap&lt;&amp;<span class="k">'static</span> <span class="k">str</span>, HandlerFn&gt; }</code></pre>
+    <p><code>typed!(f)</code> is a <code>macro_rules!</code> that generates a <em>monomorphized</em> wrapper <code>fn</code> for the concrete <code>In</code>/<code>Out</code>/<code>Err</code> of <code>f</code> and yields its pointer. Decode → call → encode are all inlined per handler (<code class="path">crates/modal-rust-runtime/src/lib.rs:189</code>):</p>
+    <pre><code><span class="k">macro_rules!</span> typed {
+  ($f:path) =&gt; {{
+    <span class="k">fn</span> __wrap(input: &amp;[<span class="k">u8</span>]) -&gt; Result&lt;Vec&lt;<span class="k">u8</span>&gt;, $crate::RunnerError&gt; {
+      <span class="k">let</span> arg = $crate::codec::decode(input)?;        <span class="c">// In inferred from $f</span>
+      <span class="k">match</span> $f(arg) {
+        Ok(out) =&gt; $crate::codec::encode(&amp;out),         <span class="c">// Out inferred from $f</span>
+        Err(e)  =&gt; <span class="c">/* wraps the user error onto RunnerError::Function */</span>
+      }
+    }
+    __wrap <span class="k">as</span> $crate::HandlerFn
+  }};
+}</code></pre>
+    <p>The two registration paths converge on this <em>same</em> wrapper. The manual builder (<code class="path">examples/add/src/lib.rs:152</code>):</p>
+    <pre><code>Registry::new().function(<span class="s">"add"</span>, typed!(add))   <span class="c">// duplicate names panic at startup</span></code></pre>
+    <p>…and the macro path, which submits the identical pointer via <code>inventory</code> and is collected by <code>Registry::from_inventory()</code> (<code class="path">crates/modal-rust-runtime/src/lib.rs:366</code>). The codec is a JSON <code>Codec</code> over bytes (<code class="path">:161</code>); a future CBOR wire format would add a sibling impl and never touch <code>HandlerFn</code> or <code>Registry</code>.</p>
+    <div class="seam"><span class="lbl">Why it matters.</span> Because the handler is a <code>fn</code> pointer and the codec is byte-neutral, the manual builder, the proc-macro, async (reserved <code>typed_async!</code>), and alternate wire formats are all <em>additive</em> — none of them can change the dispatch shape <code>run_cli</code> depends on.</div>
+
+    <h3 id="a-error">3.2 RunnerError &amp; the failure envelope — frozen at five kinds</h3>
+    <p>The runner models failure as a Rust enum that <em>wraps</em> the user error rather than stringifying it early (<code class="path">crates/modal-rust-runtime/src/lib.rs:39</code>):</p>
+    <table>
+      <tr><th>kind</th><th>cause</th><th>variant</th></tr>
+      <tr><td><code>decode_error</code></td><td>input not valid JSON, or valid JSON that won't deserialize into <code>In</code></td><td><code>Decode(String)</code></td></tr>
+      <tr><td><code>unknown_entrypoint</code></td><td><code>--entrypoint</code> name absent from the registry</td><td><code>UnknownEntrypoint(String)</code></td></tr>
+      <tr><td><code>function_error</code></td><td>handler returned <code>Err(_)</code> — the user error wrapped</td><td><code>Function { message, details }</code></td></tr>
+      <tr><td><code>encode_error</code></td><td><code>Out</code> failed to serialize (e.g. non-string map keys) — must <b>not</b> be a panic</td><td><code>Encode(String)</code></td></tr>
+      <tr><td><code>panic</code></td><td>handler unwound; message + backtrace captured</td><td><code>Panic { message, backtrace }</code></td></tr>
+    </table>
+    <p>The <code>function_error</code> kind preserves structure: when the handler's error type is <code>Serialize</code>, <code>details = serde_json::to_value(&amp;e)</code>; for opaque errors like <code>anyhow::Error</code>, <code>details</code> is <code>null</code> and only the <code>Display</code>/anyhow chain rides in <code>message</code>. The <code>typed!</code> macro picks the right path at compile time via inherent-vs-trait method specialization (<code>Wrap&lt;E&gt;</code> in <code class="path">__macro_support</code>, <code class="path">:221</code>).</p>
+    <p>The success/failure envelopes are emitted by <code>run_cli_dispatch</code> (<code class="path">:646</code>), one JSON line to stdout, exit code mirroring <code>ok</code>:</p>
+    <pre><code>{<span class="s">"ok"</span>:<span class="k">true</span>, <span class="s">"value"</span>:&lt;json&gt;}
+{<span class="s">"ok"</span>:<span class="k">false</span>,<span class="s">"error"</span>:{<span class="s">"kind"</span>:"…",<span class="s">"message"</span>:"…",<span class="s">"details"</span>:&lt;json|null&gt;,<span class="s">"backtrace"</span>:"…"}}</code></pre>
+    <p><b>Precedence is frozen:</b> top-level JSON parse → entrypoint lookup → decode <code>In</code> → call → encode <code>Out</code> (<code class="path">:665–704</code>). A malformed-JSON input is a <code>decode_error</code> even when the entrypoint is also unknown. Panic capture uses a process-wide hook installed once via <code>Once</code>, writing into a <code>thread_local!</code> slot (<code class="path">:421–491</code>) with <code>Backtrace::force_capture()</code>, so parallel panics never race and the backtrace is populated regardless of <code>RUST_BACKTRACE</code>.</p>
+    <p>The facade's <code>parse_envelope</code> (<code class="path">crates/modal-rust/src/remote.rs:657</code>) reconstructs this exact enum on the client side, so a remote failure is <em>identical in shape</em> to a local one — an unknown kind degrades to <code>Decode</code>, never a panic.</p>
+
+    <h3 id="a-config">3.3 FunctionConfig — the decorator <em>is</em> the config</h3>
+    <p>Per-function deploy/run config lives on the <code>Registration</code> alongside the handler (<code class="path">crates/modal-rust-runtime/src/lib.rs:294</code>):</p>
+    <pre><code><span class="k">pub struct</span> FunctionConfig {
+  <span class="k">pub</span> gpu:          Option&lt;&amp;<span class="k">'static</span> <span class="k">str</span>&gt;,                  <span class="c">// "T4", "A100-80GB", "H100:4"</span>
+  <span class="k">pub</span> timeout_secs: Option&lt;<span class="k">u32</span>&gt;,
+  <span class="k">pub</span> cache:        Option&lt;<span class="k">bool</span>&gt;,
+  <span class="k">pub</span> secrets:      &amp;<span class="k">'static</span> [&amp;<span class="k">'static</span> <span class="k">str</span>],            <span class="c">// named Modal secrets</span>
+  <span class="k">pub</span> volumes:      &amp;<span class="k">'static</span> [(&amp;<span class="k">'static</span> <span class="k">str</span>, &amp;<span class="k">'static</span> <span class="k">str</span>)], <span class="c">// (mount_path, name)</span>
+}</code></pre>
+    <p>This is <b>metadata only</b>: the runner ignores every field — <code>run_cli</code> dispatch, <code>HandlerFn</code>, and <code>Registry::from_inventory</code> never read it. Only the control-plane facade reads it when <em>creating</em> the Modal function (<code>Resources.gpu_config</code>, <code>timeout_secs</code>, secret/volume ids). The fields are <code>&amp;'static</code> rather than <code>String</code>/<code>Vec</code> because <code>inventory::submit!</code> builds a <code>static</code> initializer that must be <code>const</code>-constructible. A bare <code>#[modal_rust::function]</code> yields <code>FunctionConfig::default()</code> (all <code>None</code>, empty slices), so it is wire-identical to before this field existed.</p>
+    <p>The macro parses the attribute and emits the config straight into the registration (<code class="path">crates/modal-rust-macros/src/lib.rs:246</code>). See it used live in <code class="path">examples/add-macro/src/lib.rs:62</code>: <code>#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false)]</code>.</p>
+
+    <h3 id="a-sdk">3.4 The SDK client, the <code>ops/*</code> surface, the 3 fixes &amp; <code>retry_transient</code></h3>
+    <p><code>ModalClient</code> (<code class="path">crates/modal-rust-sdk/src/client.rs:39</code>) wraps the tonic-generated stub behind an <code>AuthInterceptor</code> over a hardened TLS channel. <code>connect()</code> reads <code>~/.modal.toml</code> / <code>MODAL_TOKEN_*</code>, builds the channel, and fires a <code>ClientHello</code> handshake to fail fast on bad credentials. Auth is by request <em>metadata</em>, not a login RPC: every call carries <code>x-modal-token-id/secret</code>, <code>x-modal-client-type = "1"</code>, version, platform, timestamp (<code class="path">crates/modal-rust-sdk/src/auth.rs:56</code>).</p>
+    <p>The control-plane operations are a native port of the proven file-mode recipe, each its own submodule under <code class="path">ops/</code>, all <code>impl ModalClient</code> blocks so the public surface is method calls on one client (<code class="path">crates/modal-rust-sdk/src/ops/mod.rs</code>):</p>
+    <table>
+      <tr><th>module</th><th>RPCs</th></tr>
+      <tr><td><code>ops::app</code></td><td><code>AppGetOrCreate</code> / <code>AppCreate</code> (ephemeral) / <code>AppPublish</code></td></tr>
+      <tr><td><code>ops::image</code></td><td><code>ImageGetOrCreate</code> + <code>ImageJoinStreaming</code> build poll</td></tr>
+      <tr><td><code>ops::mount</code></td><td><code>MountGetOrCreate</code> (GLOBAL) → client mount &amp; python-standalone mount</td></tr>
+      <tr><td><code>ops::local_dir</code> / <code>ops::blob</code></td><td><code>MountGetOrCreate</code> + <code>MountPutFile</code> (inline) / <code>BlobCreate</code> + HTTP PUT (≥4&nbsp;MiB)</td></tr>
+      <tr><td><code>ops::function</code></td><td><code>FunctionPrecreate</code> + <code>FunctionCreate</code> (FILE) + <code>FunctionGet</code></td></tr>
+      <tr><td><code>ops::invoke</code></td><td><code>FunctionMap</code> → <code>FunctionPutInputs</code> fallback → <code>FunctionGetOutputs</code></td></tr>
+      <tr><td><code>ops::volume</code> / <code>ops::secret</code></td><td><code>VolumeGetOrCreate</code> (V2) / <code>SecretGetOrCreate</code></td></tr>
+    </table>
+    <p>Three bugs in the reference <code>modal-rs</code> client were diagnosed against Modal's live server and baked into this SDK as <b>the three fixes</b>:</p>
+    <ol>
+      <li><b>Fix #1 — FunctionCreate XOR.</b> Modal expects exactly one of <code>function</code> / <code>function_data</code> and always wants <code>resources</code> set. The SDK sends the single-<code>Function</code> path with <code>resources</code> always populated, <code>function_data = None</code>, and <code>existing_function_id = precreate_id</code> to legalize an empty <code>function_serialized</code> in FILE mode (<code class="path">crates/modal-rust-sdk/src/ops/function.rs:326</code>).</li>
+      <li><b>Fix #2 — deploy via <code>AppPublish</code> only.</b> The legacy <code>AppSetObjects</code> RPC handler is server-broken; modern deploys publish with <code>AppPublish</code> alone (<code class="path">crates/modal-rust-sdk/src/ops/app.rs:114</code>).</li>
+      <li><b>Fix #3 — FunctionPutInputs fallback.</b> If <code>FunctionMap</code>'s response does not echo the pipelined input, it was never enqueued; the SDK then calls <code>FunctionPutInputs</code> before polling outputs (<code class="path">crates/modal-rust-sdk/src/ops/invoke.rs:188</code>).</li>
+    </ol>
+    <p>Every unary RPC (and every per-file upload) is wrapped in <code>retry_transient</code> (<code class="path">crates/modal-rust-sdk/src/retry.rs:68</code>): 100&nbsp;ms→5&nbsp;s exponential backoff with full jitter, 8 attempts, a 120&nbsp;s cap — mirroring Modal's own <code>retry_transient_errors</code>. Crucially, it retries <em>only</em> transient errors (<code>Error::is_transient</code>: connection reset, h2 protocol error, <code>UNAVAILABLE</code>/<code>Internal</code>/<code>Unknown</code>); real errors (auth, invalid-argument, in-band build/function failure) propagate on the first occurrence and are never masked.</p>
+
+    <h3 id="a-specs">3.5 ImageSpec &amp; FunctionSpec — declarative builders</h3>
+    <p><code>ImageSpec</code> (<code class="path">crates/modal-rust-sdk/src/ops/image.rs:74</code>) is a declarative recipe that renders a Dockerfile-command list. Its <code>dockerfile_commands()</code> (<code class="path">:289</code>) emits the official client's <code>add_python</code> branch — <code>COPY /python/. /usr/local</code>, an auto <code>ln -s python3 python</code> for series &lt; 3.13, and the <code>TERMINFO_DIRS</code> ENV — then optionally a rustup+CUDA block (<code>with_rust_toolchain</code>), then base64-baked wrapper modules, then any extra commands. Builders: <code>from_registry</code>, <code>with_add_python</code>, <code>with_python_standalone_mount_id</code>, <code>with_wrapper_module</code>, <code>with_command</code>, <code>with_context_mount</code>, <code>with_base_image</code> (layered <code>FROM base</code>).</p>
+    <p><code>FunctionSpec</code> (<code class="path">crates/modal-rust-sdk/src/ops/function.rs:126</code>) describes a FILE-mode function: <code>module_name</code> + <code>function_name</code> (no serialized bytecode), <code>image_id</code>, <code>mount_ids</code>, timeout, resources (GPU via <code>with_gpu</code> → <code>parse_gpu_config</code>, mirroring Modal's <code>_utils/function_utils.py</code>), <code>mount_client_dependencies = true</code> (worker injects the modal client's pip closure at boot), plus volume mounts and secret ids. Empty volume/secret lists make prost omit those fields, keeping the wire bytes identical for functions that use neither.</p>
+
+    <h3 id="a-facade">3.6 The App / Function facade &amp; RemoteConfig / DeployConfig</h3>
+    <p><code>App</code> (<code class="path">crates/modal-rust/src/app.rs:26</code>) owns a <code>Registry</code>, a per-name <code>configs</code> map, and an optional live <code>RemoteHandle</code> (a <code>Mutex&lt;ModalClient&gt;</code> + ephemeral <code>app_id</code> + a <code>OnceCell&lt;function_id&gt;</code> that single-flights the create). Constructors form a clear matrix:</p>
+    <table>
+      <tr><th>constructor</th><th>registry</th><th>configs</th><th>live?</th><th>used by</th></tr>
+      <tr><td><code>App::new(reg)</code></td><td>explicit</td><td>empty</td><td>no</td><td>manual <code>.local()</code></td></tr>
+      <tr><td><code>App::from_inventory()</code></td><td>inventory</td><td>decorator</td><td>no</td><td>macro <code>.local()</code></td></tr>
+      <tr><td><code>App::connect(name)</code></td><td>inventory</td><td>decorator</td><td>yes (ephemeral)</td><td>facade <code>.remote()</code></td></tr>
+      <tr><td><code>App::from_manifest</code> / <code>connect_from_manifest</code></td><td>empty (headless)</td><td>from <code>--describe</code></td><td>opt.</td><td>the CLI</td></tr>
+    </table>
+    <p>A <code>Function&lt;'a&gt;</code> (<code class="path">crates/modal-rust/src/function.rs:17</code>) is a cheap handle: <code>app.function("add")</code> resolves the <code>HandlerFn</code> from the registry now (<code>Option</code>, so an unknown name surfaces a clear error only when an op is actually invoked) and keeps the name. <code>RemoteConfig</code> (<code class="path">remote.rs:266</code>) and <code>DeployConfig</code> (<code class="path">deploy.rs:106</code>) carry the run/deploy knobs (source root, package, base image, timeout, gpu, cache, secrets, volumes, ignore name), each discovering its defaults from the environment (<code>MODAL_RUST_*</code>).</p>
+  </section>
+
+  <!-- ============================================================= -->
+  <section id="flows">
+    <h2>4. The data flows</h2>
+    <p>Each flow below is a numbered step-through with the exact functions and files. The first two are entirely local; the rest cross to Modal.</p>
+
+    <h3 id="f-authoring">4.1 Authoring → the inventory Registry</h3>
+    <p>Two routes, one registry shape.</p>
+    <figure>
+    <svg viewBox="0 0 700 200" width="700" height="200" role="img" aria-label="Authoring to registry">
+      <style>
+        .bx{fill:#fff;stroke:#c9ccd2;stroke-width:1.2}.bt{font:12px -apple-system,sans-serif;fill:#22262c}
+        .bd{font:10.5px -apple-system,sans-serif;fill:#6b727d}
+        .ar{stroke:#7a3cff;stroke-width:1.5;fill:none;marker-end:url(#arr)}
+        .gl{fill:#f6f2ff;stroke:#cdbcff}
+      </style>
+      <rect class="bx" x="14" y="20" width="180" height="48" rx="8"/>
+      <text class="bt" x="104" y="40" text-anchor="middle">manual builder</text>
+      <text class="bd" x="104" y="56" text-anchor="middle">.function("add", typed!(add))</text>
+      <rect class="bx" x="14" y="120" width="180" height="48" rx="8"/>
+      <text class="bt" x="104" y="140" text-anchor="middle">#[modal_rust::function]</text>
+      <text class="bd" x="104" y="156" text-anchor="middle">inventory::submit!{Registration}</text>
+      <rect class="bx" x="280" y="70" width="170" height="48" rx="8"/>
+      <text class="bt" x="365" y="90" text-anchor="middle">typed!(f) wrapper</text>
+      <text class="bd" x="365" y="106" text-anchor="middle">monomorphized fn ptr</text>
+      <rect class="bx gl" x="520" y="70" width="166" height="48" rx="8"/>
+      <text class="bt" x="603" y="90" text-anchor="middle">Registry</text>
+      <text class="bd" x="603" y="106" text-anchor="middle">BTreeMap&lt;&amp;str,HandlerFn&gt;</text>
+      <path class="ar" d="M194,44 Q240,60 280,84"/>
+      <path class="ar" d="M194,144 Q240,128 280,104"/>
+      <path class="ar" d="M450,94 L516,94"/>
+    </svg>
+    </figure>
+    <ol class="steps">
+      <li><b>Manual:</b> the user writes <code>pub fn modal_registry() -&gt; Registry</code> and the runner bin calls <code>run_cli(modal_registry())</code> (<code class="path">examples/add/src/bin/modal_runner.rs:9</code>). Each <code>.function(name, typed!(f))</code> rejects a duplicate name with a hard startup panic.</li>
+      <li><b>Macro:</b> <code>#[modal_rust::function]</code> expands to the unchanged fn plus an <code>inventory::submit!{ Registration { name, handler: typed!(f), config } }</code> (<code class="path">crates/modal-rust-macros/src/lib.rs:246</code>). The runner bin calls <code>run_cli_with_configs(Registry::from_inventory(), …)</code>.</li>
+      <li><b>Convergence:</b> <code>Registry::from_inventory()</code> (or <code>from_inventory_with_configs()</code>) inserts each submission through the <em>same</em> <code>Registry::function</code> path (<code class="path">crates/modal-rust-runtime/src/lib.rs:366,410</code>), producing a map byte-identical to the hand-built one. <code>examples/add-macro</code>'s tests assert the success envelope is byte-for-byte the manual path's.</li>
+    </ol>
+
+    <h3 id="f-local">4.2 <code>.local()</code> — in-process dispatch <span class="pill frozen">zero Modal</span></h3>
+    <p>The cheapest, highest-value path: run the registered handler in-process exactly as the runner would, minus the subprocess (<code class="path">crates/modal-rust/src/function.rs:42</code>):</p>
+    <pre><code><span class="k">pub fn</span> local&lt;In: Serialize, Out: DeserializeOwned&gt;(&amp;<span class="k">self</span>, input: In) -&gt; Result&lt;Out&gt; {
+  <span class="k">let</span> handler = <span class="k">self</span>.handler.ok_or_else(|| <span class="k">self</span>.unknown())?;
+  <span class="k">let</span> bytes = serde_json::to_vec(&amp;input).map_err(Error::Encode)?;
+  <span class="k">let</span> out = handler(&amp;bytes).map_err(Error::Runner)?;   <span class="c">// the SAME HandlerFn the runner calls</span>
+  serde_json::from_slice(&amp;out).map_err(Error::Decode)
+}</code></pre>
+    <p>Input → JSON → the handler's own <code>codec::decode</code> → <code>In</code>; the handler's <code>codec::encode</code> → JSON → <code>Out</code>. The double round-trip is intentional: it is identical to running the runner with no process boundary and no network. Errors map onto the same five-kind taxonomy. <code>App::new(modal_registry()).function("add").local(AddInput{40,2})</code> yields <code>AddOutput{sum:42}</code> — see <code class="path">examples/orchestrate/src/main.rs:44</code>.</p>
+
+    <h3 id="f-remote">4.3 <code>.remote()</code> — the run path, end to end <span class="pill run">run</span></h3>
+    <p>This is the heart of the system: the user's crate is uploaded, <code>cargo build</code> runs <b>in the function body at invoke time</b>, and the freshly built <code>modal_runner</code> execs the handler. The result returns typed, with the exact semantics of <code>.local()</code>.</p>
+
+    <figure>
+    <svg viewBox="0 0 700 470" width="700" height="470" role="img" aria-label="Remote run path">
+      <style>
+        .L{fill:#f4f5f7;stroke:#cfd3da;stroke-width:1}
+        .R{fill:#eefcf4;stroke:#bfe8d4;stroke-width:1}
+        .step{fill:#fff;stroke:#c9ccd2;stroke-width:1.1}
+        .st{font:11.5px -apple-system,sans-serif;fill:#22262c}
+        .sd{font:10px -apple-system,sans-serif;fill:#6b727d}
+        .lab{font:600 11px -apple-system,sans-serif;fill:#5c6470}
+        .a{stroke:#7a3cff;stroke-width:1.5;fill:none;marker-end:url(#arr)}
+      </style>
+      <rect class="L" x="6" y="6" width="340" height="458" rx="10"/>
+      <text class="lab" x="22" y="26">LOCAL  (your machine — modal-rust facade + sdk)</text>
+      <rect class="R" x="354" y="6" width="340" height="458" rx="10"/>
+      <text class="lab" x="372" y="26">MODAL  (control plane + container)</text>
+
+      <rect class="step" x="24" y="40" width="304" height="40" rx="7"/>
+      <text class="st" x="34" y="58">App::connect(name)</text><text class="sd" x="34" y="72">AppCreate (ephemeral) · ClientHello · ~/.modal.toml</text>
+      <rect class="step" x="24" y="92" width="304" height="40" rx="7"/>
+      <text class="st" x="34" y="110">resolve_function → ensure_function</text><text class="sd" x="34" y="124">apply decorator gpu/timeout/cache/secrets/volumes</text>
+      <rect class="step" x="24" y="144" width="304" height="44" rx="7"/>
+      <text class="st" x="34" y="162">scope::workspace_closure</text><text class="sd" x="34" y="176">cargo metadata → dep-closure dirs + rewritten Cargo.toml</text>
+      <rect class="step" x="24" y="200" width="304" height="40" rx="7"/>
+      <text class="st" x="34" y="218">mount_workspace_closure</text><text class="sd" x="34" y="232">walk+sha256+ignore · MountPutFile / Blob PUT</text>
+      <rect class="step" x="24" y="252" width="304" height="40" rx="7"/>
+      <text class="st" x="34" y="270">client + python-standalone mounts</text><text class="sd" x="34" y="284">MountGetOrCreate (GLOBAL, by name)</text>
+      <rect class="step" x="24" y="304" width="304" height="40" rx="7"/>
+      <text class="st" x="34" y="322">image_get_or_create</text><text class="sd" x="34" y="336">add_python + baked run wrapper · ImageJoinStreaming</text>
+      <rect class="step" x="24" y="356" width="304" height="40" rx="7"/>
+      <text class="st" x="34" y="374">precreate → function_create (FILE) → publish</text><text class="sd" x="34" y="388">APP_STATE_EPHEMERAL · resources.gpu_config</text>
+      <rect class="step" x="24" y="408" width="304" height="44" rx="7"/>
+      <text class="st" x="34" y="426">invoke_cbor_with_deadline</text><text class="sd" x="34" y="440">FunctionMap→PutInputs→GetOutputs · args=(entry,json)</text>
+
+      <rect class="step" x="372" y="304" width="304" height="56" rx="7"/>
+      <text class="st" x="382" y="324">container boots:</text><text class="sd" x="382" y="340">python -m modal._container_entrypoint</text><text class="sd" x="382" y="352">import modal_rust_run_wrapper → handler</text>
+      <rect class="step" x="372" y="372" width="304" height="80" rx="7"/>
+      <text class="st" x="382" y="392">handler(entrypoint, input_json):</text>
+      <text class="sd" x="382" y="408">cargo build --release -p PKG --bin modal_runner</text>
+      <text class="sd" x="382" y="422">/tmp/target/release/modal_runner --entrypoint …</text>
+      <text class="sd" x="382" y="436">→ ONE JSON envelope (stdout)  → CBOR back</text>
+
+      <path class="a" d="M328,430 L370,400"/>
+      <path class="a" d="M524,372 L524,362"/>
+      <path class="a" d="M370,425 Q345,455 250,452"/>
+    </svg>
+    <figcaption>The run path. cargo runs inside the function body (right) — never at image-build time. The result is the runner's JSON envelope, carried back as CBOR.</figcaption>
+    </figure>
+
+    <ol class="steps">
+      <li><b>Connect.</b> <code>App::connect(name)</code> builds a <code>ModalClient</code> (reads <code>~/.modal.toml</code> / <code>MODAL_TOKEN_*</code>, <code>ClientHello</code>) and creates an <b>ephemeral</b> app via <code>app_create_ephemeral</code> (<code class="path">crates/modal-rust/src/app.rs:163</code>). Ephemeral matters: the app is GC'd on client disconnect, so a run never leaves a lingering persistent deploy.</li>
+      <li><b>Resolve config &amp; ensure the function (once).</b> <code>Function::remote</code> serializes the input and calls <code>App::remote_invoke</code> → <code>resolve_function</code> (<code class="path">app.rs:244</code>), which reads the entrypoint's <code>FunctionConfig</code>, folds gpu/timeout/cache/secrets/volumes into a per-call <code>RemoteConfig</code>, then runs <code>ensure_function</code> exactly once via the <code>function_id</code> <code>OnceCell</code> (single-flighted under concurrent calls).</li>
+      <li><b>Scope the upload.</b> <code>scope::workspace_closure</code> (<code class="path">crates/modal-rust/src/scope.rs:91</code>) shells <code>cargo metadata --no-deps</code> at the workspace root and DFS-walks the target package's <em>workspace-member normal path-dep closure</em> — exactly the crate dirs <code>cargo build -p &lt;pkg&gt;</code> needs — plus the workspace <code>Cargo.lock</code> and a <b>rewritten</b> <code>Cargo.toml</code> (members trimmed to the closure, format-preserving via <code>toml_edit</code>, <code>panic="unwind"</code> kept). Everything else (sibling crates, vendored clones, docs) is excluded by construction. On any failure it returns <code>None</code> → whole-root fallback.</li>
+      <li><b>Upload as a mount.</b> <code>mount_workspace_closure</code> (<code class="path">crates/modal-rust-sdk/src/ops/local_dir.rs:115</code>) walks the chosen dirs, prunes by ignore precedence <code>.modalignore</code> &gt; <code>.gitignore</code> &gt; built-in defaults (a real gitignore engine), sha256s each surviving file, and uploads it: inline via <code>MountPutFile</code> for small files, or <code>BlobCreate</code> + an HTTP PUT to object storage for files ≥ 4&nbsp;MiB (<code class="path">ops/blob.rs:39</code>). One <code>MountGetOrCreate</code> finalizes the ephemeral mount → <code>mount_id</code>. Each file lands at <code>/src/&lt;rel&gt;</code>.</li>
+      <li><b>Resolve the platform mounts.</b> <code>client_mount_id</code> resolves the hosted, version-keyed <code>modal-client-mount-{version}</code> (GLOBAL namespace, pure lookup) so <code>modal</code> is importable in the container; <code>python_standalone_mount_id</code> resolves <code>python-build-standalone.{release}.{full}-gnu</code> for <code>add_python</code> (<code class="path">crates/modal-rust-sdk/src/ops/mount.rs</code>).</li>
+      <li><b>Build the run image.</b> <code>image_get_or_create</code> with an <code>ImageSpec</code>: <code>from_registry("rust:1-slim")</code> + <code>with_add_python("3.12")</code> + the standalone mount as build context + the base64-baked run wrapper + <code>ENTRYPOINT []</code> (<code class="path">crates/modal-rust/src/remote.rs:565–588</code>). The image carries <b>no cargo line</b> — that is the run-side build boundary. The build streams via <code>ImageJoinStreaming</code>; the builder version is resolved from the environment (must be &gt; "2024.10" so the worker mounts the client's pip closure at boot).</li>
+      <li><b>Create &amp; publish (FILE mode).</b> <code>function_precreate</code> → <code>function_create</code> with <code>definition_type = FILE</code>, empty <code>function_serialized</code>, <code>module_name = modal_rust_run_wrapper</code>, <code>function_name = handler</code>, <code>mount_ids = [client, source]</code>, <code>resources.gpu_config</code> from the decorator, then <code>app_publish_ephemeral</code> (<code class="path">remote.rs:591–643</code>). Publishing is required to make the function invokable; the <em>ephemeral</em> state keeps the app throwaway. The created <code>function_id</code> is invoked <b>directly</b> — an ephemeral app is not name-resolvable.</li>
+      <li><b>Invoke.</b> <code>invoke_cbor_with_deadline</code> encodes <code>(args, kwargs)</code> where <code>args = (entrypoint, input_json)</code> as CBOR and drives <code>FunctionMap</code> → (fix #3) <code>FunctionPutInputs</code> → poll <code>FunctionGetOutputs</code> (<code class="path">crates/modal-rust-sdk/src/ops/invoke.rs</code>). The deadline is the function's container timeout + 120&nbsp;s, because the first call pays a cold in-body <code>cargo build</code> that can run for minutes (<code class="path">app.rs:284</code>).</li>
+      <li><b>Decode.</b> The wrapper returns the runner's one-line JSON envelope <em>as a string</em>; it rides back as CBOR; <code>Function::remote</code> hands it to <code>parse_envelope::&lt;Out&gt;</code> (<code class="path">remote.rs:657</code>), which decodes <code>value</code> into <code>Out</code> on success or reconstructs the frozen <code>RunnerError</code> on failure — identical to <code>.local()</code>.</li>
+    </ol>
+    <p class="ref">Live evidence (knowledge.md): <code>add(40,2).remote() = AddOutput { sum: 42 }</code> — Modal built the crate in the function body (<code>Compiling example-add … Finished release in 14.37s</code>, <code>modal_runner exit=0</code>) and returned the real Rust result, with no <code>modal</code> CLI, no per-project <code>.py</code>, no <code>modal-rs</code>.</p>
+
+    <h3 id="f-wrapper">4.4 The embedded Python wrapper, the client mount &amp; container boot</h3>
+    <p>Why is there Python at all? Because a Modal FILE-mode function is identified by <code>module_name</code> + <code>function_name</code>, and the container boots through <code>python -m modal._container_entrypoint</code>, which does <code>importlib.import_module(module_name)</code> + <code>getattr(module, function_name)</code> and calls it. So <em>something</em> importable must be on the image. We ship <b>one</b> tiny wrapper module (baked into the image, not per-project) and let the <b>client mount</b> make <code>modal</code> importable.</p>
+    <ul>
+      <li><b>The run wrapper</b> is a Rust <code>const WRAPPER_SRC</code> with a <code>{{PACKAGE}}</code>/<code>{{CACHE}}</code> placeholder, baked base64 into the image (no shell quoting). Its <code>handler(entrypoint, input_json)</code> picks a writable build dir, runs <code>cargo build --release -p PKG --bin modal_runner</code> in the function body, writes <code>/tmp/in.json</code>, execs <code>modal_runner --entrypoint … --input-file /tmp/in.json</code>, and returns the stdout envelope verbatim (<code class="path">crates/modal-rust/src/remote.rs:60–225</code>). All cargo/rustc/user diagnostics go to stderr — load-bearing, since stdout must carry exactly one JSON line.</li>
+      <li><b>The client mount</b> is the Modal-native way to make <code>modal</code> importable: a hosted, version-keyed GLOBAL mount of the modal source at <code>/pkg</code>, attached via <code>Function.mount_ids</code> (<code class="path">crates/modal-rust-sdk/src/ops/mount.rs</code>) — exactly what the official Python SDK attaches automatically. The mount carries only the <em>source</em>; the modal client's third-party <em>pip closure</em> (<code>typing_extensions</code>, <code>grpclib</code>, …) is injected by the worker at container start when <code>mount_client_dependencies = true</code> (proto field 82, only honored for builder version &gt; "2024.10"). So there is no <code>pip install modal</code> on the modern path.</li>
+      <li><b>Python itself</b> comes from the hosted python-standalone mount via <code>add_python</code> — relocatable and not PEP-668-managed, dissolving the early <code>python-is-python3</code> / <code>--break-system-packages</code> hacks. The apt+pip path survives only as a documented fallback selected when <code>add_python</code> is unset (<code class="path">crates/modal-rust-sdk/src/ops/image.rs:289–337</code>).</li>
+    </ul>
+
+    <h3 id="f-deploy">4.5 deploy + call — build at image-build time <span class="pill deploy">deploy</span></h3>
+    <p>Deploy proves the <em>other</em> half of the build boundary. The source is COPYed into an image <b>layer</b> and <code>cargo build</code> runs <b>during the image build</b>; the deployed runtime then execs only the prebuilt <code>/app/modal_runner</code> and never invokes cargo.</p>
+    <figure>
+    <svg viewBox="0 0 700 250" width="700" height="250" role="img" aria-label="Deploy two-layer image">
+      <style>
+        .bx{fill:#fff;stroke:#c9ccd2;stroke-width:1.1}.gl{fill:#eefcf4;stroke:#bfe8d4}
+        .bt{font:12px -apple-system,sans-serif;fill:#22262c}.bd{font:10px -apple-system,sans-serif;fill:#6b727d}
+        .a{stroke:#0a7d52;stroke-width:1.6;fill:none;marker-end:url(#arrG)}
+      </style>
+      <defs><marker id="arrG" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#0a7d52"/></marker></defs>
+      <rect class="bx gl" x="20" y="30" width="200" height="78" rx="8"/>
+      <text class="bt" x="120" y="52" text-anchor="middle">BASE layer</text>
+      <text class="bd" x="120" y="70" text-anchor="middle">rust:1-slim + add_python</text>
+      <text class="bd" x="120" y="84" text-anchor="middle">(+ rustup/CUDA if needed)</text>
+      <text class="bd" x="120" y="98" text-anchor="middle">context = python-standalone</text>
+      <rect class="bx gl" x="270" y="20" width="240" height="100" rx="8"/>
+      <text class="bt" x="390" y="42" text-anchor="middle">TOP layer  (FROM base)</text>
+      <text class="bd" x="390" y="60" text-anchor="middle">bake deploy wrapper</text>
+      <text class="bd" x="390" y="74" text-anchor="middle">COPY . /  (context = source)</text>
+      <text class="bd" x="390" y="88" text-anchor="middle">RUN cargo build --release -p PKG</text>
+      <text class="bd" x="390" y="102" text-anchor="middle">cp → /app/modal_runner  (baked)</text>
+      <rect class="bx" x="270" y="160" width="240" height="64" rx="8"/>
+      <text class="bt" x="390" y="182" text-anchor="middle">call  (no build, no upload)</text>
+      <text class="bd" x="390" y="200" text-anchor="middle">from_name → invoke</text>
+      <text class="bd" x="390" y="214" text-anchor="middle">deploy wrapper execs /app/modal_runner</text>
+      <rect class="bx" x="556" y="30" width="124" height="78" rx="8"/>
+      <text class="bt" x="618" y="56" text-anchor="middle">AppPublish</text>
+      <text class="bd" x="618" y="74" text-anchor="middle">DEPLOYED</text>
+      <text class="bd" x="618" y="90" text-anchor="middle">(persistent name)</text>
+      <path class="a" d="M220,68 L268,68"/>
+      <path class="a" d="M510,70 L554,70"/>
+      <path class="a" d="M390,120 L390,158"/>
+    </svg>
+    <figcaption>Two layers because an Image has one <code>context_mount_id</code>: the base layer owns the python-standalone mount, the top layer owns the source. cargo runs only in the top layer.</figcaption>
+    </figure>
+    <ol class="steps">
+      <li><b>Upload &amp; layer.</b> <code>deploy_function</code> (<code class="path">crates/modal-rust/src/deploy.rs:267</code>) uploads the source the same way (cargo-scoped) but as the image <b>build context</b> landing at <code>/app/src</code>. It builds two layers: <code>deploy_base_layer_spec</code> (add_python) then <code>deploy_top_layer_spec</code> (<code>FROM base</code>, bake the deploy wrapper, <code>COPY . /</code>, <code>RUN cargo build --release -p PKG --bin modal_runner</code>, <code>cp</code> to <code>/app/modal_runner</code>).</li>
+      <li><b>Create &amp; publish persistently.</b> A FILE-mode function with the <b>client mount only</b> (no source mount — the binary is baked) and <code>app_publish_deployed</code> into a stable, get-or-created name (re-deploys replace in place). Returns a <code>DeployedApp</code>.</li>
+      <li><b>Call.</b> <code>call_function</code> (<code class="path">deploy.rs:403</code>) does <code>function_from_name</code> + <code>invoke_cbor_with_deadline</code> — <b>no upload, no image build, no publish</b>. The deploy wrapper (<code class="path">deploy.rs:65</code>) imports only <code>subprocess</code>/<code>sys</code>, has no <code>cargo</code>, no <code>/src</code>, no <code>CARGO_*</code>, and execs only <code>/app/modal_runner</code>. A unit test asserts that runtime purity.</li>
+    </ol>
+    <div class="seam"><span class="lbl">Proof obligation, met.</span> <code>cargo build</code> appears in the deploy/build logs and is <b>absent</b> from call logs. Live: the base + top layers built at image-build time (<code>Finished release in 9.07s</code> → binary baked to <code>/app/modal_runner</code>) and the call phase ran zero cargo. The capstone repeated this with a real Burn/CubeCL workload on a Tesla T4.</div>
+
+    <h3 id="f-spawnmap">4.6 <code>.spawn()</code> / <code>.map()</code> — fire-and-forget &amp; fan-out <span class="pill run">run</span></h3>
+    <p>Both reuse the same ensure-function head as <code>.remote()</code>, then diverge at the invoke layer (<code class="path">crates/modal-rust-sdk/src/ops/invoke.rs</code>):</p>
+    <ul>
+      <li><b><code>spawn</code></b> sends a UNARY <code>FunctionMap</code> with <code>FunctionCallInvocationType::Async</code> and returns the <code>function_call_id</code> immediately (<code>spawn_cbor</code>, <code class="path">:325</code>). <code>FunctionCall::get</code> later polls that call's output at index 0 (<code>get_by_call_cbor</code>) and decodes through the same <code>parse_envelope</code>.</li>
+      <li><b><code>map</code></b> opens a <code>FUNCTION_CALL_TYPE_MAP</code> call, enqueues N inputs each tagged with its ordinal as <code>idx</code>, polls outputs, and reassembles them <b>in input order</b> by <code>idx</code> into a <code>BTreeMap</code> (<code>map_cbor</code>, <code class="path">:453</code>). Fail-fast: the first remote failure surfaces immediately.</li>
+    </ul>
+    <p>Both poll <code>FunctionGetOutputs</code> seeding the cursor with the <code>"0-0"</code> sentinel that Modal's server requires on an indexed get (<code>LAST_ENTRY_ID_INITIAL</code>, <code class="path">:45</code>). Live: <code>map([{1,1},{2,2},{3,3},{40,2}]) → [2,4,6,42]</code> in order.</p>
+
+    <h3 id="f-cache">4.7 The build cache — one archive on a V2 volume <span class="pill run">run</span></h3>
+    <p>The run-path in-body <code>cargo build</code> is cached, on by default. Modal volumes degrade past ~50k files, so the cache is <em>not</em> <code>CARGO_HOME</code>/<code>target</code> directly on a volume; instead it is <b>one compressed archive</b> (<code>cache.tar.zst</code>, gzip fallback) on a V2 volume at <code>/cache</code> (<code class="path">crates/modal-rust/src/remote.rs:104–164</code>):</p>
+    <ol>
+      <li>On container start, the wrapper unpacks the archive to <code>/tmp</code> (build on fast local disk: <code>CARGO_HOME=/tmp/cargo</code>, <code>CARGO_TARGET_DIR=/tmp/target</code>).</li>
+      <li>After the first cold build it repacks the changed dirs into one object (atomic temp+replace), relying on <code>allow_background_commits</code> — never <code>vol.reload()</code> on the hot path.</li>
+      <li>The decorator <code>#[function(cache=false)]</code> overrides the env/default base; <code>MODAL_RUST_NO_CACHE</code> opts out. A cache miss only costs time, never correctness.</li>
+    </ol>
+    <p>The volume is resolved via <code>volume_get_or_create</code> (V2) and attached at <code>/cache</code> in <code>ensure_function</code> (<code class="path">remote.rs:458–471, 611–613</code>) — only on the run path; deploy attaches no cache volume. Live: cold cargo build 6.45s → warm <b>0.06s</b> (<code>Fresh</code>, no recompile), ~3.5× end-to-end on <code>add</code> (the real win lands on heavy builds).</p>
+
+    <h3 id="f-secrets">4.8 Secrets &amp; user volumes</h3>
+    <p><code>#[function(secrets = ["name"], volumes = ["/mount=name"])]</code> rides the <code>FunctionConfig</code> into both run and deploy. In <code>ensure_function</code> / <code>deploy_function</code>, each secret name is resolved via <code>secret_get_or_create</code> → <code>Function.secret_ids</code> (Modal injects the secret's key/values as container ENV VARS), and each user volume via <code>volume_get_or_create</code> (V1) → a <code>FunctionVolumeMount</code> at its mount path — a <em>separate</em> mount from the <code>/cache</code> cargo cache, with a guard rejecting a user mount at <code>/cache</code> (<code class="path">crates/modal-rust/src/remote.rs:473–501, 616–623</code>). Live: a fn read <code>std::env::var("MODAL_RUST_TEST_SECRET")</code> and wrote a marker to <code>/data</code> on a user volume that a fresh container read back — real cross-call persistence.</p>
+
+    <h3 id="f-cli">4.9 The CLI programmatic path</h3>
+    <p>The <code>modal-rust</code> binary cannot link the user crate, so it learns the entrypoints + per-fn config out-of-band via <code>--describe</code> (<code class="path">crates/modal-rust-cli/src/programmatic.rs</code>):</p>
+    <ol class="steps">
+      <li><b>Build for the manifest.</b> <code>cargo build --release -p &lt;pkg&gt; --bin modal_runner</code> at the workspace root (the <em>local</em> binary is for the manifest only and is never uploaded — the remote build still happens per the boundary).</li>
+      <li><b>Describe.</b> Run <code>modal_runner --describe</code> and parse the <code>modal-rust/describe@1</code> manifest: each entrypoint's name + serialized <code>FunctionConfig</code> (<code class="path">crates/modal-rust-runtime/src/lib.rs:631–798</code>). <code>--describe</code> is an additive runner subcommand; when absent, the frozen <code>--entrypoint</code> dispatch is byte-identical (the first token differs, so they never collide).</li>
+      <li><b>Drive a headless App.</b> Build <code>App::from_manifest</code> / <code>connect_from_manifest</code> (config but no handlers) and call the <em>same</em> facade ops the facade uses: <code>run</code> → <code>remote_envelope</code>, <code>deploy</code> → <code>deploy_with</code>, <code>call</code> → <code>call_envelope</code> (<code class="path">crates/modal-rust/src/app.rs:362–379</code>). The envelope string is printed verbatim and <code>ok</code> mirrors the exit code.</li>
+    </ol>
+    <p>The CLI emits no generated <code>.py</code> and spawns no <code>modal</code> subprocess — the only subprocesses are <code>cargo</code> and the user's <code>modal_runner</code>. <code>doctor</code> checks credentials (and, with <code>--rust</code>, cargo/rustc + <code>panic = "abort"</code> detection).</p>
+  </section>
+
+  <!-- ============================================================= -->
+  <section id="seams">
+    <h2>5. The frozen seams &amp; why</h2>
+    <p>Two invariants are guarded across every change. Everything else is built to be additive around them.</p>
+
+    <h3>Seam A — the runner CLI protocol</h3>
+    <p><code>modal_runner --entrypoint NAME (--input-json | --input-file | --input-stdin)</code> → exactly one JSON envelope on stdout, diagnostics on stderr, exit code mirroring <code>ok</code>, five frozen error kinds. The handler shape <code>fn(&amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;, RunnerError&gt;</code>, <code>typed!</code>, and <code>Registry</code> never change.</p>
+    <ul class="small">
+      <li><b>Why one JSON line on stdout:</b> the Python wrapper parses the result robustly despite arbitrary cargo/rustc/user build noise (which all goes to stderr).</li>
+      <li><b>Why exactly five kinds, with <code>encode_error</code> distinct from <code>panic</code>:</b> an output-serialization failure must not masquerade as a crash; the taxonomy is the stable contract the client reconstructs (<code>parse_envelope</code>).</li>
+      <li><b>Why <code>fn</code> pointers, not <code>dyn</code>:</b> the manual builder, the proc-macro, async, and CBOR are all additive precisely because dispatch is one monomorphized indirect jump that cannot change shape.</li>
+      <li><b>Additive proof:</b> <code>--describe</code> was added without touching the dispatch path — it is a strict superset gated on the first argv token (<code class="path">crates/modal-rust-runtime/src/lib.rs:631</code>), and <code>examples/add-macro</code> asserts byte-identical envelopes across manual/macro.</li>
+    </ul>
+
+    <h3>Seam B — the run-vs-deploy build boundary</h3>
+    <table>
+      <tr><th></th><th><span class="pill run">run</span></th><th><span class="pill deploy">deploy</span></th></tr>
+      <tr><td>source into container</td><td>uploaded mount at <code>/src</code> (startup)</td><td>COPYed into an image <em>layer</em> at <code>/app/src</code></td></tr>
+      <tr><td>where <code>cargo build</code> runs</td><td><b>in the function body</b>, at invoke time</td><td><b>at image-build time</b> (<code>RUN cargo build</code>)</td></tr>
+      <tr><td>runtime executes</td><td>freshly built <code>/tmp/target/release/modal_runner</code></td><td><b>only</b> the baked <code>/app/modal_runner</code></td></tr>
+      <tr><td>cargo at call time</td><td>yes (that's the point)</td><td><b>never</b></td></tr>
+      <tr><td>app lifecycle</td><td>ephemeral (GC'd on disconnect)</td><td>persistent (DEPLOYED, replaced in place)</td></tr>
+    </table>
+    <p>The deployed body execs only the prebuilt binary, mounts no source, and never invokes cargo — enforced in code (the deploy wrapper has no <code>cargo</code>/<code>/src</code>/<code>CARGO_*</code>, tested in <code class="path">crates/modal-rust/src/deploy.rs</code>) and proven in logs (cargo present in build, absent in call).</p>
+
+    <div class="note"><span class="lbl">Doc-vintage note.</span> <code class="path">workpads/architecture/boundaries.md</code> is the research-stage contract: §2/§3 (the runner protocol, error taxonomy, registry/<code>typed!</code> shapes) and §4 (the build boundary) remain authoritative and exactly describe the code. But its §5/§8 describe a since-superseded design where the CLI <em>generated Python shims</em> and shelled out to the official <code>modal</code> CLI. That entire control layer was replaced by the first-party <code>modal-rust-sdk</code> + the programmatic facade (the pivot is narrated in <code class="path">workpads/shim-backend/knowledge.md</code>). The frozen seams above survived the pivot unchanged — that was the whole point.</div>
+  </section>
+
+  <!-- ============================================================= -->
+  <section id="contribute">
+    <h2>6. How to contribute — where things live</h2>
+    <p>The codebase is organized so that the three most common kinds of change each touch a predictable, small set of files. Run the offline gates before and after: <code>cargo fmt --check</code>, <code>cargo clippy --all-targets --all-features -- -D warnings</code>, <code>cargo test</code> (live tests are <code>#[ignore]</code>d behind a <code>live</code> feature, so CI never hits Modal).</p>
+
+    <h3>Add a new Modal RPC</h3>
+    <ol>
+      <li>Find the message/method in the vendored <code class="path">crates/modal-rust-sdk/proto/api.proto</code> (compiled by <code class="path">build.rs</code> into <code>proto::api</code>). If it isn't there, sync it from <code class="path">references/modal-client/modal_proto/api.proto</code>.</li>
+      <li>Add an <code>async fn</code> on <code>impl ModalClient</code> in the right <code class="path">ops/*.rs</code> module, wrapping the call in <code>retry_unary(name, …)</code> (clone the stub per attempt). Cross-check the request shape against the official client in <code class="path">references/modal-client/py/modal/</code> — that is how the three fixes were found.</li>
+      <li>Re-export any public types from <code class="path">crates/modal-rust-sdk/src/lib.rs</code>, and add unit tests (the <code>ops</code> modules test request-building offline).</li>
+    </ol>
+
+    <h3>Add a new decorator argument</h3>
+    <ol>
+      <li>Add the field to <code>FunctionConfig</code> (<code class="path">crates/modal-rust-runtime/src/lib.rs:294</code>) as a <code>const</code>-constructible type (an <code>Option&lt;…&gt;</code> or <code>&amp;'static</code> slice); update <code>FunctionConfig::new()</code> and the <code>--describe</code> <code>DescribeConfig</code> view (keep <code>#[serde(default)]</code> for old-manifest compat — the schema stays <code>@1</code>).</li>
+      <li>Parse it in <code class="path">crates/modal-rust-macros/src/lib.rs</code> (the <code>syn::meta::parser</code> block) and emit it into the <code>inventory::submit!</code>.</li>
+      <li>Read it in the facade: thread it through <code>resolve_function</code>/<code>deploy_target_config</code> (<code class="path">crates/modal-rust/src/app.rs</code>) onto <code>RemoteConfig</code>/<code>DeployConfig</code>, then apply it in <code>ensure_function</code>/<code>deploy_function</code> via the relevant <code>FunctionSpec</code>/<code>ImageSpec</code> builder.</li>
+      <li>The CLI picks it up for free if it's in <code>DescribeConfig</code>; add it to <code>FunctionConfigView</code> in <code class="path">programmatic.rs</code>. Keep the bare-decorator path byte-identical (assert it, like <code>bare_macro_config_is_default</code>).</li>
+    </ol>
+
+    <h3>Add a new image step</h3>
+    <ol>
+      <li>Add a builder on <code>ImageSpec</code> (a field + a <code>with_*</code> method) and render it in <code>dockerfile_commands()</code> (<code class="path">crates/modal-rust-sdk/src/ops/image.rs:289</code>), respecting the existing ordering (add_python branch → rust toolchain → wrapper bakes → extras) so the default path stays byte-identical.</li>
+      <li>Wire it from the facade where the image is assembled: <code>ensure_function</code> for the run image (<code class="path">crates/modal-rust/src/remote.rs:565</code>) and/or <code>deploy_{base,top}_layer_spec</code> for deploy (<code class="path">crates/modal-rust/src/deploy.rs:213,239</code>).</li>
+      <li>Assert the rendered commands SDK-side (<code>dockerfile_commands</code> is private to the SDK) and the public <code>ImageSpec</code> fields facade-side.</li>
+    </ol>
+
+    <div class="seam"><span class="lbl">The golden rule.</span> Anything that would change the runner CLI protocol, the five error kinds, the <code>HandlerFn</code>/<code>Registry</code>/<code>typed!</code> shapes, or the run-vs-deploy boundary is <b>not</b> a normal change — it touches a frozen seam and must be reviewed against §5. Almost everything worth adding can be done additively around them.</div>
+
+    <hr>
+    <p class="ref">Authoritative narrative to mine: <code class="path">workpads/shim-backend/knowledge.md</code> (the full milestone history with dated live evidence) and <code class="path">workpads/architecture/boundaries.md</code> (the frozen runner protocol + build boundary, §2–§4). Read the crate sources for ground truth; <code class="path">references/modal-client</code> (the official Modal Python SDK, gitignored) explains why many shapes exist.</p>
+  </section>
+
+</main>
+
+<script>
+(function(){
+  // Active-section highlighting in the TOC.
+  var links = Array.prototype.slice.call(document.querySelectorAll('#toc a[href^="#"]'));
+  var map = {};
+  links.forEach(function(a){
+    var id = a.getAttribute('href').slice(1);
+    var el = document.getElementById(id);
+    if(el) map[id] = a;
+  });
+  var ids = Object.keys(map);
+  function onScroll(){
+    var y = window.scrollY + 120, current = null;
+    ids.forEach(function(id){
+      var el = document.getElementById(id);
+      if(el && el.offsetTop <= y) current = id;
+    });
+    links.forEach(function(a){ a.classList.remove('active'); });
+    if(current && map[current]) map[current].classList.add('active');
+  }
+  document.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+})();
+</script>
+</body>
+</html>
