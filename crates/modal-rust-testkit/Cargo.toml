@@ -1,0 +1,36 @@
+[package]
+name = "modal-rust-testkit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "In-process Modal gRPC mock for offline modal-rust tests (dev/test only)"
+build = "build.rs"
+publish = false           # never published; dev/test infra
+
+[lib]
+name = "modal_rust_testkit"
+
+[dependencies]
+# The mock generates ITS OWN message + server types from the same proto. These
+# are wire-compatible with the SDK's client types; tests construct responses with
+# the testkit types and assert on the testkit-recorded request types. That is
+# fine and intended (the doc's Option A note). The SDK dep is used only for the
+# CBOR codec (so the mock's envelope bytes are byte-identical to what the SDK
+# decodes) and `ModalConfig` in the `modal_config()` helper.
+modal-rust-sdk = { path = "../modal-rust-sdk" }
+# Server-side tonic. `router` is REQUIRED for Server::add_service (GOTCHA 2).
+tonic       = { version = "0.14.3", default-features = false, features = ["server", "router", "transport", "codegen"] }
+tonic-prost = "0.14.3"
+prost       = "0.14.3"
+prost-types = "0.14.3"
+tokio       = { version = "1.49", features = ["full"] }
+tokio-stream = "0.1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+# MATCH the SDK's `serde_cbor` (codec.rs) so the mock decodes the inbound invoke
+# `(args, kwargs)` tuple byte-identically to how the SDK encoded it.
+serde_cbor  = "0.11"
+
+[build-dependencies]
+tonic-prost-build = "0.14.3"
+protoc-bin-vendored = "3"

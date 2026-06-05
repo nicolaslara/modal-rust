@@ -6,6 +6,13 @@ members = [
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",
+    # Dev/test-only in-process gRPC mock backend. A workspace MEMBER (so it builds
+    # and is testable) but deliberately NOT in `default-members`: it pulls the tonic
+    # server + axum stack, which bare `cargo build`/`clippy`/`test` should not carry.
+    # The offline gate runs it explicitly with `-p modal-rust-testkit`. No SHIPPED
+    # crate depends on it — it is a `[dev-dependencies]` of the facade/SDK test
+    # targets only.
+    "crates/modal-rust-testkit",
     "examples/add",
     "examples/add-macro",
     "examples/orchestrate",

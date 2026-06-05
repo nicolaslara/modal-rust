@@ -13,6 +13,13 @@ name = "modal_rust"
 # Opt-in live Modal round-trip test for `.remote()`. Gated so the no-CUDA CI box
 # NEVER runs it; enable locally with `--features live`.
 live = []
+# TEST-ONLY seam: exposes `App::connect_at` / `App::connect_at_with`, which point a
+# real facade `App` at an explicit `server_url` (e.g. the in-process mock from
+# `modal-rust-testkit`) with dummy creds. NOT part of the shipped public API — it is
+# additive and gated so a normal `cargo build` never surfaces it. Enabled for the
+# facade's own test/integration targets via the self dev-dependency below; no SHIPPED
+# crate enables it.
+testkit = []
 
 [dependencies]
 modal-rust-sdk     = { path = "../modal-rust-sdk" }
@@ -36,6 +43,15 @@ toml_edit  = "0.22"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
+# Self dev-dependency: activates the `testkit` feature for the facade's OWN
+# test/integration/example targets ONLY (cargo merges a self dev-dep's features
+# into the crate under test for those targets). This is how the mock-backend
+# example tests reach `App::connect_at*` WITHOUT exposing the seam in `cargo build`
+# or to any downstream/shipped crate. No SHIPPED crate depends on this.
+modal-rust = { path = ".", features = ["testkit"] }
+# The in-process Modal gRPC mock backend (dev/test-only; never shipped). Drives the
+# mock-backend example tests (tests/mock_remote.rs, tests/mock_table.rs).
+modal-rust-testkit = { path = "../modal-rust-testkit" }
 # The real .local() proof: example-add::modal_registry() gives a frozen Registry.
 # Acyclic — example-add depends only on modal-rust-runtime, never on modal-rust.
 example-add = { path = "../../examples/add" }

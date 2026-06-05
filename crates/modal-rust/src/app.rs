@@ -166,14 +166,28 @@ impl App {
         configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
         run_config: RemoteConfig,
     ) -> Result<Self> {
-        let mut client = modal_rust_sdk::ModalClient::connect().await?; // From<sdk::Error>
-                                                                        // RUN path = EPHEMERAL app: it is GC'd when this client disconnects, so
-                                                                        // `.remote()` never leaves a lingering persistent deployment (the
-                                                                        // crash-loop-clutter fix). `ensure_function` creates the wrapper in this
-                                                                        // ephemeral app and invokes its `function_id` DIRECTLY — it does NOT
-                                                                        // `app_publish` (which would set APP_STATE_DEPLOYED and promote this
-                                                                        // throwaway app to a lingering persistent deploy). PERSISTENT publish is
-                                                                        // DEPLOY-only (`App::deploy`).
+        let client = modal_rust_sdk::ModalClient::connect().await?; // From<sdk::Error>
+        Self::connect_inner_with_client(name, registry, configs, run_config, client).await
+    }
+
+    /// Shared connect body taking an ALREADY-BUILT [`modal_rust_sdk::ModalClient`]:
+    /// create the ephemeral RUN app and assemble the [`App`]. Factored out of
+    /// [`connect_inner`](App::connect_inner) so the test-only `connect_at*`
+    /// constructors can supply a client built with
+    /// [`from_config`](modal_rust_sdk::ModalClient::from_config) (pointed at an
+    /// in-process mock) instead of the real [`connect`](modal_rust_sdk::ModalClient::connect).
+    ///
+    /// RUN path = EPHEMERAL app: it is GC'd when this client disconnects, so
+    /// `.remote()` never leaves a lingering persistent deployment. `ensure_function`
+    /// creates the wrapper in this ephemeral app and invokes its `function_id`
+    /// DIRECTLY — PERSISTENT publish is DEPLOY-only (`App::deploy`).
+    async fn connect_inner_with_client(
+        name: &str,
+        registry: Registry,
+        configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+        run_config: RemoteConfig,
+        mut client: modal_rust_sdk::ModalClient,
+    ) -> Result<Self> {
         let app_id = client.app_create_ephemeral(name, None).await?;
         Ok(App {
             registry,
@@ -186,6 +200,68 @@ impl App {
                 config: run_config,
             }),
         })
+    }
+
+    /// TEST-ONLY: connect at an explicit `server_url` (e.g. an in-process mock)
+    /// using the given [`Registry`] and DUMMY credentials, instead of resolving
+    /// real Modal config. Additive — does NOT change [`connect`](App::connect) or
+    /// any other constructor; the public deploy/call/remote behavior is unchanged.
+    ///
+    /// Gated behind the `testkit` feature (enabled only by the facade's test
+    /// targets via `[dev-dependencies]`), so it is NOT part of the shipped public
+    /// API. The env-var path (`MODAL_SERVER_URL`) is process-global and unsuitable
+    /// for parallel / table tests that each need their OWN mock port — hence this
+    /// per-`App` seam.
+    #[cfg(any(test, feature = "testkit"))]
+    pub async fn connect_at(name: &str, registry: Registry, server_url: String) -> Result<Self> {
+        Self::connect_at_with(name, registry, server_url, RemoteConfig::default()).await
+    }
+
+    /// As [`connect_at`](App::connect_at), plus an explicit [`RemoteConfig`]
+    /// (gpu/timeout/source dir/etc.) — the table-test entry point: each case builds
+    /// its own mock + its own per-case `RemoteConfig` and asserts the captured
+    /// `FunctionCreate` manifest.
+    #[cfg(any(test, feature = "testkit"))]
+    pub async fn connect_at_with(
+        name: &str,
+        registry: Registry,
+        server_url: String,
+        run_config: RemoteConfig,
+    ) -> Result<Self> {
+        Self::connect_at_with_configs(
+            name,
+            registry,
+            std::collections::BTreeMap::new(),
+            server_url,
+            run_config,
+        )
+        .await
+    }
+
+    /// As [`connect_at_with`](App::connect_at_with), but ALSO threads per-entrypoint
+    /// decorator [`FunctionConfig`]s — the gpu/timeout/secrets/volumes the RUN path
+    /// resolves via [`config_for`](App::config_for). This is the table-test entry
+    /// point that drives the manifest the SAME way a `#[function(gpu=.., timeout=..)]`
+    /// decorator would (the RUN path re-derives gpu/timeout from the decorator config,
+    /// not the bare `RemoteConfig`, so a faithful table must supply them here).
+    #[cfg(any(test, feature = "testkit"))]
+    pub async fn connect_at_with_configs(
+        name: &str,
+        registry: Registry,
+        configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+        server_url: String,
+        run_config: RemoteConfig,
+    ) -> Result<Self> {
+        let config = modal_rust_sdk::ModalConfig {
+            profile: "mock".into(),
+            server_url,
+            token_id: "ak-mock".into(),
+            token_secret: "as-mock".into(),
+            environment: Some("main".into()),
+            image_builder_version: None,
+        };
+        let client = modal_rust_sdk::ModalClient::from_config(config).await?;
+        Self::connect_inner_with_client(name, registry, configs, run_config, client).await
     }
 
     /// Resolve the decorator [`FunctionConfig`] for `name`. Returns
