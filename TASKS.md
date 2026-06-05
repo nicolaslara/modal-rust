@@ -29,18 +29,22 @@ mid-phase.
 >
 > **QUEUED — run AFTER the `macro-auto-io` workflow lands + is committed** (both touch the
 > macro crate / examples, so they must NOT run concurrently with it):
-> 1. **Macro-hygiene fix** — 🚀 RUNNING (`wf_67d8a794-d26`), auto-launched after `a4fceaa`.
->    The workflow at `.claude/workflows/macro-hygiene.js` re-exports
+> 1. **Macro-hygiene fix** — ✅ DONE, committed `424cb8c`. A macro-using crate now needs
+>    ONLY `modal-rust` (proven: `examples/add-macro/Cargo.toml` lists just `modal-rust` +
+>    serde/anyhow; `inventory::submit!`-through-the-facade proven by `duplicate_rejected`).
+>    The workflow at `.claude/workflows/macro-hygiene.js` re-exported
 >    `modal_rust_runtime` + `inventory` from the facade under `__private`, routes ALL macro-emitted
 >    paths via `::modal_rust::__private::…` (with `proc-macro-crate` for rename-safety; verifies
 >    `inventory::submit!` through the re-export, fallback documented), drops the direct deps from
 >    macro-using examples, and removes the README "Dependency note" — so a macro user needs only
 >    `modal-rust`.
-> 2. **Examples use the macro** — update examples to showcase the ergonomic macro form (the
->    auto-I/O `#[function] fn add(a,b)->i64` + typed `app.add(2,3)` once that lands), so the
->    ergonomics are visible. Keep SOME examples on the manual `modal_registry()`/`typed!`
->    path to teach the no-macro usage (consider a macro + manual version of each). Don't break
->    `examples/add` as the canonical explicit/manual reference.
+> 2. **Examples use the macro** — 🚀 RUNNING (`wf_69e74810-504`,
+>    `.claude/workflows/examples-use-macro.js`). Converts the GPU examples (burn-add,
+>    cuda-vector-add) to the self-describing `#[function(gpu=..)]` decorator form + inventory
+>    runner + single modal-rust dep; keeps `examples/add` MANUAL + byte-identical (the no-macro
+>    reference) with `examples/add-macro` as its twin; adapts live_burn/live_gpu; updates
+>    orchestrate + the README Examples section. Offline HARD gate = gates green + each
+>    converted example's `--describe` shows the decorator gpu config.
 > Concurrently OK right now: the docs workflow + the README code-block formatting agent (they
 > don't touch the macro crate / examples).
 >
