@@ -40,6 +40,13 @@ mid-phase.
 >    `examples/add` as the canonical explicit/manual reference.
 > Concurrently OK right now: the docs workflow + the README code-block formatting agent (they
 > don't touch the macro crate / examples).
+>
+> **DO NOT COMMIT `docs/testing-strategy.md`** — it is an offline-testing design doc the user wants
+> left UNCOMMITTED for review (use TARGETED `git add <files>`, never `git add -A`, until told). It
+> documents a layered offline-testing strategy (extract `build_*_request` fns + unit tests; a
+> `RequestSink`/`RecordingSink` to assert the whole manifest with no server = also the deferred P8
+> dump tool; `insta` snapshots; a feature-gated in-process mock tonic server for Python-parity) — a
+> potential follow-up to IMPLEMENT when the user asks (do not auto-implement).
 
 
 **[2026-06-04] `crates/modal-rust-sdk` landed + proven live.** The control-plane
