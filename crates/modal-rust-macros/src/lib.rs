@@ -80,22 +80,29 @@
 //! segment is NOT a primitive scalar (`i64`, `String`, …). See the inline classifier
 //! for the exact rule.
 //!
-//! ### Mode B emitted-path requirements (downstream `Cargo.toml`)
+//! ### Single-dep path routing (downstream `Cargo.toml`)
 //!
-//! Mode B emits two more absolute paths beyond the runtime/`inventory` deps every
-//! macro-using crate already carries (see the crate-level dep caveat above):
-//! - `::serde::{Serialize, Deserialize}` for the generated `Input` derives — every
-//!   macro-using crate already has `serde` with `derive`, so this is no new dep.
-//! - `::modal_rust_facade::{App, TypedCall}` for the typed `app.<fn>(..)` methods.
-//!   Because a macro-using crate often aliases the MACRO crate as `modal_rust`
-//!   (`extern crate modal_rust_macros as modal_rust;` so `#[modal_rust::function]`
-//!   is spellable), the macro must NOT emit `::modal_rust` for the FACADE — it would
-//!   resolve to the shadowing alias. Instead it emits `::modal_rust_facade`, which
-//!   the downstream crate guarantees with a RENAMED dependency:
-//!   `modal_rust_facade = { path = "...", package = "modal-rust" }`. (A crate that
-//!   does NOT alias the macro can drop the rename and spell the attribute as
-//!   `#[modal_rust_macros::function]`; then `::modal_rust` is unshadowed — but the
-//!   canonical `examples/add-macro` keeps the alias + adds the rename.)
+//! Every runtime / `inventory` path the macro emits is routed THROUGH the facade so a
+//! macro-using crate needs ONLY `modal-rust` (plus `serde`/`anyhow` for the handler
+//! types). The macro resolves the facade's import name with `proc-macro-crate` at
+//! expansion time and emits:
+//! - `#facade::__private::runtime::{Registration, FunctionConfig, typed!}` — the frozen
+//!   runner items, re-exported under the facade's hidden `__private::runtime`.
+//! - `#facade::__private::inventory::submit!` — `inventory`, re-exported under
+//!   `__private::inventory` (the `submit!` macro path AND the `Registration` type both
+//!   resolve through the re-export — the serde_derive single-dep pattern).
+//! - `#facade::{App, TypedCall}` for the Mode B typed `app.<fn>(..)` methods.
+//! - `::serde::{Serialize, Deserialize}` for the generated `Input` derives — `serde`
+//!   routes itself, and every macro-using crate already has `serde` with `derive`, so
+//!   this is no new dep.
+//!
+//! `#facade` is whatever extern name the user crate gives the `modal-rust` package:
+//! the default `modal_rust`, the in-workspace `crate` (`FoundCrate::Itself`), OR a
+//! rename. The canonical `examples/add-macro` keeps `extern crate modal_rust_macros as
+//! modal_rust;` (so `#[modal_rust::function]` is spellable) and renames the facade
+//! `modal_rust_facade = { package = "modal-rust" }` to dodge that shadow;
+//! `proc-macro-crate` returns `modal_rust_facade`, so EVERY routed path resolves and
+//! the crate carries no direct `modal-rust-runtime` / `inventory` dep.
 //!
 //! ### Bringing the typed methods into scope
 //!
@@ -112,12 +119,44 @@
 //! ```
 
 use proc_macro::TokenStream;
+use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{
     parse_macro_input, FnArg, GenericArgument, ItemFn, LitBool, LitInt, LitStr, PatType,
     PathArguments, ReturnType, Token, Type,
 };
+
+/// The Cargo package name of the facade crate the macro routes ALL paths through.
+const FACADE_PACKAGE: &str = "modal-rust";
+
+/// Resolve the leading path to the `modal-rust` FACADE crate as the USER crate spells
+/// it, so the macro can route every emitted path through the facade
+/// (`#facade::__private::runtime::…`, `#facade::__private::inventory::…`,
+/// `#facade::{App, TypedCall}`). This is the serde_derive / clap_derive single-dep
+/// pattern: the user needs ONLY `modal-rust`, and `proc-macro-crate` finds whatever
+/// extern name it carries.
+///
+/// - [`FoundCrate::Itself`] — the macro is expanding INSIDE the `modal-rust` crate
+///   itself (e.g. a doctest in the facade): emit `crate`.
+/// - [`FoundCrate::Name(name)`] — the facade is a dependency under `name` (the default
+///   `modal_rust`, OR a rename such as the `modal_rust_facade` alias the canonical
+///   `examples/add-macro` uses to dodge the `extern crate modal_rust_macros as
+///   modal_rust` shadow): emit `::name`.
+///
+/// On a resolution failure (no `modal-rust` dep found) fall back to `::modal_rust` —
+/// the unshadowed default name — which yields a clear "unresolved import" error
+/// pointing the user at the missing dependency.
+fn facade_path() -> proc_macro2::TokenStream {
+    match crate_name(FACADE_PACKAGE) {
+        Ok(FoundCrate::Itself) => quote!(crate),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = format_ident!("{}", name);
+            quote!(::#ident)
+        }
+        Err(_) => quote!(::modal_rust),
+    }
+}
 
 /// Attribute macro that registers a handler with the modal-rust runner via
 /// `inventory`, producing the SAME registry shape as the manual `typed!` path.
@@ -222,6 +261,10 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|s| s.value())
         .unwrap_or_else(|| fn_ident.to_string());
 
+    // Resolve the facade crate name ONCE; every emitted runtime/`inventory`/facade
+    // path is routed through it so a macro-using crate needs only `modal-rust`.
+    let facade = facade_path();
+
     // async fn -> reserved `typed_async!` shape (boundaries.md §3) is not yet
     // implemented in the runtime. Reject clearly; keep the original fn so the rest
     // of the user's crate still type-checks, and do NOT touch the sync path.
@@ -274,11 +317,14 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if mode_a {
         // Mode A: byte-identical to before — emit the unchanged fn + `typed!(fn)`
-        // registration. No generated module/shim/typed methods.
+        // registration. No generated module/shim/typed methods. The handler/registration
+        // paths are routed through the facade (`#facade::__private::runtime::…`) so the
+        // generated code is semantically identical; only the names it spells change.
         return emit_registration(
             &func,
             &entry_name,
-            quote! { ::modal_rust_runtime::typed!(#fn_ident) },
+            quote! { #facade::__private::runtime::typed!(#fn_ident) },
+            &facade,
             &gpu,
             timeout_secs,
             cache,
@@ -370,23 +416,23 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn #fn_ident<'__modal_rust_a>(
                 &'__modal_rust_a self,
                 #( #field_idents : #field_types ),*
-            ) -> ::modal_rust_facade::TypedCall<
+            ) -> #facade::TypedCall<
                 '__modal_rust_a,
                 self::#fn_ident::Input,
                 self::#fn_ident::Output,
             >;
         }
 
-        impl #trait_ident for ::modal_rust_facade::App {
+        impl #trait_ident for #facade::App {
             fn #fn_ident<'__modal_rust_a>(
                 &'__modal_rust_a self,
                 #( #field_idents : #field_types ),*
-            ) -> ::modal_rust_facade::TypedCall<
+            ) -> #facade::TypedCall<
                 '__modal_rust_a,
                 self::#fn_ident::Input,
                 self::#fn_ident::Output,
             > {
-                ::modal_rust_facade::TypedCall::new(
+                #facade::TypedCall::new(
                     self,
                     #entry_name,
                     self::#fn_ident::Input { #( #field_idents ),* },
@@ -397,7 +443,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let registration = build_registration(
         &entry_name,
-        quote! { ::modal_rust_runtime::typed!(#shim_ident) },
+        quote! { #facade::__private::runtime::typed!(#shim_ident) },
+        &facade,
         &gpu,
         timeout_secs,
         cache,
@@ -421,6 +468,7 @@ fn emit_registration(
     func: &ItemFn,
     entry_name: &str,
     handler_expr: proc_macro2::TokenStream,
+    facade: &proc_macro2::TokenStream,
     gpu: &Option<LitStr>,
     timeout_secs: Option<u64>,
     cache: Option<bool>,
@@ -430,6 +478,7 @@ fn emit_registration(
     let registration = build_registration(
         entry_name,
         handler_expr,
+        facade,
         gpu,
         timeout_secs,
         cache,
@@ -446,11 +495,16 @@ fn emit_registration(
 /// Build the `inventory::submit! { Registration { .. } }` token stream registering
 /// `#handler_expr` under `entry_name` with the decorator `FunctionConfig`.
 ///
-/// `inventory::submit!` places this in a link section that
-/// `Registry::from_inventory()` collects at runner startup. The `typed!` macro
-/// expands to a block that defines a local `fn` and coerces it to a `HandlerFn`
-/// pointer — a const-evaluable expression valid in the `static` initializer
-/// `inventory::submit!` generates.
+/// Every path is routed through the resolved `#facade`
+/// (`#facade::__private::inventory::submit!`,
+/// `#facade::__private::runtime::{Registration, FunctionConfig}`) so a macro-using
+/// crate needs ONLY `modal-rust`. `inventory::submit!` — invoked here THROUGH the
+/// facade re-export — places this in a link section that `Registry::from_inventory()`
+/// collects at runner startup; both the macro-path resolution and the
+/// `Registration` type path go through the re-export (serde_derive pattern). The
+/// `typed!` macro expands to a block that defines a local `fn` and coerces it to a
+/// `HandlerFn` pointer — a const-evaluable expression valid in the `static`
+/// initializer `inventory::submit!` generates.
 ///
 /// The decorator config flows into the registration as a `FunctionConfig`. The
 /// `gpu` literal is a `&'static str` (so the `static` `inventory::submit!`
@@ -458,9 +512,11 @@ fn emit_registration(
 /// narrowed `u64 -> u32` here. The bare form sets all three to `None` =>
 /// `FunctionConfig::default()`, which the runner ignores (so behavior is
 /// byte-identical; only the facade reads `config`).
+#[allow(clippy::too_many_arguments)]
 fn build_registration(
     entry_name: &str,
     handler_expr: proc_macro2::TokenStream,
+    facade: &proc_macro2::TokenStream,
     gpu: &Option<LitStr>,
     timeout_secs: Option<u64>,
     cache: Option<bool>,
@@ -497,11 +553,11 @@ fn build_registration(
     };
 
     quote! {
-        ::inventory::submit! {
-            ::modal_rust_runtime::Registration {
+        #facade::__private::inventory::submit! {
+            #facade::__private::runtime::Registration {
                 name: #entry_name,
                 handler: #handler_expr,
-                config: ::modal_rust_runtime::FunctionConfig {
+                config: #facade::__private::runtime::FunctionConfig {
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
                     cache: #cache_tok,

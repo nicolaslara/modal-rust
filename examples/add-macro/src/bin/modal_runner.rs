@@ -12,12 +12,17 @@
 // registration is linked and visible to `Registry::from_inventory()`.
 use example_add_macro as _;
 
+// The frozen runner protocol lives in `modal-rust-runtime`, reached through the
+// facade's hidden `__private::runtime` re-export — so this crate depends only on the
+// `modal-rust` facade (no direct `modal-rust-runtime`).
+use modal_rust_facade::__private::runtime;
+
 fn main() -> std::process::ExitCode {
     // Config-carrying entry (P9 §A.4): `from_inventory_with_configs` threads the
     // decorator gpu/timeout/cache into the additive `--describe` manifest. The
     // FROZEN `--entrypoint` dispatch ignores the configs, so this is behavior-
     // identical to `run_cli(Registry::from_inventory())` for the runner protocol.
-    let (registry, configs) = modal_rust_runtime::from_inventory_with_configs();
-    let code = modal_rust_runtime::run_cli_with_configs(registry, &configs);
+    let (registry, configs) = runtime::from_inventory_with_configs();
+    let code = runtime::run_cli_with_configs(registry, &configs);
     std::process::ExitCode::from(code as u8)
 }

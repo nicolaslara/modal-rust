@@ -19,6 +19,12 @@ modal-rust-sdk     = { path = "../modal-rust-sdk" }
 modal-rust-runtime = { path = "../modal-rust-runtime" }
 # Re-exported so users can spell `#[modal_rust::function]` (see lib.rs caveat).
 modal-rust-macros  = { path = "../modal-rust-macros" }
+# Re-exported under `__private::inventory` so the macro's `inventory::submit!{…}`
+# resolves THROUGH the facade — a macro-using crate needs no direct `inventory` dep
+# (serde_derive pattern). Same `"0.3"` req as `modal-rust-runtime`, so cargo resolves
+# ONE shared `inventory` instance: a `submit!` through this re-export lands in the
+# SAME link-section collection as the runtime's `inventory::collect!(Registration)`.
+inventory  = "0.3"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Rewrite the uploaded workspace Cargo.toml's `members`/`default-members` to the
@@ -43,4 +49,3 @@ example-add-macro = { path = "../../examples/add-macro" }
 # `App::from_inventory().remote(..)` so the decorator-sourced gpu_config rides into
 # FunctionCreate against the cuda-vector-add package on a real T4.
 modal-rust-macros = { path = "../modal-rust-macros" }
-inventory = "0.3"

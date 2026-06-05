@@ -12,3 +12,9 @@ proc-macro = true
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+# Resolve the import name of the `modal-rust` facade in the USER crate's Cargo.toml at
+# expansion time, so the macro can route every `::modal_rust_runtime` / `::inventory`
+# path THROUGH the facade (`::<facade>::__private::…`). Honors a rename (e.g. the
+# `modal_rust_facade` alias) and the in-workspace `FoundCrate::Itself` case. This is
+# the serde_derive / clap_derive single-dep pattern.
+proc-macro-crate = "3"

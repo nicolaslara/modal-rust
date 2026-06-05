@@ -13,11 +13,13 @@
 //! `modal_runner --entrypoint add --input-json '{"a":40,"b":2}'`
 //! prints exactly `{"ok":true,"value":{"sum":42}}` and exits 0.
 
-// Alias the proc-macro crate so the attribute is spelled `#[modal_rust::function]`
-// exactly as boundaries.md §3 / the ergonomics tasks specify. The macro's
-// generated code references the runtime and `inventory` by their real crate names
-// (`::modal_rust_runtime`, `::inventory`), independent of this alias.
-extern crate modal_rust_macros as modal_rust;
+// Alias the FACADE crate (`modal-rust`, renamed `modal_rust_facade` in Cargo.toml) so
+// the attribute is spelled `#[modal_rust::function]` via the facade's re-exported
+// `function` macro — exactly as boundaries.md §3 / the ergonomics tasks specify. The
+// macro's generated code routes every runtime / `inventory` path THROUGH this same
+// facade (`::modal_rust_facade::__private::…`), so this crate needs ONLY `modal-rust`
+// as its modal dependency — no direct `modal-rust-runtime` / `inventory`.
+extern crate modal_rust_facade as modal_rust;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +44,8 @@ pub struct AddOutput {
 ///
 /// `#[modal_rust::function]` expands to this unchanged fn PLUS an
 /// `inventory::submit!` of a `Registration { name: "add", handler:
-/// modal_rust_runtime::typed!(add) }`. The name defaults to the fn name (`add`);
+/// typed!(add) }` — all routed through the `modal-rust` facade
+/// (`modal_rust::__private::…`). The name defaults to the fn name (`add`);
 /// `#[modal_rust::function(name = "...")]` would override it. The handler is the
 /// SAME monomorphized `typed!` wrapper the manual `examples/add` registers by
 /// hand, so the runner protocol and envelope are identical.
@@ -76,7 +79,7 @@ pub fn add_plain(a: i64, b: i64) -> anyhow::Result<i64> {
 
 /// The macro-path twin WITH PER-FUNCTION CONFIG (P4): the
 /// `#[modal_rust::function(gpu=…, timeout=…, cache=…)]` decorator records a
-/// [`modal_rust_runtime::FunctionConfig`] alongside the registration. This is
+/// [`FunctionConfig`](modal_rust::FunctionConfig) alongside the registration. This is
 /// METADATA ONLY — the emitted handler and the runner dispatch are byte-identical
 /// to the bare path; only the facade reads the config when CREATING the Modal
 /// function. The compute is the same `a + b`, proving the config is additive sugar.
@@ -90,7 +93,7 @@ pub fn add_gpu(input: AddInput) -> anyhow::Result<AddOutput> {
 /// The macro-path twin WITH USER-FACING SECRETS + VOLUMES: the
 /// `#[modal_rust::function(secrets = [..], volumes = [..])]` decorator records the
 /// named secrets + the `(mount_path, name)` volume pairs onto the
-/// [`modal_rust_runtime::FunctionConfig`]. METADATA ONLY — the facade resolves the
+/// [`FunctionConfig`](modal_rust::FunctionConfig). METADATA ONLY — the facade resolves the
 /// secrets to ids (injected as ENV VARS) and the volumes to mounts; the emitted
 /// handler + runner dispatch stay byte-identical to the bare path. The user volume
 /// is a SEPARATE mount from the P6 cargo cache (`/cache`), so both coexist.
@@ -173,7 +176,12 @@ pub fn secret_vol_probe(input: ProbeInput) -> anyhow::Result<ProbeOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modal_rust_runtime::{FunctionConfig, Registration, Registry};
+    // The runner/registry items are reached through the `modal-rust` facade — the
+    // public re-exports for the types, and the hidden `__private::{runtime,inventory}`
+    // for the runner entry points + `inventory::iter`. This crate carries NO direct
+    // `modal-rust-runtime` / `inventory` dependency.
+    use modal_rust::__private::{inventory, runtime};
+    use modal_rust::{FunctionConfig, Registration, Registry};
 
     /// Look up a `Registration` by entrypoint name from the inventory pass.
     fn registration(name: &str) -> Option<&'static Registration> {
@@ -230,8 +238,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let mut buf = Vec::new();
-        let code =
-            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
@@ -246,7 +253,7 @@ mod tests {
         // are typed from the signature; the result decodes to the return type. The
         // user NEVER names an input/output type.
         use crate::AddPlainCall;
-        use modal_rust_facade::App;
+        use modal_rust::App;
 
         let app = App::from_inventory();
         let sum: i64 = app.add_plain(2, 3).local().unwrap();
@@ -258,7 +265,7 @@ mod tests {
         // Constraint #3: the generated input stays callable explicitly via the
         // string-keyed path, serializing to the SAME `{"a":2,"b":3}` and decoding the
         // SAME `{"value":5}` -> `5`.
-        use modal_rust_facade::App;
+        use modal_rust::App;
 
         let app = App::from_inventory();
         let sum: i64 = app
@@ -286,8 +293,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let mut buf = Vec::new();
-        let code =
-            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
@@ -303,8 +309,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let mut buf = Vec::new();
-        let code =
-            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
         assert_eq!(code, 1);
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["ok"], false);
@@ -351,8 +356,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let mut buf = Vec::new();
-        let code =
-            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
@@ -390,8 +394,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let mut buf = Vec::new();
-        let code =
-            modal_rust_runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+        let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8(buf).unwrap(),

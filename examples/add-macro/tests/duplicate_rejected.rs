@@ -8,7 +8,13 @@
 //! `#[modal_rust::function]` macro emits) twice under the same name and assert
 //! `from_inventory()` panics with the frozen "duplicate entrypoint" message.
 
-use modal_rust_runtime::{FunctionConfig, HandlerFn, Registration, Registry, RunnerError};
+// The runner/registry items + `inventory` are reached through the `modal-rust`
+// facade (renamed `modal_rust_facade`): public re-exports for the types, the hidden
+// `__private::inventory` for `submit!`. This test crate carries NO direct
+// `modal-rust-runtime` / `inventory` dependency — proving the single-dep story holds
+// for `inventory::submit!` invoked THROUGH the facade re-export too.
+use modal_rust_facade::__private::inventory;
+use modal_rust_facade::{FunctionConfig, HandlerFn, Registration, Registry, RunnerError};
 
 fn dup_handler(_input: &[u8]) -> Result<Vec<u8>, RunnerError> {
     Ok(b"null".to_vec())

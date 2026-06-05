@@ -23,21 +23,8 @@ drive local, remote, and deployed calls directly.
 
 ## Install
 
-`modal-rust` is not published to crates.io yet. For the current macro-based
-authoring path, add it from GitHub:
-
-```toml
-[dependencies]
-modal-rust = { git = "https://github.com/nicolaslara/modal-rust" }
-modal-rust-runtime = { git = "https://github.com/nicolaslara/modal-rust" }
-inventory = "0.3"
-serde = { version = "1", features = ["derive"] }
-anyhow = "1"
-```
-
-The direct `modal-rust-runtime` and `inventory` dependencies are a temporary
-ergonomics wart: the attribute macro expands to those crate paths. If you use
-manual registration instead of the macro, `modal-rust` is enough:
+`modal-rust` is not published to crates.io yet. Add it from GitHub — one
+dependency covers both the macro and the manual authoring paths:
 
 ```toml
 [dependencies]
@@ -45,6 +32,10 @@ modal-rust = { git = "https://github.com/nicolaslara/modal-rust" }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 ```
+
+The `#[modal_rust::function]` macro routes its generated code through the
+`modal-rust` facade, so you never add `modal-rust-runtime` or `inventory`
+directly — just like `serde_derive` routes through `serde`.
 
 For live Modal calls, configure Modal credentials with either `~/.modal.toml` or
 the `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` environment variables.
@@ -170,13 +161,6 @@ pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
     Ok(TrainOutput { ok: true })
 }
 ```
-
-> **Dependency note.** The macro expands to absolute `::modal_rust_runtime::...`
-> and `::inventory::submit!` paths that Rust resolves against your crate's own
-> extern prelude. A crate using `#[modal_rust::function]` must therefore add
-> `modal-rust-runtime` and `inventory` as direct dependencies alongside
-> `modal-rust` (see the [Install](#install) section above). The manual path below
-> needs only `modal-rust`.
 
 Resolve a `Function` handle by name from the inventory registry and call it three
 ways:

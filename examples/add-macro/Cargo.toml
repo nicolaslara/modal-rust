@@ -14,19 +14,20 @@ name = "modal_runner"
 path = "src/bin/modal_runner.rs"
 
 [dependencies]
-modal-rust-runtime = { path = "../../crates/modal-rust-runtime" }
-modal-rust-macros = { path = "../../crates/modal-rust-macros" }
-# The macro's auto-I/O (Mode B) `app.<fn>(..)` methods expand to
-# `::modal_rust_facade::{App, TypedCall}`. The facade crate is `modal-rust`, but this
-# crate aliases the MACRO crate as `modal_rust` (`extern crate modal_rust_macros as
-# modal_rust;` below) so the attribute is spellable as `#[modal_rust::function]`; that
-# alias shadows `::modal_rust`. So the facade is brought in under the unshadowed
-# RENAMED name `modal_rust_facade` (Cargo's `package = "..."` lets the same crate be
-# referred to by a different extern name). See the macro crate docs (spec §2).
+# SINGLE modal dependency: the `modal-rust` facade. The `#[modal_rust::function]`
+# macro routes every emitted path through this facade (`::modal_rust_facade::__private::
+# {runtime,inventory}::…` for the runtime/`inventory` items, `::modal_rust_facade::
+# {App, TypedCall}` for the Mode B typed methods), resolving the facade name via
+# `proc-macro-crate` — so this crate needs NEITHER `modal-rust-runtime` NOR
+# `inventory` as a direct dependency (the serde_derive / clap_derive single-dep
+# pattern).
+#
+# The facade is renamed `modal_rust_facade` (Cargo's `package = "..."`) for two
+# reasons: (1) `extern crate modal_rust_facade as modal_rust;` (below) makes
+# `#[modal_rust::function]` spellable via the facade's re-exported attribute, and
+# (2) `proc-macro-crate` then resolves `modal-rust` -> `modal_rust_facade`, so EVERY
+# macro-emitted path resolves under the same unshadowed name.
 modal_rust_facade = { path = "../../crates/modal-rust", package = "modal-rust" }
-# `inventory::submit!` is emitted by the macro; the user crate must carry the
-# `inventory` dependency (boundaries.md §3, ergonomics E1).
-inventory = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

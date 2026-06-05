@@ -28,24 +28,25 @@
 //! assert_eq!(out.sum, 42);
 //! ```
 //!
-//! # Using `#[modal_rust::function]` (NOT a single-dep story)
+//! # Using `#[modal_rust::function]` (a single-dep story)
 //!
 //! The [`function`] attribute is re-exported here so it is spellable as
 //! `#[modal_rust::function]` without the `extern crate ... as modal_rust;` alias
-//! hack. BUT its expansion emits absolute `::modal_rust_runtime::...` and
-//! `::inventory::submit!` paths, which Rust resolves against the *downstream
-//! crate's own* extern prelude — a `pub use` from this facade does not inject those
-//! crates. So a crate using `#[modal_rust::function]` must still add three direct
-//! deps of its own:
+//! hack. Its expansion routes every runtime / `inventory` path THROUGH this facade —
+//! `::<facade>::__private::runtime::...` and `::<facade>::__private::inventory::...`
+//! (the macro resolves `<facade>` via `proc-macro-crate`, honoring a rename) — so a
+//! crate using `#[modal_rust::function]` needs ONLY `modal-rust` as its modal
+//! dependency (plus `serde`/`anyhow` for the handler types):
 //!
 //! ```toml
-//! modal-rust         = { path = "..." }  # facade: App/Function/sdk + `function`
-//! modal-rust-runtime = { path = "..." }  # macro expands to ::modal_rust_runtime
-//! inventory          = "0.3"             # macro expands to ::inventory::submit!
+//! modal-rust = { path = "..." }  # facade: App/Function/sdk + `function` + macro deps
+//! serde      = { version = "1", features = ["derive"] }
+//! anyhow     = "1"
 //! ```
 //!
-//! The frozen macro is intentionally left unchanged; making this zero-extra-dep
-//! would require editing the macro's expansion and would break `examples/add-macro`.
+//! This mirrors how `serde_derive` routes `::serde::...` through the `serde` facade
+//! and `clap_derive` through `clap`, so the user carries one dependency, not three.
+//! See [`__private`] for the re-exports the macro names.
 
 // (1) Control-plane SDK, namespaced as `modal_rust::sdk`.
 pub use modal_rust_sdk as sdk;
@@ -62,6 +63,36 @@ pub use modal_rust_runtime::typed;
 //     alias hack (see the crate docs above for the downstream-dep caveat). Only
 //     `function` exists; there is NO `app` macro — `modal_rust::App` is a struct.
 pub use modal_rust_macros::function;
+
+/// Macro-support re-exports — NOT a stable public API (hidden from docs).
+///
+/// `#[modal_rust::function]` expands to facade-routed paths
+/// (`::<facade>::__private::runtime::…`, `::<facade>::__private::inventory::…`) so a
+/// crate using the macro needs ONLY the `modal-rust` dependency — no direct
+/// `modal-rust-runtime` / `inventory`. This mirrors how `serde_derive` routes
+/// `::serde::…` through the `serde` facade and `clap_derive` through `clap`. The
+/// macro resolves THIS crate's import name via `proc-macro-crate`, so the re-exports
+/// resolve even when the facade is renamed (e.g. the `modal_rust_facade` alias the
+/// canonical example uses to dodge the `extern crate modal_rust_macros as modal_rust`
+/// shadow).
+///
+/// Items here are an internal contract between the macro and the facade; do not
+/// depend on them directly.
+#[doc(hidden)]
+pub mod __private {
+    /// `::inventory`, re-exported so the macro's `inventory::submit!{…}` resolves
+    /// through the facade. `submit!` builds a `static` from a path to `Registration`
+    /// (re-exported below) — both edition-2018+ macro-path resolution and the type
+    /// path go through this re-export, so no direct `inventory` dep is needed.
+    pub use inventory;
+    /// The frozen runner crate, re-exported as `runtime` so the macro can name
+    /// `::<facade>::__private::runtime::{Registration, FunctionConfig, typed!}`.
+    pub use modal_rust_runtime as runtime;
+    /// `typed!` is `#[macro_export]`ed at the runtime crate root; re-export it here so
+    /// the macro can invoke it through the facade as
+    /// `::<facade>::__private::runtime::typed!`.
+    pub use modal_rust_runtime::typed;
+}
 
 mod app;
 mod deploy;
