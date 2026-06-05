@@ -22,13 +22,20 @@ mid-phase.
 > read this note + the latest commits + `workpads/shim-backend/knowledge.md`, then
 > continue. (Never log/commit Modal tokens; GPU stays on cheap T4; ephemeral run apps.)
 
+> **MACRO ERGONOMICS ARC: ✅ COMPLETE** (a4fceaa → 424cb8c → 063d283 → 66d9c0d). All three
+> features + the README refresh landed and are committed; nothing in this block is pending.
+>
 > **macro-auto-io: ✅ DONE** — landed BUILD_GREEN + live-proven, committed `a4fceaa`
 > (auto-generated Input/Output + typed `app.add(2,3).local/remote/spawn/map` from a plain
 > signature; explicit struct form byte-identical; also fixed a real upload-scoping bug —
 > strip `[dev-dependencies]` from uploaded member manifests — in `scope.rs`).
 >
-> **QUEUED — run AFTER the `macro-auto-io` workflow lands + is committed** (both touch the
-> macro crate / examples, so they must NOT run concurrently with it):
+> **README macro section: ✅ REFRESHED**, committed `66d9c0d` — the Library API tutorial now
+> leads with the auto-I/O form (`#[function] fn add(a,b)->Result<i64>` + `app.add(2,3).local()?
+> /.remote()`), presents the explicit struct form as the byte-identical named-types variant.
+>
+> **(DONE) QUEUED — ran AFTER the `macro-auto-io` workflow landed** (both touch the
+> macro crate / examples, so they did NOT run concurrently with it):
 > 1. **Macro-hygiene fix** — ✅ DONE, committed `424cb8c`. A macro-using crate now needs
 >    ONLY `modal-rust` (proven: `examples/add-macro/Cargo.toml` lists just `modal-rust` +
 >    serde/anyhow; `inventory::submit!`-through-the-facade proven by `duplicate_rejected`).
@@ -38,13 +45,12 @@ mid-phase.
 >    `inventory::submit!` through the re-export, fallback documented), drops the direct deps from
 >    macro-using examples, and removes the README "Dependency note" — so a macro user needs only
 >    `modal-rust`.
-> 2. **Examples use the macro** — 🚀 RUNNING (`wf_69e74810-504`,
->    `.claude/workflows/examples-use-macro.js`). Converts the GPU examples (burn-add,
->    cuda-vector-add) to the self-describing `#[function(gpu=..)]` decorator form + inventory
->    runner + single modal-rust dep; keeps `examples/add` MANUAL + byte-identical (the no-macro
->    reference) with `examples/add-macro` as its twin; adapts live_burn/live_gpu; updates
->    orchestrate + the README Examples section. Offline HARD gate = gates green + each
->    converted example's `--describe` shows the decorator gpu config.
+> 2. **Examples use the macro** — ✅ DONE, committed `063d283` (live-proven, cheap T4).
+>    burn-add + cuda-vector-add now self-describe via `#[function(gpu="T4")]` (their
+>    `--describe` reports gpu "T4"); single `modal-rust` dep; inventory runner. `examples/add`
+>    byte-identical (manual reference); `examples/add-macro` the twin. orchestrate exercises
+>    BOTH the manual `App::new(modal_registry())` and macro `App::from_inventory()` +
+>    `app.add_plain(2,3).local()` paths. README Examples section relabeled manual-vs-macro.
 > Concurrently OK right now: the docs workflow + the README code-block formatting agent (they
 > don't touch the macro crate / examples).
 >
