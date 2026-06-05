@@ -18,10 +18,10 @@ modal-rust = { path = "../../crates/modal-rust" }
 # `AddOutput`/`modal_registry()`). In a real project this is your own library crate
 # of `#[modal_rust::function]`s; here we reuse the proven `example-add`.
 example-add = { path = "../add" }
-# The MACRO twin — the SAME `add`, authored with `#[modal_rust::function]` + the
-# auto-I/O plain-signature `add_plain`. Importing it lets this driver show the
+# The MACRO twin — the SAME `add`, authored with the auto-I/O plain signature
+# `#[modal_rust::function] fn add(a, b)`. Importing it lets this driver show the
 # inventory/typed-method ergonomics (`App::from_inventory()`,
-# `app.add_plain(2, 3).local()`) next to the manual `App::new(modal_registry())` path.
+# `app.add(2, 3).local()`) next to the manual `App::new(modal_registry())` path.
 example-add-macro = { path = "../add-macro" }
 # `.remote()`/`deploy`/`call` are async; the example drives them with a tokio runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

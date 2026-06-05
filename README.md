@@ -476,9 +476,9 @@ The `examples/` directory holds runnable, live-proven crates:
 
 | Example | What it shows |
 | --- | --- |
-| `examples/add` | **(manual / no-macro)** The walking skeleton: a hand-written `modal_registry()` with `typed!(add)`, plus named entrypoints exercising every runner error kind. The teaching reference for the no-macro path. |
-| `examples/add-macro` | **(macro)** The same `add` authored with `#[modal_rust::function]` — plus the auto-I/O plain-signature twin `add_plain(a, b)` callable as `app.add_plain(2, 3).local()/.remote()`, and the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
-| `examples/orchestrate` | A tour of the facade driving `add` via `.local()`, `.remote()`, and `deploy`+`call` — through BOTH the manual `App::new(modal_registry())` and the macro `App::from_inventory()` + typed `app.add_plain(2, 3)` paths. |
+| `examples/add` | **(manual / no-macro)** The same `add` written by hand — the input struct, the `typed!` registration, and `modal_registry()`, i.e. everything the macro generates for you. Plus named entrypoints exercising every runner error kind. |
+| `examples/add-macro` | **(macro)** The same `add` in three lines: `#[modal_rust::function] fn add(a, b) -> anyhow::Result<i64>`, called `app.add(2, 3).remote().await?` — the macro generates the input struct, registration, and typed method. Plus the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
+| `examples/orchestrate` | A tour of the facade driving `add` via `.local()`, `.remote()`, and `deploy`+`call` — through BOTH the manual `App::new(modal_registry())` and the macro `App::from_inventory()` + typed `app.add(2, 3)` paths. |
 | `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 
@@ -487,15 +487,15 @@ typed method, no input/output struct named:
 
 ```rust
 #[modal_rust::function]                       // auto-I/O from the plain signature
-pub fn add_plain(a: i64, b: i64) -> anyhow::Result<i64> { Ok(a + b) }
+pub fn add(a: i64, b: i64) -> anyhow::Result<i64> { Ok(a + b) }
 
 #[modal_rust::function(gpu = "T4")]           // the decorator IS the config
 pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> { /* … */ }
 
 // …then, against an inventory-built App:
 let app = modal_rust::App::from_inventory();
-let five: i64 = app.add_plain(2, 3).local()?;             // offline, zero Modal
-let out = app.add_plain(2, 3).remote().await?;            // on Modal
+let five: i64 = app.add(2, 3).local()?;                   // offline, zero Modal
+let out = app.add(2, 3).remote().await?;                  // on Modal
 ```
 
 Run the local tour (no Modal credentials needed); it runs `add` in-process through
@@ -504,7 +504,7 @@ BOTH the manual registry and the macro/inventory path, printing:
 ```text
 local: add(40, 2) -> {sum: 42}
 local (macro/inventory): add(40, 2) -> {sum: 42}
-local (macro auto-I/O):  add_plain(2, 3) -> 5
+local (macro auto-I/O):  add(2, 3) -> 5
 ```
 
 ```bash

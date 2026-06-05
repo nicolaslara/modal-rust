@@ -16,7 +16,7 @@
 //! `App::connect` (inventory) threads the secret_id + volume_mount into the outbound
 //! `FunctionCreate` (the cache volume `/cache` coexists separately).
 //!
-//! Step 3 — the REAL body that runs remotely is `example_add_macro::secret_vol_probe`
+//! Step 3 — the REAL body that runs remotely is `example_add_macro::proof::secret_vol_probe`
 //! (uploaded + built in the function body via `MODAL_RUST_PACKAGE`). It reads
 //! `std::env::var("MODAL_RUST_TEST_SECRET")` (proving the secret's key/values were
 //! injected as container ENV VARS), then WRITES a unique marker to `/data/marker` on

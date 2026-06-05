@@ -10,7 +10,7 @@
 //!    `cargo run -p example-orchestrate` and in the test below; it prints `{sum:42}`.
 //!    Shown through BOTH registries: the manual `App::new(modal_registry())` (the
 //!    no-macro teaching path) and the macro `App::from_inventory()` — including the
-//!    typed positional ergonomics `app.add_plain(2, 3).local()` from the
+//!    typed positional ergonomics `app.add(2, 3).local()` from the
 //!    `#[modal_rust::function]` auto-I/O twin, where no input/output type is named.
 //! 2. **`.remote(..).await`** — the RUN path: the crate is uploaded and
 //!    `cargo build`-ed IN the Modal function body at invoke time, then the result
@@ -55,16 +55,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `#[modal_rust::function]` inventory instead of a hand-written builder. The
     // `add` entrypoint is registered the same way (string-keyed `.function("add")`
     // still works against this registry); the ergonomic surface is the typed positional
-    // method generated for the plain-signature `add_plain` — no input/output type is
+    // method generated for the plain-signature `add` — no input/output type is
     // ever named, the args are typed from the signature, and the result decodes to the
-    // return type. (The macro twin's `AddInput`/`AddOutput` mirror the manual
-    // `example_add` derives — one serde direction each — so they are driven through the
-    // runner; the typed `add_plain::{Input, Output}` the macro generates derive both
+    // return type. (The macro generates `add::{Input, Output}` deriving both serde
     // directions, which is what the facade `.local()` callers use.)
-    use example_add_macro::AddPlainCall; // the generated typed-method trait
+    use example_add_macro::AddCall; // the generated typed-method trait
     let macro_app = App::from_inventory();
 
-    // The `#[modal_rust::function]` inventory registers `add` (and `add_plain`) into the
+    // The `#[modal_rust::function]` inventory registers `add` into the
     // SAME `Registry` shape the manual builder produced — proven via the macro crate's
     // re-exported `Registry::from_inventory()` lookup.
     let macro_registry = Registry::from_inventory();
@@ -75,11 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("local (macro/inventory): registry resolves `add` by name");
 
     // Auto-I/O ergonomics: typed positional method, result decodes to the return type.
-    let plain_sum: i64 = macro_app.add_plain(2, 3).local()?;
-    println!("local (macro auto-I/O):  add_plain(2, 3) -> {plain_sum}");
+    let plain_sum: i64 = macro_app.add(2, 3).local()?;
+    println!("local (macro auto-I/O):  add(2, 3) -> {plain_sum}");
     assert_eq!(
         plain_sum, 5,
-        "the typed app.add_plain(2,3).local() path must compute 5"
+        "the typed app.add(2,3).local() path must compute 5"
     );
 
     // ----- 2 & 3. LIVE: `.remote()` and deploy/call (credential-gated) -----------
@@ -159,13 +157,13 @@ mod tests {
 
     /// The MACRO path guarantees the same offline contract via the inventory registry
     /// and the typed positional method — no input/output type named. Guards the
-    /// ergonomic surface (`App::from_inventory()` + `app.add_plain(2, 3).local()`).
+    /// ergonomic surface (`App::from_inventory()` + `app.add(2, 3).local()`).
     #[test]
-    fn local_macro_add_plain_returns_5() {
-        use example_add_macro::AddPlainCall;
+    fn local_macro_add_returns_5() {
+        use example_add_macro::AddCall;
         let app = App::from_inventory();
         let sum: i64 = app
-            .add_plain(2, 3)
+            .add(2, 3)
             .local()
             .expect("the typed macro .local() path should run in-process");
         assert_eq!(sum, 5);
