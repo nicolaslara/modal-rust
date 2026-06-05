@@ -556,6 +556,20 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 
+Every example runs offline (in-process, no Modal). Run them all and check their
+output with `bash scripts/check-examples.sh`, or one at a time from the repo root:
+
+```bash
+(cd examples/quickstart && cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":2,"b":3}')
+# -> {"ok":true,"value":5}
+
+(cd examples/add-macro  && cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}')
+# -> {"ok":true,"value":42}
+
+(cd examples/add        && cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}')
+# -> {"ok":true,"value":{"sum":42}}
+```
+
 The macro path is the ergonomic one — decorate a plain function and call it as a
 typed method, no input/output struct named:
 
@@ -577,8 +591,9 @@ BOTH the manual registry and the macro/inventory path, printing:
 
 ```text
 local: add(40, 2) -> {sum: 42}
-local (macro/inventory): add(40, 2) -> {sum: 42}
+local (macro/inventory): registry resolves `add` by name
 local (macro auto-I/O):  add(2, 3) -> 5
+(skipping live .remote()/deploy/call — set RUN_REMOTE=1 with Modal credentials to run them)
 ```
 
 ```bash
