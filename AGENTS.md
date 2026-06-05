@@ -133,6 +133,23 @@ contract is the stable seam — guard it across every change. See
 - Keep generated shims, research clones, and scratch artifacts under gitignored
   paths (`.modal-rust/`, `target/`, `tmp/`).
 
+## Examples & README Rules
+
+- Every example shown in the README MUST be a real, compiled, tested example crate
+  (its own crate, written exactly as a real user would write it). The README is a
+  tested artifact, never hand-written prose code.
+- The README includes the EXACT bash to run each shown example (`cd examples/<x> &&
+  cargo run …` / `cargo run -p <x> …`), and that command is covered by a test that
+  runs it and checks the expected output. A stale README must be a TEST FAILURE.
+- Curate: do NOT show every example in the README — pick a few for clarity. The code
+  shown is clearly the one the run command executes.
+- For README clarity you MAY elide implementation that is UNRELATED to this project
+  (the actual computation — e.g. GPU/ML math) with `// …`, but ALL modal-rust code a
+  user must write (the single `modal-rust` dep, `#[modal_rust::function]`,
+  `modal_runner!()`, the `App`/config calls) MUST be shown in full and match the real
+  crate's form. The shown code keeps the same shape as the crate; only off-topic
+  internals are trimmed.
+
 ## Modal / Secrets Rules
 
 - Never log or commit Modal tokens, `~/.modal.toml` contents, API keys, or
