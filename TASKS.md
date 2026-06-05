@@ -22,6 +22,22 @@ mid-phase.
 > read this note + the latest commits + `workpads/shim-backend/knowledge.md`, then
 > continue. (Never log/commit Modal tokens; GPU stays on cheap T4; ephemeral run apps.)
 
+> **QUEUED — run AFTER the `macro-auto-io` workflow lands + is committed** (both touch the
+> macro crate / examples, so they must NOT run concurrently with it):
+> 1. **Macro-hygiene fix** — eliminate the `modal-rust-runtime` + `inventory` direct-dep wart:
+>    re-export them from the `modal-rust` facade under `__private` and make the macro emit
+>    `::modal_rust::__private::{runtime,inventory}::…` (use the `proc-macro-crate` crate so a
+>    renamed `modal-rust` still resolves; verify `inventory::submit!` works through the
+>    re-export, else keep `inventory` direct but still drop `modal-rust-runtime`). Then the
+>    user needs only `modal-rust`; drop the README "Dependency note".
+> 2. **Examples use the macro** — update examples to showcase the ergonomic macro form (the
+>    auto-I/O `#[function] fn add(a,b)->i64` + typed `app.add(2,3)` once that lands), so the
+>    ergonomics are visible. Keep SOME examples on the manual `modal_registry()`/`typed!`
+>    path to teach the no-macro usage (consider a macro + manual version of each). Don't break
+>    `examples/add` as the canonical explicit/manual reference.
+> Concurrently OK right now: the docs workflow + the README code-block formatting agent (they
+> don't touch the macro crate / examples).
+
 
 **[2026-06-04] `crates/modal-rust-sdk` landed + proven live.** The control-plane
 client decision is resolved to **(b)**: our own lean first-party Modal gRPC client,
