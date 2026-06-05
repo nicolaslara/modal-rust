@@ -4,8 +4,8 @@
 //! inventory `Registration.config` directly and exercise the offline proof body.
 
 use example_add_macro::proof::{secret_vol_probe, ProbeInput};
-use modal_rust_facade::__private::inventory;
-use modal_rust_facade::{FunctionConfig, Registration};
+use modal_rust::__private::inventory;
+use modal_rust::{FunctionConfig, Registration};
 
 fn registration(name: &str) -> Option<&'static Registration> {
     inventory::iter::<Registration>
@@ -38,6 +38,25 @@ fn secrets_and_volumes_decorator_parses_into_config() {
     for (mount, _name) in reg.config.volumes {
         assert_ne!(*mount, "/cache");
     }
+}
+
+#[test]
+fn macro_captures_user_package_for_auto_detect() {
+    // PACKAGE AUTO-DETECT (P2): the `#[modal_rust::function]` macro captured THIS
+    // crate's `env!("CARGO_PKG_NAME")` into every registration, so `.remote()` builds
+    // `cargo build -p example-add-macro` automatically — no `MODAL_RUST_PACKAGE`.
+    let reg = registration("add").expect("macro must register `add`");
+    assert_eq!(reg.package, "example-add-macro");
+    // Every decorated handler in one crate carries the SAME package.
+    for name in ["add_gpu", "add_extras", "secret_vol_probe"] {
+        let r = registration(name).unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(r.package, "example-add-macro", "{name} package");
+    }
+    // The runtime helper the facade's `App::connect` reads surfaces the same value.
+    assert_eq!(
+        modal_rust::__private::runtime::package_from_inventory(),
+        Some("example-add-macro")
+    );
 }
 
 #[test]

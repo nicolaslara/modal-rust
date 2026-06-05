@@ -21,6 +21,64 @@ The default command-line path is the `modal-rust` CLI. The library API also
 includes a first-party Rust client for Modal's control plane, so Rust code can
 drive local, remote, and deployed calls directly.
 
+## Quickstart
+
+A whole modal-rust crate is a single `modal-rust` dependency, a plain
+`#[function]`, and a one-line runner. Write the function:
+
+```rust quickstart
+use modal_rust::function;
+
+/// Add two integers — the whole function. `#[function]` generates the JSON
+/// input/output plumbing, registers the entrypoint via `inventory`, and adds a
+/// typed `app.add(2, 3)` method to `App` (brought into scope with one `use`:
+/// `use quickstart::AddCall;`, or `use quickstart::*;`).
+#[function]
+pub fn add(a: i64, b: i64) -> anyhow::Result<i64> {
+    Ok(a + b)
+}
+```
+
+Add the runner — the whole `src/bin/modal_runner.rs` is one line (`quickstart` is
+your library crate's name; it has no `__private`, no hand-written `main`):
+
+```rust
+modal_rust::modal_runner!(quickstart);
+```
+
+Then run it three ways — the typed `app.add(2, 3)` method comes from a one-line
+`use` of the generated `AddCall` trait:
+
+```rust
+use modal_rust::App;
+use quickstart::AddCall; // or `use quickstart::*;`
+
+async fn run() -> anyhow::Result<()> {
+    // `.local()` runs the handler in-process — no Modal, no network.
+    let app = App::local();
+    let sum: i64 = app.add(2, 3).local()?;
+    assert_eq!(sum, 5);
+
+    // `.remote()` uploads THIS crate and builds it on Modal at call time. The
+    // package to build (`cargo build -p quickstart`) is auto-detected from the
+    // macro — no `MODAL_RUST_PACKAGE` to set.
+    let app = App::connect("my-rust-app").await?;
+    let sum: i64 = app.add(2, 3).remote().await?;
+    assert_eq!(sum, 5);
+    Ok(())
+}
+```
+
+That is the entire newcomer surface: **one `modal-rust` dependency, no rename, no
+`__private`, no environment variable, no hand-written runner.** The
+[`examples/quickstart`](examples/quickstart) crate is exactly this code (a
+drift-guard test asserts the `rust quickstart` block above is its real source), so
+`cargo test -p quickstart` proves it compiles and runs.
+
+See the [step-by-step Getting Started guide](docs/getting-started.md) for
+prerequisites (a Modal account + token), the run/deploy walkthrough, a
+Python→Rust cheat sheet, and troubleshooting.
+
 ## Install
 
 `modal-rust` is not published to crates.io yet. Add it from GitHub — one
@@ -118,10 +176,14 @@ pub fn add(a: i64, b: i64) -> anyhow::Result<i64> {
 ```
 
 `App::local()` builds an in-process app over every annotated function, and each
-one gets a typed method — there is no input or output type to name at the call site:
+one gets a typed method — there is no input or output type to name at the call
+site. The typed method lives on a generated `AddCall` trait (named after the
+function); bring it into scope with one `use` of your crate's `AddCall`, or a glob
+(`use my_crate::*;`) to bring in every function's trait at once:
 
 ```rust
 use modal_rust::App;
+use my_crate::AddCall; // or `use my_crate::*;` — required for the typed `app.add(..)`
 
 async fn example() -> anyhow::Result<()> {
     let app = App::local();
@@ -142,6 +204,18 @@ async fn example() -> anyhow::Result<()> {
 Under the hood the macro still generates a nameable `add::Input { a, b }` /
 `add::Output` pair, so you can also call dynamically by string when you need to:
 `app.function("add").remote(add::Input { a: 2, b: 3 })`.
+
+Finally, every macro-path crate needs a `modal_runner` binary — the whole
+`src/bin/modal_runner.rs` is one line (pass your library crate's name so its
+registered functions are linked in):
+
+```rust
+modal_rust::modal_runner!(my_crate);
+```
+
+This expands to the runner `main()` and runs the frozen runner protocol; you never
+write `main()` or touch any internal `__private` path. (A single-binary crate with
+the functions in `main.rs` writes the bare `modal_rust::modal_runner!();`.)
 
 If you would rather define **named, documented I/O types** yourself, pass a single
 serializable struct in and return one out. The macro detects this form and

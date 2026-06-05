@@ -273,6 +273,16 @@ pub struct Registration {
     /// (`#[modal_rust::function(gpu=…, timeout=…, cache=…)]`). METADATA ONLY — the
     /// runner ignores it (see [`FunctionConfig`]). Default = all `None`.
     pub config: FunctionConfig,
+    /// The cargo package the decorated handler lives in — captured by the
+    /// `#[modal_rust::function]` macro as `env!("CARGO_PKG_NAME")` AT THE USER
+    /// CRATE's expansion site, so it is the USER's package, not the facade's. The
+    /// RUN path threads this into [`crate::FunctionConfig`]-adjacent
+    /// `RemoteConfig.package` so `cargo build -p <pkg>` targets the right crate
+    /// WITHOUT the user setting `MODAL_RUST_PACKAGE` (which still overrides).
+    /// METADATA ONLY — the runner ignores it. Empty string for a hand-written
+    /// `Registration` that does not set it (then the facade falls back to the env
+    /// var / v0 default).
+    pub package: &'static str,
 }
 
 /// Per-function deploy/run CONFIG sourced from
@@ -416,6 +426,27 @@ pub fn from_inventory_with_configs() -> (Registry, Vec<(&'static str, FunctionCo
         configs.push((registration.name, registration.config.clone()));
     }
     (registry, configs)
+}
+
+/// The cargo package name captured by the `#[modal_rust::function]` macro from the
+/// USER crate's `env!("CARGO_PKG_NAME")` at expansion time.
+///
+/// Returns the first non-empty [`Registration::package`] collected from
+/// [`inventory`] (every decorated handler in one crate carries the SAME package, so
+/// the first is canonical). `None` when there are no decorated handlers, or only
+/// hand-written `Registration`s that left `package` empty — the facade then falls
+/// back to `MODAL_RUST_PACKAGE` / the v0 default.
+///
+/// This is how `App::connect(..).remote()` learns which package to
+/// `cargo build -p <pkg>` WITHOUT the user setting `MODAL_RUST_PACKAGE`: the macro
+/// runs in the user's crate, so the captured name is the user's package. The runner
+/// never calls this (it dispatches by name only); it is read solely by the
+/// control-plane facade when assembling the RUN/DEPLOY `RemoteConfig`.
+pub fn package_from_inventory() -> Option<&'static str> {
+    inventory::iter::<Registration>
+        .into_iter()
+        .map(|r| r.package)
+        .find(|p| !p.is_empty())
 }
 
 thread_local! {

@@ -2,8 +2,8 @@
 
 use example_add_macro::add;
 use example_add_macro::AddCall;
-use modal_rust_facade::__private::runtime;
-use modal_rust_facade::{App, Registry};
+use modal_rust::__private::runtime;
+use modal_rust::{App, Registry};
 
 #[test]
 fn add_is_a_plain_fn() {

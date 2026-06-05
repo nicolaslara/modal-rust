@@ -14,20 +14,19 @@ name = "modal_runner"
 path = "src/bin/modal_runner.rs"
 
 [dependencies]
-# SINGLE modal dependency: the `modal-rust` facade. The `#[modal_rust::function]`
-# macro routes every emitted path through this facade (`::modal_rust_facade::__private::
-# {runtime,inventory}::…` for the runtime/`inventory` items, `::modal_rust_facade::
-# {App, TypedCall}` for the Mode B typed methods), resolving the facade name via
-# `proc-macro-crate` — so this crate needs NEITHER `modal-rust-runtime` NOR
-# `inventory` as a direct dependency (the serde_derive / clap_derive single-dep
-# pattern).
+# SINGLE modal dependency: the `modal-rust` facade, under its OWN name (NO rename).
+# A fresh external user writes exactly this. The `#[modal_rust::function]` macro
+# routes every emitted path through the facade (`::modal_rust::__private::{runtime,
+# inventory}::…` for the runtime/`inventory` items, `::modal_rust::{App, TypedCall}`
+# for the Mode B typed methods), resolving the facade name via `proc-macro-crate` —
+# so this crate needs NEITHER `modal-rust-runtime` NOR `inventory` as a direct
+# dependency (the serde_derive / clap_derive single-dep pattern).
 #
-# The facade is renamed `modal_rust_facade` (Cargo's `package = "..."`) for two
-# reasons: (1) `extern crate modal_rust_facade as modal_rust;` (below) makes
-# `#[modal_rust::function]` spellable via the facade's re-exported attribute, and
-# (2) `proc-macro-crate` then resolves `modal-rust` -> `modal_rust_facade`, so EVERY
-# macro-emitted path resolves under the same unshadowed name.
-modal_rust_facade = { path = "../../crates/modal-rust", package = "modal-rust" }
+# Historically this dep was renamed `modal_rust_facade` to dodge an `extern crate
+# modal_rust_macros as modal_rust` shadow; that shadow is gone, so `use
+# modal_rust::function;` + `#[modal_rust::function]` against the plain `modal-rust`
+# dep compiles with NO rename — exactly the README form.
+modal-rust = { path = "../../crates/modal-rust" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

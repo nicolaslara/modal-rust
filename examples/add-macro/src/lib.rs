@@ -6,11 +6,11 @@
 //! `app.add(2, 3)` method — so the call site never names an input/output type.
 //! This is the Rust twin of Python's `@app.function()\ndef add(a, b): return a + b`.
 
-// Alias the facade crate (`modal-rust`, renamed `modal_rust_facade` in Cargo.toml)
-// so the attribute is spelled `#[modal_rust::function]`. The macro routes every
-// emitted path through this facade, so this crate needs ONLY `modal-rust`.
-extern crate modal_rust_facade as modal_rust;
-
+// The ONLY modal dependency is `modal-rust` (under its own name — NO rename). The
+// macro routes every emitted path through this facade, so this crate needs nothing
+// else modal-related. `use modal_rust::function;` makes the attribute spellable as
+// `#[function]` (or `#[modal_rust::function]`) — exactly the README form a fresh
+// external user would write.
 use modal_rust::function;
 
 /// Add two integers — the whole function.

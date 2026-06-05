@@ -59,10 +59,13 @@ pub use modal_rust_runtime::{FunctionConfig, HandlerFn, Registration, Registry, 
 // build a Registry by hand through the facade.
 pub use modal_rust_runtime::typed;
 
-// (3) Proc-macro re-export. Makes `#[modal_rust::function]` spellable without the
-//     alias hack (see the crate docs above for the downstream-dep caveat). Only
-//     `function` exists; there is NO `app` macro — `modal_rust::App` is a struct.
-pub use modal_rust_macros::function;
+// (3) Proc-macro re-exports. Make `#[modal_rust::function]` and
+//     `modal_rust::modal_runner!()` spellable without the alias hack (see the crate
+//     docs above for the downstream-dep caveat). `function` is the handler
+//     attribute; `modal_runner!()` expands to the runner `main()` (the whole
+//     `src/bin/modal_runner.rs` in one line, with NO `__private` in user code).
+//     There is NO `app` macro — `modal_rust::App` is a struct.
+pub use modal_rust_macros::{function, modal_runner};
 
 /// Macro-support re-exports — NOT a stable public API (hidden from docs).
 ///

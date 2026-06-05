@@ -13,6 +13,10 @@ members = [
     # crate depends on it — it is a `[dev-dependencies]` of the facade/SDK test
     # targets only.
     "crates/modal-rust-testkit",
+    # The README quickstart, as a real compiled+tested crate (the cleanest newcomer
+    # surface: single `modal-rust` dep, 3-line #[function], one-line modal_runner!()).
+    # A drift-guard test asserts the README's quickstart block IS this crate's source.
+    "examples/quickstart",
     "examples/add",
     "examples/add-macro",
     "examples/orchestrate",
@@ -33,6 +37,7 @@ default-members = [
     "crates/modal-rust-runtime",
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",
+    "examples/quickstart",
     "examples/add",
     "examples/add-macro",
     "examples/orchestrate",

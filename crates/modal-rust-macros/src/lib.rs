@@ -460,6 +460,89 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Generate the modal-rust runner `main()` — the whole `src/bin/modal_runner.rs`
+/// body in ONE line, so the user never writes a runner `main()` and never names the
+/// `#[doc(hidden)] __private` runtime re-exports (the serde_derive pattern: the
+/// `__private` usage lives only in GENERATED code).
+///
+/// Usage — the user's `src/bin/modal_runner.rs` is exactly:
+///
+/// ```ignore
+/// // Functions live in the package's LIBRARY crate (the usual layout): name it so
+/// // its `inventory` submissions are linked into this runner binary.
+/// modal_rust::modal_runner!(my_crate);
+///
+/// // Functions live in THIS file (a single-binary crate, no separate lib): no name
+/// // needed — the submissions are already in this crate.
+/// modal_rust::modal_runner!();
+/// ```
+///
+/// This expands to the SAME runner the hand-written bin produced: it (optionally
+/// links the lib crate then) assembles the registry + decorator configs via
+/// `from_inventory_with_configs()` and runs the FROZEN runner CLI protocol via
+/// `run_cli_with_configs`, mirroring `ok` in the process exit code. It is fully
+/// ADDITIVE — a hand-written runner using the old `__private::runtime` path keeps
+/// working unchanged.
+///
+/// ## Why the optional crate name
+///
+/// A `[[bin]]` target does NOT automatically link its package's library crate in
+/// Cargo, so a runner in `src/bin/modal_runner.rs` would not see the lib's
+/// `inventory::submit!` registrations unless it references the lib. Passing the lib
+/// crate's name emits a `use <crate> as _;` link — the one fact the macro cannot
+/// infer (it has no knowledge of the host package's lib name). This keeps the body a
+/// single line while removing BOTH the `main()` boilerplate AND the `__private`
+/// leak.
+///
+/// Every emitted path is routed through the resolved facade
+/// (`#facade::__private::runtime::…`), so a crate that writes `modal_runner!()`
+/// needs ONLY the `modal-rust` dependency. The host crate still needs the
+/// `[[bin]] name = "modal_runner"` target (the RUN/DEPLOY wrapper builds
+/// `--bin modal_runner`).
+#[proc_macro]
+pub fn modal_runner(input: TokenStream) -> TokenStream {
+    // Optional single argument: the library crate ident whose `inventory`
+    // submissions must be linked into this runner binary (`use <crate> as _;`).
+    // Empty = the functions are in THIS crate (single-binary layout).
+    let link_crate: Option<syn::Ident> = if input.is_empty() {
+        None
+    } else {
+        match syn::parse::<syn::Ident>(input) {
+            Ok(ident) => Some(ident),
+            Err(_) => {
+                let err = syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "modal_rust::modal_runner! takes at most ONE argument: the library \
+                     crate name to link (e.g. `modal_runner!(my_crate);`), or nothing \
+                     for a single-binary crate (`modal_runner!();`)",
+                )
+                .to_compile_error();
+                return err.into();
+            }
+        }
+    };
+
+    let facade = facade_path();
+    // Link the lib crate's `inventory::submit!` link-section into this binary when a
+    // crate name was given; a `use <crate> as _;` is the idiomatic side-effect link.
+    let link = link_crate.map(|c| quote! { use #c as _; });
+    quote! {
+        #link
+        fn main() -> ::std::process::ExitCode {
+            // Assemble the registry + per-entrypoint decorator configs from the
+            // `inventory` submissions (the `#[modal_rust::function]` registrations),
+            // then run the FROZEN runner CLI protocol. The configs ride into the
+            // additive `--describe` manifest; the `--entrypoint` dispatch ignores
+            // them, so this is behavior-identical to the hand-written runner.
+            let (registry, configs) =
+                #facade::__private::runtime::from_inventory_with_configs();
+            let code = #facade::__private::runtime::run_cli_with_configs(registry, &configs);
+            ::std::process::ExitCode::from(code as u8)
+        }
+    }
+    .into()
+}
+
 /// Mode-A emission helper: keep the original fn verbatim and submit a
 /// `Registration` whose handler is `#handler_expr` (here `typed!(#fn_ident)`), with
 /// the decorator config — byte-identical to the pre-auto-I/O path.
@@ -564,6 +647,13 @@ fn build_registration(
                     secrets: #secrets_tok,
                     volumes: #volumes_tok,
                 },
+                // Capture the USER crate's cargo package name HERE — this macro
+                // expands in the user's crate, so `env!("CARGO_PKG_NAME")` is the
+                // user's package, not the facade's. The RUN/DEPLOY path threads it
+                // into `RemoteConfig.package` so `cargo build -p <pkg>` targets the
+                // right crate WITHOUT the user setting `MODAL_RUST_PACKAGE` (which
+                // still overrides). METADATA ONLY — the runner ignores it.
+                package: ::core::env!("CARGO_PKG_NAME"),
             }
         }
     }

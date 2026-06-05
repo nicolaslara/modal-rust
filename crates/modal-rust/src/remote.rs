@@ -330,6 +330,35 @@ pub struct RemoteConfig {
     pub volumes: Vec<(String, String)>,
 }
 
+impl RemoteConfig {
+    /// Fill in [`package`](RemoteConfig::package) from the macro-captured inventory
+    /// package when the user has NOT set `MODAL_RUST_PACKAGE`.
+    ///
+    /// Precedence (highest → lowest): `MODAL_RUST_PACKAGE` (`env_override`) → the
+    /// macro-captured `env!("CARGO_PKG_NAME")` (`detected`, from
+    /// [`modal_rust_runtime::package_from_inventory`]) → the existing value (the v0
+    /// default left by [`discover_package`]). `env_override`/`detected` are passed
+    /// in (rather than read here) so this stays a pure, unit-testable transform.
+    ///
+    /// This is what makes the library `App::connect(..).remote()` path build the
+    /// RIGHT package automatically: the macro ran in the user's crate, so `detected`
+    /// is the user's package, not the facade's hardcoded `"example-add"`.
+    pub fn with_detected_package(
+        mut self,
+        env_override: Option<&str>,
+        detected: Option<&str>,
+    ) -> Self {
+        // The env var (when set) already won inside `discover_package`; only fill
+        // from the detected inventory package when there is no env override.
+        if env_override.is_none() {
+            if let Some(pkg) = detected {
+                self.package = pkg.to_string();
+            }
+        }
+        self
+    }
+}
+
 impl Default for RemoteConfig {
     fn default() -> Self {
         RemoteConfig {
@@ -379,7 +408,15 @@ fn discover_local_root() -> PathBuf {
 }
 
 /// Discover the cargo package for `-p`: `MODAL_RUST_PACKAGE` if set, else the v0
-/// default `"example-add"`. Registry-derived package selection is a later milestone.
+/// default `"example-add"`.
+///
+/// This is the BASE; the real package usually comes from AUTO-DETECT — the
+/// `#[modal_rust::function]` macro captures the user crate's `env!("CARGO_PKG_NAME")`
+/// into the inventory, and [`App::connect`](crate::App::connect) folds it in via
+/// [`RemoteConfig::with_detected_package`]. The env var still OVERRIDES both. The v0
+/// default only survives when there is NO env var AND no decorated handler (a manual
+/// registry with no `#[function]`), in which case the user supplies an explicit
+/// `RemoteConfig` or sets `MODAL_RUST_PACKAGE`.
 fn discover_package() -> String {
     std::env::var("MODAL_RUST_PACKAGE").unwrap_or_else(|_| "example-add".to_string())
 }
@@ -849,6 +886,44 @@ mod tests {
         );
         // The user volume mount must not be the reserved cargo-cache path.
         assert_ne!(cfg.volumes[0].0, CACHE_MOUNT);
+    }
+
+    #[test]
+    fn with_detected_package_precedence() {
+        // PACKAGE AUTO-DETECT precedence (P2): env override > macro-detected > base.
+        // Serialized against env-mutating tests (RemoteConfig::default reads env).
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("MODAL_RUST_PACKAGE");
+
+        // No env override, a detected package => the detected package is used (this is
+        // the headline win: a fresh user crate gets `-p <their-crate>` automatically,
+        // never the hardcoded v0 `example-add`). This is exactly what `App::connect`
+        // does: `with_detected_package(env_override.as_deref(), package_from_inventory())`.
+        let cfg = RemoteConfig::default().with_detected_package(None, Some("my-user-crate"));
+        assert_eq!(cfg.package, "my-user-crate");
+
+        // No env override AND no detected package (a manual registry, no `#[function]`)
+        // => the base (v0 default) survives.
+        let base = RemoteConfig::default().package.clone();
+        let cfg = RemoteConfig::default().with_detected_package(None, None);
+        assert_eq!(cfg.package, base);
+
+        // MODAL_RUST_PACKAGE still OVERRIDES auto-detect end-to-end: with the env var
+        // set, `discover_package()` shapes `default().package` to the override, and
+        // `with_detected_package` (called with `env_override = Some(..)`) leaves it —
+        // it does NOT clobber the env value with the detected one. This is the
+        // `App::connect` call shape with the env var present.
+        std::env::set_var("MODAL_RUST_PACKAGE", "forced-pkg");
+        let env_override = std::env::var("MODAL_RUST_PACKAGE").ok();
+        let cfg = RemoteConfig::default()
+            .with_detected_package(env_override.as_deref(), Some("my-user-crate"));
+        assert_eq!(
+            cfg.package, "forced-pkg",
+            "MODAL_RUST_PACKAGE still overrides auto-detect"
+        );
+        std::env::remove_var("MODAL_RUST_PACKAGE");
     }
 
     #[test]

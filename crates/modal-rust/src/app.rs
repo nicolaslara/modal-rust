@@ -102,7 +102,17 @@ impl App {
             .into_iter()
             .map(|(n, c)| (n.to_string(), c))
             .collect();
-        App::connect_inner(name, registry, configs, RemoteConfig::default()).await
+        // PACKAGE AUTO-DETECT: the `#[modal_rust::function]` macro captured the
+        // user's `env!("CARGO_PKG_NAME")` into each inventory `Registration`. Thread
+        // it into the RUN config so `cargo build -p <pkg>` targets the user's crate
+        // WITHOUT them setting `MODAL_RUST_PACKAGE`. `MODAL_RUST_PACKAGE` still
+        // OVERRIDES (it is applied first inside `RemoteConfig::default()`), so this
+        // only fills in the package when the env var is unset.
+        let run_config = RemoteConfig::default().with_detected_package(
+            std::env::var("MODAL_RUST_PACKAGE").ok().as_deref(),
+            modal_rust_runtime::package_from_inventory(),
+        );
+        App::connect_inner(name, registry, configs, run_config).await
     }
 
     /// As [`App::connect`], but combines an explicit [`Registry`] with a live
