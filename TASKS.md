@@ -17,10 +17,16 @@ mid-phase.
 > something is genuinely wrong** (a real design failure, not flakiness). Drive each item
 > via a workflow; verify with cargo before committing (rust-analyzer diagnostics are
 > often stale here — cargo is ground truth). Order: (1) README GPU+CLI accuracy [DONE],
-> (2) `.spawn()`/`.map()` fan-out, (3) P6 cargo cache (benchmark on burn-add), (4)
-> user-facing secrets/volumes, (5) P10 delete the codegen/shims. A fresh context should
-> read this note + the latest commits + `workpads/shim-backend/knowledge.md`, then
-> continue. (Never log/commit Modal tokens; GPU stays on cheap T4; ephemeral run apps.)
+> (2) `.spawn()`/`.map()` fan-out [DONE — function.rs + live_spawn_map.rs/local.rs], (3) P6
+> cargo cache [DONE — remote.rs CACHE_* + V2 volume archive], (4) user-facing secrets/volumes
+> [DONE — decorator `secrets=[..]`/`volumes=["MOUNT=NAME"]` + facade resolve], (5) P10 delete
+> the codegen/shims [DONE 2026-06-04 — CLI is programmatic-only]. **AFK RUN COMPLETE: the whole
+> ordered backlog (1–5) is finished and verified (cargo test green); the macro ergonomics arc
+> (auto-io + hygiene + examples + README, a4fceaa→66d9c0d) is also done.** Remaining work is the
+> larger parity roadmap in `docs/PARITY.md §10` (Cls / web-endpoints / Sandbox / Dict / Queue /
+> NFS, inline-secrets-from-dict, retries, autoscaling, schedule, starmap) — NOT in this AFK
+> scope; surface for the user to prioritize. (Never log/commit Modal tokens; GPU stays on cheap
+> T4; ephemeral run apps.)
 
 > **MACRO ERGONOMICS ARC: ✅ COMPLETE** (a4fceaa → 424cb8c → 063d283 → 66d9c0d). All three
 > features + the README refresh landed and are committed; nothing in this block is pending.
