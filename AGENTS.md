@@ -125,6 +125,8 @@ contract is the stable seam — guard it across every change. See
 
 ## Git Rules
 
+- Always use simple, single-line commit messages. One concise subject line, no
+  body, no bullet lists. (e.g. `examples: make ergonomic add(a,b) the headline`).
 - Do not commit or push without explicit user confirmation.
 - If asked to commit, show files and message first.
 - No destructive git commands unless explicitly requested.
