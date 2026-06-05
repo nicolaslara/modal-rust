@@ -28,6 +28,47 @@ use crate::error::{Error, Result};
 use crate::proto::api::{ObjectCreationType, SecretGetOrCreateRequest};
 use crate::retry::retry_unary;
 
+/// Build the `SecretGetOrCreate` request for the `from_name` PURE-LOOKUP path —
+/// pure, no I/O. Mirrors `Secret.from_name`: `object_creation_type` UNSPECIFIED, no
+/// `env_dict`; the optional `required_keys` ride through (the server asserts them).
+///
+/// Extracted from [`ModalClient::secret_get_or_create`]; the method passes the
+/// resolved `environment_name`.
+pub fn build_secret_from_name_request(
+    name: &str,
+    required_keys: &[String],
+    environment_name: String,
+) -> SecretGetOrCreateRequest {
+    SecretGetOrCreateRequest {
+        deployment_name: name.to_string(),
+        environment_name,
+        object_creation_type: ObjectCreationType::Unspecified as i32,
+        required_keys: required_keys.to_vec(),
+        ..Default::default() // env_dict empty; app_id empty; reserved namespace unset
+    }
+}
+
+/// Build the `SecretGetOrCreate` request for the `from_dict` CREATE path — pure, no
+/// I/O. Mirrors `Secret.from_dict`/`_create_deployed`: `object_creation_type`
+/// CREATE_IF_MISSING (idempotent) + the `env_dict`; no `required_keys`. The VALUES
+/// are never logged.
+///
+/// Extracted from [`ModalClient::secret_from_dict`]; the method passes the resolved
+/// `environment_name`.
+pub fn build_secret_from_dict_request(
+    name: &str,
+    env: &HashMap<String, String>,
+    environment_name: String,
+) -> SecretGetOrCreateRequest {
+    SecretGetOrCreateRequest {
+        deployment_name: name.to_string(),
+        environment_name,
+        object_creation_type: ObjectCreationType::CreateIfMissing as i32,
+        env_dict: env.clone(),
+        ..Default::default() // required_keys empty; app_id empty
+    }
+}
+
 impl ModalClient {
     /// Resolve a deployed Secret BY NAME and return its `secret_id`. Mirrors
     /// `Secret.from_name` (secret.py:402): a pure lookup (`object_creation_type`
@@ -46,13 +87,7 @@ impl ModalClient {
         let environment_name = self.env_or_default(environment);
         // Pure lookup (UNSPECIFIED == "just lookup", api.proto:208) — mirrors
         // `Secret.from_name`, which sets neither object_creation_type nor env_dict.
-        let req = SecretGetOrCreateRequest {
-            deployment_name: name.to_string(),
-            environment_name,
-            object_creation_type: ObjectCreationType::Unspecified as i32,
-            required_keys: required_keys.to_vec(),
-            ..Default::default() // env_dict empty; app_id empty; reserved namespace unset
-        };
+        let req = build_secret_from_name_request(name, required_keys, environment_name);
         self.secret_get_or_create_inner("secret_get_or_create", req, name)
             .await
     }
@@ -76,13 +111,7 @@ impl ModalClient {
         environment: Option<&str>,
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
-        let req = SecretGetOrCreateRequest {
-            deployment_name: name.to_string(),
-            environment_name,
-            object_creation_type: ObjectCreationType::CreateIfMissing as i32,
-            env_dict: env.clone(),
-            ..Default::default() // required_keys empty; app_id empty
-        };
+        let req = build_secret_from_dict_request(name, env, environment_name);
         self.secret_get_or_create_inner("secret_from_dict", req, name)
             .await
     }
@@ -122,14 +151,15 @@ mod tests {
     #[test]
     fn from_name_request_is_pure_lookup() {
         // `secret_get_or_create` (from_name) must NOT set a creation type or env_dict
-        // — it is a pure lookup (UNSPECIFIED == "just lookup").
-        let req = SecretGetOrCreateRequest {
-            deployment_name: "my-secret".to_string(),
-            environment_name: "main".to_string(),
-            object_creation_type: ObjectCreationType::Unspecified as i32,
-            required_keys: vec!["API_KEY".to_string()],
-            ..Default::default()
-        };
+        // — it is a pure lookup (UNSPECIFIED == "just lookup"). Driven THROUGH the
+        // production builder (not a hand-built literal).
+        let req = build_secret_from_name_request(
+            "my-secret",
+            &["API_KEY".to_string()],
+            "main".to_string(),
+        );
+        assert_eq!(req.deployment_name, "my-secret");
+        assert_eq!(req.environment_name, "main");
         assert_eq!(req.object_creation_type, 0);
         assert!(req.env_dict.is_empty(), "from_name sends no env_dict");
         assert_eq!(req.required_keys, vec!["API_KEY".to_string()]);
@@ -138,16 +168,11 @@ mod tests {
     #[test]
     fn from_dict_request_is_create_if_missing() {
         // `secret_from_dict` must CREATE_IF_MISSING (idempotent) and carry the
-        // env_dict; it sets no required_keys.
+        // env_dict; it sets no required_keys. Driven THROUGH the production builder.
         let mut env = HashMap::new();
         env.insert("FOO".to_string(), "bar".to_string());
-        let req = SecretGetOrCreateRequest {
-            deployment_name: "ephemeral".to_string(),
-            environment_name: "main".to_string(),
-            object_creation_type: ObjectCreationType::CreateIfMissing as i32,
-            env_dict: env.clone(),
-            ..Default::default()
-        };
+        let req = build_secret_from_dict_request("ephemeral", &env, "main".to_string());
+        assert_eq!(req.deployment_name, "ephemeral");
         assert_eq!(req.object_creation_type, 1);
         assert_eq!(req.env_dict.get("FOO").map(String::as_str), Some("bar"));
         assert!(req.required_keys.is_empty());

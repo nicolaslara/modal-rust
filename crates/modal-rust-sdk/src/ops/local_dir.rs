@@ -106,6 +106,46 @@ pub struct WorkspaceClosureSpec<'a> {
     pub modalignore_name: &'a str,
 }
 
+/// Build the EPHEMERAL source `MountGetOrCreate` request — pure, no I/O.
+///
+/// The WORKSPACE-namespace, EPHEMERAL-creation mount that carries the uploaded
+/// source/build-context `files` (the SHA-addressed [`MountFile`] descriptors).
+/// Extracted from [`ModalClient::finalize_mount`]; the method passes the resolved
+/// `environment_name` and the already-uploaded `files`.
+pub fn build_mount_get_or_create_source_request(
+    environment_name: String,
+    files: Vec<MountFile>,
+) -> MountGetOrCreateRequest {
+    MountGetOrCreateRequest {
+        deployment_name: String::new(),
+        namespace: DeploymentNamespace::Workspace as i32,
+        environment_name,
+        object_creation_type: ObjectCreationType::Ephemeral as i32,
+        files,
+        // EPHEMERAL needs no app_id. TODO(fallback): if the server ever
+        // rejects EPHEMERAL for use in Function.mount_ids, switch to
+        // ANONYMOUS_OWNED_BY_APP (=4) with app_id set by the facade.
+        app_id: String::new(),
+    }
+}
+
+/// Build a `MountPutFile` request — pure, no I/O. ONE builder for BOTH shapes the
+/// upload tail relies on:
+/// - the existence PROBE (`data == None` ⇒ "do you already have it?"),
+/// - the inline/blob UPLOAD (`data == Some(..)`).
+///
+/// Extracted from [`ModalClient::ensure_file_uploaded`] /
+/// [`ModalClient::mount_put_file_probe`].
+pub fn build_mount_put_file_request(
+    sha256_hex: &str,
+    data: Option<DataOneof>,
+) -> MountPutFileRequest {
+    MountPutFileRequest {
+        sha256_hex: sha256_hex.to_string(),
+        data_oneof: data,
+    }
+}
+
 impl ModalClient {
     /// Upload ONLY the closure crate directories (plus the explicit extra files) as
     /// an EPHEMERAL Modal mount under `remote_path`; return its `mount_id`. PRIMARY
@@ -198,17 +238,7 @@ impl ModalClient {
 
         // Keyed by the sha-addressed `files` set: re-sending yields the same mount,
         // so retrying on a transient reset is safe.
-        let req = MountGetOrCreateRequest {
-            deployment_name: String::new(),
-            namespace: DeploymentNamespace::Workspace as i32,
-            environment_name,
-            object_creation_type: ObjectCreationType::Ephemeral as i32,
-            files: mount_files,
-            // EPHEMERAL needs no app_id. TODO(fallback): if the server ever
-            // rejects EPHEMERAL for use in Function.mount_ids, switch to
-            // ANONYMOUS_OWNED_BY_APP (=4) with app_id set by the facade.
-            app_id: String::new(),
-        };
+        let req = build_mount_get_or_create_source_request(environment_name, mount_files);
         let stub = self.stub();
         let resp = retry_unary("mount_get_or_create(source)", || {
             let mut stub = stub.clone();
@@ -275,10 +305,7 @@ impl ModalClient {
         };
         // The server dedups by sha256_hex, so re-PUT of the same bytes is a no-op:
         // safe to retry on a transient reset.
-        let req = MountPutFileRequest {
-            sha256_hex: sha256.to_string(),
-            data_oneof: Some(data_oneof),
-        };
+        let req = build_mount_put_file_request(sha256, Some(data_oneof));
         let stub = self.stub();
         retry_unary("mount_put_file(upload)", || {
             let mut stub = stub.clone();
@@ -304,10 +331,7 @@ impl ModalClient {
     /// Issue a probe-shape `MountPutFile` (no data) and return `exists`.
     async fn mount_put_file_probe(&mut self, sha256: &str) -> Result<bool> {
         // Pure existence read — idempotent, safe to retry on a transient reset.
-        let req = MountPutFileRequest {
-            sha256_hex: sha256.to_string(),
-            data_oneof: None,
-        };
+        let req = build_mount_put_file_request(sha256, None);
         let stub = self.stub();
         Ok(retry_unary("mount_put_file(probe)", || {
             let mut stub = stub.clone();
@@ -584,6 +608,44 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn build_mount_get_or_create_source_request_is_ephemeral_workspace() {
+        let files = vec![MountFile {
+            filename: "/src/app/src/lib.rs".to_string(),
+            sha256_hex: "abc".to_string(),
+            size: Some(7),
+            mode: Some(0o644),
+        }];
+        let req = build_mount_get_or_create_source_request("main".to_string(), files);
+        // EPHEMERAL + WORKSPACE namespace; empty deployment_name/app_id.
+        assert_eq!(req.namespace, DeploymentNamespace::Workspace as i32);
+        assert_eq!(
+            req.object_creation_type,
+            ObjectCreationType::Ephemeral as i32
+        );
+        assert!(req.deployment_name.is_empty());
+        assert!(req.app_id.is_empty());
+        assert_eq!(req.environment_name, "main");
+        // The uploaded files pass through.
+        assert_eq!(req.files.len(), 1);
+        assert_eq!(req.files[0].filename, "/src/app/src/lib.rs");
+    }
+
+    #[test]
+    fn build_mount_put_file_request_probe_vs_upload() {
+        // PROBE: data_oneof None ("do you have it?").
+        let probe = build_mount_put_file_request("deadbeef", None);
+        assert_eq!(probe.sha256_hex, "deadbeef");
+        assert!(probe.data_oneof.is_none(), "probe sends no data");
+
+        // INLINE UPLOAD: data_oneof Some(Data(..)).
+        let upload = build_mount_put_file_request("deadbeef", Some(DataOneof::Data(vec![1, 2, 3])));
+        match upload.data_oneof {
+            Some(DataOneof::Data(bytes)) => assert_eq!(bytes, vec![1, 2, 3]),
+            other => panic!("expected inline Data, got {other:?}"),
+        }
     }
 
     #[test]

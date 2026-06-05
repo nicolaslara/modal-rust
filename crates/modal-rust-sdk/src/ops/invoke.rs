@@ -74,6 +74,71 @@ impl Invocation {
     }
 }
 
+/// Build the `FunctionMap` request (api.proto) — pure, no I/O.
+///
+/// The single builder for ALL THREE invoke call-shapes (the `function_call_type` +
+/// `function_call_invocation_type` + `pipelined_inputs` distinguish them):
+/// - unary+sync = `.remote()` (one pipelined input),
+/// - unary+async = `.spawn()` (one pipelined input),
+/// - map+sync = `.map()` (EMPTY pipelined — the MAP call opens empty).
+pub fn build_function_map_request(
+    function_id: &str,
+    call_type: FunctionCallType,
+    invocation_type: FunctionCallInvocationType,
+    pipelined: Vec<FunctionPutInputsItem>,
+) -> FunctionMapRequest {
+    FunctionMapRequest {
+        function_id: function_id.to_string(),
+        function_call_type: call_type as i32,
+        function_call_invocation_type: invocation_type as i32,
+        pipelined_inputs: pipelined,
+        ..Default::default()
+    }
+}
+
+/// Build the `FunctionPutInputs` request (api.proto) — pure, no I/O.
+///
+/// Shared by the fix-#3 fallback enqueue (`.remote()`/`.spawn()`, one input) and the
+/// `.map()` fan-out (N inputs, each carrying its `idx`).
+pub fn build_function_put_inputs_request(
+    function_id: &str,
+    function_call_id: &str,
+    inputs: Vec<FunctionPutInputsItem>,
+) -> FunctionPutInputsRequest {
+    FunctionPutInputsRequest {
+        function_id: function_id.to_string(),
+        function_call_id: function_call_id.to_string(),
+        inputs,
+    }
+}
+
+/// Build the `FunctionGetOutputs` request (api.proto:4247) — pure, no I/O.
+///
+/// `index` selects WHICH output (`start_idx == end_idx == index`); `None` leaves
+/// both unset — the byte-for-byte single-input `.remote()` / map-batch shape. The
+/// poll always sets `clear_on_success` and the `OUTPUTS_TIMEOUT_SECS` long-poll
+/// window, advancing `last_entry_id` across reconnects.
+pub fn build_function_get_outputs_request(
+    function_call_id: &str,
+    max_values: i32,
+    last_entry_id: String,
+    index: Option<i32>,
+) -> FunctionGetOutputsRequest {
+    FunctionGetOutputsRequest {
+        function_call_id: function_call_id.to_string(),
+        max_values,
+        timeout: OUTPUTS_TIMEOUT_SECS,
+        last_entry_id,
+        clear_on_success: true,
+        // Per-index get (Python `pop_function_call_outputs` sets
+        // start_idx=end_idx=index). `None` => unfiltered next output, preserving
+        // the byte-for-byte single-input `.remote()` / batched map behavior.
+        start_idx: index,
+        end_idx: index,
+        ..Default::default()
+    }
+}
+
 impl ModalClient {
     /// Invoke `function_id` with CBOR-encoded `args` (a serializable positional
     /// tuple) and `kwargs` (a serializable map), returning the decoded result `R`.
@@ -162,13 +227,12 @@ impl ModalClient {
         // we retry on transient like Python (which relies on server-side input
         // dedup). A non-idempotent user function would need a server idempotency
         // token before enabling this generally.
-        let map_req = FunctionMapRequest {
-            function_id: function_id.to_string(),
-            function_call_type: FunctionCallType::Unary as i32,
-            function_call_invocation_type: FunctionCallInvocationType::Sync as i32,
-            pipelined_inputs: vec![item.clone()],
-            ..Default::default()
-        };
+        let map_req = build_function_map_request(
+            function_id,
+            FunctionCallType::Unary,
+            FunctionCallInvocationType::Sync,
+            vec![item.clone()],
+        );
         let stub = self.stub();
         let map = retry_unary("function_map", || {
             let mut stub = stub.clone();
@@ -189,11 +253,8 @@ impl ModalClient {
             // Same double-enqueue caveat as FunctionMap; same v0 stance (retry —
             // harmless for the pure `add`). The item carries idx/function_call_id
             // so the server can dedup within a call.
-            let put_req = FunctionPutInputsRequest {
-                function_id: function_id.to_string(),
-                function_call_id: function_call_id.clone(),
-                inputs: vec![item],
-            };
+            let put_req =
+                build_function_put_inputs_request(function_id, &function_call_id, vec![item]);
             let stub = self.stub();
             let put = retry_unary("function_put_inputs", || {
                 let mut stub = stub.clone();
@@ -243,19 +304,12 @@ impl ModalClient {
             // Pure read with a last_entry_id cursor — a transient reset retries the
             // single poll window rather than failing the whole invoke (analogous to
             // the image-build poll reconnect).
-            let req = FunctionGetOutputsRequest {
-                function_call_id: function_call_id.to_string(),
-                max_values: 1,
-                timeout: OUTPUTS_TIMEOUT_SECS,
-                last_entry_id: last_entry_id.clone(),
-                clear_on_success: true,
-                // Per-index get (Python `pop_function_call_outputs` sets
-                // start_idx=end_idx=index). `None` => unfiltered next output,
-                // preserving the byte-for-byte single-input `.remote()` behavior.
-                start_idx: index,
-                end_idx: index,
-                ..Default::default()
-            };
+            let req = build_function_get_outputs_request(
+                function_call_id,
+                1,
+                last_entry_id.clone(),
+                index,
+            );
             let stub = self.stub();
             let resp = retry_unary("function_get_outputs", || {
                 let mut stub = stub.clone();
@@ -364,13 +418,12 @@ impl ModalClient {
         // Step 1 — FunctionMap (UNARY + ASYNC) with the input pipelined. Same
         // double-enqueue caveat as `.remote()` (idempotent `add`; `get` reads
         // idx 0).
-        let map_req = FunctionMapRequest {
-            function_id: function_id.to_string(),
-            function_call_type: FunctionCallType::Unary as i32,
-            function_call_invocation_type: FunctionCallInvocationType::Async as i32,
-            pipelined_inputs: vec![item.clone()],
-            ..Default::default()
-        };
+        let map_req = build_function_map_request(
+            function_id,
+            FunctionCallType::Unary,
+            FunctionCallInvocationType::Async,
+            vec![item.clone()],
+        );
         let stub = self.stub();
         let map = retry_unary("function_map", || {
             let mut stub = stub.clone();
@@ -388,11 +441,8 @@ impl ModalClient {
 
         // Step 2 — fix #3: if the input was NOT pipelined back, enqueue it.
         if map.pipelined_inputs.is_empty() {
-            let put_req = FunctionPutInputsRequest {
-                function_id: function_id.to_string(),
-                function_call_id: function_call_id.clone(),
-                inputs: vec![item],
-            };
+            let put_req =
+                build_function_put_inputs_request(function_id, &function_call_id, vec![item]);
             let stub = self.stub();
             let put = retry_unary("function_put_inputs", || {
                 let mut stub = stub.clone();
@@ -468,13 +518,12 @@ impl ModalClient {
 
         // Step 1 — open the MAP call EMPTY (Python opens with no pipelined inputs,
         // parallel_map.py:371-378), SYNC collect.
-        let map_req = FunctionMapRequest {
-            function_id: function_id.to_string(),
-            function_call_type: FunctionCallType::Map as i32,
-            function_call_invocation_type: FunctionCallInvocationType::Sync as i32,
-            pipelined_inputs: vec![],
-            ..Default::default()
-        };
+        let map_req = build_function_map_request(
+            function_id,
+            FunctionCallType::Map,
+            FunctionCallInvocationType::Sync,
+            vec![],
+        );
         let stub = self.stub();
         let map = retry_unary("function_map", || {
             let mut stub = stub.clone();
@@ -505,11 +554,7 @@ impl ModalClient {
                 ..Default::default()
             });
         }
-        let put_req = FunctionPutInputsRequest {
-            function_id: function_id.to_string(),
-            function_call_id: function_call_id.clone(),
-            inputs: items,
-        };
+        let put_req = build_function_put_inputs_request(function_id, &function_call_id, items);
         let stub = self.stub();
         let put = retry_unary("function_put_inputs", || {
             let mut stub = stub.clone();
@@ -538,14 +583,12 @@ impl ModalClient {
                     deadline.as_secs()
                 )));
             }
-            let req = FunctionGetOutputsRequest {
-                function_call_id: function_call_id.clone(),
-                max_values: n as i32,
-                timeout: OUTPUTS_TIMEOUT_SECS,
-                last_entry_id: last_entry_id.clone(),
-                clear_on_success: true,
-                ..Default::default()
-            };
+            let req = build_function_get_outputs_request(
+                &function_call_id,
+                n as i32,
+                last_entry_id.clone(),
+                None,
+            );
             let stub = self.stub();
             let resp = retry_unary("function_get_outputs", || {
                 let mut stub = stub.clone();
@@ -689,5 +732,92 @@ mod tests {
         got.insert(2_i32, "c");
         let err = reassemble_in_order(got, 3).unwrap_err();
         assert!(format!("{err}").contains("missing index 1 of 3"));
+    }
+
+    fn input_item(idx: i32) -> FunctionPutInputsItem {
+        FunctionPutInputsItem {
+            idx,
+            input: Some(FunctionInput {
+                data_format: DataFormat::Cbor as i32,
+                final_input: false,
+                method_name: None,
+                args_oneof: Some(ArgsOneof::Args(vec![1, 2, 3])),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_function_map_request_three_call_shapes() {
+        // remote = unary + sync, one pipelined input.
+        let remote = build_function_map_request(
+            "fu-1",
+            FunctionCallType::Unary,
+            FunctionCallInvocationType::Sync,
+            vec![input_item(0)],
+        );
+        assert_eq!(remote.function_id, "fu-1");
+        assert_eq!(remote.function_call_type, FunctionCallType::Unary as i32);
+        assert_eq!(
+            remote.function_call_invocation_type,
+            FunctionCallInvocationType::Sync as i32
+        );
+        assert_eq!(remote.pipelined_inputs.len(), 1);
+
+        // spawn = unary + ASYNC, one pipelined input (the spawn invariant).
+        let spawn = build_function_map_request(
+            "fu-1",
+            FunctionCallType::Unary,
+            FunctionCallInvocationType::Async,
+            vec![input_item(0)],
+        );
+        assert_eq!(
+            spawn.function_call_invocation_type,
+            FunctionCallInvocationType::Async as i32
+        );
+        assert_eq!(spawn.pipelined_inputs.len(), 1);
+
+        // map = MAP + sync, EMPTY pipelined (the MAP call opens empty).
+        let map = build_function_map_request(
+            "fu-1",
+            FunctionCallType::Map,
+            FunctionCallInvocationType::Sync,
+            vec![],
+        );
+        assert_eq!(map.function_call_type, FunctionCallType::Map as i32);
+        assert!(
+            map.pipelined_inputs.is_empty(),
+            "MAP opens with empty pipelined_inputs"
+        );
+    }
+
+    #[test]
+    fn build_function_put_inputs_request_carries_inputs() {
+        let items = vec![input_item(0), input_item(1)];
+        let req = build_function_put_inputs_request("fu-1", "fc-1", items);
+        assert_eq!(req.function_id, "fu-1");
+        assert_eq!(req.function_call_id, "fc-1");
+        assert_eq!(req.inputs.len(), 2);
+        assert_eq!(req.inputs[0].idx, 0);
+        assert_eq!(req.inputs[1].idx, 1);
+    }
+
+    #[test]
+    fn build_function_get_outputs_request_index_filter_and_constants() {
+        // index=None ⇒ start_idx/end_idx both None (the single-input .remote() shape).
+        let unfiltered = build_function_get_outputs_request("fc-1", 1, "0-0".to_string(), None);
+        assert_eq!(unfiltered.function_call_id, "fc-1");
+        assert_eq!(unfiltered.max_values, 1);
+        assert_eq!(unfiltered.last_entry_id, "0-0");
+        assert!(unfiltered.clear_on_success);
+        assert_eq!(unfiltered.timeout, OUTPUTS_TIMEOUT_SECS);
+        assert_eq!(unfiltered.start_idx, None);
+        assert_eq!(unfiltered.end_idx, None);
+
+        // index=Some(i) ⇒ start_idx == end_idx == i (the per-index get path).
+        let indexed = build_function_get_outputs_request("fc-1", 1, "1-0".to_string(), Some(3));
+        assert_eq!(indexed.start_idx, Some(3));
+        assert_eq!(indexed.end_idx, Some(3));
+        assert_eq!(indexed.last_entry_id, "1-0");
     }
 }

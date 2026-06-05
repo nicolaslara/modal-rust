@@ -13,6 +13,42 @@ use crate::error::{Error, Result};
 use crate::proto::api::{ObjectCreationType, VolumeFsVersion, VolumeGetOrCreateRequest};
 use crate::retry::retry_unary;
 
+/// Build the `VolumeGetOrCreate` request — pure, no I/O. Mirrors
+/// `Volume.from_name(..., create_if_missing, version)`: sets ONLY `deployment_name`,
+/// `environment_name`, `object_creation_type`, and `version`.
+///
+/// - `v2 = true` ⇒ `VolumeFsVersion::V2` (concurrent writes — the cargo cache);
+///   `false` ⇒ `Unspecified` (server default == V1; the user-volume path).
+/// - `create_if_missing = true` ⇒ `CreateIfMissing` (idempotent); `false` ⇒
+///   `Unspecified` (pure lookup).
+///
+/// Extracted from [`ModalClient::volume_get_or_create`]; the method passes the
+/// resolved `environment_name`.
+pub fn build_volume_get_or_create_request(
+    name: &str,
+    v2: bool,
+    create_if_missing: bool,
+    environment_name: String,
+) -> VolumeGetOrCreateRequest {
+    let version = if v2 {
+        VolumeFsVersion::V2 as i32
+    } else {
+        VolumeFsVersion::Unspecified as i32 // == Python version=None
+    };
+    let object_creation_type = if create_if_missing {
+        ObjectCreationType::CreateIfMissing as i32
+    } else {
+        ObjectCreationType::Unspecified as i32 // pure lookup
+    };
+    VolumeGetOrCreateRequest {
+        deployment_name: name.to_string(),
+        environment_name,
+        object_creation_type,
+        version,
+        ..Default::default() // app_id empty; reserved namespace never set
+    }
+}
+
 impl ModalClient {
     /// Resolve a persistent Volume by deployment name, creating it if missing,
     /// and return its `volume_id`.
@@ -32,23 +68,7 @@ impl ModalClient {
         environment: Option<&str>,
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
-        let version = if v2 {
-            VolumeFsVersion::V2 as i32
-        } else {
-            VolumeFsVersion::Unspecified as i32 // == Python version=None
-        };
-        let object_creation_type = if create_if_missing {
-            ObjectCreationType::CreateIfMissing as i32
-        } else {
-            ObjectCreationType::Unspecified as i32 // pure lookup
-        };
-        let req = VolumeGetOrCreateRequest {
-            deployment_name: name.to_string(),
-            environment_name,
-            object_creation_type,
-            version,
-            ..Default::default() // app_id empty; reserved namespace never set
-        };
+        let req = build_volume_get_or_create_request(name, v2, create_if_missing, environment_name);
         let stub = self.stub();
         // CREATE_IF_MISSING is idempotent server-side, so a retry after a dropped
         // response re-resolves the same volume_id (mirrors mount_get_or_create).
@@ -70,6 +90,7 @@ impl ModalClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::proto::api::{ObjectCreationType, VolumeFsVersion};
 
     #[test]
@@ -82,5 +103,34 @@ mod tests {
     fn create_flag_maps_to_creation_type() {
         assert_eq!(ObjectCreationType::CreateIfMissing as i32, 1);
         assert_eq!(ObjectCreationType::Unspecified as i32, 0);
+    }
+
+    #[test]
+    fn build_volume_get_or_create_v2_create() {
+        // The cargo-cache path: V2 + create-if-missing.
+        let req = build_volume_get_or_create_request(
+            "modal-rust-cargo-cache",
+            true,
+            true,
+            "main".to_string(),
+        );
+        assert_eq!(req.deployment_name, "modal-rust-cargo-cache");
+        assert_eq!(req.environment_name, "main");
+        assert_eq!(req.version, VolumeFsVersion::V2 as i32);
+        assert_eq!(
+            req.object_creation_type,
+            ObjectCreationType::CreateIfMissing as i32
+        );
+    }
+
+    #[test]
+    fn build_volume_get_or_create_v1_create() {
+        // The user-volume path: V1 (Unspecified == server default) + create.
+        let req = build_volume_get_or_create_request("my-vol", false, true, "main".to_string());
+        assert_eq!(req.version, VolumeFsVersion::Unspecified as i32);
+        assert_eq!(
+            req.object_creation_type,
+            ObjectCreationType::CreateIfMissing as i32
+        );
     }
 }

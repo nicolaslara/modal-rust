@@ -278,6 +278,94 @@ fn supported_formats() -> Vec<i32> {
     vec![DataFormat::Pickle as i32, DataFormat::Cbor as i32]
 }
 
+/// Build the `FunctionPrecreate` request (api.proto:4250) — pure, no I/O.
+///
+/// Extracted from [`ModalClient::function_precreate`]. Advertises `[PICKLE, CBOR]`
+/// for both input and output formats; `function_type = FUNCTION`.
+pub fn build_function_precreate_request(
+    app_id: &str,
+    function_name: &str,
+) -> FunctionPrecreateRequest {
+    FunctionPrecreateRequest {
+        app_id: app_id.to_string(),
+        function_name: function_name.to_string(),
+        function_type: FunctionType::Function as i32,
+        supported_input_formats: supported_formats(),
+        supported_output_formats: supported_formats(),
+        ..Default::default()
+    }
+}
+
+/// Build the `FunctionCreate` request (api.proto:4240) in FILE mode — **fix #1**,
+/// pure, no I/O.
+///
+/// Extracted from [`ModalClient::function_create`]; moves BOTH the inner [`Function`]
+/// build AND the request wrapper. The byte-for-byte invariants this pins:
+/// - the XOR — `function` is set, `function_data` is left `None` (NEVER both);
+/// - `existing_function_id == precreate_function_id` (legalizes empty
+///   `function_serialized` in FILE mode);
+/// - `function_serialized` empty, `definition_type = FILE`, `function_type = FUNCTION`;
+/// - `resources` ALWAYS set (fix #1);
+/// - empty `volume_mounts` / `secret_ids` ⇒ prost omits those fields ⇒ wire-identical
+///   to before P6 / before secrets for existing callers.
+pub fn build_function_create_request(
+    app_id: &str,
+    precreate_function_id: &str,
+    spec: &FunctionSpec,
+) -> FunctionCreateRequest {
+    let function = Function {
+        module_name: spec.module_name.clone(),
+        function_name: spec.function_name.clone(),
+        mount_ids: spec.mount_ids.clone(),
+        image_id: spec.image_id.clone(),
+        function_serialized: Vec::new(), // FILE mode: empty.
+        definition_type: DefinitionType::File as i32,
+        function_type: FunctionType::Function as i32,
+        resources: Some(spec.resources.to_proto()), // fix #1: always set.
+        timeout_secs: spec.timeout_secs,
+        supported_input_formats: supported_formats(),
+        supported_output_formats: supported_formats(),
+        // Worker injects the client dep closure at container start (modern
+        // builder), so the add_python image needs no `pip install modal` layer.
+        mount_client_dependencies: spec.mount_client_dependencies,
+        // Empty list ⇒ prost omits field 33 ⇒ byte-identical to pre-P6 for all
+        // existing (no-volume) callers. P6 attaches the cargo-cache volume here;
+        // user volumes (`#[function(volumes=..)]`) attach DISTINCT-path mounts.
+        volume_mounts: spec.volume_mounts.iter().map(|m| m.to_proto()).collect(),
+        // Empty list ⇒ prost omits field 10 ⇒ byte-identical for all existing
+        // (no-secret) callers. The user `#[function(secrets=..)]` path pushes
+        // resolved secret ids here; Modal injects their key/values as ENV VARS.
+        secret_ids: spec.secret_ids.clone(),
+        ..Default::default()
+    };
+
+    FunctionCreateRequest {
+        function: Some(function),
+        app_id: app_id.to_string(),
+        existing_function_id: precreate_function_id.to_string(),
+        function_data: None, // fix #1: XOR — never both.
+        ..Default::default()
+    }
+}
+
+/// Build the `FunctionGet` / `from_name` request (api.proto:4242) — pure, no I/O.
+///
+/// Extracted from [`ModalClient::function_from_name`]; the method passes the
+/// resolved `environment_name`. `object_tag` is the function name; `app_version`
+/// stays `0` (latest).
+pub fn build_function_get_request(
+    app_name: &str,
+    function_name: &str,
+    environment_name: String,
+) -> FunctionGetRequest {
+    FunctionGetRequest {
+        app_name: app_name.to_string(),
+        object_tag: function_name.to_string(),
+        environment_name,
+        app_version: 0,
+    }
+}
+
 impl ModalClient {
     /// `FunctionPrecreate` (api.proto:4250). Returns the precreate `function_id`,
     /// which is carried into [`ModalClient::function_create`] as
@@ -292,14 +380,7 @@ impl ModalClient {
         // Re-precreate of the same app_id+function_name returns a usable id; the
         // downstream function_create reconciles via existing_function_id, so a
         // retry after a dropped response is safe.
-        let req = FunctionPrecreateRequest {
-            app_id: app_id.to_string(),
-            function_name: function_name.to_string(),
-            function_type: FunctionType::Function as i32,
-            supported_input_formats: supported_formats(),
-            supported_output_formats: supported_formats(),
-            ..Default::default()
-        };
+        let req = build_function_precreate_request(app_id, function_name);
         let stub = self.stub();
         let resp = retry_unary("function_precreate", || {
             let mut stub = stub.clone();
@@ -329,43 +410,11 @@ impl ModalClient {
         precreate_function_id: &str,
         spec: &FunctionSpec,
     ) -> Result<CreatedFunction> {
-        let function = Function {
-            module_name: spec.module_name.clone(),
-            function_name: spec.function_name.clone(),
-            mount_ids: spec.mount_ids.clone(),
-            image_id: spec.image_id.clone(),
-            function_serialized: Vec::new(), // FILE mode: empty.
-            definition_type: DefinitionType::File as i32,
-            function_type: FunctionType::Function as i32,
-            resources: Some(spec.resources.to_proto()), // fix #1: always set.
-            timeout_secs: spec.timeout_secs,
-            supported_input_formats: supported_formats(),
-            supported_output_formats: supported_formats(),
-            // Worker injects the client dep closure at container start (modern
-            // builder), so the add_python image needs no `pip install modal` layer.
-            mount_client_dependencies: spec.mount_client_dependencies,
-            // Empty list ⇒ prost omits field 33 ⇒ byte-identical to pre-P6 for all
-            // existing (no-volume) callers. P6 attaches the cargo-cache volume here;
-            // user volumes (`#[function(volumes=..)]`) attach DISTINCT-path mounts.
-            volume_mounts: spec.volume_mounts.iter().map(|m| m.to_proto()).collect(),
-            // Empty list ⇒ prost omits field 10 ⇒ byte-identical for all existing
-            // (no-secret) callers. The user `#[function(secrets=..)]` path pushes
-            // resolved secret ids here; Modal injects their key/values as ENV VARS.
-            secret_ids: spec.secret_ids.clone(),
-            ..Default::default()
-        };
-
         // Sent with existing_function_id = precreate id + a fixed definition; the
         // server reconciles by precreate id, so re-sending the same definition
         // after a dropped response is idempotent (mirrors Python, which retries
         // FunctionCreate).
-        let req = FunctionCreateRequest {
-            function: Some(function),
-            app_id: app_id.to_string(),
-            existing_function_id: precreate_function_id.to_string(),
-            function_data: None, // fix #1: XOR — never both.
-            ..Default::default()
-        };
+        let req = build_function_create_request(app_id, precreate_function_id, spec);
         let stub = self.stub();
         let resp = retry_unary("function_create", || {
             let mut stub = stub.clone();
@@ -410,12 +459,7 @@ impl ModalClient {
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
         // Pure read — idempotent, safe to retry.
-        let req = FunctionGetRequest {
-            app_name: app_name.to_string(),
-            object_tag: function_name.to_string(),
-            environment_name,
-            app_version: 0,
-        };
+        let req = build_function_get_request(app_name, function_name, environment_name);
         let stub = self.stub();
         let resp = retry_unary("function_get", || {
             let mut stub = stub.clone();
@@ -616,5 +660,91 @@ mod tests {
         assert!(FunctionSpec::new("m", "handler", "im-1")
             .with_gpu(Some("T4:nope"))
             .is_err());
+    }
+
+    #[test]
+    fn build_function_precreate_request_advertises_formats() {
+        let req = build_function_precreate_request("ap-1", "handler");
+        assert_eq!(req.app_id, "ap-1");
+        assert_eq!(req.function_name, "handler");
+        assert_eq!(req.function_type, FunctionType::Function as i32);
+        // [PICKLE, CBOR] for both directions.
+        assert_eq!(req.supported_input_formats, supported_formats());
+        assert_eq!(req.supported_output_formats, supported_formats());
+    }
+
+    #[test]
+    fn build_function_create_request_file_mode_xor_and_wrapper() {
+        // The headline: a FILE-mode spec with two mount ids + a T4 gpu + a cache
+        // volume + secrets projects the full wrapper invariant offline.
+        let spec = FunctionSpec::new("modal_rust_run_wrapper", "handler", "im-1")
+            .with_mount_ids(vec!["mo-client".to_string(), "mo-source".to_string()])
+            .with_timeout_secs(1800)
+            .with_gpu(Some("T4"))
+            .expect("valid gpu")
+            .with_volume_mount("vo-cache", "/cache")
+            .with_secret_id("sc-1");
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+
+        // XOR: function is set, function_data is NOT (fix #1).
+        let function = req.function.expect("FILE-mode sets `function`");
+        assert!(req.function_data.is_none(), "XOR: function_data unset");
+        // Wrapper invariant: app_id + existing_function_id == precreate id.
+        assert_eq!(req.app_id, "ap-1");
+        assert_eq!(req.existing_function_id, "fu-pre-1");
+        // FILE mode: empty serialized, FILE definition, FUNCTION type.
+        assert!(function.function_serialized.is_empty());
+        assert_eq!(function.definition_type, DefinitionType::File as i32);
+        assert_eq!(function.function_type, FunctionType::Function as i32);
+        assert_eq!(function.module_name, "modal_rust_run_wrapper");
+        assert_eq!(function.function_name, "handler");
+        assert_eq!(function.image_id, "im-1");
+        assert_eq!(function.timeout_secs, 1800);
+        // Mount ids ride through in order (client, source).
+        assert_eq!(function.mount_ids, vec!["mo-client", "mo-source"]);
+        // GPU projects onto resources.gpu_config.
+        let gpu = function
+            .resources
+            .as_ref()
+            .and_then(|r| r.gpu_config.as_ref())
+            .expect("gpu_config set for T4");
+        assert_eq!(gpu.gpu_type, "T4");
+        // The cargo-cache volume mount rode in.
+        assert_eq!(function.volume_mounts.len(), 1);
+        assert_eq!(function.volume_mounts[0].mount_path, "/cache");
+        // Secrets round-trip.
+        assert_eq!(function.secret_ids, vec!["sc-1"]);
+    }
+
+    #[test]
+    fn build_function_create_request_bare_cpu_is_byte_identical_to_pre_p6() {
+        // A bare CPU spec leaves gpu_config / volume_mounts / secret_ids unset — the
+        // byte-identical-to-pre-P6 path.
+        let spec = FunctionSpec::new("modal_rust_run_wrapper", "handler", "im-1")
+            .with_mount_ids(vec!["mo-client".to_string(), "mo-source".to_string()]);
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+        let function = req.function.expect("function set");
+        // CPU: resources set (fix #1) but gpu_config unset.
+        assert!(
+            function
+                .resources
+                .as_ref()
+                .and_then(|r| r.gpu_config.as_ref())
+                .is_none(),
+            "bare CPU leaves gpu_config unset"
+        );
+        assert!(function.volume_mounts.is_empty(), "no volume mounts");
+        assert!(function.secret_ids.is_empty(), "no secrets");
+        assert!(req.function_data.is_none(), "XOR holds for CPU too");
+    }
+
+    #[test]
+    fn build_function_get_request_is_pure_read() {
+        let req = build_function_get_request("my-app", "handler", "main".to_string());
+        assert_eq!(req.app_name, "my-app");
+        assert_eq!(req.object_tag, "handler");
+        assert_eq!(req.environment_name, "main");
+        // Latest version.
+        assert_eq!(req.app_version, 0);
     }
 }

@@ -452,6 +452,26 @@ fn bake_command(module_name: &str, source: &str) -> String {
     )
 }
 
+/// Build the `ImageGetOrCreate` request (api.proto:4260) — pure, no I/O.
+///
+/// Extracted from [`ModalClient::image_get_or_create`]; the method resolves the
+/// `builder_version` (config override > environment setting) and passes it in. The
+/// image sub-message comes from [`ImageSpec::to_proto`] (already covered by the
+/// `dockerfile_commands` / `to_proto` sub-message tests); this wraps it with
+/// `app_id` + `builder_version`.
+pub fn build_image_get_or_create_request(
+    spec: &ImageSpec,
+    app_id: &str,
+    builder_version: String,
+) -> ImageGetOrCreateRequest {
+    ImageGetOrCreateRequest {
+        image: Some(spec.to_proto()),
+        app_id: app_id.to_string(),
+        builder_version,
+        ..Default::default()
+    }
+}
+
 impl ModalClient {
     /// Build (or fetch the cached) image for `spec` under `app_id` and return its
     /// `image_id`, blocking until the build finishes.
@@ -476,12 +496,7 @@ impl ModalClient {
         // Modal dedups images by content hash: re-issuing the initial
         // get-or-create returns the same image_id/build, so it is safe to retry on
         // a transient reset. (The build POLL has its own reconnect loop below.)
-        let req = ImageGetOrCreateRequest {
-            image: Some(spec.to_proto()),
-            app_id: app_id.to_string(),
-            builder_version,
-            ..Default::default()
-        };
+        let req = build_image_get_or_create_request(spec, app_id, builder_version);
         let stub = self.stub();
         let resp = retry_unary("image_get_or_create", || {
             let mut stub = stub.clone();
@@ -931,5 +946,36 @@ mod tests {
             .decode(b64)
             .expect("valid base64");
         assert_eq!(decoded, src.as_bytes());
+    }
+
+    #[test]
+    fn build_image_get_or_create_request_carries_wrapper_image_and_version() {
+        // The wrapper: image sub-message present, app_id + builder_version carried.
+        // Pairs with the existing to_proto / dockerfile_commands sub-message tests.
+        let spec = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py")
+            .with_wrapper_module(
+                "modal_rust_run_wrapper",
+                "def handler(e, i):\n    return i\n",
+            );
+        let req = build_image_get_or_create_request(&spec, "ap-1", "2025.06".to_string());
+        assert_eq!(req.app_id, "ap-1");
+        assert_eq!(req.builder_version, "2025.06");
+        let image = req.image.expect("image sub-message present");
+        // The first dockerfile command is the FROM line (proof the spec rode in).
+        assert_eq!(image.dockerfile_commands[0], "FROM rust:1-slim");
+        // The add_python COPY is present; no cargo build (RUN builds in-body).
+        assert!(image
+            .dockerfile_commands
+            .iter()
+            .any(|c| c == "COPY /python/. /usr/local"));
+        assert!(
+            !image
+                .dockerfile_commands
+                .iter()
+                .any(|c| c.contains("cargo build")),
+            "RUN image builds in-body, not at image-build time"
+        );
     }
 }

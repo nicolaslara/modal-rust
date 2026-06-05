@@ -143,3 +143,95 @@ async fn function_create_manifest_table() {
         let _ = fs::remove_dir_all(&tmp);
     }
 }
+
+/// Row 6 (P6 cache, table form) — cache ON vs OFF across a 2-row table, each on its
+/// OWN loopback port. ON ⇒ one VolumeGetOrCreate(V2, cargo-cache name) + a `/cache`
+/// mount; OFF ⇒ zero VolumeGetOrCreate + empty volume_mounts (byte-identical to
+/// pre-P6).
+#[tokio::test]
+async fn cache_on_off_volume_manifest_table() {
+    struct CacheCase {
+        name: &'static str,
+        cache: bool,
+        expect_volumes: usize,
+    }
+
+    let cases = [
+        CacheCase {
+            name: "cache-on",
+            cache: true,
+            expect_volumes: 1,
+        },
+        CacheCase {
+            name: "cache-off",
+            cache: false,
+            expect_volumes: 0,
+        },
+    ];
+
+    for c in cases {
+        let mock = MockModal::start().await.expect("mock up");
+        let tmp = std::env::temp_dir().join(format!(
+            "modal-rust-mock-cachetable-{}-{}",
+            std::process::id(),
+            c.name
+        ));
+        let mut rc = tiny_source_config(&tmp);
+        rc.cache = c.cache;
+        // A bare decorator (cache=None) DEFERS to RemoteConfig.cache, so the per-case
+        // `rc.cache` is what decides the cargo-cache volume (the override semantics).
+        let mut decorator = BTreeMap::new();
+        decorator.insert(
+            "add".to_string(),
+            FunctionConfig {
+                gpu: None,
+                timeout_secs: Some(600),
+                cache: None,
+                secrets: &[],
+                volumes: &[],
+            },
+        );
+        let app = App::connect_at_with_configs(
+            "cache-table-app",
+            modal_registry(),
+            decorator,
+            mock.url(),
+            rc,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("case {}: connect: {e}", c.name));
+
+        let _: serde_json::Value = app
+            .function("add")
+            .remote(serde_json::json!({ "a": 1, "b": 2 }))
+            .await
+            .unwrap_or_else(|e| panic!("case {}: remote: {e}", c.name));
+
+        let function = mock
+            .last::<FunctionCreateRequest>()
+            .and_then(|fc| fc.function)
+            .unwrap_or_else(|| panic!("case {}: no function", c.name));
+        assert_eq!(
+            mock.took::<VolumeGetOrCreateRequest>(),
+            c.expect_volumes,
+            "case {}: VolumeGetOrCreate count",
+            c.name
+        );
+        assert_eq!(
+            function.volume_mounts.len(),
+            c.expect_volumes,
+            "case {}: volume_mounts on the function",
+            c.name
+        );
+        if c.cache {
+            let vol = mock
+                .last::<VolumeGetOrCreateRequest>()
+                .unwrap_or_else(|| panic!("case {}: no volume", c.name));
+            assert_eq!(vol.deployment_name, "modal-rust-cargo-cache");
+            assert_eq!(vol.version, VolumeFsVersion::V2 as i32);
+            assert_eq!(function.volume_mounts[0].mount_path, "/cache");
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

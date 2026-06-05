@@ -96,6 +96,7 @@ pub mod __private {
 
 mod app;
 mod deploy;
+mod dump;
 mod error;
 mod function;
 mod remote;
@@ -103,6 +104,9 @@ mod scope;
 
 pub use app::App;
 pub use deploy::{DeployConfig, DeployedApp};
+// The additive, network-free dry-run / dump (the deferred P8). New types/methods —
+// the facade's run/deploy/call public signatures are unchanged.
+pub use dump::{Manifest, MountRole, PlannedRequest, RunMode};
 pub use error::{Error, Result};
 pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root

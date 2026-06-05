@@ -27,6 +27,22 @@ use crate::retry::{jitter, retry_unary, RetryPolicy};
 /// modal-rs `LARGE_FILE_BLOB_THRESHOLD_BYTES` (`blob_transfer.rs:8`).
 pub const LARGE_FILE_BLOB_THRESHOLD: usize = 4 * 1024 * 1024;
 
+/// Build the `BlobCreate` request (api.proto) — pure, no I/O.
+///
+/// Computes the content-addressed base64 SHA-256 + content length INTERNALLY (the
+/// side-effecting presigned-URL `PUT` stays in [`ModalClient::blob_create_and_put`]).
+/// `content_md5` is omitted (optional for the single-part sizes we use), matching
+/// the inline literal it replaces.
+pub fn build_blob_create_request(data: &[u8]) -> BlobCreateRequest {
+    let content_sha256_base64 =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
+    BlobCreateRequest {
+        content_md5: String::new(),
+        content_sha256_base64,
+        content_length: data.len() as i64,
+    }
+}
+
 impl ModalClient {
     /// Upload `data` as a single-part blob and return its `blob_id`.
     ///
@@ -37,16 +53,10 @@ impl ModalClient {
     ///    bytes (require a 2xx); a multipart plan → error (unsupported here).
     /// 3. Return `resp.blob_id`.
     pub(crate) async fn blob_create_and_put(&mut self, data: &[u8]) -> Result<String> {
-        let sha256_b64 = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
-
         // BlobCreate returns a presigned URL for the content-addressed sha;
         // re-requesting is safe (a new URL for the same content), so retry on a
         // transient reset.
-        let req = BlobCreateRequest {
-            content_md5: String::new(),
-            content_sha256_base64: sha256_b64,
-            content_length: data.len() as i64,
-        };
+        let req = build_blob_create_request(data);
         let stub = self.stub();
         let resp = retry_unary("blob_create", || {
             let mut stub = stub.clone();
@@ -133,5 +143,34 @@ async fn put_blob_bytes(url: &str, data: &[u8]) -> Result<()> {
         tokio::time::sleep(jitter(delay)).await;
         delay = delay.mul_f64(policy.delay_factor).min(policy.max_delay);
         attempt += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_blob_create_carries_length_and_b64_sha() {
+        let data = b"hello blob";
+        let req = build_blob_create_request(data);
+        // content_length == data.len().
+        assert_eq!(req.content_length, data.len() as i64);
+        // content_sha256_base64 is the base64 SHA-256 of the bytes.
+        let want = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
+        assert_eq!(req.content_sha256_base64, want);
+        // md5 is omitted for the single-part path.
+        assert!(req.content_md5.is_empty(), "content_md5 stays empty");
+    }
+
+    #[test]
+    fn build_blob_create_empty_bytes() {
+        let req = build_blob_create_request(&[]);
+        assert_eq!(req.content_length, 0);
+        // SHA-256 of the empty string, base64-encoded.
+        assert_eq!(
+            req.content_sha256_base64,
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+        );
     }
 }

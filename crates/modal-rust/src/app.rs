@@ -570,6 +570,24 @@ impl App {
     pub(crate) fn known_names(&self) -> Vec<String> {
         self.registry.names().map(|n| n.to_string()).collect()
     }
+
+    /// The app name the offline dump ([`App::dry_run`]) renders for the RUN path:
+    /// the connected ephemeral app's name if this App is connected, else `fallback`
+    /// (the config package — a bare, unconnected App has no app name). NO network.
+    pub(crate) fn dump_app_name(&self, fallback: &str) -> String {
+        self.remote
+            .as_ref()
+            .map(|h| h.app_name.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    /// The decorator config the offline DEPLOY dump ([`App::dump_deploy_manifest`])
+    /// applies — the SAME selection [`App::deploy_with`] uses. NO network.
+    pub(crate) fn deploy_target_config_for_dump(
+        &self,
+    ) -> Option<modal_rust_runtime::FunctionConfig> {
+        self.deploy_target_config()
+    }
 }
 
 #[cfg(test)]

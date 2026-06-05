@@ -70,3 +70,30 @@ pub use ops::invoke::Invocation;
 pub use ops::local_dir::{WorkspaceClosureSpec, DEFAULT_IGNORE_PATTERNS, DEFAULT_MODALIGNORE_NAME};
 pub use ops::mount::{client_mount_name, python_standalone_mount_name};
 pub use ops::DEFAULT_BASE_IMAGE;
+
+/// Internal: the pure `build_*_request` functions, re-exported so the facade's
+/// offline dry-run/dump (`modal_rust::dump`) can assemble the SAME control-plane
+/// requests the live path sends — built ON these identical builders, so the dumped
+/// manifest can never drift from the wire. NOT a stable public API; the
+/// `build_*_request` functions are the seam the run/deploy ops already call.
+#[doc(hidden)]
+pub mod planning {
+    pub use crate::ops::app::{
+        build_app_create_request, build_app_get_or_create_request, build_app_publish_request,
+    };
+    pub use crate::ops::blob::build_blob_create_request;
+    pub use crate::ops::function::{
+        build_function_create_request, build_function_get_request, build_function_precreate_request,
+    };
+    pub use crate::ops::image::build_image_get_or_create_request;
+    pub use crate::ops::invoke::{
+        build_function_get_outputs_request, build_function_map_request,
+        build_function_put_inputs_request,
+    };
+    pub use crate::ops::local_dir::{
+        build_mount_get_or_create_source_request, build_mount_put_file_request,
+    };
+    pub use crate::ops::mount::build_mount_get_or_create_global_request;
+    pub use crate::ops::secret::{build_secret_from_dict_request, build_secret_from_name_request};
+    pub use crate::ops::volume::build_volume_get_or_create_request;
+}

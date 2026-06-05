@@ -19,6 +19,27 @@ use crate::ops::CLIENT_VERSION;
 use crate::proto::api::{DeploymentNamespace, MountGetOrCreateRequest, ObjectCreationType};
 use crate::retry::retry_unary;
 
+/// Build the GLOBAL `MountGetOrCreate` lookup request — pure, no I/O. Looks up a
+/// hosted mount by deployment name in the GLOBAL namespace with
+/// `OBJECT_CREATION_TYPE_UNSPECIFIED` (pure lookup — Python's `from_name._load`
+/// neither sets a creation type nor creates this mount).
+///
+/// Covers the hosted client mount and the python-standalone mount. Extracted from
+/// [`ModalClient::global_mount_id`]; the method passes the resolved
+/// `environment_name`.
+pub fn build_mount_get_or_create_global_request(
+    deployment_name: &str,
+    environment_name: String,
+) -> MountGetOrCreateRequest {
+    MountGetOrCreateRequest {
+        deployment_name: deployment_name.to_string(),
+        namespace: DeploymentNamespace::Global as i32,
+        environment_name,
+        object_creation_type: ObjectCreationType::Unspecified as i32,
+        ..Default::default()
+    }
+}
+
 /// Hosted client-mount deployment name for a given Modal client version
 /// (`client_mount_name()`, mount.py:62-69). The Python helper strips any
 /// `+githash` suffix; our [`CLIENT_VERSION`] is already clean.
@@ -132,13 +153,7 @@ impl ModalClient {
         environment: Option<&str>,
     ) -> Result<Option<String>> {
         let environment_name = self.env_or_default(environment);
-        let req = MountGetOrCreateRequest {
-            deployment_name: deployment_name.to_string(),
-            namespace: DeploymentNamespace::Global as i32,
-            environment_name,
-            object_creation_type: ObjectCreationType::Unspecified as i32,
-            ..Default::default()
-        };
+        let req = build_mount_get_or_create_global_request(deployment_name, environment_name);
         let stub = self.stub();
         let resp = retry_unary("mount_get_or_create(global)", || {
             let mut stub = stub.clone();
@@ -179,5 +194,24 @@ mod tests {
     #[test]
     fn python_standalone_mount_name_rejects_unsupported_series() {
         assert_eq!(python_standalone_mount_name("3.99"), None);
+    }
+
+    #[test]
+    fn build_mount_get_or_create_global_is_pure_lookup() {
+        let req = build_mount_get_or_create_global_request(
+            "modal-client-mount-1.3.2",
+            "main".to_string(),
+        );
+        assert_eq!(req.deployment_name, "modal-client-mount-1.3.2");
+        assert_eq!(req.environment_name, "main");
+        // GLOBAL namespace, UNSPECIFIED creation (pure lookup, never creates).
+        assert_eq!(req.namespace, DeploymentNamespace::Global as i32);
+        assert_eq!(
+            req.object_creation_type,
+            ObjectCreationType::Unspecified as i32
+        );
+        // No files / app_id on a lookup.
+        assert!(req.files.is_empty());
+        assert!(req.app_id.is_empty());
     }
 }
