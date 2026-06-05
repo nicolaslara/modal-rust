@@ -103,9 +103,50 @@ identical for both.
 
 ### Authoring with `#[modal_rust::function]` (the macro path)
 
-Annotate a normal Rust function with serializable input and output types. The
-macro registers it through `inventory`, so there is no `modal_registry()` builder
-to maintain — `App::from_inventory()` collects every annotated function:
+Annotate a plain Rust function. The macro generates the input/output plumbing,
+registers the function through `inventory` (so there is no `modal_registry()`
+builder to maintain), and adds a typed method to `App` named after the function —
+so **you never hand-write `AddInput`/`AddOutput` structs unless you want to**:
+
+```rust
+use modal_rust::function;
+
+#[function]
+pub fn add(a: i64, b: i64) -> anyhow::Result<i64> {
+    Ok(a + b)
+}
+```
+
+`App::from_inventory()` collects every annotated function, and each one gets a
+typed method — there is no input or output type to name at the call site:
+
+```rust
+use modal_rust::App;
+
+async fn example() -> anyhow::Result<()> {
+    let app = App::from_inventory();
+
+    // `.local()` runs the handler in-process — no Modal, no network.
+    let sum: i64 = app.add(2, 3).local()?;
+    assert_eq!(sum, 5);
+
+    // `.remote()` uploads the crate and runs it on Modal; `.spawn()`
+    // (fire-and-forget) and `.map()` (fan-out) hang off the same typed method.
+    let app = App::connect("my-rust-app").await?;
+    let sum: i64 = app.add(2, 3).remote().await?;
+    assert_eq!(sum, 5);
+    Ok(())
+}
+```
+
+Under the hood the macro still generates a nameable `add::Input { a, b }` /
+`add::Output` pair, so you can also call dynamically by string when you need to:
+`app.function("add").remote(add::Input { a: 2, b: 3 })`.
+
+If you would rather define **named, documented I/O types** yourself, pass a single
+serializable struct in and return one out. The macro detects this form and
+compiles to a byte-identical handler — it is what the manual `Registry` path and
+the call/deploy examples below use:
 
 ```rust
 use modal_rust::function;
