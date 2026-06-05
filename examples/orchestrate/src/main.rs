@@ -8,8 +8,8 @@
 //! 1. **`.local(..)`** — in-process dispatch through the SAME frozen registry the
 //!    runner uses. ZERO Modal, ZERO network. This is the path that runs in
 //!    `cargo run -p example-orchestrate` and in the test below; it prints `{sum:42}`.
-//!    Shown through BOTH registries: the manual `App::new(modal_registry())` (the
-//!    no-macro teaching path) and the macro `App::from_inventory()` — including the
+//!    Shown through BOTH registries: the manual `App::local_with_registry(modal_registry())` (the
+//!    no-macro teaching path) and the macro `App::local()` — including the
 //!    typed positional ergonomics `app.add(2, 3).local()` from the
 //!    `#[modal_rust::function]` auto-I/O twin, where no input/output type is named.
 //! 2. **`.remote(..).await`** — the RUN path: the crate is uploaded and
@@ -38,9 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ----- 1. OFFLINE: `.local()` — the primary, zero-Modal path -----------------
     //
     // Build an App from an explicit Registry (here `example_add::modal_registry()`;
-    // with the `#[modal_rust::function]` macro you would call `App::from_inventory()`
+    // with the `#[modal_rust::function]` macro you would call `App::local()`
     // instead). No network, no credentials, nothing to install.
-    let app = App::new(modal_registry());
+    let app = App::local_with_registry(modal_registry());
 
     // Resolve a Function handle by entrypoint name and run it in-process. The input
     // and output are your real Rust types — `.local()` is `serde_json` in / handler /
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("local: add(40, 2) -> {{sum: {}}}", out.sum);
     assert_eq!(out.sum, 42, "the offline .local() path must compute 42");
 
-    // ----- 1b. OFFLINE (MACRO PATH): App::from_inventory() + typed app.fn() -------
+    // ----- 1b. OFFLINE (MACRO PATH): App::local() + typed app.fn() -------
     //
     // The SAME offline `.local()` dispatch, but the registry comes from the
     // `#[modal_rust::function]` inventory instead of a hand-written builder. The
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // return type. (The macro generates `add::{Input, Output}` deriving both serde
     // directions, which is what the facade `.local()` callers use.)
     use example_add_macro::AddCall; // the generated typed-method trait
-    let macro_app = App::from_inventory();
+    let macro_app = App::local();
 
     // The `#[modal_rust::function]` inventory registers `add` into the
     // SAME `Registry` shape the manual builder produced — proven via the macro crate's
@@ -147,7 +147,7 @@ mod tests {
     /// Modal, no network, no credentials.
     #[test]
     fn local_add_returns_42() {
-        let app = App::new(modal_registry());
+        let app = App::local_with_registry(modal_registry());
         let out: AddOutput = app
             .function("add")
             .local(AddInput { a: 40, b: 2 })
@@ -157,11 +157,11 @@ mod tests {
 
     /// The MACRO path guarantees the same offline contract via the inventory registry
     /// and the typed positional method — no input/output type named. Guards the
-    /// ergonomic surface (`App::from_inventory()` + `app.add(2, 3).local()`).
+    /// ergonomic surface (`App::local()` + `app.add(2, 3).local()`).
     #[test]
     fn local_macro_add_returns_5() {
         use example_add_macro::AddCall;
-        let app = App::from_inventory();
+        let app = App::local();
         let sum: i64 = app
             .add(2, 3)
             .local()

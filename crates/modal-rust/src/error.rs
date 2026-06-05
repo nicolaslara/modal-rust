@@ -33,7 +33,7 @@ pub enum Error {
     /// (`.remote()`/`.spawn()`/`.map()`/`FunctionCall::get`) and `connect()`.
     Sdk(modal_rust_sdk::Error),
     /// A RUN-path call (`.remote()`/`.spawn()`/`.map()`) was made on an
-    /// [`App`](crate::App) that was built offline (`App::new`/`App::from_inventory`)
+    /// [`App`](crate::App) that was built offline (`App::local`/`App::local_with_registry`)
     /// and never [`connect`](crate::App::connect)ed. Remote execution needs the live
     /// control-plane handle.
     NotConnected(String),
@@ -55,7 +55,7 @@ impl Error {
     pub(crate) fn not_connected() -> Error {
         Error::NotConnected(
             "`.remote()` requires a connected App: call `App::connect(name).await` \
-             (App::new / App::from_inventory are offline-only, for `.local()`)."
+             (App::local / App::local_with_registry are offline-only, for `.local()`)."
                 .to_string(),
         )
     }

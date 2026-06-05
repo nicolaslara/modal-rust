@@ -3,7 +3,7 @@
 //! Drives the facade end-to-end against REAL Modal so the decorator-sourced GPU
 //! config rides into `FunctionCreate`:
 //!   `#[modal_rust::function(gpu = "T4", name = "vector_add")]` (in THIS test binary)
-//!   → `App::from_inventory()` captures `FunctionConfig { gpu: Some("T4"), .. }`
+//!   → `App::connect(..)` captures `FunctionConfig { gpu: Some("T4"), .. }`
 //!   → `app.function("vector_add").remote(GpuIn { n })`
 //!   → the facade sets `FunctionSpec::with_gpu(Some("T4"))` → `Resources.gpu_config`
 //!     (gpu_type "T4", count 1) on the outbound `FunctionCreate`

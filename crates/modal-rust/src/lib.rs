@@ -20,7 +20,7 @@
 //! use modal_rust::App;
 //! use example_add::{modal_registry, AddInput, AddOutput};
 //!
-//! let app = App::new(modal_registry()); // or App::from_inventory()
+//! let app = App::local_with_registry(modal_registry()); // or App::local()
 //! let out: AddOutput = app
 //!     .function("add")
 //!     .local(AddInput { a: 40, b: 2 })

@@ -19,16 +19,16 @@ type MapInput<'a> = ((&'a str, String), std::collections::HashMap<String, ()>);
 
 /// The user-facing application handle.
 ///
-/// Build one from an explicit [`Registry`] ([`App::new`]) or from the
-/// inventory-collected registry ([`App::from_inventory`], the
-/// `#[modal_rust::function]` path). Resolve a [`Function`] handle by entrypoint
-/// name with [`App::function`].
+/// Build an offline (in-process, no Modal) handle with [`App::local`] (the
+/// `#[modal_rust::function]` path) or from an explicit [`Registry`] with
+/// [`App::local_with_registry`]; build a remote handle with [`App::connect`].
+/// Resolve a [`Function`] handle by entrypoint name with [`App::function`].
 pub struct App {
     /// Owned registry; the ONLY field `.local()` needs.
     registry: Registry,
     /// Per-entrypoint config from `#[modal_rust::function(...)]`. EMPTY for the
-    /// manual `App::new(registry)` / `connect_with_registry` path (no decorator =>
-    /// facade defaults apply via [`App::config_for`]).
+    /// manual `App::local_with_registry(registry)` / `connect_with_registry` path
+    /// (no decorator => facade defaults apply via [`App::config_for`]).
     configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
     /// `None` until [`App::connect`]; the live control-plane handle `.remote()`
     /// consumes. `.local()` never touches it.
@@ -59,13 +59,14 @@ struct RemoteHandle {
 }
 
 impl App {
-    /// Build from an explicit [`Registry`] (manual builder path — e.g.
-    /// `example_add::modal_registry()`). Zero Modal, zero network.
+    /// Build an offline (in-process, no Modal) app from an explicit [`Registry`]
+    /// (manual builder path — e.g. `example_add::modal_registry()`). Zero Modal,
+    /// zero network.
     ///
     /// The manual path has NO decorator config: `configs` is empty, so
     /// [`App::config_for`] returns `FunctionConfig::default()` (all `None`) and the
     /// facade falls back to its path defaults — behavior preserved.
-    pub fn new(registry: Registry) -> Self {
+    pub fn local_with_registry(registry: Registry) -> Self {
         App {
             registry,
             configs: std::collections::BTreeMap::new(),
@@ -73,10 +74,10 @@ impl App {
         }
     }
 
-    /// Build from the inventory-collected [`Registry`] (the
-    /// `#[modal_rust::function]` macro path), ALSO capturing each entrypoint's
-    /// decorator [`FunctionConfig`]. Zero Modal, zero network.
-    pub fn from_inventory() -> Self {
+    /// Build an offline (in-process, no Modal) app over the functions decorated
+    /// with `#[modal_rust::function]`, ALSO capturing each entrypoint's decorator
+    /// [`FunctionConfig`]. Zero Modal, zero network.
+    pub fn local() -> Self {
         let (registry, configs) = modal_rust_runtime::from_inventory_with_configs();
         App {
             registry,
@@ -576,12 +577,12 @@ mod tests {
     use super::*;
     // Link example-add-macro's inventory submissions (incl. the decorated `add_gpu`
     // with `gpu="T4", timeout=1800, cache=false`) into this test binary so
-    // `App::from_inventory()` surfaces their FunctionConfig.
+    // `App::local()` surfaces their FunctionConfig.
     use example_add_macro as _;
 
     #[test]
-    fn from_inventory_captures_decorator_config() {
-        let app = App::from_inventory();
+    fn local_captures_decorator_config() {
+        let app = App::local();
         // The decorated entrypoint's config flows through `config_for`.
         let gpu_cfg = app.config_for("add_gpu");
         assert_eq!(gpu_cfg.gpu, Some("T4"));
@@ -593,10 +594,10 @@ mod tests {
     }
 
     #[test]
-    fn from_inventory_captures_secrets_and_volumes() {
+    fn local_captures_secrets_and_volumes() {
         // The decorated `add_extras` (`secrets=["my-secret"], volumes=["/data=my-vol"]`)
         // flows through `config_for` so the RUN/DEPLOY paths can resolve + attach them.
-        let app = App::from_inventory();
+        let app = App::local();
         let cfg = app.config_for("add_extras");
         assert_eq!(cfg.secrets, &["my-secret"]);
         assert_eq!(cfg.volumes, &[("/data", "my-vol")]);
@@ -630,7 +631,7 @@ mod tests {
 
         // The decorated `add_gpu` entrypoint carries cache=Some(false) end-to-end, so
         // the RUN path will force cache off for it regardless of the env base.
-        let app = App::from_inventory();
+        let app = App::local();
         assert_eq!(app.config_for("add_gpu").cache, Some(false));
         assert!(!apply(app.config_for("add_gpu").cache, true));
         // The bare `add` entrypoint defers (cache=None).
@@ -639,10 +640,10 @@ mod tests {
     }
 
     #[test]
-    fn manual_new_path_config_is_default() {
-        // The manual `App::new(registry)` path has NO decorator config (empty
-        // configs map), so `config_for` returns the default for any name.
-        let app = App::new(Registry::new());
+    fn manual_local_with_registry_path_config_is_default() {
+        // The manual `App::local_with_registry(registry)` path has NO decorator config
+        // (empty configs map), so `config_for` returns the default for any name.
+        let app = App::local_with_registry(Registry::new());
         assert_eq!(
             app.config_for("anything"),
             modal_rust_runtime::FunctionConfig::default()

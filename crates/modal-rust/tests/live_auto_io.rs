@@ -31,7 +31,7 @@ use std::time::Duration;
 
 // Link example-add-macro's inventory submissions (incl. the plain-signature
 // `add`) AND bring its generated typed-call trait into scope, so
-// `App::from_inventory()` surfaces the handler and `app.add(..)` resolves.
+// `App::connect(..)` surfaces the handler and `app.add(..)` resolves.
 use example_add_macro::add;
 use example_add_macro::AddCall;
 use modal_rust::{App, Error};

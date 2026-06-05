@@ -117,14 +117,14 @@ pub fn add(a: i64, b: i64) -> anyhow::Result<i64> {
 }
 ```
 
-`App::from_inventory()` collects every annotated function, and each one gets a
-typed method — there is no input or output type to name at the call site:
+`App::local()` builds an in-process app over every annotated function, and each
+one gets a typed method — there is no input or output type to name at the call site:
 
 ```rust
 use modal_rust::App;
 
 async fn example() -> anyhow::Result<()> {
-    let app = App::from_inventory();
+    let app = App::local();
 
     // `.local()` runs the handler in-process — no Modal, no network.
     let sum: i64 = app.add(2, 3).local()?;
@@ -222,7 +222,7 @@ pub struct AddOutput {
 }
 
 async fn example() -> anyhow::Result<()> {
-    let app = App::from_inventory();
+    let app = App::local();
 
     // `.local()` runs the handler in-process — no Modal, no network.
     let out: AddOutput = app
@@ -317,9 +317,9 @@ pub fn modal_registry() -> Registry {
 }
 ```
 
-Then hand the registry to `App` instead of using `from_inventory()`:
+Then hand the registry to `App` instead of using `App::local()`:
 
-- `App::new(modal_registry())` for offline `.local()` calls, and
+- `App::local_with_registry(modal_registry())` for offline `.local()` calls, and
 - `App::connect_with_registry("my-rust-app", modal_registry()).await?` for live
   `.remote()` / deploy / call.
 
@@ -478,7 +478,7 @@ The `examples/` directory holds runnable, live-proven crates:
 | --- | --- |
 | `examples/add` | **(manual / no-macro)** The same `add` written by hand — the input struct, the `typed!` registration, and `modal_registry()`, i.e. everything the macro generates for you. Plus named entrypoints exercising every runner error kind. |
 | `examples/add-macro` | **(macro)** The same `add` in three lines: `#[modal_rust::function] fn add(a, b) -> anyhow::Result<i64>`, called `app.add(2, 3).remote().await?` — the macro generates the input struct, registration, and typed method. Plus the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
-| `examples/orchestrate` | A tour of the facade driving `add` via `.local()`, `.remote()`, and `deploy`+`call` — through BOTH the manual `App::new(modal_registry())` and the macro `App::from_inventory()` + typed `app.add(2, 3)` paths. |
+| `examples/orchestrate` | A tour of the facade driving `add` via `.local()`, `.remote()`, and `deploy`+`call` — through BOTH the manual `App::local_with_registry(modal_registry())` and the macro `App::local()` + typed `app.add(2, 3)` paths. |
 | `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 
@@ -492,8 +492,8 @@ pub fn add(a: i64, b: i64) -> anyhow::Result<i64> { Ok(a + b) }
 #[modal_rust::function(gpu = "T4")]           // the decorator IS the config
 pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> { /* … */ }
 
-// …then, against an inventory-built App:
-let app = modal_rust::App::from_inventory();
+// …then, against an in-process (local) App:
+let app = modal_rust::App::local();
 let five: i64 = app.add(2, 3).local()?;                   // offline, zero Modal
 let out = app.add(2, 3).remote().await?;                  // on Modal
 ```

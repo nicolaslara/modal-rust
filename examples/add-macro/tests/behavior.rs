@@ -43,7 +43,7 @@ fn add_registered_via_inventory_runner_envelope() {
 #[test]
 fn add_typed_app_method_local() {
     // Auto-I/O ergonomics: typed positional method, no input/output type named.
-    let app = App::from_inventory();
+    let app = App::local();
     let sum: i64 = app.add(2, 3).local().unwrap();
     assert_eq!(sum, 5);
 }
@@ -51,7 +51,7 @@ fn add_typed_app_method_local() {
 #[test]
 fn add_explicit_input_path_local() {
     // The generated input stays callable explicitly via the string-keyed path.
-    let app = App::from_inventory();
+    let app = App::local();
     let sum: i64 = app
         .function("add")
         .local(add::Input { a: 2, b: 3 })
