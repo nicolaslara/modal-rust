@@ -1868,6 +1868,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-background-jobs"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "example-burn-add"
 version = "0.0.0"
 dependencies = [

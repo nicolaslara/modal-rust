@@ -23,6 +23,7 @@ members = [
     "examples/orchestrate",
     "examples/ways-to-call",
     "examples/fan-out-map",
+    "examples/background-jobs",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -47,6 +48,7 @@ default-members = [
     "examples/orchestrate",
     "examples/ways-to-call",
     "examples/fan-out-map",
+    "examples/background-jobs",
     "examples/cuda-vector-add",
 ]
 

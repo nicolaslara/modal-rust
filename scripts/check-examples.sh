@@ -108,6 +108,11 @@ run "ways-to-call: .local() tour" 'local:  square(6) -> 36' \
 run "fan-out-map: local fan-out (results in input order)" 'intro -> 8 words, 1 min' \
   "cargo run -q -p example-fan-out-map --bin fan_out_map"
 
+# background-jobs — fire-and-forget with .spawn()+.get(timeout); OFFLINE runs the
+# job in-process (the deterministic result a spawned run converges to)
+run "background-jobs: local job (result a spawn converges to)" "job 'nightly-report' done -> 250000 rounds, digest 17267777379177717202" \
+  "cargo run -q -p example-background-jobs --bin background_jobs"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
@@ -124,6 +129,7 @@ elif ! has_creds; then
   echo "     orchestrate     RUN_REMOTE=1 cargo run -p example-orchestrate"
   echo "     ways-to-call    RUN_REMOTE=1 cargo run -p example-ways-to-call --bin ways_to_call"
   echo "     fan-out-map     RUN_REMOTE=1 cargo run -p example-fan-out-map --bin fan_out_map"
+  echo "     background-jobs RUN_REMOTE=1 cargo run -p example-background-jobs --bin background_jobs"
   echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
   echo
@@ -146,6 +152,12 @@ else
     "RUN_REMOTE=1 cargo run -q -p example-fan-out-map --bin fan_out_map" \
     'remote .map([..]) over 3 docs (results in input order):' \
     'intro -> 8 words, 1 min'
+
+  # LIVE (CPU): background-jobs fires the job with .spawn() and polls the handle.
+  live "background-jobs: live .spawn() + .get(timeout) (CPU)" \
+    "RUN_REMOTE=1 cargo run -q -p example-background-jobs --bin background_jobs" \
+    'spawn: job fired -> handle ' \
+    "get:   job 'nightly-report' done -> 250000 rounds, digest 17267777379177717202"
 
   if [[ "${RUN_GPU:-}" == "1" ]]; then
     # GPU: cuda-vector-add on a T4 via the RUN path (in-body build, Tier 0).
