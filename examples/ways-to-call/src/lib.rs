@@ -1,0 +1,25 @@
+//! `examples/ways-to-call` — one function, called four ways.
+//!
+//! Teaching ONE concept: a single `#[modal_rust::function]` exposes FOUR invocation
+//! shapes through the typed `app.square(n)` method the macro generates:
+//!
+//! - `.local()`            — in-process, zero Modal, zero network.
+//! - `.remote().await`     — one call on Modal (upload + in-body build + run).
+//! - `.spawn().await` + `.get()` — fire-and-forget, poll for the result later.
+//! - `.map([..]).await`    — fan-out over many inputs, results in input order.
+//!
+//! All four hang off the SAME typed method (`app.square(n)`); no input/output type
+//! is ever named at the call site. The companion `src/bin/ways_to_call.rs` is the
+//! runnable tour (offline `.local()` runs by default; the live shapes are
+//! credential-gated). `src/bin/modal_runner.rs` is the one-line runner.
+
+use modal_rust::function;
+
+/// Square an integer — the whole function. The macro generates the JSON I/O
+/// plumbing, registers the entrypoint via `inventory`, and adds a typed
+/// `app.square(5)` method that chains into `.local()` / `.remote().await` /
+/// `.spawn()` / `.map(..)` — the four shapes this example shows.
+#[function]
+pub fn square(n: i64) -> anyhow::Result<i64> {
+    Ok(n * n)
+}

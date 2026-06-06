@@ -100,6 +100,10 @@ run "add (manual): add(40, 2)" '{"ok":true,"value":{"sum":42}}' \
 run "orchestrate: local tour" 'add(2, 3) -> 5' \
   "cd examples/orchestrate && cargo run -q --bin orchestrate"
 
+# ways-to-call — one function, four invocation shapes; OFFLINE runs the .local() one
+run "ways-to-call: .local() tour" 'local:  square(6) -> 36' \
+  "cargo run -q -p example-ways-to-call --bin ways_to_call"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
@@ -114,6 +118,7 @@ elif ! has_creds; then
   echo "   MODAL_TOKEN_ID + MODAL_TOKEN_SECRET). With credentials they run"
   echo "   automatically. The commands they would run:"
   echo "     orchestrate     RUN_REMOTE=1 cargo run -p example-orchestrate"
+  echo "     ways-to-call    RUN_REMOTE=1 cargo run -p example-ways-to-call --bin ways_to_call"
   echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
   echo
@@ -123,6 +128,13 @@ else
     "RUN_REMOTE=1 cargo run -q -p example-orchestrate --bin orchestrate" \
     'remote: add(40, 2) -> {sum: 42}' \
     'call: add(40, 2) -> {sum: 42}'
+
+  # LIVE (CPU): ways-to-call drives the three remote shapes (.remote/.spawn/.map).
+  live "ways-to-call: live .remote() + .spawn() + .map() (CPU)" \
+    "RUN_REMOTE=1 cargo run -q -p example-ways-to-call --bin ways_to_call" \
+    'remote: square(6) -> 36' \
+    'spawn:  square(7) -> 49' \
+    'map:    square([2, 3, 4]) -> [4, 9, 16]'
 
   if [[ "${RUN_GPU:-}" == "1" ]]; then
     # GPU: cuda-vector-add on a T4 via the RUN path (in-body build, Tier 0).
