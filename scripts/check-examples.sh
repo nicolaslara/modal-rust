@@ -151,6 +151,16 @@ run "timeout-and-cache: --describe (timeout + cache ride through inventory)" '"t
 run "custom-base: dry-run renders a CUDA-devel base FROM line" 'base:   FROM nvidia/cuda:12.6.3-devel-ubuntu22.04' \
   "cargo run -q -p example-custom-base --bin custom_base"
 
+# deploy-and-call — the run-vs-deploy build boundary (the production model). The
+# offline driver dry-runs BOTH manifests and prints where each builds: .remote()
+# builds IN the body (RUN image carries no cargo build); deploy bakes the binary at
+# image-build time (top layer `cargo build --release`, client-mount-only
+# FunctionCreate, persistent publish). A mock-backed test (tests/manifest.rs) drives
+# a REAL deploy + call and asserts the deploy manifest AND that call resolves the
+# function with no rebuild. Modal-requiring deploy/call commands are compile-only.
+run "deploy-and-call: deploy builds once, call invokes with no rebuild" 'boundary: deploy builds ONCE at image-build, call invokes with no rebuild' \
+  "cargo run -q -p example-deploy-and-call --bin deploy_and_call"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"

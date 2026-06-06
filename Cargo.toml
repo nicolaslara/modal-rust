@@ -29,6 +29,7 @@ members = [
     "examples/volumes",
     "examples/timeout-and-cache",
     "examples/custom-base",
+    "examples/deploy-and-call",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -59,6 +60,7 @@ default-members = [
     "examples/volumes",
     "examples/timeout-and-cache",
     "examples/custom-base",
+    "examples/deploy-and-call",
     "examples/cuda-vector-add",
 ]
 

@@ -1920,6 +1920,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-deploy-and-call"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "modal-rust-testkit",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "example-error-handling"
 version = "0.0.0"
 dependencies = [
