@@ -64,6 +64,11 @@ pub(crate) const RUST_VER: &str = "1";
 pub(crate) const PYTHON_SERIES: &str = "3.12";
 /// In-body `cargo build` needs far longer than the SDK's 300s invoke default.
 pub(crate) const REMOTE_TIMEOUT_SECS: u32 = 1800;
+/// Genuine LAST-RESORT package fallback for [`discover_package`]: used ONLY when
+/// neither `MODAL_RUST_PACKAGE` nor a macro-detected `CARGO_PKG_NAME` is available.
+/// In practice the macro/env always win; this only survives a manual registry with
+/// no `#[function]` and no env override.
+pub(crate) const DEFAULT_PACKAGE: &str = "example-add";
 
 /// Stable in-container mount path for the cargo-cache V2 volume (P6). The single
 /// archive object lives at `{CACHE_MOUNT}/{CACHE_ARCHIVE_NAME}`.
@@ -254,18 +259,18 @@ fn discover_local_root() -> PathBuf {
     nearest_manifest.unwrap_or(cwd)
 }
 
-/// Discover the cargo package for `-p`: `MODAL_RUST_PACKAGE` if set, else the v0
-/// default `"example-add"`.
+/// Discover the cargo package for `-p`: `MODAL_RUST_PACKAGE` if set, else the
+/// genuine last-resort [`DEFAULT_PACKAGE`].
 ///
 /// This is the BASE; the real package usually comes from AUTO-DETECT — the
 /// `#[modal_rust::function]` macro captures the user crate's `env!("CARGO_PKG_NAME")`
 /// into the inventory, and [`App::connect`](crate::App::connect) folds it in via
-/// [`RemoteConfig::with_detected_package`]. The env var still OVERRIDES both. The v0
-/// default only survives when there is NO env var AND no decorated handler (a manual
-/// registry with no `#[function]`), in which case the user supplies an explicit
-/// `RemoteConfig` or sets `MODAL_RUST_PACKAGE`.
+/// [`RemoteConfig::with_detected_package`]. The env var still OVERRIDES both. The
+/// [`DEFAULT_PACKAGE`] fallback only survives when there is NO env var AND no
+/// decorated handler (a manual registry with no `#[function]`), in which case the
+/// user supplies an explicit `RemoteConfig` or sets `MODAL_RUST_PACKAGE`.
 fn discover_package() -> String {
-    std::env::var("MODAL_RUST_PACKAGE").unwrap_or_else(|_| "example-add".to_string())
+    std::env::var("MODAL_RUST_PACKAGE").unwrap_or_else(|_| DEFAULT_PACKAGE.to_string())
 }
 
 /// Discover the run base image: `MODAL_RUST_BASE_IMAGE` if set, else the default

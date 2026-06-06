@@ -41,9 +41,14 @@ pub(crate) const DEPLOY_WRAPPER_CALLABLE: &str = "handler";
 pub(crate) const DEPLOY_SRC: &str = "/app/src";
 /// The fixed path the freshly built `modal_runner` is baked to.
 pub(crate) const DEPLOY_RUNNER: &str = "/app/modal_runner";
-/// Default STABLE deploy app name (re-deploys REPLACE under this name, so re-runs
-/// never accumulate). Override with `MODAL_RUST_DEPLOY_APP`.
-pub(crate) const DEFAULT_DEPLOY_APP: &str = "modal-rust-add-deploy";
+/// The SINGLE canonical default STABLE deploy app name (re-deploys REPLACE under
+/// this name, so re-runs never accumulate). Override with `MODAL_RUST_DEPLOY_APP`.
+///
+/// This is the ONE source of truth for the default deploy app: it backs
+/// [`DeployConfig::default`] AND the `modal-rust` CLI's `--app` default (which
+/// re-exports this constant as `modal_rust::DEFAULT_DEPLOY_APP`), so the library and
+/// CLI defaults cannot drift apart.
+pub const DEFAULT_DEPLOY_APP: &str = "modal-rust-add-deploy";
 /// Output-poll deadline for a deployed-function call. No in-body build at call
 /// time (the binary is prebuilt), so the SDK default suffices.
 pub(crate) const DEPLOY_CALL_DEADLINE: Duration = Duration::from_secs(600);

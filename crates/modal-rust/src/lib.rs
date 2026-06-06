@@ -113,7 +113,7 @@ mod remote;
 mod scope;
 
 pub use app::App;
-pub use deploy::{DeployConfig, DeployedApp};
+pub use deploy::{DeployConfig, DeployedApp, DEFAULT_DEPLOY_APP};
 // The additive, network-free dry-run / dump (the deferred P8). New types/methods —
 // the facade's run/deploy/call public signatures are unchanged.
 pub use dump::{Manifest, MountRole, PlannedRequest, RunMode};

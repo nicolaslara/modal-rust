@@ -25,7 +25,11 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 /// The default persistent deploy app name (boundaries.md / tasks.md M7).
-const DEFAULT_DEPLOY_APP: &str = "modal-rust-add-poc";
+///
+/// Re-exported from the facade so the CLI and `DeployConfig::default` share ONE
+/// source of truth and cannot disagree (previously this was a divergent local
+/// `"modal-rust-add-poc"` string).
+use modal_rust::DEFAULT_DEPLOY_APP;
 
 #[derive(Parser)]
 #[command(
