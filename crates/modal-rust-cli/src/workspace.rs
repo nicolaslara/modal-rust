@@ -45,11 +45,18 @@ pub fn workspace_root(start: &Path) -> Result<PathBuf> {
     })
 }
 
-/// Does this manifest text declare a `[workspace]` table?
-fn declares_workspace(text: &str) -> bool {
+/// Does this manifest text declare a `[workspace]` table (i.e. is it a workspace
+/// root)? A tolerant line-scan (no TOML-parser dependency, keeping the CLI's dep
+/// surface minimal). The single shared scanner used by both `workspace_root`
+/// (here) and the `doctor` panic-profile resolver (`doctor.rs`), so the two
+/// "is this a workspace?" checks cannot drift apart again.
+///
+/// Matches the bare `[workspace]` table header (with or without a trailing
+/// comment) and any `[workspace.*]` sub-table (e.g. `[workspace.package]`).
+pub(crate) fn declares_workspace(text: &str) -> bool {
     text.lines()
         .map(str::trim)
-        .any(|l| l == "[workspace]" || l.starts_with("[workspace."))
+        .any(|l| l.starts_with("[workspace]") || l.starts_with("[workspace."))
 }
 
 /// Read the cargo PACKAGE name (`[package].name`) from `<project>/Cargo.toml`.
@@ -113,10 +120,18 @@ mod tests {
 
     #[test]
     fn workspace_table_detected() {
+        // Bare `[workspace]` header.
         assert!(declares_workspace("[workspace]\nmembers = []\n"));
+        // `[workspace.*]` sub-tables (e.g. `[workspace.package]`).
         assert!(declares_workspace(
             "[workspace.package]\nedition = \"2021\"\n"
         ));
+        // Indented header (the scan trims each line).
+        assert!(declares_workspace("  [workspace]\n"));
+        // A `[workspace]` header with a trailing comment — the edge case the
+        // doctor's former copy uniquely handled; the unified scanner keeps it.
+        assert!(declares_workspace("[workspace] # the root\nmembers = []\n"));
+        // A plain package manifest is NOT a workspace root.
         assert!(!declares_workspace(
             "[package]\nname = \"x\"\n[dependencies]\n"
         ));

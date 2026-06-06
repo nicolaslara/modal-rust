@@ -156,7 +156,7 @@ fn check_panic_profile(manifest_dir: &std::path::Path) -> Check {
             // A manifest we cannot read is skipped (non-fatal): the abort check is a
             // best-effort guard, and an unreadable manifest is not itself an abort.
             if let Ok(text) = std::fs::read_to_string(&manifest) {
-                let is_workspace_root = manifest_declares_workspace(&text);
+                let is_workspace_root = crate::workspace::declares_workspace(&text);
                 if let Some(panic_val) = release_profile_panic(&text) {
                     // Workspace-root setting wins; record the first one found walking
                     // up, but a root setting overrides a member one.
@@ -201,14 +201,6 @@ fn check_panic_profile(manifest_dir: &std::path::Path) -> Check {
             ))
         }
     }
-}
-
-/// Does this manifest text declare a `[workspace]` table (i.e. is it a workspace
-/// root)? A tolerant line-scan (no TOML parser dependency).
-fn manifest_declares_workspace(text: &str) -> bool {
-    text.lines()
-        .map(str::trim)
-        .any(|l| l == "[workspace]" || l.starts_with("[workspace.") || l.starts_with("[workspace]"))
 }
 
 /// Extract the `panic = "..."` value from a `[profile.release]` table, if present.
@@ -316,15 +308,6 @@ mod tests {
     fn no_release_panic_setting_is_none() {
         let text = "[package]\nname=\"x\"\n[profile.dev]\npanic = \"abort\"\n";
         assert_eq!(release_profile_panic(text), None);
-    }
-
-    #[test]
-    fn workspace_root_detected() {
-        assert!(manifest_declares_workspace("[workspace]\nmembers = []\n"));
-        assert!(manifest_declares_workspace(
-            "[workspace.package]\nedition = \"2021\"\n"
-        ));
-        assert!(!manifest_declares_workspace("[package]\nname = \"x\"\n"));
     }
 
     #[test]
