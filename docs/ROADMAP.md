@@ -1,6 +1,6 @@
 # modal-rust — Roadmap & Tech Debt
 
-Living backlog. Source for the ergonomics/docs items: `docs/ergonomics-and-docs-review.md`
+Living backlog. Source for the ergonomics/docs items: `docs/local/ergonomics-and-docs-review.md`
 (prioritized table + 7 sub-30-min quick wins). Update this file as items land.
 
 ---
@@ -76,4 +76,5 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
 - The `testkit`-feature `connect_at*` seam is a test-only hook living in shipped `app.rs`
   (gated + documented, but still shipped surface).
 - `add-macro/src/proof.rs` is a small "kitchen-sink" module (the relocated config/secrets demos).
-- `docs/testing-strategy.md` is a dangling uncommitted file (intentional, but it's been sitting).
+- Local-only working notes (testing-strategy, ergonomics review, architecture-issues, data-user-flows,
+  examples-catalogue) live in the gitignored `docs/local/` — intentionally not committed.
