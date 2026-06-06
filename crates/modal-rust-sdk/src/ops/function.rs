@@ -20,7 +20,6 @@ use crate::proto::api::{
     DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
     GpuConfig, Resources, VolumeMount,
 };
-use crate::retry::retry_unary;
 
 /// Parse a Modal GPU spec into a [`GpuConfig`], mirroring `parse_gpu_config`
 /// (modal `_utils/function_utils.py:628`). Format: `"TYPE"` or `"TYPE:count"`.
@@ -320,7 +319,7 @@ fn supported_formats() -> Vec<i32> {
 ///
 /// Extracted from [`ModalClient::function_precreate`]. Advertises `[PICKLE, CBOR]`
 /// for both input and output formats; `function_type = FUNCTION`.
-pub fn build_function_precreate_request(
+pub(crate) fn build_function_precreate_request(
     app_id: &str,
     function_name: &str,
 ) -> FunctionPrecreateRequest {
@@ -346,7 +345,7 @@ pub fn build_function_precreate_request(
 /// - `resources` ALWAYS set (fix #1);
 /// - empty `volume_mounts` / `secret_ids` ⇒ prost omits those fields ⇒ wire-identical
 ///   to before P6 / before secrets for existing callers.
-pub fn build_function_create_request(
+pub(crate) fn build_function_create_request(
     app_id: &str,
     precreate_function_id: &str,
     spec: &FunctionSpec,
@@ -405,7 +404,7 @@ pub fn build_function_create_request(
 /// Extracted from [`ModalClient::function_from_name`]; the method passes the
 /// resolved `environment_name`. `object_tag` is the function name; `app_version`
 /// stays `0` (latest).
-pub fn build_function_get_request(
+pub(crate) fn build_function_get_request(
     app_name: &str,
     function_name: &str,
     environment_name: String,
@@ -433,13 +432,11 @@ impl ModalClient {
         // downstream function_create reconciles via existing_function_id, so a
         // retry after a dropped response is safe.
         let req = build_function_precreate_request(app_id, function_name);
-        let stub = self.stub();
-        let resp = retry_unary("function_precreate", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.function_precreate(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("function_precreate", req, |mut stub, req| async move {
+                stub.function_precreate(req).await
+            })
+            .await?;
 
         if resp.function_id.is_empty() {
             return Err(Error::build(
@@ -467,13 +464,11 @@ impl ModalClient {
         // after a dropped response is idempotent (mirrors Python, which retries
         // FunctionCreate).
         let req = build_function_create_request(app_id, precreate_function_id, spec);
-        let stub = self.stub();
-        let resp = retry_unary("function_create", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.function_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("function_create", req, |mut stub, req| async move {
+                stub.function_create(req).await
+            })
+            .await?;
 
         if resp.function_id.is_empty() {
             return Err(Error::build(
@@ -512,13 +507,11 @@ impl ModalClient {
         let environment_name = self.env_or_default(environment);
         // Pure read — idempotent, safe to retry.
         let req = build_function_get_request(app_name, function_name, environment_name);
-        let stub = self.stub();
-        let resp = retry_unary("function_get", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.function_get(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("function_get", req, |mut stub, req| async move {
+                stub.function_get(req).await
+            })
+            .await?;
 
         if resp.function_id.is_empty() {
             return Err(Error::build(format!(

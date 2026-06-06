@@ -71,29 +71,16 @@ pub use ops::local_dir::{WorkspaceClosureSpec, DEFAULT_IGNORE_PATTERNS, DEFAULT_
 pub use ops::mount::{client_mount_name, python_standalone_mount_name};
 pub use ops::DEFAULT_BASE_IMAGE;
 
-/// Internal: the pure `build_*_request` functions, re-exported so the facade's
-/// offline dry-run/dump (`modal_rust::dump`) can assemble the SAME control-plane
-/// requests the live path sends — built ON these identical builders, so the dumped
-/// manifest can never drift from the wire. NOT a stable public API; the
-/// `build_*_request` functions are the seam the run/deploy ops already call.
-#[doc(hidden)]
+/// Typed, SDK-owned planning projections for the facade's offline dry-run/dump
+/// (`modal_rust::dump`): assemble the SAME control-plane requests the live path
+/// sends — built ON the identical internal `build_*_request` builders the run/deploy
+/// ops call, so the dumped manifest can never drift from the wire — then PROJECT
+/// them into SDK-owned plain structs ([`PlannedImage`](planning::PlannedImage) /
+/// [`PlannedFunction`](planning::PlannedFunction)). This keeps RAW `modal.client`
+/// proto types OUT of the SDK's public API: the facade reads the typed projection,
+/// never the proto.
 pub mod planning {
-    pub use crate::ops::app::{
-        build_app_create_request, build_app_get_or_create_request, build_app_publish_request,
+    pub use crate::ops::planning::{
+        plan_function_request, plan_image_request, PlannedFunction, PlannedImage,
     };
-    pub use crate::ops::blob::build_blob_create_request;
-    pub use crate::ops::function::{
-        build_function_create_request, build_function_get_request, build_function_precreate_request,
-    };
-    pub use crate::ops::image::build_image_get_or_create_request;
-    pub use crate::ops::invoke::{
-        build_function_get_outputs_request, build_function_map_request,
-        build_function_put_inputs_request,
-    };
-    pub use crate::ops::local_dir::{
-        build_mount_get_or_create_source_request, build_mount_put_file_request,
-    };
-    pub use crate::ops::mount::build_mount_get_or_create_global_request;
-    pub use crate::ops::secret::{build_secret_from_dict_request, build_secret_from_name_request};
-    pub use crate::ops::volume::build_volume_get_or_create_request;
 }

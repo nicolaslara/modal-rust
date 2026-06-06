@@ -20,7 +20,7 @@ use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::proto::api::blob_create_response::UploadTypeOneof;
 use crate::proto::api::BlobCreateRequest;
-use crate::retry::{jitter, retry_unary, RetryPolicy};
+use crate::retry::{jitter, RetryPolicy};
 
 /// Files at or above this size go through the blob path instead of inline
 /// `MountPutFile.data`. Matches Modal's `LARGE_FILE_LIMIT` (`blob_utils.py`) and
@@ -33,7 +33,7 @@ pub const LARGE_FILE_BLOB_THRESHOLD: usize = 4 * 1024 * 1024;
 /// side-effecting presigned-URL `PUT` stays in [`ModalClient::blob_create_and_put`]).
 /// `content_md5` is omitted (optional for the single-part sizes we use), matching
 /// the inline literal it replaces.
-pub fn build_blob_create_request(data: &[u8]) -> BlobCreateRequest {
+pub(crate) fn build_blob_create_request(data: &[u8]) -> BlobCreateRequest {
     let content_sha256_base64 =
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data));
     BlobCreateRequest {
@@ -57,13 +57,11 @@ impl ModalClient {
         // re-requesting is safe (a new URL for the same content), so retry on a
         // transient reset.
         let req = build_blob_create_request(data);
-        let stub = self.stub();
-        let resp = retry_unary("blob_create", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.blob_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("blob_create", req, |mut stub, req| async move {
+                stub.blob_create(req).await
+            })
+            .await?;
 
         let blob_id = resp.blob_id.clone();
         match resp.upload_type_oneof {

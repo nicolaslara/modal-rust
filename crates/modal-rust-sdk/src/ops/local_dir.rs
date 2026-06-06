@@ -55,7 +55,6 @@ use crate::proto::api::{
     DeploymentNamespace, MountFile, MountGetOrCreateRequest, MountPutFileRequest,
     ObjectCreationType,
 };
-use crate::retry::retry_unary;
 
 /// Client-side completion deadline for a single file's `MountPutFile` upload.
 /// After the upload `MountPutFile`, the server may still report `exists=false`
@@ -112,7 +111,7 @@ pub struct WorkspaceClosureSpec<'a> {
 /// source/build-context `files` (the SHA-addressed [`MountFile`] descriptors).
 /// Extracted from [`ModalClient::finalize_mount`]; the method passes the resolved
 /// `environment_name` and the already-uploaded `files`.
-pub fn build_mount_get_or_create_source_request(
+pub(crate) fn build_mount_get_or_create_source_request(
     environment_name: String,
     files: Vec<MountFile>,
 ) -> MountGetOrCreateRequest {
@@ -136,7 +135,7 @@ pub fn build_mount_get_or_create_source_request(
 ///
 /// Extracted from [`ModalClient::ensure_file_uploaded`] /
 /// [`ModalClient::mount_put_file_probe`].
-pub fn build_mount_put_file_request(
+pub(crate) fn build_mount_put_file_request(
     sha256_hex: &str,
     data: Option<DataOneof>,
 ) -> MountPutFileRequest {
@@ -239,13 +238,13 @@ impl ModalClient {
         // Keyed by the sha-addressed `files` set: re-sending yields the same mount,
         // so retrying on a transient reset is safe.
         let req = build_mount_get_or_create_source_request(environment_name, mount_files);
-        let stub = self.stub();
-        let resp = retry_unary("mount_get_or_create(source)", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.mount_get_or_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc(
+                "mount_get_or_create(source)",
+                req,
+                |mut stub, req| async move { stub.mount_get_or_create(req).await },
+            )
+            .await?;
 
         if resp.mount_id.is_empty() {
             return Err(Error::build(
@@ -306,11 +305,8 @@ impl ModalClient {
         // The server dedups by sha256_hex, so re-PUT of the same bytes is a no-op:
         // safe to retry on a transient reset.
         let req = build_mount_put_file_request(sha256, Some(data_oneof));
-        let stub = self.stub();
-        retry_unary("mount_put_file(upload)", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.mount_put_file(req).await?.into_inner()) }
+        self.retry_rpc("mount_put_file(upload)", req, |mut stub, req| async move {
+            stub.mount_put_file(req).await
         })
         .await?;
 
@@ -332,14 +328,12 @@ impl ModalClient {
     async fn mount_put_file_probe(&mut self, sha256: &str) -> Result<bool> {
         // Pure existence read — idempotent, safe to retry on a transient reset.
         let req = build_mount_put_file_request(sha256, None);
-        let stub = self.stub();
-        Ok(retry_unary("mount_put_file(probe)", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.mount_put_file(req).await?.into_inner()) }
-        })
-        .await?
-        .exists)
+        Ok(self
+            .retry_rpc("mount_put_file(probe)", req, |mut stub, req| async move {
+                stub.mount_put_file(req).await
+            })
+            .await?
+            .exists)
     }
 }
 

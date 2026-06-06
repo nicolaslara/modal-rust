@@ -17,7 +17,6 @@ use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::ops::CLIENT_VERSION;
 use crate::proto::api::{DeploymentNamespace, MountGetOrCreateRequest, ObjectCreationType};
-use crate::retry::retry_unary;
 
 /// Build the GLOBAL `MountGetOrCreate` lookup request — pure, no I/O. Looks up a
 /// hosted mount by deployment name in the GLOBAL namespace with
@@ -27,7 +26,7 @@ use crate::retry::retry_unary;
 /// Covers the hosted client mount and the python-standalone mount. Extracted from
 /// [`ModalClient::global_mount_id`]; the method passes the resolved
 /// `environment_name`.
-pub fn build_mount_get_or_create_global_request(
+pub(crate) fn build_mount_get_or_create_global_request(
     deployment_name: &str,
     environment_name: String,
 ) -> MountGetOrCreateRequest {
@@ -154,13 +153,13 @@ impl ModalClient {
     ) -> Result<Option<String>> {
         let environment_name = self.env_or_default(environment);
         let req = build_mount_get_or_create_global_request(deployment_name, environment_name);
-        let stub = self.stub();
-        let resp = retry_unary("mount_get_or_create(global)", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.mount_get_or_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc(
+                "mount_get_or_create(global)",
+                req,
+                |mut stub, req| async move { stub.mount_get_or_create(req).await },
+            )
+            .await?;
         if resp.mount_id.is_empty() {
             Ok(None)
         } else {

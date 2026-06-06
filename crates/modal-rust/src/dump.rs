@@ -10,16 +10,17 @@
 //! [`crate::remote::ensure_function`] / [`crate::deploy::deploy_function`] and, for
 //! the load-bearing requests (the image layers + the `FunctionCreate`), feeds the
 //! IDENTICAL [`modal_rust_sdk::FunctionSpec`] / [`modal_rust_sdk::ImageSpec`] the live
-//! path builds into the SAME `modal_rust_sdk::planning::build_*_request` functions the
-//! live ops call. So the projected manifest reflects exactly what the wire would
-//! carry. Canned ids (`mo-1`, `im-1`, …) are threaded the way the mock backend
-//! assigns them, so the cross-check test against the mock's recorded-request ORDER
-//! holds (see `tests/mock_remote.rs`).
+//! path builds into the SAME `modal_rust_sdk::planning::plan_*_request` projections —
+//! which call the live ops' internal `build_*_request` builders and return SDK-owned
+//! typed structs (no raw proto leaks across the crate boundary). So the projected
+//! manifest reflects exactly what the wire would carry. Canned ids (`mo-1`, `im-1`,
+//! …) are threaded the way the mock backend assigns them, so the cross-check test
+//! against the mock's recorded-request ORDER holds (see `tests/mock_remote.rs`).
 //!
 //! This is purely ADDITIVE: it does NOT change `remote`/`deploy`/`call` semantics or
 //! signatures. The live path is untouched.
 
-use modal_rust_sdk::planning::{build_function_create_request, build_image_get_or_create_request};
+use modal_rust_sdk::planning::{plan_function_request, plan_image_request};
 use modal_rust_sdk::{FunctionSpec, ImageSpec};
 
 use crate::control_plane::{
@@ -308,12 +309,12 @@ impl ControlPlane for RecordingControlPlane {
     }
 
     async fn ensure_image(&mut self, app_id: &str, spec: &ImageSpec, layer: u8) -> Result<String> {
-        // Project through the SAME pure SDK builder the live path calls, so the
-        // rendered dockerfile_commands are exactly what the wire would carry.
-        let req = build_image_get_or_create_request(spec, app_id, "2025.06".to_string());
-        let dockerfile_commands = req.image.map(|i| i.dockerfile_commands).unwrap_or_default();
+        // Project through the SAME pure SDK builder the live path calls (via the typed
+        // planning API, so no raw proto crosses the boundary), so the rendered
+        // dockerfile_commands are exactly what the wire would carry.
+        let planned = plan_image_request(spec, app_id, "2025.06");
         self.requests.push(PlannedRequest::ImageGetOrCreate {
-            dockerfile_commands,
+            dockerfile_commands: planned.dockerfile_commands,
             layer,
         });
         Ok(format!("im-{}", self.next_id()))
@@ -332,28 +333,19 @@ impl ControlPlane for RecordingControlPlane {
         precreate_id: &str,
         spec: &FunctionSpec,
     ) -> Result<(String, String)> {
-        // Project the SAME FunctionSpec the live path builds through the SDK builder.
-        let req = build_function_create_request(app_id, precreate_id, spec);
-        let function = req.function.expect("FILE-mode sets `function`");
-        let gpu = function
-            .resources
-            .as_ref()
-            .and_then(|r| r.gpu_config.as_ref())
-            .map(|g| g.gpu_type.clone());
-        let volume_mounts = function
-            .volume_mounts
-            .iter()
-            .map(|m| (m.mount_path.clone(), m.volume_id.clone()))
-            .collect();
+        // Project the SAME FunctionSpec the live path builds through the typed planning
+        // API (which calls the SDK's internal builder, then returns an SDK-owned
+        // struct — no raw proto crosses the boundary).
+        let planned = plan_function_request(app_id, precreate_id, spec);
         self.requests.push(PlannedRequest::FunctionCreate {
-            module: function.module_name.clone(),
-            function: function.function_name.clone(),
-            mount_ids_count: function.mount_ids.len(),
-            gpu,
-            timeout_secs: function.timeout_secs,
-            volume_mounts,
-            secret_count: function.secret_ids.len(),
-            function_data_is_none: req.function_data.is_none(),
+            module: planned.module_name,
+            function: planned.function_name,
+            mount_ids_count: planned.mount_ids_count,
+            gpu: planned.gpu,
+            timeout_secs: planned.timeout_secs,
+            volume_mounts: planned.volume_mounts,
+            secret_count: planned.secret_ids_count,
+            function_data_is_none: planned.function_data_is_none,
         });
         // A deterministic function id keeps the cumulative publish union non-empty;
         // it never appears in the recorded manifest (the publish carries no ids).

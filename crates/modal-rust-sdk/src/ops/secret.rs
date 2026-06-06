@@ -26,7 +26,6 @@ use std::collections::HashMap;
 use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::proto::api::{ObjectCreationType, SecretGetOrCreateRequest};
-use crate::retry::retry_unary;
 
 /// Build the `SecretGetOrCreate` request for the `from_name` PURE-LOOKUP path —
 /// pure, no I/O. Mirrors `Secret.from_name`: `object_creation_type` UNSPECIFIED, no
@@ -34,7 +33,7 @@ use crate::retry::retry_unary;
 ///
 /// Extracted from [`ModalClient::secret_get_or_create`]; the method passes the
 /// resolved `environment_name`.
-pub fn build_secret_from_name_request(
+pub(crate) fn build_secret_from_name_request(
     name: &str,
     required_keys: &[String],
     environment_name: String,
@@ -55,7 +54,7 @@ pub fn build_secret_from_name_request(
 ///
 /// Extracted from [`ModalClient::secret_from_dict`]; the method passes the resolved
 /// `environment_name`.
-pub fn build_secret_from_dict_request(
+pub(crate) fn build_secret_from_dict_request(
     name: &str,
     env: &HashMap<String, String>,
     environment_name: String,
@@ -126,13 +125,11 @@ impl ModalClient {
         req: SecretGetOrCreateRequest,
         name: &str,
     ) -> Result<String> {
-        let stub = self.stub();
-        let resp = retry_unary(op, || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.secret_get_or_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc(op, req, |mut stub, req| async move {
+                stub.secret_get_or_create(req).await
+            })
+            .await?;
 
         if resp.secret_id.is_empty() {
             return Err(Error::build(format!(

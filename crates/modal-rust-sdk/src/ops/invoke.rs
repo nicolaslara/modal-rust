@@ -31,7 +31,6 @@ use crate::proto::api::{
     DataFormat, FunctionCallInvocationType, FunctionCallType, FunctionGetOutputsRequest,
     FunctionInput, FunctionMapRequest, FunctionPutInputsItem, FunctionPutInputsRequest,
 };
-use crate::retry::retry_unary;
 
 /// Per-poll timeout (seconds) for `FunctionGetOutputs` long-poll reconnects.
 const OUTPUTS_TIMEOUT_SECS: f32 = 55.0;
@@ -81,7 +80,7 @@ impl Invocation {
 /// - unary+sync = `.remote()` (one pipelined input),
 /// - unary+async = `.spawn()` (one pipelined input),
 /// - map+sync = `.map()` (EMPTY pipelined — the MAP call opens empty).
-pub fn build_function_map_request(
+pub(crate) fn build_function_map_request(
     function_id: &str,
     call_type: FunctionCallType,
     invocation_type: FunctionCallInvocationType,
@@ -100,7 +99,7 @@ pub fn build_function_map_request(
 ///
 /// Shared by the fix-#3 fallback enqueue (`.remote()`/`.spawn()`, one input) and the
 /// `.map()` fan-out (N inputs, each carrying its `idx`).
-pub fn build_function_put_inputs_request(
+pub(crate) fn build_function_put_inputs_request(
     function_id: &str,
     function_call_id: &str,
     inputs: Vec<FunctionPutInputsItem>,
@@ -118,7 +117,7 @@ pub fn build_function_put_inputs_request(
 /// both unset — the byte-for-byte single-input `.remote()` / map-batch shape. The
 /// poll always sets `clear_on_success` and the `OUTPUTS_TIMEOUT_SECS` long-poll
 /// window, advancing `last_entry_id` across reconnects.
-pub fn build_function_get_outputs_request(
+pub(crate) fn build_function_get_outputs_request(
     function_call_id: &str,
     max_values: i32,
     last_entry_id: String,
@@ -219,55 +218,13 @@ impl ModalClient {
             ..Default::default()
         };
 
-        // Step 1 — FunctionMap with the input pipelined.
-        //
-        // CARE: FunctionMap enqueues an input, so a retry could double-enqueue. For
-        // v0 the run path only invokes the pure `add` (idempotent) and poll_outputs
-        // reads exactly ONE output, so a duplicate enqueue is observably harmless —
-        // we retry on transient like Python (which relies on server-side input
-        // dedup). A non-idempotent user function would need a server idempotency
-        // token before enabling this generally.
-        let map_req = build_function_map_request(
-            function_id,
-            FunctionCallType::Unary,
-            FunctionCallInvocationType::Sync,
-            vec![item.clone()],
-        );
-        let stub = self.stub();
-        let map = retry_unary("function_map", || {
-            let mut stub = stub.clone();
-            let req = map_req.clone();
-            async move { Ok(stub.function_map(req).await?.into_inner()) }
-        })
-        .await?;
-
-        let function_call_id = map.function_call_id;
-        if function_call_id.is_empty() {
-            return Err(Error::build(
-                "FunctionMap returned an empty function_call_id".to_string(),
-            ));
-        }
-
-        // Step 2 — fix #3: if the input was NOT pipelined (echoed back), enqueue it.
-        if map.pipelined_inputs.is_empty() {
-            // Same double-enqueue caveat as FunctionMap; same v0 stance (retry —
-            // harmless for the pure `add`). The item carries idx/function_call_id
-            // so the server can dedup within a call.
-            let put_req =
-                build_function_put_inputs_request(function_id, &function_call_id, vec![item]);
-            let stub = self.stub();
-            let put = retry_unary("function_put_inputs", || {
-                let mut stub = stub.clone();
-                let req = put_req.clone();
-                async move { Ok(stub.function_put_inputs(req).await?.into_inner()) }
-            })
+        // Steps 1+2 — UNARY+SYNC FunctionMap with the input pipelined, then the fix-#3
+        // FunctionPutInputs fallback when the server did not enqueue it. See
+        // [`ModalClient::enqueue_pipelined`] for the shared sequence + the
+        // double-enqueue caveat (idempotent `add`; poll reads exactly ONE output).
+        let function_call_id = self
+            .enqueue_pipelined(function_id, FunctionCallInvocationType::Sync, item)
             .await?;
-            if put.inputs.is_empty() {
-                return Err(Error::build(
-                    "FunctionPutInputs accepted no inputs (input queue full?)".to_string(),
-                ));
-            }
-        }
 
         // Step 3 — poll FunctionGetOutputs until the result arrives.
         self.poll_outputs_indexed(&function_call_id, None, deadline)
@@ -303,24 +260,10 @@ impl ModalClient {
 
             // Pure read with a last_entry_id cursor — a transient reset retries the
             // single poll window rather than failing the whole invoke (analogous to
-            // the image-build poll reconnect).
-            let req = build_function_get_outputs_request(
-                function_call_id,
-                1,
-                last_entry_id.clone(),
-                index,
-            );
-            let stub = self.stub();
-            let resp = retry_unary("function_get_outputs", || {
-                let mut stub = stub.clone();
-                let req = req.clone();
-                async move { Ok(stub.function_get_outputs(req).await?.into_inner()) }
-            })
-            .await?;
-
-            if !resp.last_entry_id.is_empty() {
-                last_entry_id = resp.last_entry_id;
-            }
+            // the image-build poll reconnect). The shared helper advances the cursor.
+            let resp = self
+                .poll_one_output(function_call_id, 1, &mut last_entry_id, index)
+                .await?;
 
             if let Some(item) = resp.outputs.into_iter().next() {
                 // When a specific index was requested, defensively ignore any output
@@ -415,47 +358,13 @@ impl ModalClient {
             ..Default::default()
         };
 
-        // Step 1 — FunctionMap (UNARY + ASYNC) with the input pipelined. Same
-        // double-enqueue caveat as `.remote()` (idempotent `add`; `get` reads
-        // idx 0).
-        let map_req = build_function_map_request(
-            function_id,
-            FunctionCallType::Unary,
-            FunctionCallInvocationType::Async,
-            vec![item.clone()],
-        );
-        let stub = self.stub();
-        let map = retry_unary("function_map", || {
-            let mut stub = stub.clone();
-            let req = map_req.clone();
-            async move { Ok(stub.function_map(req).await?.into_inner()) }
-        })
-        .await?;
-
-        let function_call_id = map.function_call_id;
-        if function_call_id.is_empty() {
-            return Err(Error::build(
-                "FunctionMap returned an empty function_call_id".to_string(),
-            ));
-        }
-
-        // Step 2 — fix #3: if the input was NOT pipelined back, enqueue it.
-        if map.pipelined_inputs.is_empty() {
-            let put_req =
-                build_function_put_inputs_request(function_id, &function_call_id, vec![item]);
-            let stub = self.stub();
-            let put = retry_unary("function_put_inputs", || {
-                let mut stub = stub.clone();
-                let req = put_req.clone();
-                async move { Ok(stub.function_put_inputs(req).await?.into_inner()) }
-            })
+        // Steps 1+2 — UNARY+ASYNC FunctionMap with the input pipelined, then the
+        // fix-#3 FunctionPutInputs fallback. Same shared sequence as `.remote()` but
+        // ASYNC (Python `spawn`, _functions.py:1878); see
+        // [`ModalClient::enqueue_pipelined`] for the double-enqueue caveat.
+        let function_call_id = self
+            .enqueue_pipelined(function_id, FunctionCallInvocationType::Async, item)
             .await?;
-            if put.inputs.is_empty() {
-                return Err(Error::build(
-                    "FunctionPutInputs accepted no inputs (input queue full?)".to_string(),
-                ));
-            }
-        }
 
         // Step 3 — return the call id. Do NOT poll (fire-and-forget).
         Ok(function_call_id)
@@ -517,20 +426,20 @@ impl ModalClient {
         }
 
         // Step 1 — open the MAP call EMPTY (Python opens with no pipelined inputs,
-        // parallel_map.py:371-378), SYNC collect.
+        // parallel_map.py:371-378), SYNC collect. (The MAP open does NOT take the
+        // `enqueue_pipelined` fix-#3 path — it deliberately opens with no inputs and
+        // enqueues all N below.)
         let map_req = build_function_map_request(
             function_id,
             FunctionCallType::Map,
             FunctionCallInvocationType::Sync,
             vec![],
         );
-        let stub = self.stub();
-        let map = retry_unary("function_map", || {
-            let mut stub = stub.clone();
-            let req = map_req.clone();
-            async move { Ok(stub.function_map(req).await?.into_inner()) }
-        })
-        .await?;
+        let map = self
+            .retry_rpc("function_map", map_req, |mut stub, req| async move {
+                stub.function_map(req).await
+            })
+            .await?;
         let function_call_id = map.function_call_id;
         if function_call_id.is_empty() {
             return Err(Error::build(
@@ -555,13 +464,11 @@ impl ModalClient {
             });
         }
         let put_req = build_function_put_inputs_request(function_id, &function_call_id, items);
-        let stub = self.stub();
-        let put = retry_unary("function_put_inputs", || {
-            let mut stub = stub.clone();
-            let req = put_req.clone();
-            async move { Ok(stub.function_put_inputs(req).await?.into_inner()) }
-        })
-        .await?;
+        let put = self
+            .retry_rpc("function_put_inputs", put_req, |mut stub, req| async move {
+                stub.function_put_inputs(req).await
+            })
+            .await?;
         if put.inputs.len() < n {
             return Err(Error::build(format!(
                 "FunctionPutInputs accepted {} of {n} inputs (input queue full?)",
@@ -583,23 +490,11 @@ impl ModalClient {
                     deadline.as_secs()
                 )));
             }
-            let req = build_function_get_outputs_request(
-                &function_call_id,
-                n as i32,
-                last_entry_id.clone(),
-                None,
-            );
-            let stub = self.stub();
-            let resp = retry_unary("function_get_outputs", || {
-                let mut stub = stub.clone();
-                let req = req.clone();
-                async move { Ok(stub.function_get_outputs(req).await?.into_inner()) }
-            })
-            .await?;
-
-            if !resp.last_entry_id.is_empty() {
-                last_entry_id = resp.last_entry_id;
-            }
+            // Same long-poll window + cursor advance + transient retry as
+            // `poll_outputs_indexed`, but batched (max_values = N) and unfiltered.
+            let resp = self
+                .poll_one_output(&function_call_id, n as i32, &mut last_entry_id, None)
+                .await?;
 
             for item in resp.outputs {
                 let data_format =

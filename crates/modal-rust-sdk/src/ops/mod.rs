@@ -27,7 +27,9 @@ pub mod image;
 pub mod invoke;
 pub mod local_dir;
 pub mod mount;
+pub mod planning;
 pub mod secret;
+mod transport;
 pub mod volume;
 
 use crate::proto::api::generic_result::GenericStatus;

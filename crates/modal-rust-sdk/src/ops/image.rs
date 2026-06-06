@@ -59,7 +59,6 @@ use crate::ops::{describe_failure, result_status, ResultState, DEFAULT_BASE_IMAG
 use crate::proto::api::{
     BaseImage, Image, ImageContextFile, ImageGetOrCreateRequest, ImageJoinStreamingRequest,
 };
-use crate::retry::retry_unary;
 
 /// Per-stream timeout (seconds) for `ImageJoinStreaming` long-poll reconnects.
 const JOIN_STREAM_TIMEOUT_SECS: f32 = 55.0;
@@ -459,7 +458,7 @@ fn bake_command(module_name: &str, source: &str) -> String {
 /// image sub-message comes from [`ImageSpec::to_proto`] (already covered by the
 /// `dockerfile_commands` / `to_proto` sub-message tests); this wraps it with
 /// `app_id` + `builder_version`.
-pub fn build_image_get_or_create_request(
+pub(crate) fn build_image_get_or_create_request(
     spec: &ImageSpec,
     app_id: &str,
     builder_version: String,
@@ -497,13 +496,11 @@ impl ModalClient {
         // get-or-create returns the same image_id/build, so it is safe to retry on
         // a transient reset. (The build POLL has its own reconnect loop below.)
         let req = build_image_get_or_create_request(spec, app_id, builder_version);
-        let stub = self.stub();
-        let resp = retry_unary("image_get_or_create", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.image_get_or_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("image_get_or_create", req, |mut stub, req| async move {
+                stub.image_get_or_create(req).await
+            })
+            .await?;
 
         let image_id = resp.image_id;
         if image_id.is_empty() {

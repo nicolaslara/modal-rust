@@ -15,7 +15,6 @@ use crate::error::Result;
 use crate::proto::api::{
     AppCreateRequest, AppGetOrCreateRequest, AppPublishRequest, AppState, ObjectCreationType,
 };
-use crate::retry::retry_unary;
 
 /// Build the `AppGetOrCreate` request (api.proto:4142) — pure, no I/O.
 ///
@@ -23,7 +22,7 @@ use crate::retry::retry_unary;
 /// unit-testable offline; the method passes the resolved `environment_name` (it
 /// resolves it via `env_or_default` exactly as before). Created with
 /// `OBJECT_CREATION_TYPE_CREATE_IF_MISSING` semantics.
-pub fn build_app_get_or_create_request(
+pub(crate) fn build_app_get_or_create_request(
     app_name: &str,
     environment_name: String,
 ) -> AppGetOrCreateRequest {
@@ -39,7 +38,10 @@ pub fn build_app_get_or_create_request(
 /// Extracted from [`ModalClient::app_create_ephemeral`]; the method passes the
 /// resolved `environment_name`. `app_state` is `APP_STATE_EPHEMERAL` (GC'd when the
 /// client disconnects).
-pub fn build_app_create_request(description: &str, environment_name: String) -> AppCreateRequest {
+pub(crate) fn build_app_create_request(
+    description: &str,
+    environment_name: String,
+) -> AppCreateRequest {
     AppCreateRequest {
         client_id: String::new(),
         description: description.to_string(),
@@ -54,7 +56,7 @@ pub fn build_app_create_request(description: &str, environment_name: String) -> 
 /// Extracted from [`ModalClient::app_publish`]. `app_state` decides persistence
 /// (`Ephemeral` on the RUN path, `Deployed` on the DEPLOY path); the
 /// `function_ids` / `definition_ids` maps ride through unchanged.
-pub fn build_app_publish_request(
+pub(crate) fn build_app_publish_request(
     app_id: &str,
     app_name: &str,
     app_state: AppState,
@@ -99,13 +101,11 @@ impl ModalClient {
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
         let req = build_app_get_or_create_request(app_name, environment_name);
-        let stub = self.stub();
-        let resp = retry_unary("app_get_or_create", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.app_get_or_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("app_get_or_create", req, |mut stub, req| async move {
+                stub.app_get_or_create(req).await
+            })
+            .await?;
         Ok(resp.app_id)
     }
 
@@ -125,13 +125,11 @@ impl ModalClient {
         // app, but ephemerals are GC'd when the client disconnects, so retrying is
         // acceptable (per the resilience spec A.5).
         let req = build_app_create_request(description, environment_name);
-        let stub = self.stub();
-        let resp = retry_unary("app_create", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.app_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("app_create", req, |mut stub, req| async move {
+                stub.app_create(req).await
+            })
+            .await?;
         Ok(resp.app_id)
     }
 
@@ -168,13 +166,11 @@ impl ModalClient {
         // reset is safe.
         let req =
             build_app_publish_request(app_id, app_name, app_state, function_ids, definition_ids);
-        let stub = self.stub();
-        let resp = retry_unary("app_publish", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.app_publish(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("app_publish", req, |mut stub, req| async move {
+                stub.app_publish(req).await
+            })
+            .await?;
 
         Ok(PublishedApp {
             url: resp.url,

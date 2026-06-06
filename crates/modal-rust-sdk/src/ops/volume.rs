@@ -11,7 +11,6 @@
 use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::proto::api::{ObjectCreationType, VolumeFsVersion, VolumeGetOrCreateRequest};
-use crate::retry::retry_unary;
 
 /// Build the `VolumeGetOrCreate` request — pure, no I/O. Mirrors
 /// `Volume.from_name(..., create_if_missing, version)`: sets ONLY `deployment_name`,
@@ -24,7 +23,7 @@ use crate::retry::retry_unary;
 ///
 /// Extracted from [`ModalClient::volume_get_or_create`]; the method passes the
 /// resolved `environment_name`.
-pub fn build_volume_get_or_create_request(
+pub(crate) fn build_volume_get_or_create_request(
     name: &str,
     v2: bool,
     create_if_missing: bool,
@@ -69,15 +68,13 @@ impl ModalClient {
     ) -> Result<String> {
         let environment_name = self.env_or_default(environment);
         let req = build_volume_get_or_create_request(name, v2, create_if_missing, environment_name);
-        let stub = self.stub();
         // CREATE_IF_MISSING is idempotent server-side, so a retry after a dropped
         // response re-resolves the same volume_id (mirrors mount_get_or_create).
-        let resp = retry_unary("volume_get_or_create", || {
-            let mut stub = stub.clone();
-            let req = req.clone();
-            async move { Ok(stub.volume_get_or_create(req).await?.into_inner()) }
-        })
-        .await?;
+        let resp = self
+            .retry_rpc("volume_get_or_create", req, |mut stub, req| async move {
+                stub.volume_get_or_create(req).await
+            })
+            .await?;
 
         if resp.volume_id.is_empty() {
             return Err(Error::build(format!(
