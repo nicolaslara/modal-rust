@@ -396,7 +396,6 @@ impl App {
         let function_id = cell
             .get_or_try_init(|| async {
                 let mut run_config = handle.config.clone();
-                run_config.cache = effective_cache;
                 run_config.options = options.clone();
                 let mut client = handle.client.lock().await;
                 // The publish set is the cumulative union across entrypoints (AppPublish

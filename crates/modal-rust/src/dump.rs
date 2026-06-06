@@ -396,7 +396,6 @@ impl crate::App {
         let cfg = {
             let mut c = config.clone();
             let effective_cache = options.cache.unwrap_or(c.cache);
-            c.cache = effective_cache;
             options.cache = Some(effective_cache);
             c.options = options;
             c
@@ -424,7 +423,7 @@ impl crate::App {
             },
             base_image: &cfg.base_image,
             install_rust: cfg.install_rust,
-            cache: cfg.cache,
+            cache: cfg.options.cache.unwrap_or(cfg.cache),
             entrypoints: &entrypoints,
         };
 

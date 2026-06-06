@@ -392,7 +392,10 @@ pub(crate) async fn ensure_function(
         },
         base_image: &config.base_image,
         install_rust: config.install_rust,
-        cache: config.cache,
+        // `cache` flows from the per-function override (`options.cache`), falling back to
+        // the run-level default (`config.cache`) — symmetric with `timeout` above. The
+        // flat `config.cache` is the default only; it is never overwritten per entrypoint.
+        cache: config.options.cache.unwrap_or(config.cache),
         entrypoints: &entrypoints,
     };
 
