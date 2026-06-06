@@ -36,7 +36,9 @@
 //! `::<facade>::__private::runtime::...` and `::<facade>::__private::inventory::...`
 //! (the macro resolves `<facade>` via `proc-macro-crate`, honoring a rename) — so a
 //! crate using `#[modal_rust::function]` needs ONLY `modal-rust` as its modal
-//! dependency (plus `serde`/`anyhow` for the handler types):
+//! dependency (plus `serde`/`anyhow` for the handler types). The macro submits one
+//! facade-owned [`Registration`] record that atomically carries both dispatch and
+//! control-plane metadata:
 //!
 //! ```toml
 //! modal-rust = { path = "..." }  # facade: App/Function/sdk + `function` + macro deps
@@ -54,7 +56,7 @@ pub use modal_rust_sdk as sdk;
 // (2) Runtime essentials that appear in the facade's public API / error paths.
 //     Selective — NOT a glob — so `__macro_support`/`codec` stay out of the
 //     facade's stable surface.
-pub use modal_rust_runtime::{FunctionConfig, HandlerFn, Registration, Registry, RunnerError};
+pub use modal_rust_runtime::{HandlerFn, Registry, RunnerError};
 // `typed!` is #[macro_export] at the runtime crate root; re-export it for users who
 // build a Registry by hand through the facade.
 pub use modal_rust_runtime::typed;
@@ -83,13 +85,16 @@ pub use modal_rust_macros::{function, modal_runner};
 /// depend on them directly.
 #[doc(hidden)]
 pub mod __private {
+    /// Run the facade-owned inventory path; used by `modal_runner!()`.
+    pub use crate::registration::run_cli_from_inventory;
     /// `::inventory`, re-exported so the macro's `inventory::submit!{…}` resolves
-    /// through the facade. `submit!` builds a `static` from a path to `Registration`
-    /// (re-exported below) — both edition-2018+ macro-path resolution and the type
-    /// path go through this re-export, so no direct `inventory` dep is needed.
+    /// through the facade. `submit!` builds a `static` from a path to the facade
+    /// [`crate::Registration`] type — both edition-2018+ macro-path resolution and
+    /// the type path go through this re-export, so no direct `inventory` dep is
+    /// needed.
     pub use inventory;
     /// The frozen runner crate, re-exported as `runtime` so the macro can name
-    /// `::<facade>::__private::runtime::{Registration, FunctionConfig, typed!}`.
+    /// `::<facade>::__private::runtime::typed!`.
     pub use modal_rust_runtime as runtime;
     /// `typed!` is `#[macro_export]`ed at the runtime crate root; re-export it here so
     /// the macro can invoke it through the facade as
@@ -102,6 +107,7 @@ mod deploy;
 mod dump;
 mod error;
 mod function;
+mod registration;
 mod remote;
 mod scope;
 
@@ -112,6 +118,11 @@ pub use deploy::{DeployConfig, DeployedApp};
 pub use dump::{Manifest, MountRole, PlannedRequest, RunMode};
 pub use error::{Error, Result};
 pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
+pub use registration::{
+    from_inventory_with_configs, package_from_inventory, registry_from_inventory,
+    run_cli_from_inventory, run_cli_with_args_and_configs, run_cli_with_args_from_inventory,
+    FunctionConfig, Registration,
+};
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly.
 pub use remote::RemoteConfig;

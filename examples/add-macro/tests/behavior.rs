@@ -3,7 +3,7 @@
 use example_add_macro::add;
 use example_add_macro::AddCall;
 use modal_rust::__private::runtime;
-use modal_rust::{App, Registry};
+use modal_rust::App;
 
 #[test]
 fn add_is_a_plain_fn() {
@@ -26,13 +26,13 @@ fn add_generates_named_input_and_output() {
 fn add_registered_via_inventory_runner_envelope() {
     // The generated spread shim is registered under `add` and dispatches through the
     // UNCHANGED runner: wire input `{"a":2,"b":3}` -> envelope `{"ok":true,"value":5}`.
-    assert!(Registry::from_inventory().get("add").is_some());
+    assert!(modal_rust::registry_from_inventory().get("add").is_some());
     let argv: Vec<String> = ["--entrypoint", "add", "--input-json", r#"{"a":2,"b":3}"#]
         .iter()
         .map(|s| s.to_string())
         .collect();
     let mut buf = Vec::new();
-    let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+    let code = runtime::run_cli_with_args(modal_rust::registry_from_inventory(), &argv, &mut buf);
     assert_eq!(code, 0);
     assert_eq!(
         String::from_utf8(buf).unwrap(),
@@ -66,7 +66,7 @@ fn unknown_entrypoint_error_kind() {
         .map(|s| s.to_string())
         .collect();
     let mut buf = Vec::new();
-    let code = runtime::run_cli_with_args(Registry::from_inventory(), &argv, &mut buf);
+    let code = runtime::run_cli_with_args(modal_rust::registry_from_inventory(), &argv, &mut buf);
     assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
     assert_eq!(v["ok"], false);

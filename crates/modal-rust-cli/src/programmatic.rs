@@ -30,7 +30,7 @@ use crate::workspace;
 const DESCRIBE_SCHEMA_FAMILY: &str = "modal-rust/describe@";
 const DESCRIBE_SCHEMA_MAJOR: u32 = 1;
 
-/// The serialized view of `modal_rust_runtime::FunctionConfig` from the
+/// The serialized view of facade `modal_rust::FunctionConfig` from the
 /// `--describe` manifest (P9 §A.3): `gpu: string|null`, `timeout_secs: u32|null`,
 /// `cache: bool|null`, plus the additive `secrets: [string]` and `volumes:
 /// [[mount, name]]`. The two list fields default empty (`#[serde(default)]`) so an

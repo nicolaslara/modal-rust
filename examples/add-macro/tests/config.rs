@@ -54,7 +54,7 @@ fn macro_captures_user_package_for_auto_detect() {
     }
     // The runtime helper the facade's `App::connect` reads surfaces the same value.
     assert_eq!(
-        modal_rust::__private::runtime::package_from_inventory(),
+        modal_rust::package_from_inventory(),
         Some("example-add-macro")
     );
 }

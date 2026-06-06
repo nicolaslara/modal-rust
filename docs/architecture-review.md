@@ -165,12 +165,12 @@ and map. `ImageSpec`/`FunctionSpec` are declarative builders that render to prot
   deploy-side twin (`DEPLOY_WRAPPER_SRC`, `deploy.rs:65`) is mercifully small and has a
   good negative-assertion test that it contains no `cargo`/`/src`/`CARGO_` (`:453`).
 - **The additive-config hand-threading.** A decorator value travels:
-  `#[function(gpu=..)]` → `FunctionConfig.gpu` (`runtime/lib.rs:298`) →
+  `#[function(gpu=..)]` → facade `FunctionConfig.gpu` (`registration.rs`) →
   `App.configs` map (`app.rs:32`) → copied in `resolve_function` (`app.rs:250`) →
   `RemoteConfig.gpu` (`remote.rs:292`) → `FunctionSpec::with_gpu` (`function.rs:214`)
   → `Resources.gpu_config` proto. Each hop is individually justified, but there are
   five copies of essentially the same five fields (gpu/timeout/cache/secrets/volumes)
-  across `FunctionConfig`, `DescribeConfig` (`runtime/lib.rs:737`),
+  across `FunctionConfig`, `DescribeConfig` (`registration.rs`),
   `FunctionConfigView` (`programmatic.rs:39`), `RemoteConfig`, and `DeployConfig`.
   Adding a sixth knob means touching all five plus the macro.
 

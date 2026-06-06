@@ -213,12 +213,12 @@
     <div class="crate-grid">
       <div class="crate">
         <h4>modal-rust-runtime <span class="pill frozen">FROZEN</span></h4>
-        <div class="resp">The runner contract. The <code>Registry</code> (<code>BTreeMap&lt;&amp;str, HandlerFn&gt;</code>), <code>typed!</code>, <code>RunnerError</code> (5 kinds), <code>FunctionConfig</code>, <code>run_cli</code> + the file-mode runner CLI protocol, and <code>inventory</code> collection. Deps: only <code>serde</code>, <code>serde_json</code>, <code>anyhow</code>, <code>inventory</code> + a hand-rolled arg parser — <b>no Modal, network, or Python</b>, because it is recompiled on every run and baked into every deploy image.</div>
+        <div class="resp">The runner contract. The <code>Registry</code> (<code>BTreeMap&lt;&amp;str, HandlerFn&gt;</code>), <code>typed!</code>, <code>RunnerError</code> (5 kinds), <code>run_cli</code> + the file-mode runner CLI protocol, and optional dispatch-only <code>inventory</code> collection. Deps: only <code>serde</code>, <code>serde_json</code>, <code>anyhow</code>, <code>inventory</code> + a hand-rolled arg parser — <b>no Modal, network, or Python</b>, because it is recompiled on every run and baked into every deploy image.</div>
         <div class="files"><code class="path">crates/modal-rust-runtime/src/lib.rs</code> (1113 lines)</div>
       </div>
       <div class="crate">
         <h4>modal-rust-macros</h4>
-        <div class="resp">The <code>#[modal_rust::function(...)]</code> attribute. Purely additive sugar: it emits the unchanged user fn plus an <code>inventory::submit!</code> of a <code>Registration</code> whose handler is the same <code>typed!(f)</code> wrapper the manual builder produces, carrying the decorator's <code>gpu/timeout/cache/secrets/volumes</code> as a <code>FunctionConfig</code>.</div>
+        <div class="resp">The <code>#[modal_rust::function(...)]</code> attribute. Purely additive sugar: it emits the unchanged user fn plus one facade-owned <code>inventory::submit!</code> of a <code>Registration</code> whose handler is the same <code>typed!(f)</code> wrapper the manual builder produces, paired atomically with the decorator's <code>gpu/timeout/cache/secrets/volumes</code> as a <code>FunctionConfig</code>.</div>
         <div class="files"><code class="path">crates/modal-rust-macros/src/lib.rs</code></div>
       </div>
       <div class="crate">
@@ -293,7 +293,7 @@
     <p>The facade's <code>parse_envelope</code> (<code class="path">crates/modal-rust/src/remote.rs:657</code>) reconstructs this exact enum on the client side, so a remote failure is <em>identical in shape</em> to a local one — an unknown kind degrades to <code>Decode</code>, never a panic.</p>
 
     <h3 id="a-config">3.3 FunctionConfig — the decorator <em>is</em> the config</h3>
-    <p>Per-function deploy/run config lives on the <code>Registration</code> alongside the handler (<code class="path">crates/modal-rust-runtime/src/lib.rs:294</code>):</p>
+    <p>Per-function deploy/run config lives on the facade-owned <code>Registration</code> alongside the handler (<code class="path">crates/modal-rust/src/registration.rs</code>), while the runtime registration remains dispatch-only:</p>
     <pre><code><span class="k">pub struct</span> FunctionConfig {
   <span class="k">pub</span> gpu:          Option&lt;&amp;<span class="k">'static</span> <span class="k">str</span>&gt;,                  <span class="c">// "T4", "A100-80GB", "H100:4"</span>
   <span class="k">pub</span> timeout_secs: Option&lt;<span class="k">u32</span>&gt;,
@@ -301,7 +301,7 @@
   <span class="k">pub</span> secrets:      &amp;<span class="k">'static</span> [&amp;<span class="k">'static</span> <span class="k">str</span>],            <span class="c">// named Modal secrets</span>
   <span class="k">pub</span> volumes:      &amp;<span class="k">'static</span> [(&amp;<span class="k">'static</span> <span class="k">str</span>, &amp;<span class="k">'static</span> <span class="k">str</span>)], <span class="c">// (mount_path, name)</span>
 }</code></pre>
-    <p>This is <b>metadata only</b>: the runner ignores every field — <code>run_cli</code> dispatch, <code>HandlerFn</code>, and <code>Registry::from_inventory</code> never read it. Only the control-plane facade reads it when <em>creating</em> the Modal function (<code>Resources.gpu_config</code>, <code>timeout_secs</code>, secret/volume ids). The fields are <code>&amp;'static</code> rather than <code>String</code>/<code>Vec</code> because <code>inventory::submit!</code> builds a <code>static</code> initializer that must be <code>const</code>-constructible. A bare <code>#[modal_rust::function]</code> yields <code>FunctionConfig::default()</code> (all <code>None</code>, empty slices), so it is wire-identical to before this field existed.</p>
+    <p>This is <b>facade metadata</b>: the runner crate never defines or reads these fields. The facade reads them when <em>creating</em> the Modal function (<code>Resources.gpu_config</code>, <code>timeout_secs</code>, secret/volume ids) and splits the single atomic registration into a runtime <code>Registry</code> plus per-entrypoint configs. The fields are <code>&amp;'static</code> rather than <code>String</code>/<code>Vec</code> because <code>inventory::submit!</code> builds a <code>static</code> initializer that must be <code>const</code>-constructible. A bare <code>#[modal_rust::function]</code> yields <code>FunctionConfig::default()</code> (all <code>None</code>, empty slices), so it is wire-identical to before this field existed.</p>
     <p>The macro parses the attribute and emits the config straight into the registration (<code class="path">crates/modal-rust-macros/src/lib.rs:246</code>). See it used live in <code class="path">examples/add-macro/src/lib.rs:62</code>: <code>#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false)]</code>.</p>
 
     <h3 id="a-sdk">3.4 The SDK client, the <code>ops/*</code> surface, the 3 fixes &amp; <code>retry_transient</code></h3>
@@ -375,8 +375,8 @@
     </figure>
     <ol class="steps">
       <li><b>Manual:</b> the user writes <code>pub fn modal_registry() -&gt; Registry</code> and the runner bin calls <code>run_cli(modal_registry())</code> (<code class="path">examples/add/src/bin/modal_runner.rs:9</code>). Each <code>.function(name, typed!(f))</code> rejects a duplicate name with a hard startup panic.</li>
-      <li><b>Macro:</b> <code>#[modal_rust::function]</code> expands to the unchanged fn plus an <code>inventory::submit!{ Registration { name, handler: typed!(f), config } }</code> (<code class="path">crates/modal-rust-macros/src/lib.rs:246</code>). The runner bin calls <code>run_cli_with_configs(Registry::from_inventory(), …)</code>.</li>
-      <li><b>Convergence:</b> <code>Registry::from_inventory()</code> (or <code>from_inventory_with_configs()</code>) inserts each submission through the <em>same</em> <code>Registry::function</code> path (<code class="path">crates/modal-rust-runtime/src/lib.rs:366,410</code>), producing a map byte-identical to the hand-built one. <code>examples/add-macro</code>'s tests assert the success envelope is byte-for-byte the manual path's.</li>
+      <li><b>Macro:</b> <code>#[modal_rust::function]</code> expands to the unchanged fn plus one facade-owned <code>inventory::submit!{ Registration { name, handler: typed!(f), config, package } }</code> (<code class="path">crates/modal-rust-macros/src/lib.rs</code>). The runner bin calls <code>modal_rust::run_cli_from_inventory()</code>.</li>
+      <li><b>Convergence:</b> <code>modal_rust::registry_from_inventory()</code> inserts each facade submission through the <em>same</em> <code>Registry::function</code> path, producing a map byte-identical to the hand-built one. <code>examples/add-macro</code>'s tests assert the success envelope is byte-for-byte the manual path's.</li>
     </ol>
 
     <h3 id="f-local">4.2 <code>.local()</code> — in-process dispatch <span class="pill frozen">zero Modal</span></h3>
@@ -527,7 +527,7 @@
     <p>The <code>modal-rust</code> binary cannot link the user crate, so it learns the entrypoints + per-fn config out-of-band via <code>--describe</code> (<code class="path">crates/modal-rust-cli/src/programmatic.rs</code>):</p>
     <ol class="steps">
       <li><b>Build for the manifest.</b> <code>cargo build --release -p &lt;pkg&gt; --bin modal_runner</code> at the workspace root (the <em>local</em> binary is for the manifest only and is never uploaded — the remote build still happens per the boundary).</li>
-      <li><b>Describe.</b> Run <code>modal_runner --describe</code> and parse the <code>modal-rust/describe@1</code> manifest: each entrypoint's name + serialized <code>FunctionConfig</code> (<code class="path">crates/modal-rust-runtime/src/lib.rs:631–798</code>). <code>--describe</code> is an additive runner subcommand; when absent, the frozen <code>--entrypoint</code> dispatch is byte-identical (the first token differs, so they never collide).</li>
+      <li><b>Describe.</b> Run <code>modal_runner --describe</code> and parse the <code>modal-rust/describe@1</code> manifest: each entrypoint's name + serialized facade <code>FunctionConfig</code> (<code class="path">crates/modal-rust/src/registration.rs</code>). <code>--describe</code> is an additive facade-runner subcommand; when absent, the frozen runtime <code>--entrypoint</code> dispatch is byte-identical (the first token differs, so they never collide).</li>
       <li><b>Drive a headless App.</b> Build <code>App::from_manifest</code> / <code>connect_from_manifest</code> (config but no handlers) and call the <em>same</em> facade ops the facade uses: <code>run</code> → <code>remote_envelope</code>, <code>deploy</code> → <code>deploy_with</code>, <code>call</code> → <code>call_envelope</code> (<code class="path">crates/modal-rust/src/app.rs:362–379</code>). The envelope string is printed verbatim and <code>ok</code> mirrors the exit code.</li>
     </ol>
     <p>The CLI emits no generated <code>.py</code> and spawns no <code>modal</code> subprocess — the only subprocesses are <code>cargo</code> and the user's <code>modal_runner</code>. <code>doctor</code> checks credentials (and, with <code>--rust</code>, cargo/rustc + <code>panic = "abort"</code> detection).</p>
@@ -575,7 +575,7 @@
 
     <h3>Add a new decorator argument</h3>
     <ol>
-      <li>Add the field to <code>FunctionConfig</code> (<code class="path">crates/modal-rust-runtime/src/lib.rs:294</code>) as a <code>const</code>-constructible type (an <code>Option&lt;…&gt;</code> or <code>&amp;'static</code> slice); update <code>FunctionConfig::new()</code> and the <code>--describe</code> <code>DescribeConfig</code> view (keep <code>#[serde(default)]</code> for old-manifest compat — the schema stays <code>@1</code>).</li>
+      <li>Add the field to facade <code>FunctionConfig</code> (<code class="path">crates/modal-rust/src/registration.rs</code>) as a <code>const</code>-constructible type (an <code>Option&lt;…&gt;</code> or <code>&amp;'static</code> slice); update <code>FunctionConfig::new()</code> and the <code>--describe</code> <code>DescribeConfig</code> view (keep <code>#[serde(default)]</code> for old-manifest compat — the schema stays <code>@1</code>). Do not add Modal vocabulary to <code>modal-rust-runtime</code>.</li>
       <li>Parse it in <code class="path">crates/modal-rust-macros/src/lib.rs</code> (the <code>syn::meta::parser</code> block) and emit it into the <code>inventory::submit!</code>.</li>
       <li>Read it in the facade: thread it through <code>resolve_function</code> and the per-entrypoint deploy resolution (<code class="path">crates/modal-rust/src/app.rs</code>) onto <code>RemoteConfig</code>/<code>DeployConfig</code>, then apply it per entrypoint in <code>ensure_function</code>/<code>deploy_function</code> via the relevant <code>FunctionSpec</code>/<code>ImageSpec</code> builder.</li>
       <li>The CLI picks it up for free if it's in <code>DescribeConfig</code>; add it to <code>FunctionConfigView</code> in <code class="path">programmatic.rs</code>. Keep the bare-decorator path byte-identical (assert it, like <code>bare_macro_config_is_default</code>).</li>

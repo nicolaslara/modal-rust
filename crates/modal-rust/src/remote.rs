@@ -395,7 +395,7 @@ impl RemoteConfig {
     ///
     /// Precedence (highest → lowest): `MODAL_RUST_PACKAGE` (`env_override`) → the
     /// macro-captured `env!("CARGO_PKG_NAME")` (`detected`, from
-    /// [`modal_rust_runtime::package_from_inventory`]) → the existing value (the v0
+    /// [`crate::package_from_inventory`]) → the existing value (the v0
     /// default left by [`discover_package`]). `env_override`/`detected` are passed
     /// in (rather than read here) so this stays a pure, unit-testable transform.
     ///

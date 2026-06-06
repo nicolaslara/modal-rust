@@ -14,6 +14,7 @@ modal-rs version) WILL drift — re-verify before pinning.
 | Product goal + runtime contract | project.md | 2026-06-03 | Goal, design stances (build boundary is the hard invariant; direct-execution-first with a Sandbox fallback; prefer static dispatch), runtime contract, crate layout, phases |
 | Agent rules + runner protocol | AGENTS.md | 2026-06-03 | Design stances (build boundary is the hard invariant; direct-execution-first with a Sandbox fallback; prefer static dispatch), runner protocol, git/Modal/secrets rules, verification |
 | Working practices + gates | WORKING.md | 2026-06-03 | Core loop, verification depth table, workpad gates, confidence/review |
+| Runtime/control-plane registration split | crates/modal-rust-runtime/src/lib.rs; crates/modal-rust/src/registration.rs; crates/modal-rust-macros/src/lib.rs | 2026-06-06 | Runtime registration is dispatch-only; facade registration atomically pairs handler + FunctionConfig + package for macro inventory |
 | Modal Images reference | https://modal.com/docs/reference/modal.Image | 2026-06-03 | `add_local_dir` copy=False (startup) vs copy=True (image layer); `run_commands`; `ignore=`; `from_registry`/`add_python`; `entrypoint([])` (§1.1) |
 | Modal Images guide | https://modal.com/docs/guide/images | 2026-06-03 | copy=False adds files at startup, no later build steps; per-layer cache cascade (§1.1) |
 | Modal custom container guide | https://modal.com/docs/guide/custom-container | 2026-06-03 | `run_commands` build-time shell + network egress (git clone, apt) (§1.1) |

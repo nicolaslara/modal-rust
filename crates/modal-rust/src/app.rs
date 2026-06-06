@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::deploy::{self, DeployConfig, DeployedApp};
 use crate::remote::{self, RemoteConfig};
-use crate::{Error, Function, Registry, Result};
+use crate::{Error, Function, FunctionConfig, Registry, Result};
 
 /// One `map` input as the SDK's `map_cbor` expects it: `(args, kwargs)` where
 /// `args = (entrypoint, input_json)` (the SAME 2-tuple `.remote()` sends) and
@@ -47,7 +47,7 @@ pub struct App {
     /// Per-entrypoint config from `#[modal_rust::function(...)]`. EMPTY for the
     /// manual `App::local_with_registry(registry)` / `connect_with_registry` path
     /// (no decorator => facade defaults apply via [`App::config_for`]).
-    configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+    configs: std::collections::BTreeMap<String, FunctionConfig>,
     /// `None` until [`App::connect`]; the live control-plane handle `.remote()`
     /// consumes. `.local()` never touches it.
     remote: Option<RemoteHandle>,
@@ -107,7 +107,7 @@ impl App {
     /// with `#[modal_rust::function]`, ALSO capturing each entrypoint's decorator
     /// [`FunctionConfig`]. Zero Modal, zero network.
     pub fn local() -> Self {
-        let (registry, configs) = modal_rust_runtime::from_inventory_with_configs();
+        let (registry, configs) = crate::from_inventory_with_configs();
         App {
             registry,
             configs: configs
@@ -126,7 +126,7 @@ impl App {
     /// Enables [`Function::remote`](crate::Function::remote); `.local()` never
     /// needs this call. `.spawn()`/`.map()` remain stubbed.
     pub async fn connect(name: &str) -> Result<Self> {
-        let (registry, configs) = modal_rust_runtime::from_inventory_with_configs();
+        let (registry, configs) = crate::from_inventory_with_configs();
         let configs = configs
             .into_iter()
             .map(|(n, c)| (n.to_string(), c))
@@ -139,7 +139,7 @@ impl App {
         // only fills in the package when the env var is unset.
         let run_config = RemoteConfig::default().with_detected_package(
             std::env::var("MODAL_RUST_PACKAGE").ok().as_deref(),
-            modal_rust_runtime::package_from_inventory(),
+            crate::package_from_inventory(),
         );
         App::connect_inner(name, registry, configs, run_config).await
     }
@@ -166,9 +166,7 @@ impl App {
     ///
     /// Zero Modal, zero network — pair with
     /// [`connect_from_manifest`](App::connect_from_manifest) for the live handle.
-    pub fn from_manifest(
-        configs: impl IntoIterator<Item = (String, modal_rust_runtime::FunctionConfig)>,
-    ) -> Self {
+    pub fn from_manifest(configs: impl IntoIterator<Item = (String, FunctionConfig)>) -> Self {
         App {
             registry: Registry::new(),
             configs: configs.into_iter().collect(),
@@ -183,7 +181,7 @@ impl App {
     /// CWD). Headless: no handlers, so only `.remote()`/`deploy`/`call` work (P9 §B).
     pub async fn connect_from_manifest(
         name: &str,
-        configs: impl IntoIterator<Item = (String, modal_rust_runtime::FunctionConfig)>,
+        configs: impl IntoIterator<Item = (String, FunctionConfig)>,
         run_config: RemoteConfig,
     ) -> Result<Self> {
         App::connect_inner(
@@ -203,7 +201,7 @@ impl App {
     async fn connect_inner(
         name: &str,
         registry: Registry,
-        configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+        configs: std::collections::BTreeMap<String, FunctionConfig>,
         run_config: RemoteConfig,
     ) -> Result<Self> {
         let client = modal_rust_sdk::ModalClient::connect().await?; // From<sdk::Error>
@@ -224,7 +222,7 @@ impl App {
     async fn connect_inner_with_client(
         name: &str,
         registry: Registry,
-        configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+        configs: std::collections::BTreeMap<String, FunctionConfig>,
         run_config: RemoteConfig,
         mut client: modal_rust_sdk::ModalClient,
     ) -> Result<Self> {
@@ -289,7 +287,7 @@ impl App {
     pub async fn connect_at_with_configs(
         name: &str,
         registry: Registry,
-        configs: std::collections::BTreeMap<String, modal_rust_runtime::FunctionConfig>,
+        configs: std::collections::BTreeMap<String, FunctionConfig>,
         server_url: String,
         run_config: RemoteConfig,
     ) -> Result<Self> {
@@ -308,7 +306,7 @@ impl App {
     /// Resolve the decorator [`FunctionConfig`] for `name`. Returns
     /// `FunctionConfig::default()` (all `None`) for the manual path or an unknown
     /// name, so the facade's path defaults apply.
-    pub(crate) fn config_for(&self, name: &str) -> modal_rust_runtime::FunctionConfig {
+    pub(crate) fn config_for(&self, name: &str) -> FunctionConfig {
         self.configs.get(name).cloned().unwrap_or_default()
     }
 
@@ -693,10 +691,60 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Link example-add-macro's inventory submissions (incl. the decorated `add_gpu`
-    // with `gpu="T4", timeout=1800, cache=false`) into this test binary so
-    // `App::local()` surfaces their FunctionConfig.
-    use example_add_macro as _;
+    use crate::{HandlerFn, Registration, RunnerError};
+
+    // Test-only macro-style registrations for this crate's own inventory.
+    //
+    // `App::local()` collects `Registration` records from the current `modal-rust`
+    // crate instance. In these unit tests, `example-add-macro` would depend on a
+    // separate `modal-rust` crate instance, so importing that example would not give
+    // this test module any records to collect. Submit the records here instead.
+    //
+    // The three records model the macro cases these tests need: bare config,
+    // gpu/timeout/cache config, and secrets/volumes config. The handler body is
+    // irrelevant; these tests assert config discovery, not dispatch behavior.
+    fn test_handler(_input: &[u8]) -> std::result::Result<Vec<u8>, RunnerError> {
+        Ok(b"null".to_vec())
+    }
+
+    inventory::submit! {
+        Registration {
+            name: "add",
+            handler: test_handler as HandlerFn,
+            config: FunctionConfig::new(),
+            package: "modal-rust",
+        }
+    }
+
+    inventory::submit! {
+        Registration {
+            name: "add_gpu",
+            handler: test_handler as HandlerFn,
+            config: FunctionConfig {
+                gpu: Some("T4"),
+                timeout_secs: Some(1800),
+                cache: Some(false),
+                secrets: &[],
+                volumes: &[],
+            },
+            package: "modal-rust",
+        }
+    }
+
+    inventory::submit! {
+        Registration {
+            name: "add_extras",
+            handler: test_handler as HandlerFn,
+            config: FunctionConfig {
+                gpu: None,
+                timeout_secs: None,
+                cache: None,
+                secrets: &["my-secret"],
+                volumes: &[("/data", "my-vol")],
+            },
+            package: "modal-rust",
+        }
+    }
 
     #[test]
     fn local_captures_decorator_config() {
@@ -708,7 +756,7 @@ mod tests {
         assert_eq!(gpu_cfg.cache, Some(false));
         // The bare decorated entrypoint has the default (all-None) config.
         let bare = app.config_for("add");
-        assert_eq!(bare, modal_rust_runtime::FunctionConfig::default());
+        assert_eq!(bare, FunctionConfig::default());
     }
 
     #[test]
@@ -731,13 +779,10 @@ mod tests {
         // deploy now publishes ONE Modal function PER ENTRYPOINT, each with its OWN
         // config, so divergent gpu/timeout are NO LONGER rejected — they coexist.
         let app = App::from_manifest([
-            (
-                "cpu".to_string(),
-                modal_rust_runtime::FunctionConfig::default(),
-            ),
+            ("cpu".to_string(), FunctionConfig::default()),
             (
                 "gpu".to_string(),
-                modal_rust_runtime::FunctionConfig {
+                FunctionConfig {
                     gpu: Some("T4"),
                     timeout_secs: Some(1800),
                     cache: None,
@@ -760,7 +805,7 @@ mod tests {
 
     #[test]
     fn deploy_plan_carries_identical_per_entrypoint_configs() {
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             gpu: Some("T4"),
             timeout_secs: Some(1800),
             cache: Some(false), // deploy ignores run-cache config
@@ -812,10 +857,7 @@ mod tests {
         // The manual `App::local_with_registry(registry)` path has NO decorator config
         // (empty configs map), so `config_for` returns the default for any name.
         let app = App::local_with_registry(Registry::new());
-        assert_eq!(
-            app.config_for("anything"),
-            modal_rust_runtime::FunctionConfig::default()
-        );
+        assert_eq!(app.config_for("anything"), FunctionConfig::default());
     }
 
     #[test]
@@ -824,7 +866,7 @@ mod tests {
         // config but NO handlers (empty Registry). `config_for` surfaces the manifest
         // config; `known_names()` is empty (headless), so `.local()` would fail but
         // `.remote()`/`deploy`/`call` (which never touch handlers) work.
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             gpu: Some("A100"),
             timeout_secs: Some(900),
             cache: Some(true),
@@ -835,19 +877,13 @@ mod tests {
         assert_eq!(app.config_for("add"), cfg);
         assert!(app.known_names().is_empty(), "manifest App is headless");
         // An unknown name falls back to the default config.
-        assert_eq!(
-            app.config_for("missing"),
-            modal_rust_runtime::FunctionConfig::default()
-        );
+        assert_eq!(app.config_for("missing"), FunctionConfig::default());
     }
 
     #[test]
     fn from_manifest_default_config_roundtrips() {
         // P9 §G.1: a default-config entry round-trips to the all-None config.
-        let app = App::from_manifest([(
-            "add".to_string(),
-            modal_rust_runtime::FunctionConfig::default(),
-        )]);
+        let app = App::from_manifest([("add".to_string(), FunctionConfig::default())]);
         let c = app.config_for("add");
         assert_eq!(c.gpu, None);
         assert_eq!(c.timeout_secs, None);

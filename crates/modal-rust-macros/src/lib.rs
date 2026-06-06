@@ -4,12 +4,13 @@
 //! `pub fn add(input: AddInput) -> anyhow::Result<AddOutput>`, expands to:
 //!
 //! 1. the **unchanged** original function, and
-//! 2. an `inventory::submit!` registration whose handler is the SAME
-//!    monomorphized `modal_rust_runtime::typed!(add)` wrapper `fn` pointer the
-//!    manual `Registry::new().function("add", typed!(add))` builder produces.
+//! 2. one facade-owned `inventory::submit!` registration whose handler is the
+//!    SAME monomorphized `modal_rust_runtime::typed!(add)` wrapper `fn` pointer
+//!    the manual `Registry::new().function("add", typed!(add))` builder produces,
+//!    paired atomically with the control-plane metadata.
 //!
-//! `Registry::from_inventory()` then collects every submission into the SAME
-//! `BTreeMap<&'static str, HandlerFn>` as the manual path (boundaries.md §3). The
+//! `modal_rust::registry_from_inventory()` then collects every submission into the
+//! SAME `BTreeMap<&'static str, HandlerFn>` as the manual path (boundaries.md §3). The
 //! macro is **purely additive**: it changes neither the runner CLI protocol, the
 //! five-kind `RunnerError` envelope, nor the `HandlerFn` / `Registry` / `typed!`
 //! shapes. The manual builder path stays fully intact and both converge on one
@@ -24,12 +25,10 @@
 //! ## Optional per-function config
 //!
 //! `#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false)]` records a
-//! [`modal_rust_runtime::FunctionConfig`] alongside the registration. This is
-//! METADATA ONLY — the runner ignores it; only the control-plane facade reads it
-//! when creating the Modal function (`Resources.gpu_config`, `timeout_secs`). All
-//! keys are optional; the bare `#[modal_rust::function]` and `name = "..."` forms
-//! record `FunctionConfig::default()` (all `None`, empty secrets/volumes), so the
-//! runtime-observable behavior is byte-identical to before this addition.
+//! facade-owned [`modal_rust::FunctionConfig`] in the same inventory record as the
+//! handler. This is control-plane metadata only: the facade reads it when creating
+//! the Modal function (`Resources.gpu_config`, `timeout_secs`), while runtime
+//! dispatch sees only `name` + `HandlerFn`.
 //!
 //! ## User-facing secrets + volumes
 //!
@@ -86,11 +85,11 @@
 //! macro-using crate needs ONLY `modal-rust` (plus `serde`/`anyhow` for the handler
 //! types). The macro resolves the facade's import name with `proc-macro-crate` at
 //! expansion time and emits:
-//! - `#facade::__private::runtime::{Registration, FunctionConfig, typed!}` — the frozen
-//!   runner items, re-exported under the facade's hidden `__private::runtime`.
+//! - `#facade::{Registration, FunctionConfig}` — the facade-owned atomic
+//!   discovery record and its control-plane config.
+//! - `#facade::__private::runtime::typed!` — the frozen runner wrapper macro.
 //! - `#facade::__private::inventory::submit!` — `inventory`, re-exported under
-//!   `__private::inventory` (the `submit!` macro path AND the `Registration` type both
-//!   resolve through the re-export — the serde_derive single-dep pattern).
+//!   `__private::inventory`.
 //! - `#facade::{App, TypedCall}` for the Mode B typed `app.<fn>(..)` methods.
 //! - `::serde::{Serialize, Deserialize}` for the generated `Input` derives — `serde`
 //!   routes itself, and every macro-using crate already has `serde` with `derive`, so
@@ -182,8 +181,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Parse the optional arguments. All are optional; the bare
     // `#[modal_rust::function]` (and `name = "..."`) set none of gpu/timeout/cache,
-    // so the emitted `FunctionConfig` is `default()` (all `None`) — runtime-
-    // observable behavior stays byte-identical (the runner ignores `config`).
+    // so the emitted facade `FunctionConfig` is `default()` (all `None`) —
+    // runtime-observable behavior stays byte-identical.
     let mut explicit_name: Option<LitStr> = None;
     let mut gpu: Option<LitStr> = None; // gpu = "T4"
     let mut timeout_secs: Option<u64> = None; // timeout = 1800   (LitInt -> u64, narrow at emit)
@@ -478,11 +477,9 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 ///
 /// This expands to the SAME runner the hand-written bin produced: it (optionally
-/// links the lib crate then) assembles the registry + decorator configs via
-/// `from_inventory_with_configs()` and runs the FROZEN runner CLI protocol via
-/// `run_cli_with_configs`, mirroring `ok` in the process exit code. It is fully
-/// ADDITIVE — a hand-written runner using the old `__private::runtime` path keeps
-/// working unchanged.
+/// links the lib crate then) assembles the registry + decorator configs from the
+/// facade's atomic inventory records and runs the FROZEN runner CLI protocol,
+/// mirroring `ok` in the process exit code.
 ///
 /// ## Why the optional crate name
 ///
@@ -530,22 +527,19 @@ pub fn modal_runner(input: TokenStream) -> TokenStream {
         #link
         fn main() -> ::std::process::ExitCode {
             // Assemble the registry + per-entrypoint decorator configs from the
-            // `inventory` submissions (the `#[modal_rust::function]` registrations),
-            // then run the FROZEN runner CLI protocol. The configs ride into the
-            // additive `--describe` manifest; the `--entrypoint` dispatch ignores
-            // them, so this is behavior-identical to the hand-written runner.
-            let (registry, configs) =
-                #facade::__private::runtime::from_inventory_with_configs();
-            let code = #facade::__private::runtime::run_cli_with_configs(registry, &configs);
+            // facade-owned atomic `inventory` submissions, then run the FROZEN
+            // runner CLI protocol. The configs ride into the additive `--describe`
+            // manifest; the `--entrypoint` dispatch ignores them.
+            let code = #facade::__private::run_cli_from_inventory();
             ::std::process::ExitCode::from(code as u8)
         }
     }
     .into()
 }
 
-/// Mode-A emission helper: keep the original fn verbatim and submit a
-/// `Registration` whose handler is `#handler_expr` (here `typed!(#fn_ident)`), with
-/// the decorator config — byte-identical to the pre-auto-I/O path.
+/// Mode-A emission helper: keep the original fn verbatim and submit one facade
+/// `Registration` whose handler is `#handler_expr` (here `typed!(#fn_ident)`),
+/// with the decorator config in the same record.
 #[allow(clippy::too_many_arguments)]
 fn emit_registration(
     func: &ItemFn,
@@ -579,22 +573,20 @@ fn emit_registration(
 /// `#handler_expr` under `entry_name` with the decorator `FunctionConfig`.
 ///
 /// Every path is routed through the resolved `#facade`
-/// (`#facade::__private::inventory::submit!`,
-/// `#facade::__private::runtime::{Registration, FunctionConfig}`) so a macro-using
-/// crate needs ONLY `modal-rust`. `inventory::submit!` — invoked here THROUGH the
-/// facade re-export — places this in a link section that `Registry::from_inventory()`
-/// collects at runner startup; both the macro-path resolution and the
-/// `Registration` type path go through the re-export (serde_derive pattern). The
+/// (`#facade::__private::inventory::submit!`, `#facade::{Registration,
+/// FunctionConfig}`) so a macro-using crate needs ONLY `modal-rust`.
+/// `inventory::submit!` — invoked here THROUGH the facade re-export — places this
+/// in a link section that the facade collects at runner startup. The
 /// `typed!` macro expands to a block that defines a local `fn` and coerces it to a
 /// `HandlerFn` pointer — a const-evaluable expression valid in the `static`
 /// initializer `inventory::submit!` generates.
 ///
-/// The decorator config flows into the registration as a `FunctionConfig`. The
+/// The decorator config flows into the facade registration as a `FunctionConfig`. The
 /// `gpu` literal is a `&'static str` (so the `static` `inventory::submit!`
 /// initializer stays `const`-valid, matching `name: &'static str`); `timeout` is
 /// narrowed `u64 -> u32` here. The bare form sets all three to `None` =>
-/// `FunctionConfig::default()`, which the runner ignores (so behavior is
-/// byte-identical; only the facade reads `config`).
+/// `FunctionConfig::default()`, which runtime dispatch ignores (so behavior is
+/// byte-identical; only the facade reads `config` for control-plane work).
 #[allow(clippy::too_many_arguments)]
 fn build_registration(
     entry_name: &str,
@@ -637,10 +629,10 @@ fn build_registration(
 
     quote! {
         #facade::__private::inventory::submit! {
-            #facade::__private::runtime::Registration {
+            #facade::Registration {
                 name: #entry_name,
                 handler: #handler_expr,
-                config: #facade::__private::runtime::FunctionConfig {
+                config: #facade::FunctionConfig {
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
                     cache: #cache_tok,

@@ -188,6 +188,15 @@ Seeded from `research-synthesis.md` §2 (locked decisions). Items marked
 
 Seeded from `research-synthesis.md` §1 (verified facts). Confidence as noted there.
 
+- **2026-06-06 — runtime/control-plane registration boundary repaired.**
+  `modal-rust-runtime::Registration` is dispatch-only again (`name`, `handler`).
+  Macro discovery now submits one facade-owned `modal_rust::Registration` that
+  atomically pairs `handler` with `FunctionConfig` and `package`; the facade splits
+  that single record into a runtime `Registry` plus control-plane configs. This
+  avoids the two-submit footgun while removing Modal vocabulary from the runtime
+  crate. Evidence: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  and `cargo test` passed on 2026-06-06.
+
 - `add_local_dir(local, remote, *, copy=False, ignore=[])` defaults `copy=False`;
   `copy=False` mounts files at container startup (not an image layer, no later
   build steps), `copy=True` bakes a build-time layer (required for later

@@ -28,7 +28,7 @@
 //! round-trips.
 
 use example_add::{modal_registry, AddInput, AddOutput};
-use modal_rust::{App, DeployConfig, Registry};
+use modal_rust::{App, DeployConfig};
 
 /// The persistent app name used by the deploy/call demo.
 const DEPLOY_APP: &str = "modal-rust-orchestrate-demo";
@@ -64,8 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The `#[modal_rust::function]` inventory registers `add` into the
     // SAME `Registry` shape the manual builder produced — proven via the macro crate's
-    // re-exported `Registry::from_inventory()` lookup.
-    let macro_registry = Registry::from_inventory();
+    // re-exported `modal_rust::registry_from_inventory()` lookup.
+    let macro_registry = modal_rust::registry_from_inventory();
     assert!(
         macro_registry.get("add").is_some(),
         "the #[modal_rust::function] inventory must register `add`"

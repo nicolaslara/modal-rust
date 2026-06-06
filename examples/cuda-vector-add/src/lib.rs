@@ -292,11 +292,9 @@ mod tests {
     #[test]
     fn registry_has_vector_add() {
         // The `#[modal_rust::function]` decorator submits `vector_add` to inventory;
-        // `Registry::from_inventory()` collects it into the SAME lookup the manual
-        // builder produced. `Registry` resolves through the facade re-export (the
-        // `extern crate … as modal_rust` alias above).
-        use modal_rust::Registry;
-        let reg = Registry::from_inventory();
+        // `modal_rust::registry_from_inventory()` collects it into the SAME lookup the manual
+        // builder produced.
+        let reg = modal_rust::registry_from_inventory();
         assert!(reg.get("vector_add").is_some());
         assert!(reg.get("nope").is_none());
     }

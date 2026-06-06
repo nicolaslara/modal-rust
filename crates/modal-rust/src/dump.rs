@@ -542,6 +542,7 @@ impl crate::App {
 mod tests {
     use super::*;
     use crate::App;
+    use crate::FunctionConfig;
     use std::collections::BTreeMap;
 
     /// A tiny base `RemoteConfig` for the dump (no network, no real workspace read):
@@ -577,7 +578,7 @@ mod tests {
     #[test]
     fn dry_run_renders_the_full_run_sequence() {
         // A T4 + cache-on entrypoint (the decorator config the macro would set).
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             gpu: Some("T4"),
             timeout_secs: Some(1800),
             cache: Some(true),
@@ -697,9 +698,9 @@ mod tests {
     #[test]
     fn dry_run_cache_off_drops_the_volume() {
         // cache=false ⇒ no VolumeGetOrCreate, no /cache mount (byte-identical to pre-P6).
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             cache: Some(false),
-            ..modal_rust_runtime::FunctionConfig::default()
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([("add".to_string(), cfg)]);
         let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");
@@ -721,11 +722,11 @@ mod tests {
     #[test]
     fn dry_run_secrets_and_user_volumes_ride_into_function_create() {
         // A decorated entrypoint with a secret + a user volume.
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             cache: Some(false), // keep the manifest minimal
             secrets: &["api-creds"],
             volumes: &[("/data", "my-vol")],
-            ..modal_rust_runtime::FunctionConfig::default()
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([("add".to_string(), cfg)]);
         let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");
@@ -760,10 +761,10 @@ mod tests {
     #[test]
     fn dump_deploy_manifest_is_client_mount_only_with_cargo_build() {
         // Deploy with a decorated entrypoint (gpu, to prove it flows through).
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             gpu: Some("A100"),
             timeout_secs: Some(900),
-            ..modal_rust_runtime::FunctionConfig::default()
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([("add".to_string(), cfg)]);
         let dcfg = DeployConfig {
@@ -857,16 +858,13 @@ mod tests {
         // entrypoints render TWO precreate+FunctionCreate pairs (distinct object tags,
         // each its own gpu/timeout) over ONE shared image — the rejection is gone.
         let app = App::from_manifest([
-            (
-                "cpu".to_string(),
-                modal_rust_runtime::FunctionConfig::default(),
-            ),
+            ("cpu".to_string(), FunctionConfig::default()),
             (
                 "gpu".to_string(),
-                modal_rust_runtime::FunctionConfig {
+                FunctionConfig {
                     gpu: Some("A100"),
                     timeout_secs: Some(900),
-                    ..modal_rust_runtime::FunctionConfig::default()
+                    ..FunctionConfig::default()
                 },
             ),
         ]);
@@ -926,10 +924,10 @@ mod tests {
     fn dry_run_user_volume_at_cache_path_is_rejected() {
         // A user volume mounted at the reserved /cache path collides with the cargo
         // cache — the dump surfaces the SAME error the live path would.
-        let cfg = modal_rust_runtime::FunctionConfig {
+        let cfg = FunctionConfig {
             cache: Some(true),
             volumes: &[("/cache", "rogue")],
-            ..modal_rust_runtime::FunctionConfig::default()
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([("add".to_string(), cfg)]);
         let err = app.dry_run("add", &run_cfg()).unwrap_err();
@@ -940,7 +938,7 @@ mod tests {
     fn dry_run_works_without_a_connected_app() {
         // The dump never connects: a manual `App::from_manifest` (no remote handle)
         // still renders, using the package as the app name fallback.
-        let app = App::from_manifest(BTreeMap::<String, modal_rust_runtime::FunctionConfig>::new());
+        let app = App::from_manifest(BTreeMap::<String, FunctionConfig>::new());
         let manifest = app.dry_run("add", &run_cfg()).expect("offline dry_run");
         assert_eq!(manifest.app_name, "app", "falls back to the package name");
         assert!(!manifest.requests.is_empty());
