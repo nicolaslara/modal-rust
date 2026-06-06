@@ -113,6 +113,17 @@ run "fan-out-map: local fan-out (results in input order)" 'intro -> 8 words, 1 m
 run "background-jobs: local job (result a spawn converges to)" "job 'nightly-report' done -> 250000 rounds, digest 17267777379177717202" \
   "cargo run -q -p example-background-jobs --bin background_jobs"
 
+# error-handling — how a failure crosses the boundary. The driver runs BOTH failing
+# functions offline and prints the wire envelope each produces (the structured one
+# carries machine-readable `details` the caller branches on).
+run "error-handling: structured error -> details + branch" 'branch:     short by 50 cents -> prompt a top-up' \
+  "cargo run -q -p example-error-handling --bin error_handling"
+
+# error-handling — the plain anyhow path lands on `function_error` with `details:null`
+# (proven straight through the frozen runner CLI envelope).
+run "error-handling: anyhow error -> function_error, details:null" '"kind":"function_error","message":"insufficient funds: asked 150, have 100"' \
+  "cd examples/error-handling && cargo run -q --bin modal_runner -- --entrypoint withdraw --input-json '{\"amount\":150,\"balance\":100}'"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
