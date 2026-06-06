@@ -66,7 +66,8 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   reconciled.
 - Runner-bin boilerplate (→ Active #1).
 - Large files: `runtime/lib.rs` ~1113, `remote.rs` ~980, `image.rs` ~935;
-  `WRAPPER_SRC`/`DEPLOY_WRAPPER_SRC` are 160+-line inline Python heredocs embedded in Rust strings.
+  the RUN wrapper has been extracted to `remote/wrapper.py`, while the smaller
+  `DEPLOY_WRAPPER_SRC` is still an inline Python heredoc embedded in a Rust string.
 - The testkit duplicates the 4129-line proto + a 201-RPC server (its own `build_server`) —
   acceptable for a dev crate, but heavy.
 

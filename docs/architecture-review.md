@@ -82,12 +82,12 @@ in their head.
 
 ### Bad / weak
 
-- **`remote.rs` mixes three abstraction levels in one file:** a 165-line Python
-  program (the `WRAPPER_SRC` string literal, `remote.rs:60–225`), the 13-field
-  `RemoteConfig` struct (`:266`), six env-discovery helpers (`discover_*`,
-  `:344–423`), and the multi-step control-plane `ensure_function` (`:446`). A reader
-  fixing the cache logic must scroll past Rust config plumbing to reach embedded
-  Python. (See §6.)
+- **`remote.rs` mixes several abstraction levels in one file:** `RemoteConfig`,
+  env-discovery helpers (`discover_*`), the multi-step control-plane
+  `ensure_function`, and runner-envelope parsing all live together. The RUN wrapper
+  Python has been extracted to `remote/wrapper.py`, which removes the worst embedded
+  string problem, but the remaining config/discovery/control-plane split is still a
+  good reorg target. (See §6.)
 - **Inline `std::collections::` and `std::env::var` full-path spellings** recur where a
   `use` would read better — e.g. `app.rs:215` `std::collections::HashMap::new()` twice
   on adjacent lines; `app.rs:18` even introduces a `MapInput` alias specifically to
@@ -101,8 +101,9 @@ in their head.
 
 ### Could improve
 
-- Pull the `WRAPPER_SRC` Python out of `remote.rs` into its own module or a
-  `include_str!` of a real `.py` file (which would also get Python-syntax tooling).
+- Continue splitting `remote.rs` now that the RUN wrapper lives in a real
+  `remote/wrapper.py` included with `include_str!`; the remaining obvious extraction
+  is the env/config discovery code.
 - A few `let cfg_x = ...; let cfg_y = ...;` ladders in `resolve_function` could be a
   single small struct-update.
 
@@ -150,18 +151,13 @@ and map. `ImageSpec`/`FunctionSpec` are declarative builders that render to prot
   cache default). A future shared `BuildPathConfig` core could remove that smaller
   doc/field duplication, but the high-risk gpu/timeout/cache/secrets/volumes copy chain
   is gone.
-- **The embedded-Python-wrapper-as-Rust-string is a deliberate but leaky abstraction.**
-  `WRAPPER_SRC` (`remote.rs:60`) is a full Python program — including an entire cache
-  pack/unpack subsystem (`_unpack_cache`, `_pack_cache`, `_pack_one`, zstd/gzip
-  fallback) — living as a `&'static str` with `{{PACKAGE}}`/`{{CACHE}}`/`{{ARCHIVE_*}}`
-  template holes filled by `run_wrapper_src` (`:237`). It is base64-baked into the
-  Dockerfile (`image.rs:447`), so there is no shell-quoting risk, and there is a test
-  asserting the placeholders are substituted and the archive path matches the Rust
-  constants (`remote.rs:709`, `:724`). But: this Python has no type checking, no
-  linting, no unit tests of its *own* logic (only that the string substitutes), and it
-  has grown the cache state machine that arguably wants to be real code. The
-  deploy-side twin (`DEPLOY_WRAPPER_SRC`, `deploy.rs:65`) is mercifully small and has a
-  good negative-assertion test that it contains no `cargo`/`/src`/`CARGO_` (`:453`).
+- **[FIXED 2026-06-06] The RUN wrapper is no longer an embedded templated Rust
+  string.** `WRAPPER_SRC` now comes from `include_str!("remote/wrapper.py")`; package,
+  cache, and archive-path parameters are passed as base64-encoded JSON through
+  `MODAL_RUST_RUN_CONFIG_JSON_B64`. The Python can be syntax-checked and has a
+  dedicated `wrapper_test.py` exercised from `cargo test`, while Rust only supplies
+  data. The deploy-side twin (`DEPLOY_WRAPPER_SRC`, `deploy.rs:65`) remains small and
+  has a good negative-assertion test that it contains no `cargo`/`/src`/`CARGO_`.
 - **[FIXED 2026-06-06] The additive-config hand-threading was collapsed.** A
   decorator value now travels through one static boundary and one owned domain type:
   `#[function(gpu=..)]` → static facade `FunctionConfig` (`registration.rs`) →
@@ -329,7 +325,7 @@ a new example.
 | File | LOC | Verdict |
 | --- | --- | --- |
 | `runtime/src/lib.rs` (1113, ~819 real) | The frozen core. **Justifiably one file** — it is THE seam and benefits from being read as a unit. Could optionally split `codec` and `__macro_support` into submodules, but the cohesion argument wins. |
-| `modal-rust/src/remote.rs` (980, ~704 real) | **Should be split.** The embedded Python `WRAPPER_SRC` (~165 lines) + cache subsystem wants its own module (or a real `.py` via `include_str!`); the `discover_*` env helpers want a `config_discovery` module; `ensure_function` + `RemoteConfig` + `parse_envelope` are the actual facade logic. |
+| `modal-rust/src/remote.rs` (980, ~704 real) | **Should still be split.** The RUN wrapper is now a real `remote/wrapper.py` included with `include_str!`, but the `discover_*` env helpers still want a `config_discovery` module; `ensure_function` + `RemoteConfig` + `parse_envelope` are the actual facade logic. |
 | `sdk/ops/image.rs` (935, ~602 real) | Borderline. The Dockerfile rendering (`dockerfile_commands`, `to_proto`, `bake_command`) and the build-poll (`poll_image_build`, `drain_build_window`) are two distinct concerns that could split into `image/render.rs` + `image/build.rs`. Tests are ~334 lines — the real unit is moderate. |
 | `sdk/ops/local_dir.rs` (837, ~581 real) | Reasonable as-is; it has one job (upload) with a clear pipeline (matcher → collect → hash → upload → finalize). The `cfg(unix)`/`cfg(not unix)` `file_mode` split (`:570`) is clean. |
 | `sdk/ops/invoke.rs` (693, ~627 real) | Mostly real code, low test ratio. `invoke`/`spawn`/`map`/`get` share a lot of `FunctionMap`+fix#3 boilerplate (the same ~20-line enqueue block appears in `invoke_raw_with_deadline`, `spawn_raw`, and `map_cbor`). A private `enqueue_one`/`enqueue_n` helper would cut ~40 duplicated lines. |
@@ -422,11 +418,11 @@ a new example.
    `enqueue(function_call_type, invocation_type, items)` helper. ~40 lines, directly
    testable. *(value: medium, cost: low)*
 
-4. **Split `remote.rs`.** Move `WRAPPER_SRC` + `run_wrapper_src` + the cache template
-   into `remote/wrapper.rs` (ideally `include_str!("wrapper.py")` so the Python gets
-   real tooling), and the `discover_*` helpers into `remote/discover.rs`. Leaves
-   `remote.rs` as just `RemoteConfig` + `ensure_function` + `parse_envelope`. Pure
-   reorg, no API change. *(value: high, cost: medium)*
+4. **Split `remote.rs` further.** The RUN wrapper extraction is done
+   (`remote/wrapper.py` + `include_str!` + JSON env config). Move the remaining
+   `discover_*` helpers into `remote/discover.rs`, leaving `remote.rs` as just
+   `RemoteConfig` + `ensure_function` + `parse_envelope`. Pure reorg, no API change.
+   *(value: medium, cost: low)*
 
 5. **Consider a shared build/source config core for `RemoteConfig`/`DeployConfig`.**
    The per-function option core is already factored as `FunctionOptions`; the remaining

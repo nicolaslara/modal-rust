@@ -35,6 +35,12 @@ file + `references.md` from the synthesis.
 Seeded from `research-synthesis.md` §2 (locked decisions). Items marked
 **[CHANGED]** folded in a HIGH-severity review `must_fix`.
 
+- **[CHANGED — Rust MED, 2026-06-06] RUN wrapper source is real Python, not a
+  templated Rust string.** `crates/modal-rust/src/remote/wrapper.py` is included by
+  Rust with `include_str!`; package/cache/archive parameters travel as
+  base64-encoded JSON in `MODAL_RUST_RUN_CONFIG_JSON_B64`. This preserves the run
+  build boundary while making the wrapper syntax-checkable and unit-testable.
+
 - **Single virtual cargo workspace** at repo root: `crates/modal-rust-runtime`,
   `crates/modal-rust-cli`, `crates/modal-rust-client`, `crates/modal-rust-macros`
   (empty placeholder), plus `examples/add`. Edition 2021 for published crates

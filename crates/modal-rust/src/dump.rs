@@ -26,8 +26,8 @@ use crate::deploy::{
     DeployConfig, DEPLOY_SRC, DEPLOY_WRAPPER_CALLABLE, DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC,
 };
 use crate::remote::{
-    run_wrapper_src, RemoteConfig, CACHE_MOUNT, CACHE_VOLUME_NAME, PYTHON_SERIES, WRAPPER_CALLABLE,
-    WRAPPER_MODULE,
+    run_wrapper_config_env, run_wrapper_src, RemoteConfig, CACHE_MOUNT, CACHE_VOLUME_NAME,
+    PYTHON_SERIES, WRAPPER_CALLABLE, WRAPPER_MODULE,
 };
 use crate::{Error, Result};
 
@@ -389,7 +389,12 @@ impl crate::App {
             spec = spec.with_rust_toolchain();
         }
         let spec = spec
-            .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src(&cfg.package, cfg.cache))
+            .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src())
+            .with_command(run_wrapper_config_env(
+                &cfg.package,
+                cfg.cache,
+                &cfg.remote_src,
+            ))
             .with_command("ENV RUST_BACKTRACE=1")
             .with_command("ENTRYPOINT []");
         let image_id = sink.image(&spec, 0);
