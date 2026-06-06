@@ -197,6 +197,14 @@ Seeded from `research-synthesis.md` §1 (verified facts). Confidence as noted th
   crate. Evidence: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   and `cargo test` passed on 2026-06-06.
 
+- **2026-06-06 — per-function option duplication collapsed.** `FunctionConfig`
+  remains only as the const-friendly inventory initializer; the facade converts it
+  once into owned `FunctionOptions`. `App.configs`, run `RemoteConfig.options`,
+  deploy `DeployConfig.options`, `DeployEntrypoint.options`, dry-run, and the CLI
+  `--describe` parser now carry that one owned shape. This removes the previous
+  `DescribeConfig` / `FunctionConfigView` / `Box::leak` path and stops
+  gpu/timeout/cache/secrets/volumes from being re-declared across run and deploy.
+
 - `add_local_dir(local, remote, *, copy=False, ignore=[])` defaults `copy=False`;
   `copy=False` mounts files at container startup (not an image layer, no later
   build steps), `copy=True` bakes a build-time layer (required for later

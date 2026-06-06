@@ -121,7 +121,7 @@ pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
 pub use registration::{
     from_inventory_with_configs, package_from_inventory, registry_from_inventory,
     run_cli_from_inventory, run_cli_with_args_and_configs, run_cli_with_args_from_inventory,
-    FunctionConfig, Registration,
+    FunctionConfig, FunctionOptions, Registration,
 };
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly.

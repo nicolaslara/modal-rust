@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::deploy::{self, DeployConfig, DeployedApp};
 use crate::remote::{self, RemoteConfig};
-use crate::{Error, Function, FunctionConfig, Registry, Result};
+use crate::{Error, Function, FunctionOptions, Registry, Result};
 
 /// One `map` input as the SDK's `map_cbor` expects it: `(args, kwargs)` where
 /// `args = (entrypoint, input_json)` (the SAME 2-tuple `.remote()` sends) and
@@ -28,11 +28,7 @@ type MapInput<'a> = ((&'a str, String), std::collections::HashMap<String, ()>);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RunFunctionKey {
     entrypoint: String,
-    gpu: Option<String>,
-    timeout_secs: u32,
-    cache: bool,
-    secrets: Vec<String>,
-    volumes: Vec<(String, String)>,
+    options: FunctionOptions,
 }
 
 /// The user-facing application handle.
@@ -47,7 +43,7 @@ pub struct App {
     /// Per-entrypoint config from `#[modal_rust::function(...)]`. EMPTY for the
     /// manual `App::local_with_registry(registry)` / `connect_with_registry` path
     /// (no decorator => facade defaults apply via [`App::config_for`]).
-    configs: std::collections::BTreeMap<String, FunctionConfig>,
+    configs: std::collections::BTreeMap<String, FunctionOptions>,
     /// `None` until [`App::connect`]; the live control-plane handle `.remote()`
     /// consumes. `.local()` never touches it.
     remote: Option<RemoteHandle>,
@@ -93,7 +89,7 @@ impl App {
     /// zero network.
     ///
     /// The manual path has NO decorator config: `configs` is empty, so
-    /// [`App::config_for`] returns `FunctionConfig::default()` (all `None`) and the
+    /// [`App::config_for`] returns `FunctionOptions::default()` (all `None`) and the
     /// facade falls back to its path defaults — behavior preserved.
     pub fn local_with_registry(registry: Registry) -> Self {
         App {
@@ -105,15 +101,12 @@ impl App {
 
     /// Build an offline (in-process, no Modal) app over the functions decorated
     /// with `#[modal_rust::function]`, ALSO capturing each entrypoint's decorator
-    /// [`FunctionConfig`]. Zero Modal, zero network.
+    /// owned [`FunctionOptions`]. Zero Modal, zero network.
     pub fn local() -> Self {
         let (registry, configs) = crate::from_inventory_with_configs();
         App {
             registry,
-            configs: configs
-                .into_iter()
-                .map(|(n, c)| (n.to_string(), c))
-                .collect(),
+            configs: FunctionOptions::by_name(configs),
             remote: None,
         }
     }
@@ -127,10 +120,7 @@ impl App {
     /// needs this call. `.spawn()`/`.map()` remain stubbed.
     pub async fn connect(name: &str) -> Result<Self> {
         let (registry, configs) = crate::from_inventory_with_configs();
-        let configs = configs
-            .into_iter()
-            .map(|(n, c)| (n.to_string(), c))
-            .collect();
+        let configs = FunctionOptions::by_name(configs);
         // PACKAGE AUTO-DETECT: the `#[modal_rust::function]` macro captured the
         // user's `env!("CARGO_PKG_NAME")` into each inventory `Registration`. Thread
         // it into the RUN config so `cargo build -p <pkg>` targets the user's crate
@@ -166,10 +156,14 @@ impl App {
     ///
     /// Zero Modal, zero network — pair with
     /// [`connect_from_manifest`](App::connect_from_manifest) for the live handle.
-    pub fn from_manifest(configs: impl IntoIterator<Item = (String, FunctionConfig)>) -> Self {
+    pub fn from_manifest<I, O>(configs: I) -> Self
+    where
+        I: IntoIterator<Item = (String, O)>,
+        O: Into<FunctionOptions>,
+    {
         App {
             registry: Registry::new(),
-            configs: configs.into_iter().collect(),
+            configs: FunctionOptions::by_name(configs),
             remote: None,
         }
     }
@@ -179,15 +173,19 @@ impl App {
     /// package), instead of `connect_inner`'s hardcoded `RemoteConfig::default()`
     /// (which would (mis)discover `local_root`/`package` from the CLI's arbitrary
     /// CWD). Headless: no handlers, so only `.remote()`/`deploy`/`call` work (P9 §B).
-    pub async fn connect_from_manifest(
+    pub async fn connect_from_manifest<I, O>(
         name: &str,
-        configs: impl IntoIterator<Item = (String, FunctionConfig)>,
+        configs: I,
         run_config: RemoteConfig,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (String, O)>,
+        O: Into<FunctionOptions>,
+    {
         App::connect_inner(
             name,
             Registry::new(),
-            configs.into_iter().collect(),
+            FunctionOptions::by_name(configs),
             run_config,
         )
         .await
@@ -201,7 +199,7 @@ impl App {
     async fn connect_inner(
         name: &str,
         registry: Registry,
-        configs: std::collections::BTreeMap<String, FunctionConfig>,
+        configs: std::collections::BTreeMap<String, FunctionOptions>,
         run_config: RemoteConfig,
     ) -> Result<Self> {
         let client = modal_rust_sdk::ModalClient::connect().await?; // From<sdk::Error>
@@ -222,7 +220,7 @@ impl App {
     async fn connect_inner_with_client(
         name: &str,
         registry: Registry,
-        configs: std::collections::BTreeMap<String, FunctionConfig>,
+        configs: std::collections::BTreeMap<String, FunctionOptions>,
         run_config: RemoteConfig,
         mut client: modal_rust_sdk::ModalClient,
     ) -> Result<Self> {
@@ -270,7 +268,7 @@ impl App {
         Self::connect_at_with_configs(
             name,
             registry,
-            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::<String, FunctionOptions>::new(),
             server_url,
             run_config,
         )
@@ -278,19 +276,23 @@ impl App {
     }
 
     /// As [`connect_at_with`](App::connect_at_with), but ALSO threads per-entrypoint
-    /// decorator [`FunctionConfig`]s — the gpu/timeout/secrets/volumes the RUN path
+    /// decorator [`FunctionOptions`] — the gpu/timeout/secrets/volumes the RUN path
     /// resolves via [`config_for`](App::config_for). This is the table-test entry
     /// point that drives the manifest the SAME way a `#[function(gpu=.., timeout=..)]`
     /// decorator would (the RUN path re-derives gpu/timeout from the decorator config,
     /// not the bare `RemoteConfig`, so a faithful table must supply them here).
     #[cfg(any(test, feature = "testkit"))]
-    pub async fn connect_at_with_configs(
+    pub async fn connect_at_with_configs<I, O>(
         name: &str,
         registry: Registry,
-        configs: std::collections::BTreeMap<String, FunctionConfig>,
+        configs: I,
         server_url: String,
         run_config: RemoteConfig,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (String, O)>,
+        O: Into<FunctionOptions>,
+    {
         let config = modal_rust_sdk::ModalConfig {
             profile: "mock".into(),
             server_url,
@@ -300,13 +302,20 @@ impl App {
             image_builder_version: None,
         };
         let client = modal_rust_sdk::ModalClient::from_config(config).await?;
-        Self::connect_inner_with_client(name, registry, configs, run_config, client).await
+        Self::connect_inner_with_client(
+            name,
+            registry,
+            FunctionOptions::by_name(configs),
+            run_config,
+            client,
+        )
+        .await
     }
 
-    /// Resolve the decorator [`FunctionConfig`] for `name`. Returns
-    /// `FunctionConfig::default()` (all `None`) for the manual path or an unknown
+    /// Resolve the decorator [`FunctionOptions`] for `name`. Returns
+    /// `FunctionOptions::default()` (all `None`) for the manual path or an unknown
     /// name, so the facade's path defaults apply.
-    pub(crate) fn config_for(&self, name: &str) -> FunctionConfig {
+    pub(crate) fn config_for(&self, name: &str) -> FunctionOptions {
         self.configs.get(name).cloned().unwrap_or_default()
     }
 
@@ -361,32 +370,18 @@ impl App {
         handle: &RemoteHandle,
         entrypoint: &str,
     ) -> Result<(String, std::time::Duration)> {
-        let cfg = self.config_for(entrypoint);
-        let cfg_gpu: Option<String> = cfg.gpu.map(|s| s.to_string());
-        let cfg_timeout: Option<u32> = cfg.timeout_secs;
+        let mut options = self.config_for(entrypoint);
         // P6 cache precedence: the decorator `#[function(cache=…)]` (explicit
         // `Some(_)`) OVERRIDES the env/default base; a bare `#[function]` (`None`)
         // defers to `run_config.cache` (folded from MODAL_RUST_NO_CACHE / default ON).
         // Matches the gpu/timeout override semantics.
-        let cfg_cache: Option<bool> = cfg.cache;
-        // USER secrets/volumes from the decorator: owned copies for the create.
-        // Empty ⇒ no extras ⇒ wire-identical to before.
-        let cfg_secrets: Vec<String> = cfg.secrets.iter().map(|s| s.to_string()).collect();
-        let cfg_volumes: Vec<(String, String)> = cfg
-            .volumes
-            .iter()
-            .map(|(m, n)| (m.to_string(), n.to_string()))
-            .collect();
-
-        let effective_cache = cfg_cache.unwrap_or(handle.config.cache);
-        let effective_timeout = cfg_timeout.unwrap_or(handle.config.timeout_secs);
+        let effective_cache = options.cache.unwrap_or(handle.config.cache);
+        let effective_timeout = options.timeout_secs.unwrap_or(handle.config.timeout_secs);
+        options.cache = Some(effective_cache);
+        options.timeout_secs = Some(effective_timeout);
         let key = RunFunctionKey {
             entrypoint: entrypoint.to_string(),
-            gpu: cfg_gpu.clone(),
-            timeout_secs: effective_timeout,
-            cache: effective_cache,
-            secrets: cfg_secrets.clone(),
-            volumes: cfg_volumes.clone(),
+            options: options.clone(),
         };
         // Resolve (and memoize) the invokable function_id for this effective
         // config. The map lock is held only long enough to fetch/create the cell;
@@ -401,11 +396,8 @@ impl App {
         let function_id = cell
             .get_or_try_init(|| async {
                 let mut run_config = handle.config.clone();
-                run_config.gpu = cfg_gpu.clone();
-                run_config.timeout_override_secs = cfg_timeout;
                 run_config.cache = effective_cache;
-                run_config.secrets = cfg_secrets.clone();
-                run_config.volumes = cfg_volumes.clone();
+                run_config.options = options.clone();
                 let mut client = handle.client.lock().await;
                 // The publish set is the cumulative union across entrypoints (AppPublish
                 // REPLACES the set), so lock it across the create so each per-entrypoint
@@ -558,7 +550,7 @@ impl App {
     /// entrypoint (object tag = the entrypoint), carrying its effective
     /// gpu/timeout/secrets/volumes so `call(app, entrypoint)` resolves the right one.
     ///
-    /// Source precedence: the decorator [`FunctionConfig`]s when present (the
+    /// Source precedence: the decorator [`FunctionOptions`] when present (the
     /// `#[function(...)]` path); else the registered handler NAMES with default config
     /// each (the manual `connect_with_registry` path — so each registered entrypoint
     /// is deployed under its own name). EMPTY only when there are NEITHER configs NOR
@@ -572,14 +564,7 @@ impl App {
                 .iter()
                 .map(|(name, cfg)| deploy::DeployEntrypoint {
                     name: name.clone(),
-                    gpu: cfg.gpu.map(|s| s.to_string()),
-                    timeout_secs: cfg.timeout_secs,
-                    secrets: cfg.secrets.iter().map(|s| s.to_string()).collect(),
-                    volumes: cfg
-                        .volumes
-                        .iter()
-                        .map(|(m, n)| (m.to_string(), n.to_string()))
-                        .collect(),
+                    options: cfg.clone(),
                 })
                 .collect();
         }
@@ -590,10 +575,7 @@ impl App {
             .into_iter()
             .map(|name| deploy::DeployEntrypoint {
                 name,
-                gpu: None,
-                timeout_secs: None,
-                secrets: Vec::new(),
-                volumes: Vec::new(),
+                options: FunctionOptions::default(),
             })
             .collect()
     }
@@ -677,10 +659,7 @@ impl App {
         if entrypoints.is_empty() {
             vec![deploy::DeployEntrypoint {
                 name: deploy::DEPLOY_WRAPPER_CALLABLE.to_string(),
-                gpu: config.gpu.clone(),
-                timeout_secs: config.timeout_override_secs,
-                secrets: config.secrets.clone(),
-                volumes: config.volumes.clone(),
+                options: config.options.clone(),
             }]
         } else {
             entrypoints
@@ -691,7 +670,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HandlerFn, Registration, RunnerError};
+    use crate::{FunctionConfig, HandlerFn, Registration, RunnerError};
 
     // Test-only macro-style registrations for this crate's own inventory.
     //
@@ -751,12 +730,12 @@ mod tests {
         let app = App::local();
         // The decorated entrypoint's config flows through `config_for`.
         let gpu_cfg = app.config_for("add_gpu");
-        assert_eq!(gpu_cfg.gpu, Some("T4"));
+        assert_eq!(gpu_cfg.gpu.as_deref(), Some("T4"));
         assert_eq!(gpu_cfg.timeout_secs, Some(1800));
         assert_eq!(gpu_cfg.cache, Some(false));
         // The bare decorated entrypoint has the default (all-None) config.
         let bare = app.config_for("add");
-        assert_eq!(bare, FunctionConfig::default());
+        assert_eq!(bare, FunctionOptions::default());
     }
 
     #[test]
@@ -765,8 +744,11 @@ mod tests {
         // flows through `config_for` so the RUN/DEPLOY paths can resolve + attach them.
         let app = App::local();
         let cfg = app.config_for("add_extras");
-        assert_eq!(cfg.secrets, &["my-secret"]);
-        assert_eq!(cfg.volumes, &[("/data", "my-vol")]);
+        assert_eq!(cfg.secrets, vec!["my-secret".to_string()]);
+        assert_eq!(
+            cfg.volumes,
+            vec![("/data".to_string(), "my-vol".to_string())]
+        );
         // A bare entrypoint carries no extras (empty), so it stays wire-identical.
         let bare = app.config_for("add");
         assert!(bare.secrets.is_empty());
@@ -797,10 +779,10 @@ mod tests {
         let cpu = plan.iter().find(|e| e.name == "cpu").expect("cpu in plan");
         let gpu = plan.iter().find(|e| e.name == "gpu").expect("gpu in plan");
         // Each carries its OWN divergent config — no clobber, no rejection.
-        assert_eq!(cpu.gpu, None);
-        assert_eq!(cpu.timeout_secs, None);
-        assert_eq!(gpu.gpu.as_deref(), Some("T4"));
-        assert_eq!(gpu.timeout_secs, Some(1800));
+        assert_eq!(cpu.options.gpu, None);
+        assert_eq!(cpu.options.timeout_secs, None);
+        assert_eq!(gpu.options.gpu.as_deref(), Some("T4"));
+        assert_eq!(gpu.options.timeout_secs, Some(1800));
     }
 
     #[test]
@@ -819,10 +801,13 @@ mod tests {
         let plan = app.deploy_entrypoints();
         assert_eq!(plan.len(), 2);
         for ep in &plan {
-            assert_eq!(ep.gpu.as_deref(), Some("T4"));
-            assert_eq!(ep.timeout_secs, Some(1800));
-            assert_eq!(ep.secrets, &["my-secret".to_string()]);
-            assert_eq!(ep.volumes, &[("/data".to_string(), "my-vol".to_string())]);
+            assert_eq!(ep.options.gpu.as_deref(), Some("T4"));
+            assert_eq!(ep.options.timeout_secs, Some(1800));
+            assert_eq!(ep.options.secrets, &["my-secret".to_string()]);
+            assert_eq!(
+                ep.options.volumes,
+                vec![("/data".to_string(), "my-vol".to_string())]
+            );
         }
     }
 
@@ -857,7 +842,7 @@ mod tests {
         // The manual `App::local_with_registry(registry)` path has NO decorator config
         // (empty configs map), so `config_for` returns the default for any name.
         let app = App::local_with_registry(Registry::new());
-        assert_eq!(app.config_for("anything"), FunctionConfig::default());
+        assert_eq!(app.config_for("anything"), FunctionOptions::default());
     }
 
     #[test]
@@ -874,10 +859,10 @@ mod tests {
             volumes: &[("/data", "my-vol")],
         };
         let app = App::from_manifest([("add".to_string(), cfg.clone())]);
-        assert_eq!(app.config_for("add"), cfg);
+        assert_eq!(app.config_for("add"), FunctionOptions::from(&cfg));
         assert!(app.known_names().is_empty(), "manifest App is headless");
         // An unknown name falls back to the default config.
-        assert_eq!(app.config_for("missing"), FunctionConfig::default());
+        assert_eq!(app.config_for("missing"), FunctionOptions::default());
     }
 
     #[test]

@@ -286,11 +286,8 @@ async fn divergent_entrypoint_configs_deploy_distinct_functions() {
         modalignore_name: run_cfg.modalignore_name.clone(),
         base_image: run_cfg.base_image.clone(),
         timeout_secs: 300,
-        gpu: None,
-        timeout_override_secs: None,
         install_rust: false,
-        secrets: Vec::new(),
-        volumes: Vec::new(),
+        ..DeployConfig::for_app("divergent-deploy-app")
     };
     let _deployed = app.deploy_with(deploy_cfg).await.expect("deploy ok");
 

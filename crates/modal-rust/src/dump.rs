@@ -326,18 +326,13 @@ impl crate::App {
     pub fn dry_run(&self, entrypoint: &str, config: &RemoteConfig) -> Result<Manifest> {
         // Fold the decorator config exactly as `App::resolve_function` does, so the
         // dumped manifest matches what `.remote()` would send for this entrypoint.
-        let dcfg = self.config_for(entrypoint);
+        let mut options = self.config_for(entrypoint);
         let cfg = {
             let mut c = config.clone();
-            c.gpu = dcfg.gpu.map(|s| s.to_string());
-            c.timeout_override_secs = dcfg.timeout_secs;
-            c.cache = dcfg.cache.unwrap_or(c.cache);
-            c.secrets = dcfg.secrets.iter().map(|s| s.to_string()).collect();
-            c.volumes = dcfg
-                .volumes
-                .iter()
-                .map(|(m, n)| (m.to_string(), n.to_string()))
-                .collect();
+            let effective_cache = options.cache.unwrap_or(c.cache);
+            c.cache = effective_cache;
+            options.cache = Some(effective_cache);
+            c.options = options;
             c
         };
         // The dump uses the connected ephemeral app's name if present, else falls
@@ -361,12 +356,13 @@ impl crate::App {
         };
 
         // 1b. User secrets (from_name lookup), in order.
-        let secret_ids: Vec<String> = cfg.secrets.iter().map(|n| sink.secret(n)).collect();
+        let secret_ids: Vec<String> = cfg.options.secrets.iter().map(|n| sink.secret(n)).collect();
 
         // 1c. User volumes (V1, create), in order. A `/cache` collision is rejected by
         //     the live path; the dump surfaces the same error.
-        let mut user_volume_mounts: Vec<(String, String)> = Vec::with_capacity(cfg.volumes.len());
-        for (mount_path, name) in &cfg.volumes {
+        let mut user_volume_mounts: Vec<(String, String)> =
+            Vec::with_capacity(cfg.options.volumes.len());
+        for (mount_path, name) in &cfg.options.volumes {
             if cfg.cache && mount_path == CACHE_MOUNT {
                 return Err(Error::config(format!(
                     "user volume mount path {CACHE_MOUNT:?} collides with the cargo-cache \
@@ -409,13 +405,13 @@ impl crate::App {
         // 6. FunctionCreate (FILE mode) — build the SAME FunctionSpec the live path
         //    builds (object tag = entrypoint; in-container callable = WRAPPER_CALLABLE),
         //    then project it through the SDK builder.
-        let timeout = cfg.timeout_override_secs.unwrap_or(cfg.timeout_secs);
+        let timeout = cfg.options.timeout_secs.unwrap_or(cfg.timeout_secs);
         let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
             .with_app_function_name(&object_tag)
             .with_mount_ids(vec![client_mount_id, source_mount_id])
             .with_mount_client_dependencies(true)
             .with_timeout_secs(timeout)
-            .with_gpu(cfg.gpu.clone())?;
+            .with_gpu(cfg.options.gpu.clone())?;
         if let Some(vid) = cache_vol_id {
             fn_spec = fn_spec.with_volume_mount(vid, CACHE_MOUNT);
         }
@@ -506,19 +502,20 @@ impl crate::App {
                 function_name: object_tag.clone(),
             });
             let precreate_id = "fu-pre-1";
-            let timeout = ep.timeout_secs.unwrap_or(config.timeout_secs);
+            let timeout = ep.options.timeout_secs.unwrap_or(config.timeout_secs);
             let mut fn_spec =
                 FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
                     .with_app_function_name(&object_tag)
                     .with_mount_ids(vec![client_mount_id.clone()])
                     .with_mount_client_dependencies(true)
                     .with_timeout_secs(timeout)
-                    .with_gpu(ep.gpu.clone())?;
-            let secret_ids: Vec<String> = ep.secrets.iter().map(|n| sink.secret(n)).collect();
+                    .with_gpu(ep.options.gpu.clone())?;
+            let secret_ids: Vec<String> =
+                ep.options.secrets.iter().map(|n| sink.secret(n)).collect();
             if !secret_ids.is_empty() {
                 fn_spec = fn_spec.with_secret_ids(secret_ids);
             }
-            for (mount_path, name) in &ep.volumes {
+            for (mount_path, name) in &ep.options.volumes {
                 let vid = sink.volume(name, false);
                 fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
             }

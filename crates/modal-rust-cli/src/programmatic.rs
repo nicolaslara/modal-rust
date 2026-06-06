@@ -8,7 +8,7 @@
 //!    ONLY; the REMOTE build still happens per the frozen build boundary (in-body for
 //!    `run`, at image-build for `deploy`). The CLI does NOT upload this local binary.
 //! 2. Run `<workspace_root>/target/release/modal_runner --describe`, parse the
-//!    `modal-rust/describe@1` manifest (entrypoints + per-entrypoint `FunctionConfig`).
+//!    `modal-rust/describe@1` manifest (entrypoints + per-entrypoint `FunctionOptions`).
 //! 3. Drive the facade `App`: `run` = ephemeral app (`remote_envelope`), `deploy` =
 //!    persistent (`deploy_with`), `call` = `from_name` + invoke (`call_envelope`).
 //!
@@ -21,7 +21,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use modal_rust::{App, DeployConfig, FunctionConfig, RemoteConfig};
+use modal_rust::{App, DeployConfig, FunctionOptions, RemoteConfig};
 
 use crate::workspace;
 
@@ -30,27 +30,11 @@ use crate::workspace;
 const DESCRIBE_SCHEMA_FAMILY: &str = "modal-rust/describe@";
 const DESCRIBE_SCHEMA_MAJOR: u32 = 1;
 
-/// The serialized view of facade `modal_rust::FunctionConfig` from the
-/// `--describe` manifest (P9 §A.3): `gpu: string|null`, `timeout_secs: u32|null`,
-/// `cache: bool|null`, plus the additive `secrets: [string]` and `volumes:
-/// [[mount, name]]`. The two list fields default empty (`#[serde(default)]`) so an
-/// OLD manifest (pre-secrets/volumes) still parses.
-#[derive(Debug, Clone, Deserialize)]
-struct FunctionConfigView {
-    gpu: Option<String>,
-    timeout_secs: Option<u32>,
-    cache: Option<bool>,
-    #[serde(default)]
-    secrets: Vec<String>,
-    #[serde(default)]
-    volumes: Vec<(String, String)>,
-}
-
 /// One entrypoint in the parsed manifest.
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestEntry {
     name: String,
-    config: FunctionConfigView,
+    config: FunctionOptions,
 }
 
 /// The parsed `--describe` manifest.
@@ -81,59 +65,12 @@ impl Manifest {
     }
 }
 
-/// `FunctionConfigView.gpu` is `Option<String>`, but `FunctionConfig.gpu` is
-/// `Option<&'static str>`. The CLI only needs the run/deploy config's
-/// `gpu: Option<String>` + `timeout_secs`, so it never has to widen to `'static`.
-/// We keep the owned `String` gpu locally and apply it to `RemoteConfig`/`DeployConfig`
-/// (whose `gpu` is `Option<String>`). For `App::from_manifest`/`connect_from_manifest`
-/// we build a `FunctionConfig` whose `&'static str` gpu is leaked from the manifest
-/// string — acceptable for a short-lived CLI process invoked once per command.
-fn to_function_config(view: &FunctionConfigView) -> FunctionConfig {
-    FunctionConfig {
-        // Leak the gpu string to `&'static str`: the CLI runs one command then exits,
-        // so this bounded one-time leak (≤ entrypoint count) never accumulates.
-        gpu: view.gpu.clone().map(|s| &*Box::leak(s.into_boxed_str())),
-        timeout_secs: view.timeout_secs,
-        cache: view.cache,
-        // Same bounded leak for secrets/volumes (≤ a few per entrypoint): the manifest
-        // strings become the `&'static` slices `FunctionConfig` requires. The facade
-        // reads them back to owned `String`s before any RPC, so this is a one-shot leak.
-        secrets: leak_str_slice(&view.secrets),
-        volumes: leak_pair_slice(&view.volumes),
-    }
-}
-
-/// Leak a `&[String]` to a `&'static [&'static str]` (bounded one-time CLI leak,
-/// see [`to_function_config`]).
-fn leak_str_slice(items: &[String]) -> &'static [&'static str] {
-    let leaked: Vec<&'static str> = items
-        .iter()
-        .map(|s| &*Box::leak(s.clone().into_boxed_str()))
-        .collect();
-    Box::leak(leaked.into_boxed_slice())
-}
-
-/// Leak a `&[(String, String)]` to a `&'static [(&'static str, &'static str)]`
-/// (bounded one-time CLI leak, see [`to_function_config`]).
-fn leak_pair_slice(items: &[(String, String)]) -> &'static [(&'static str, &'static str)] {
-    let leaked: Vec<(&'static str, &'static str)> = items
-        .iter()
-        .map(|(a, b)| {
-            (
-                &*Box::leak(a.clone().into_boxed_str()),
-                &*Box::leak(b.clone().into_boxed_str()),
-            )
-        })
-        .collect();
-    Box::leak(leaked.into_boxed_slice())
-}
-
-/// Build the manifest configs (`name -> FunctionConfig`) the facade `App` carries.
-fn manifest_configs(manifest: &Manifest) -> Vec<(String, FunctionConfig)> {
+/// Build the manifest configs (`name -> FunctionOptions`) the facade `App` carries.
+fn manifest_configs(manifest: &Manifest) -> Vec<(String, FunctionOptions)> {
     manifest
         .entrypoints
         .iter()
-        .map(|e| (e.name.clone(), to_function_config(&e.config)))
+        .map(|e| (e.name.clone(), e.config.clone()))
         .collect()
 }
 
@@ -234,8 +171,7 @@ pub async fn cmd_run_programmatic(
     timeout: Option<u64>,
 ) -> Result<i32> {
     let (manifest, root, package) = build_and_describe(project)?;
-    let entry = manifest.entry(entrypoint)?;
-    let cfg = &entry.config;
+    let _ = manifest.entry(entrypoint)?;
     if let Some(t) = timeout {
         eprintln!(
             "modal-rust: note: --timeout {t}s is informational; the entrypoint's decorator \
@@ -248,8 +184,6 @@ pub async fn cmd_run_programmatic(
     let run_config = RemoteConfig {
         local_root: root,
         package,
-        gpu: cfg.gpu.clone(),
-        timeout_override_secs: cfg.timeout_secs,
         ..RemoteConfig::default()
     };
 
@@ -315,7 +249,7 @@ pub async fn cmd_call_programmatic(
 ) -> Result<i32> {
     let app = App::connect_from_manifest(
         "modal-rust-cli-call",
-        std::iter::empty::<(String, FunctionConfig)>(),
+        std::iter::empty::<(String, FunctionOptions)>(),
         RemoteConfig::default(),
     )
     .await
@@ -384,21 +318,24 @@ mod tests {
     }
 
     #[test]
-    fn to_function_config_maps_fields() {
-        let view = FunctionConfigView {
-            gpu: Some("A100".to_string()),
-            timeout_secs: Some(900),
-            cache: Some(true),
-            secrets: vec!["my-secret".to_string()],
-            volumes: vec![("/data".to_string(), "my-vol".to_string())],
-        };
-        let c = to_function_config(&view);
-        assert_eq!(c.gpu, Some("A100"));
+    fn manifest_configs_preserve_owned_options() {
+        let json = r#"{"schema":"modal-rust/describe@1","entrypoints":[
+            {"name":"add","config":{
+                "gpu":"A100",
+                "timeout_secs":900,
+                "cache":true,
+                "secrets":["my-secret"],
+                "volumes":[["/data","my-vol"]]
+            }}]}"#;
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        let configs = manifest_configs(&manifest);
+        let c = &configs[0].1;
+        assert_eq!(configs[0].0, "add");
+        assert_eq!(c.gpu.as_deref(), Some("A100"));
         assert_eq!(c.timeout_secs, Some(900));
         assert_eq!(c.cache, Some(true));
-        // Secrets/volumes flow through (leaked to `&'static`).
-        assert_eq!(c.secrets, &["my-secret"]);
-        assert_eq!(c.volumes, &[("/data", "my-vol")]);
+        assert_eq!(c.secrets, vec!["my-secret".to_string()]);
+        assert_eq!(c.volumes, vec![("/data".to_string(), "my-vol".to_string())]);
     }
 
     #[test]

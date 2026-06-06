@@ -4,7 +4,8 @@
 //! the atomic macro-discovery record that pairs dispatch with Modal control-plane
 //! metadata, so an inventory user submits one record or none.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{HandlerFn, Registry};
 
@@ -47,6 +48,67 @@ impl FunctionConfig {
     }
 }
 
+/// Owned per-function deploy/run options after leaving the static inventory
+/// boundary.
+///
+/// `FunctionConfig` exists only because `inventory::submit!` needs a
+/// const-constructible static initializer. The facade converts that borrowed shape
+/// into this owned domain type exactly once, then run/deploy/CLI code carries
+/// `FunctionOptions` instead of re-declaring `gpu`/`timeout`/`cache`/`secrets`/
+/// `volumes` in each layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FunctionOptions {
+    /// GPU spec string, Modal-format (`"T4"`, `"A100"`, `"A100-80GB"`, `"H100:4"`).
+    /// `None` => CPU.
+    pub gpu: Option<String>,
+    /// Function timeout (seconds). `None` => path default.
+    pub timeout_secs: Option<u32>,
+    /// Cache hint. `None` => path default.
+    pub cache: Option<bool>,
+    /// Named Modal secrets to attach.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// User-volume mounts to attach as `(mount_path, volume_name)` pairs.
+    #[serde(default)]
+    pub volumes: Vec<(String, String)>,
+}
+
+impl FunctionOptions {
+    pub(crate) fn by_name<I, N, O>(configs: I) -> BTreeMap<String, Self>
+    where
+        I: IntoIterator<Item = (N, O)>,
+        N: Into<String>,
+        O: Into<Self>,
+    {
+        configs
+            .into_iter()
+            .map(|(name, options)| (name.into(), options.into()))
+            .collect()
+    }
+}
+
+impl From<&FunctionConfig> for FunctionOptions {
+    fn from(config: &FunctionConfig) -> Self {
+        FunctionOptions {
+            gpu: config.gpu.map(str::to_string),
+            timeout_secs: config.timeout_secs,
+            cache: config.cache,
+            secrets: config.secrets.iter().map(|s| s.to_string()).collect(),
+            volumes: config
+                .volumes
+                .iter()
+                .map(|(mount_path, name)| (mount_path.to_string(), name.to_string()))
+                .collect(),
+        }
+    }
+}
+
+impl From<FunctionConfig> for FunctionOptions {
+    fn from(config: FunctionConfig) -> Self {
+        FunctionOptions::from(&config)
+    }
+}
+
 /// The single macro-discovery record submitted to facade inventory.
 ///
 /// Keeping `handler` and the control-plane metadata in one record makes the
@@ -78,12 +140,15 @@ pub fn registry_from_inventory() -> Registry {
 
 /// Build the runtime registry and the per-name control-plane configs from one
 /// pass over the same facade-owned inventory records.
-pub fn from_inventory_with_configs() -> (Registry, Vec<(&'static str, FunctionConfig)>) {
+pub fn from_inventory_with_configs() -> (Registry, Vec<(&'static str, FunctionOptions)>) {
     let mut registry = Registry::new();
     let mut configs = Vec::new();
     for registration in inventory::iter::<Registration> {
         registry = registry.function(registration.name, registration.handler);
-        configs.push((registration.name, registration.config.clone()));
+        configs.push((
+            registration.name,
+            FunctionOptions::from(&registration.config),
+        ));
     }
     (registry, configs)
 }
@@ -112,7 +177,7 @@ pub fn run_cli_with_args_from_inventory<W: std::io::Write>(argv: &[String], out:
 /// Runtime dispatch plus the facade-owned additive `--describe` branch.
 pub fn run_cli_with_args_and_configs<W: std::io::Write>(
     registry: Registry,
-    configs: &[(&'static str, FunctionConfig)],
+    configs: &[(&'static str, FunctionOptions)],
     argv: &[String],
     out: &mut W,
 ) -> i32 {
@@ -133,36 +198,15 @@ struct DescribeManifest<'a> {
 #[derive(Serialize)]
 struct DescribeEntry<'a> {
     name: &'a str,
-    config: DescribeConfig,
-}
-
-#[derive(Serialize)]
-struct DescribeConfig {
-    gpu: Option<&'static str>,
-    timeout_secs: Option<u32>,
-    cache: Option<bool>,
-    secrets: &'static [&'static str],
-    volumes: &'static [(&'static str, &'static str)],
-}
-
-impl From<&FunctionConfig> for DescribeConfig {
-    fn from(c: &FunctionConfig) -> Self {
-        DescribeConfig {
-            gpu: c.gpu,
-            timeout_secs: c.timeout_secs,
-            cache: c.cache,
-            secrets: c.secrets,
-            volumes: c.volumes,
-        }
-    }
+    config: &'a FunctionOptions,
 }
 
 fn emit_describe<W: std::io::Write>(
     registry: &Registry,
-    configs: &[(&'static str, FunctionConfig)],
+    configs: &[(&'static str, FunctionOptions)],
     out: &mut W,
 ) -> i32 {
-    let default = FunctionConfig::default();
+    let default = FunctionOptions::default();
     let entrypoints: Vec<DescribeEntry<'_>> = registry
         .names()
         .map(|&name| {
@@ -171,10 +215,7 @@ fn emit_describe<W: std::io::Write>(
                 .find(|(n, _)| *n == name)
                 .map(|(_, c)| c)
                 .unwrap_or(&default);
-            DescribeEntry {
-                name,
-                config: DescribeConfig::from(config),
-            }
+            DescribeEntry { name, config }
         })
         .collect();
     let manifest = DescribeManifest {
@@ -226,14 +267,14 @@ mod tests {
 
     #[test]
     fn describe_emits_manifest_with_configs() {
-        let configs: &[(&'static str, FunctionConfig)] = &[(
+        let configs: &[(&'static str, FunctionOptions)] = &[(
             "add",
-            FunctionConfig {
-                gpu: Some("T4"),
+            FunctionOptions {
+                gpu: Some("T4".to_string()),
                 timeout_secs: Some(1800),
                 cache: Some(false),
-                secrets: &["my-secret"],
-                volumes: &[("/data", "my-vol")],
+                secrets: vec!["my-secret".to_string()],
+                volumes: vec![("/data".to_string(), "my-vol".to_string())],
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -267,6 +308,26 @@ mod tests {
         assert!(d.volumes.is_empty());
         let c = FunctionConfig::new();
         assert_eq!(d, c);
+    }
+
+    #[test]
+    fn function_config_converts_to_owned_options() {
+        let config = FunctionConfig {
+            gpu: Some("T4"),
+            timeout_secs: Some(1800),
+            cache: Some(false),
+            secrets: &["my-secret"],
+            volumes: &[("/data", "my-vol")],
+        };
+        let options = FunctionOptions::from(&config);
+        assert_eq!(options.gpu.as_deref(), Some("T4"));
+        assert_eq!(options.timeout_secs, Some(1800));
+        assert_eq!(options.cache, Some(false));
+        assert_eq!(options.secrets, vec!["my-secret".to_string()]);
+        assert_eq!(
+            options.volumes,
+            vec![("/data".to_string(), "my-vol".to_string())]
+        );
     }
 
     #[test]

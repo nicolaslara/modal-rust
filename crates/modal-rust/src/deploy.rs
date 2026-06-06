@@ -28,7 +28,7 @@ use std::time::Duration;
 use modal_rust_sdk::{FunctionSpec, ImageSpec, ModalClient};
 
 use crate::remote::{RemoteConfig, PYTHON_SERIES};
-use crate::{Error, Result};
+use crate::{Error, FunctionOptions, Result};
 
 /// Fixed importable module name for the baked DEPLOY wrapper
 /// (`/root/modal_rust_deploy_wrapper.py`). DISTINCT from the run wrapper module so
@@ -126,13 +126,6 @@ pub struct DeployConfig {
     pub base_image: String,
     /// Function timeout (seconds). No in-body build, so a modest default is fine.
     pub timeout_secs: u32,
-    /// GPU spec for the deployed entrypoint (from the decorator [`FunctionConfig`]).
-    /// `None` = CPU. Set by `App::deploy_with` from the decorated entrypoint's
-    /// config before [`deploy_function`].
-    pub gpu: Option<String>,
-    /// Per-entrypoint timeout override (decorator `FunctionConfig.timeout_secs`).
-    /// When `Some`, REPLACES [`timeout_secs`](DeployConfig::timeout_secs).
-    pub timeout_override_secs: Option<u32>,
     /// Install the Rust toolchain (rustup) + the CUDA build/run env into the deploy
     /// BASE layer. Set when [`base_image`](DeployConfig::base_image) is a non-Rust
     /// base (e.g. a `nvidia/cuda:<ver>-devel` Tier-1 base; boundaries.md §9) so the
@@ -141,17 +134,10 @@ pub struct DeployConfig {
     /// [`for_app`](DeployConfig::for_app), so the `MODAL_RUST_INSTALL_RUST` env default
     /// flows through automatically (parity with `base_image`).
     pub install_rust: bool,
-    /// Named Modal secrets to attach (from `#[function(secrets = [..])]`). Resolved
-    /// to `secret_id`s and attached to `Function.secret_ids`; Modal injects their
-    /// key/values as ENV VARS. DEFAULT EMPTY. Set by `App::deploy_with` from the
-    /// decorated entrypoint's config (parity with the RUN path).
-    pub secrets: Vec<String>,
-    /// User volumes to attach as `(mount_path, volume_name)` pairs (from
-    /// `#[function(volumes = ["/data=my-vol"])]`). Each `volume_name` is resolved via
-    /// [`ModalClient::volume_get_or_create`] and mounted at `mount_path`. The DEPLOY
-    /// path has no cargo cache, so there is no `/cache` collision concern. DEFAULT
-    /// EMPTY.
-    pub volumes: Vec<(String, String)>,
+    /// Owned per-function Modal options used by the manual/no-decorator fallback
+    /// function. Decorated entrypoints carry their own [`FunctionOptions`] in
+    /// [`DeployEntrypoint`].
+    pub options: FunctionOptions,
 }
 
 impl DeployConfig {
@@ -168,11 +154,8 @@ impl DeployConfig {
             modalignore_name: base.modalignore_name,
             base_image: base.base_image,
             timeout_secs: 300,
-            gpu: None,
-            timeout_override_secs: None,
             install_rust: base.install_rust,
-            secrets: Vec::new(),
-            volumes: Vec::new(),
+            options: FunctionOptions::default(),
         }
     }
 }
@@ -267,14 +250,8 @@ fn deploy_top_layer_spec(base_image_id: &str, source_mount_id: &str, package: &s
 pub(crate) struct DeployEntrypoint {
     /// The entrypoint name = the Modal object TAG (`from_name` resolves it at call).
     pub name: String,
-    /// GPU spec for this entrypoint (`None` = CPU).
-    pub gpu: Option<String>,
-    /// Per-entrypoint timeout override (else the [`DeployConfig`] default).
-    pub timeout_secs: Option<u32>,
-    /// Named Modal secrets to attach (resolved to ids, injected as ENV VARS).
-    pub secrets: Vec<String>,
-    /// User volumes `(mount_path, volume_name)` to attach.
-    pub volumes: Vec<(String, String)>,
+    /// Owned per-entrypoint Modal options.
+    pub options: FunctionOptions,
 }
 
 /// Sanitize an entrypoint name into a Modal object TAG (deploy parity with the RUN
@@ -373,10 +350,7 @@ pub(crate) async fn deploy_function(
     let plan: Vec<DeployEntrypoint> = if entrypoints.is_empty() {
         vec![DeployEntrypoint {
             name: DEPLOY_WRAPPER_CALLABLE.to_string(),
-            gpu: config.gpu.clone(),
-            timeout_secs: config.timeout_override_secs,
-            secrets: config.secrets.clone(),
-            volumes: config.volumes.clone(),
+            options: config.options.clone(),
         }]
     } else {
         entrypoints.to_vec()
@@ -394,19 +368,19 @@ pub(crate) async fn deploy_function(
         //    IN-CONTAINER callable stays DEPLOY_WRAPPER_CALLABLE ("handler") on
         //    `implementation_name`. `mount_client_dependencies = true` (default,
         //    explicit) so the worker injects the modal client dep closure at start.
-        let timeout = ep.timeout_secs.unwrap_or(config.timeout_secs);
+        let timeout = ep.options.timeout_secs.unwrap_or(config.timeout_secs);
         let mut fn_spec =
             FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
                 .with_app_function_name(&object_tag)
                 .with_mount_ids(vec![client_mount_id.clone()])
                 .with_mount_client_dependencies(true)
                 .with_timeout_secs(timeout)
-                .with_gpu(ep.gpu.clone())?;
+                .with_gpu(ep.options.gpu.clone())?;
         // 6b. USER secrets: resolve each named secret to an id and attach →
         //     Function.secret_ids (Modal injects their key/values as ENV VARS). Values
         //     never logged. Empty ⇒ no-op.
-        let mut secret_ids: Vec<String> = Vec::with_capacity(ep.secrets.len());
-        for name in &ep.secrets {
+        let mut secret_ids: Vec<String> = Vec::with_capacity(ep.options.secrets.len());
+        for name in &ep.options.secrets {
             secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
         }
         if !secret_ids.is_empty() {
@@ -414,7 +388,7 @@ pub(crate) async fn deploy_function(
         }
         // 6c. USER volumes: resolve each named volume (create-if-missing, V1) and attach
         //     at its mount_path. DEPLOY has no cargo cache, so no `/cache` collision.
-        for (mount_path, name) in &ep.volumes {
+        for (mount_path, name) in &ep.options.volumes {
             let vid = client
                 .volume_get_or_create(name, false /* v1 */, true /* create */, None)
                 .await?;
@@ -619,27 +593,30 @@ mod tests {
         // defaults OFF, so the default deploy path stays byte-identical.
         assert!(!cfg.install_rust, "install_rust defaults off");
         // User secrets/volumes default EMPTY (wire-identical to before).
-        assert!(cfg.secrets.is_empty(), "secrets default empty");
-        assert!(cfg.volumes.is_empty(), "volumes default empty");
+        assert!(cfg.options.secrets.is_empty(), "secrets default empty");
+        assert!(cfg.options.volumes.is_empty(), "volumes default empty");
     }
 
     #[test]
     fn deploy_config_secrets_volumes_are_settable_non_macro() {
-        // Non-macro override: `DeployConfig`'s public fields let a builder/explicit
-        // caller set secrets + user volumes WITHOUT the decorator.
+        // Non-macro override: `DeployConfig.options` lets a builder/explicit caller
+        // set secrets + user volumes WITHOUT the decorator.
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Struct-update over the env-aware config: a non-macro caller sets ONLY
-        // secrets/volumes and keeps every other field.
+        // Struct-update over the env-aware config: a non-macro caller sets ONLY the
+        // owned function options and keeps every other field.
         let cfg = DeployConfig {
-            secrets: vec!["api-creds".to_string()],
-            volumes: vec![("/models".to_string(), "weights".to_string())],
+            options: FunctionOptions {
+                secrets: vec!["api-creds".to_string()],
+                volumes: vec![("/models".to_string(), "weights".to_string())],
+                ..FunctionOptions::default()
+            },
             ..DeployConfig::for_app("my-app")
         };
-        assert_eq!(cfg.secrets, vec!["api-creds".to_string()]);
+        assert_eq!(cfg.options.secrets, vec!["api-creds".to_string()]);
         assert_eq!(
-            cfg.volumes,
+            cfg.options.volumes,
             vec![("/models".to_string(), "weights".to_string())]
         );
     }

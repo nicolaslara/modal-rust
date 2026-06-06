@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use modal_rust_sdk::{FunctionSpec, ImageSpec, ModalClient};
 
-use crate::{Error, Result, RunnerError};
+use crate::{Error, FunctionOptions, Result, RunnerError};
 
 /// Fixed importable module name for the baked run wrapper
 /// (`/root/modal_rust_run_wrapper.py`).
@@ -357,13 +357,6 @@ pub struct RemoteConfig {
     pub base_image: String,
     /// Function timeout (seconds) — covers the in-body cargo build.
     pub timeout_secs: u32,
-    /// GPU spec for this run's entrypoint (from the decorator [`FunctionConfig`]).
-    /// `None` = CPU. Set by `App::remote_invoke` from `config_for(entrypoint)`
-    /// before [`ensure_function`].
-    pub gpu: Option<String>,
-    /// Per-entrypoint timeout override (decorator `FunctionConfig.timeout_secs`).
-    /// When `Some`, REPLACES the path default [`timeout_secs`](RemoteConfig::timeout_secs).
-    pub timeout_override_secs: Option<u32>,
     /// Install the Rust toolchain (rustup) + the CUDA build/run env into the run
     /// image. Set when [`base_image`](RemoteConfig::base_image) is a non-Rust base
     /// (e.g. a `nvidia/cuda:<ver>-devel` Tier-1 base; boundaries.md §9) so the
@@ -376,17 +369,13 @@ pub struct RemoteConfig {
     /// `#[function(cache=false)]` overrides this per-entrypoint (app.rs). A cache
     /// miss/failure only costs time — it NEVER changes the build result.
     pub cache: bool,
-    /// Named Modal secrets to attach (from `#[function(secrets = [..])]`). Each name
-    /// is resolved to a `secret_id` via [`ModalClient::secret_get_or_create`] and
-    /// attached to `FunctionCreate.secret_ids`; Modal injects the secret's
-    /// key/values as ENV VARS in the container. DEFAULT EMPTY (wire-identical to
-    /// before). Set by `App::resolve_function` from `config_for(entrypoint)`.
-    pub secrets: Vec<String>,
-    /// User volumes to attach as `(mount_path, volume_name)` pairs (from
-    /// `#[function(volumes = ["/data=my-vol"])]`). Each `volume_name` is resolved via
-    /// [`ModalClient::volume_get_or_create`] and mounted at `mount_path` — a SEPARATE
-    /// mount from the P6 cargo cache (`/cache`), so both coexist. DEFAULT EMPTY.
-    pub volumes: Vec<(String, String)>,
+    /// Owned per-function Modal options after the inventory/manifest boundary.
+    /// `timeout_secs` overrides this path's [`timeout_secs`](RemoteConfig::timeout_secs);
+    /// `cache` has already been folded into [`cache`](RemoteConfig::cache) by
+    /// `App::resolve_function` so `cache=None` can defer to the run-path default.
+    /// Secrets and user volumes are resolved to ids immediately before
+    /// `FunctionCreate`.
+    pub options: FunctionOptions,
 }
 
 impl RemoteConfig {
@@ -428,12 +417,9 @@ impl Default for RemoteConfig {
             modalignore_name: modal_rust_sdk::DEFAULT_MODALIGNORE_NAME.to_string(),
             base_image: discover_base_image(),
             timeout_secs: REMOTE_TIMEOUT_SECS,
-            gpu: None,
-            timeout_override_secs: None,
             install_rust: discover_install_rust(),
             cache: discover_cache(),
-            secrets: Vec::new(),
-            volumes: Vec::new(),
+            options: FunctionOptions::default(),
         }
     }
 }
@@ -596,8 +582,8 @@ pub(crate) async fn ensure_function(
     //     be attached below. Modal injects the secret's key/values as ENV VARS in the
     //     container. EMPTY ⇒ no secrets ⇒ wire-identical to before. Values never
     //     logged. SEPARATE concern from the cargo cache.
-    let mut secret_ids: Vec<String> = Vec::with_capacity(config.secrets.len());
-    for name in &config.secrets {
+    let mut secret_ids: Vec<String> = Vec::with_capacity(config.options.secrets.len());
+    for name in &config.options.secrets {
         secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
     }
 
@@ -607,8 +593,9 @@ pub(crate) async fn ensure_function(
     //     cargo cache (`/cache`) — both coexist. User volumes use V1 (server default;
     //     general-purpose persistent storage), not the V2 the cargo cache needs. A
     //     user mount at `/cache` would collide with the cargo cache, so reject it.
-    let mut user_volume_mounts: Vec<(String, String)> = Vec::with_capacity(config.volumes.len());
-    for (mount_path, name) in &config.volumes {
+    let mut user_volume_mounts: Vec<(String, String)> =
+        Vec::with_capacity(config.options.volumes.len());
+    for (mount_path, name) in &config.options.volumes {
         if config.cache && mount_path == CACHE_MOUNT {
             return Err(Error::config(format!(
                 "user volume mount path {CACHE_MOUNT:?} collides with the cargo-cache \
@@ -723,7 +710,7 @@ pub(crate) async fn ensure_function(
     // cold in-body `cargo build`; a too-small decorator timeout can starve the first
     // cold build (no floor is imposed). `with_gpu(None)` is a CPU no-op (gpu_config
     // stays unset → CPU wire bytes identical).
-    let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
+    let timeout = config.options.timeout_secs.unwrap_or(config.timeout_secs);
     // Object TAG = the entrypoint (unique per app, its own config); IN-CONTAINER
     // callable stays WRAPPER_CALLABLE ("handler"), rolled onto `implementation_name`.
     let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
@@ -731,7 +718,7 @@ pub(crate) async fn ensure_function(
         .with_mount_ids(vec![client_mount_id, source_mount_id])
         .with_mount_client_dependencies(true)
         .with_timeout_secs(timeout)
-        .with_gpu(config.gpu.clone())?;
+        .with_gpu(config.options.gpu.clone())?;
     // P6: attach the resolved cargo-cache volume at /cache with background commits
     // ENABLED. Only when caching is on (else `cache_vol_id` is None ⇒ no volume ⇒
     // wire-identical to pre-P6).
@@ -977,26 +964,29 @@ mod tests {
 
     #[test]
     fn remote_config_secrets_volumes_are_settable_non_macro() {
-        // Non-macro override: `RemoteConfig`'s public fields let a builder/explicit
-        // caller set secrets + user volumes WITHOUT the decorator. Serialized against
+        // Non-macro override: `RemoteConfig.options` lets a builder/explicit caller
+        // set secrets + user volumes WITHOUT the decorator. Serialized against
         // env-mutating tests (RemoteConfig::default reads MODAL_RUST_*).
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Struct-update over the env-aware default: a non-macro caller sets ONLY
-        // secrets/volumes and keeps every discovered default.
+        // Struct-update over the env-aware default: a non-macro caller sets ONLY the
+        // owned function options and keeps every discovered path default.
         let cfg = RemoteConfig {
-            secrets: vec!["api-creds".to_string()],
-            volumes: vec![("/data".to_string(), "my-vol".to_string())],
+            options: FunctionOptions {
+                secrets: vec!["api-creds".to_string()],
+                volumes: vec![("/data".to_string(), "my-vol".to_string())],
+                ..FunctionOptions::default()
+            },
             ..RemoteConfig::default()
         };
-        assert_eq!(cfg.secrets, vec!["api-creds".to_string()]);
+        assert_eq!(cfg.options.secrets, vec!["api-creds".to_string()]);
         assert_eq!(
-            cfg.volumes,
+            cfg.options.volumes,
             vec![("/data".to_string(), "my-vol".to_string())]
         );
         // The user volume mount must not be the reserved cargo-cache path.
-        assert_ne!(cfg.volumes[0].0, CACHE_MOUNT);
+        assert_ne!(cfg.options.volumes[0].0, CACHE_MOUNT);
     }
 
     #[test]
@@ -1157,8 +1147,8 @@ mod tests {
         // P6: the cargo build cache is ON by default.
         assert!(cfg.cache, "cache defaults ON");
         // User secrets/volumes default EMPTY (wire-identical to before).
-        assert!(cfg.secrets.is_empty(), "secrets default empty");
-        assert!(cfg.volumes.is_empty(), "volumes default empty");
+        assert!(cfg.options.secrets.is_empty(), "secrets default empty");
+        assert!(cfg.options.volumes.is_empty(), "volumes default empty");
 
         // Same test (one process-env mutation site, no cross-test race): the env
         // overrides flip the CUDA Tier-1 knob + base image. `MODAL_RUST_INSTALL_RUST`

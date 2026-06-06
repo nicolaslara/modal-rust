@@ -29,10 +29,9 @@ The milestone-by-milestone adversarial process shows clearly in two opposite way
   protocol has not drifted; transient-vs-terminal error handling is principled.
 - **The accreted cost:** the run-path Python wrapper has grown into a ~165-line
   embedded Python string with its own cache subsystem; `RemoteConfig` and
-  `DeployConfig` are near-duplicate 13-field structs; the additive-config flow
-  (`FunctionConfig` → decorator → `RemoteConfig`/`DeployConfig` → `FunctionSpec` →
-  proto) is threaded by hand through several layers; and the `#[modal_rust::function]`
-  macro forces three direct dependencies on downstream users.
+  `DeployConfig` still share source/build defaults; and new decorator knobs still
+  require touching the macro plus the SDK application point. The former
+  downstream-dependency leak and five-shape additive-config copy chain are now fixed.
 
 None of these are architectural faults — they are the visible sediment of an
 additive-only, freeze-the-seam discipline. The prioritized refactors at the end are
@@ -141,17 +140,16 @@ and map. `ImageSpec`/`FunctionSpec` are declarative builders that render to prot
 
 ### Leaky / questionable abstractions
 
-- **`RemoteConfig` vs `DeployConfig` duplication.** These two structs share 12 of their
-  ~13 fields (`local_root`, `package`, `use_cargo_scoping`, `modalignore_name`,
-  `base_image`, `timeout_secs`, `gpu`, `timeout_override_secs`, `install_rust`,
-  `secrets`, `volumes`, plus near-identical doc comments). `DeployConfig::for_app`
-  (`deploy.rs:161`) literally constructs itself field-by-field *from* a
-  `RemoteConfig::default()`. The genuine differences are tiny: `DeployConfig` adds
-  `app_name` and a different `timeout_secs` default (300 vs 1800), and drops
-  `remote_src` and `cache`. A shared `BuildConfig` core with two thin wrappers would
-  remove ~40 lines of struct + doc duplication and one whole copy of the
-  secrets/volumes/install_rust doc paragraphs. This is the clearest "accreted
-  complexity" in the codebase.
+- **`RemoteConfig` vs `DeployConfig` still share build/source defaults.** The
+  per-function Modal options are no longer copied through these structs: the facade now
+  converts static `FunctionConfig` into owned `FunctionOptions`, and `App`,
+  `RemoteConfig`, `DeployConfig`, deploy plans, dry-run, and the CLI manifest all carry
+  that one type. The remaining duplication is the build/source-path core
+  (`local_root`, `package`, `use_cargo_scoping`, `modalignore_name`, `base_image`,
+  `timeout_secs`, `install_rust`, plus deploy's `app_name` and run's `remote_src` /
+  cache default). A future shared `BuildPathConfig` core could remove that smaller
+  doc/field duplication, but the high-risk gpu/timeout/cache/secrets/volumes copy chain
+  is gone.
 - **The embedded-Python-wrapper-as-Rust-string is a deliberate but leaky abstraction.**
   `WRAPPER_SRC` (`remote.rs:60`) is a full Python program — including an entire cache
   pack/unpack subsystem (`_unpack_cache`, `_pack_cache`, `_pack_one`, zstd/gzip
@@ -164,15 +162,15 @@ and map. `ImageSpec`/`FunctionSpec` are declarative builders that render to prot
   has grown the cache state machine that arguably wants to be real code. The
   deploy-side twin (`DEPLOY_WRAPPER_SRC`, `deploy.rs:65`) is mercifully small and has a
   good negative-assertion test that it contains no `cargo`/`/src`/`CARGO_` (`:453`).
-- **The additive-config hand-threading.** A decorator value travels:
-  `#[function(gpu=..)]` → facade `FunctionConfig.gpu` (`registration.rs`) →
-  `App.configs` map (`app.rs:32`) → copied in `resolve_function` (`app.rs:250`) →
-  `RemoteConfig.gpu` (`remote.rs:292`) → `FunctionSpec::with_gpu` (`function.rs:214`)
-  → `Resources.gpu_config` proto. Each hop is individually justified, but there are
-  five copies of essentially the same five fields (gpu/timeout/cache/secrets/volumes)
-  across `FunctionConfig`, `DescribeConfig` (`registration.rs`),
-  `FunctionConfigView` (`programmatic.rs:39`), `RemoteConfig`, and `DeployConfig`.
-  Adding a sixth knob means touching all five plus the macro.
+- **[FIXED 2026-06-06] The additive-config hand-threading was collapsed.** A
+  decorator value now travels through one static boundary and one owned domain type:
+  `#[function(gpu=..)]` → static facade `FunctionConfig` (`registration.rs`) →
+  owned `FunctionOptions` → `FunctionSpec::with_gpu` / timeout / secret / volume
+  application. The `--describe` manifest serializes `FunctionOptions` directly, and
+  the CLI deserializes it directly, so the previous `DescribeConfig` /
+  `FunctionConfigView` / `Box::leak` path is gone. Adding a new per-function knob still
+  touches the macro and the SDK application point, but no longer requires five parallel
+  struct declarations plus string/slice conversion sites.
 
 ### Under-abstracted
 
@@ -430,14 +428,11 @@ a new example.
    `remote.rs` as just `RemoteConfig` + `ensure_function` + `parse_envelope`. Pure
    reorg, no API change. *(value: high, cost: medium)*
 
-5. **Introduce a shared `BuildConfig` core for `RemoteConfig`/`DeployConfig`.** Factor
-   the 12 shared fields (`local_root`, `package`, `use_cargo_scoping`,
-   `modalignore_name`, `base_image`, `gpu`, `timeout_override_secs`, `install_rust`,
-   `secrets`, `volumes`, …) into one struct that both embed or flatten. Keeps the two
-   public types (different defaults, `app_name`) but removes ~40 lines of struct + a
-   whole duplicated copy of the secrets/volumes/install_rust doc paragraphs. Public API
-   can stay source-compatible if the shared fields remain accessible. *(value: high,
-   cost: medium — touches public structs, do it carefully)*
+5. **Consider a shared build/source config core for `RemoteConfig`/`DeployConfig`.**
+   The per-function option core is already factored as `FunctionOptions`; the remaining
+   overlap is source/build defaults (`local_root`, `package`, scoping, ignore name,
+   base image, timeout default, install-rust). Factor those only if the two structs
+   keep drifting. *(value: medium, cost: medium — touches public structs)*
 
 6. **Optionally split `image.rs`** into `image/render.rs` (`dockerfile_commands`,
    `to_proto`, `bake_command`, `python_series_lt_13`) and `image/build.rs`
