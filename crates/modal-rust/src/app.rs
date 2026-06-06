@@ -78,7 +78,7 @@ struct RemoteHandle {
     /// SET-STATE publish, so each per-entrypoint create re-publishes the UNION of all
     /// functions created so far (else the prior entrypoint is de-invoked). Guarded by
     /// its own `Mutex` so the publish set stays consistent under concurrent creates.
-    published: Mutex<remote::PublishedFunctions>,
+    published: Mutex<crate::control_plane::Published>,
     /// RUN-path knobs (source dir, package, image, timeout, ignore set).
     config: RemoteConfig,
 }
@@ -233,7 +233,7 @@ impl App {
                 app_id,
                 app_name: name.to_string(),
                 function_ids: Mutex::new(BTreeMap::new()),
-                published: Mutex::new(remote::PublishedFunctions::default()),
+                published: Mutex::new(crate::control_plane::Published::default()),
                 config: run_config,
             }),
         })

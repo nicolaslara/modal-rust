@@ -22,14 +22,13 @@
 use modal_rust_sdk::planning::{build_function_create_request, build_image_get_or_create_request};
 use modal_rust_sdk::{FunctionSpec, ImageSpec};
 
-use crate::deploy::{
-    DeployConfig, DEPLOY_SRC, DEPLOY_WRAPPER_CALLABLE, DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC,
+use crate::control_plane::{
+    provision, AppState, Boundary, ControlPlane, Entrypoint, ProvisionInputs, Published,
+    SourceInputs, DEPLOY_BOUNDARY, RUN_BOUNDARY,
 };
-use crate::remote::{
-    run_wrapper_config_env, run_wrapper_src, RemoteConfig, CACHE_MOUNT, CACHE_VOLUME_NAME,
-    PYTHON_SERIES, WRAPPER_CALLABLE, WRAPPER_MODULE,
-};
-use crate::{Error, Result};
+use crate::deploy::{DeployConfig, DEPLOY_SRC};
+use crate::remote::RemoteConfig;
+use crate::Result;
 
 /// Which path a [`Manifest`] was assembled for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,18 +212,30 @@ impl Manifest {
     }
 }
 
-/// A tiny "planning sink" that hands out the SAME canned ids the mock backend
-/// assigns, so the threaded ids the live path would carry are reproduced offline.
-/// Mount/volume ids increment (`mo-1`, `mo-2`, …); the rest are fixed (`ap-1`,
-/// `im-1`, `fu-pre-1`, …) — mirroring `crates/modal-rust-testkit/src/servicer.rs`.
-struct PlanningSink {
+/// The RECORDING control plane = the dry-run / dump. Each [`ControlPlane`] method
+/// RECORDS the request it was handed as a [`PlannedRequest`] and returns a
+/// DETERMINISTIC fake id (`ap-1`, `im-{n}`, `mo-{n}`, …) so [`provision`] keeps
+/// threading. The recorded [`requests`](RecordingControlPlane::requests) ARE the
+/// manifest — so `dump` is literally `provision(RecordingControlPlane, …)` and can
+/// never drift from the live path.
+///
+/// Ids mirror `crates/modal-rust-testkit/src/servicer.rs`: mount/volume/image share
+/// ONE incrementing counter (`mo-{n}` / `vo-{n}` / `im-{n}`); the rest are fixed
+/// (`ap-1`, `sc-1`, `fu-pre-1`, `fu-1`). The `FunctionCreate` / `ImageGetOrCreate`
+/// projections are built ON the SAME pure SDK `build_*_request` builders the live
+/// path calls, so the projected fields are exactly what the wire would carry.
+///
+/// Dump fidelity boundary: this records the TOP-LEVEL RPCs (with fabricated ids), not
+/// the live-only `ImageJoinStreaming` poll loop or the per-file mount PUT/probe
+/// traffic — those are encapsulated inside `LiveControlPlane` and never reach here.
+struct RecordingControlPlane {
     counter: u64,
     requests: Vec<PlannedRequest>,
 }
 
-impl PlanningSink {
+impl RecordingControlPlane {
     fn new() -> Self {
-        PlanningSink {
+        RecordingControlPlane {
             counter: 0,
             requests: Vec::new(),
         }
@@ -234,95 +245,150 @@ impl PlanningSink {
         self.counter += 1;
         self.counter
     }
+}
 
-    fn push(&mut self, req: PlannedRequest) {
-        self.requests.push(req);
+impl ControlPlane for RecordingControlPlane {
+    async fn ensure_app(
+        &mut self,
+        app_name: &str,
+        _pre_resolved: Option<&str>,
+        state: AppState,
+    ) -> Result<String> {
+        // The dump renders the FULL set the path implies, so the RUN ephemeral
+        // AppCreate (issued at connect time on the live path) is recorded here too.
+        match state {
+            AppState::Ephemeral => self.requests.push(PlannedRequest::AppCreate {
+                description: app_name.to_string(),
+            }),
+            AppState::Deployed => self.requests.push(PlannedRequest::AppGetOrCreate {
+                app_name: app_name.to_string(),
+            }),
+        }
+        Ok("ap-1".to_string())
     }
 
-    /// Record a `MountGetOrCreate` (role) and return the canned `mo-{n}` id the live
-    /// path would thread onward.
-    fn mount(&mut self, role: MountRole) -> String {
-        self.push(PlannedRequest::MountGetOrCreate { role });
-        format!("mo-{}", self.next_id())
-    }
-
-    /// Record a `VolumeGetOrCreate` and return the canned `vo-{n}` id.
-    fn volume(&mut self, name: &str, v2: bool) -> String {
-        self.push(PlannedRequest::VolumeGetOrCreate {
+    async fn ensure_volume(&mut self, name: &str, v2: bool) -> Result<String> {
+        self.requests.push(PlannedRequest::VolumeGetOrCreate {
             name: name.to_string(),
             v2,
         });
-        format!("vo-{}", self.next_id())
+        Ok(format!("vo-{}", self.next_id()))
     }
 
-    /// Record a `SecretGetOrCreate` and return the canned `sc-1` id.
-    fn secret(&mut self, name: &str) -> String {
-        self.push(PlannedRequest::SecretGetOrCreate {
+    async fn ensure_secret(&mut self, name: &str) -> Result<String> {
+        self.requests.push(PlannedRequest::SecretGetOrCreate {
             name: name.to_string(),
         });
-        "sc-1".to_string()
+        Ok("sc-1".to_string())
     }
 
-    /// Record an `ImageGetOrCreate` (built via the SAME SDK builder the live path
-    /// calls) and return the canned `im-{n}` id.
-    fn image(&mut self, spec: &ImageSpec, layer: u8) -> String {
-        // Built ON the pure builder, so the rendered dockerfile_commands are exactly
-        // what the wire would carry (no drift). app_id/builder_version are immaterial
-        // to the projection but supplied for byte-fidelity.
-        let req = build_image_get_or_create_request(spec, "ap-1", "2025.06".to_string());
+    async fn ensure_client_mount(&mut self) -> Result<String> {
+        self.requests.push(PlannedRequest::MountGetOrCreate {
+            role: MountRole::Client,
+        });
+        Ok(format!("mo-{}", self.next_id()))
+    }
+
+    async fn ensure_source_mount(
+        &mut self,
+        _source: &SourceInputs<'_>,
+        _remote_path: &str,
+    ) -> Result<String> {
+        self.requests.push(PlannedRequest::MountGetOrCreate {
+            role: MountRole::Source,
+        });
+        Ok(format!("mo-{}", self.next_id()))
+    }
+
+    async fn ensure_python_mount(&mut self, _series: &str) -> Result<String> {
+        self.requests.push(PlannedRequest::MountGetOrCreate {
+            role: MountRole::PythonStandalone,
+        });
+        Ok(format!("mo-{}", self.next_id()))
+    }
+
+    async fn ensure_image(&mut self, app_id: &str, spec: &ImageSpec, layer: u8) -> Result<String> {
+        // Project through the SAME pure SDK builder the live path calls, so the
+        // rendered dockerfile_commands are exactly what the wire would carry.
+        let req = build_image_get_or_create_request(spec, app_id, "2025.06".to_string());
         let dockerfile_commands = req.image.map(|i| i.dockerfile_commands).unwrap_or_default();
-        self.push(PlannedRequest::ImageGetOrCreate {
+        self.requests.push(PlannedRequest::ImageGetOrCreate {
             dockerfile_commands,
             layer,
         });
-        format!("im-{}", self.next_id())
+        Ok(format!("im-{}", self.next_id()))
     }
-}
 
-/// Project a `FunctionSpec` (the SAME spec the live path builds) through the SDK's
-/// `build_function_create_request` and record the `FunctionCreate` projection. The
-/// projected fields come straight off the built request, so the dump can never drift
-/// from the wire.
-fn record_function_create(sink: &mut PlanningSink, spec: &FunctionSpec, precreate_id: &str) {
-    let req = build_function_create_request("ap-1", precreate_id, spec);
-    let function = req.function.expect("FILE-mode sets `function`");
-    let gpu = function
-        .resources
-        .as_ref()
-        .and_then(|r| r.gpu_config.as_ref())
-        .map(|g| g.gpu_type.clone());
-    let volume_mounts = function
-        .volume_mounts
-        .iter()
-        .map(|m| (m.mount_path.clone(), m.volume_id.clone()))
-        .collect();
-    sink.push(PlannedRequest::FunctionCreate {
-        module: function.module_name.clone(),
-        function: function.function_name.clone(),
-        mount_ids_count: function.mount_ids.len(),
-        gpu,
-        timeout_secs: function.timeout_secs,
-        volume_mounts,
-        secret_count: function.secret_ids.len(),
-        function_data_is_none: req.function_data.is_none(),
-    });
+    async fn precreate(&mut self, _app_id: &str, object_tag: &str) -> Result<String> {
+        self.requests.push(PlannedRequest::FunctionPrecreate {
+            function_name: object_tag.to_string(),
+        });
+        Ok("fu-pre-1".to_string())
+    }
+
+    async fn create(
+        &mut self,
+        app_id: &str,
+        precreate_id: &str,
+        spec: &FunctionSpec,
+    ) -> Result<(String, String)> {
+        // Project the SAME FunctionSpec the live path builds through the SDK builder.
+        let req = build_function_create_request(app_id, precreate_id, spec);
+        let function = req.function.expect("FILE-mode sets `function`");
+        let gpu = function
+            .resources
+            .as_ref()
+            .and_then(|r| r.gpu_config.as_ref())
+            .map(|g| g.gpu_type.clone());
+        let volume_mounts = function
+            .volume_mounts
+            .iter()
+            .map(|m| (m.mount_path.clone(), m.volume_id.clone()))
+            .collect();
+        self.requests.push(PlannedRequest::FunctionCreate {
+            module: function.module_name.clone(),
+            function: function.function_name.clone(),
+            mount_ids_count: function.mount_ids.len(),
+            gpu,
+            timeout_secs: function.timeout_secs,
+            volume_mounts,
+            secret_count: function.secret_ids.len(),
+            function_data_is_none: req.function_data.is_none(),
+        });
+        // A deterministic function id keeps the cumulative publish union non-empty;
+        // it never appears in the recorded manifest (the publish carries no ids).
+        Ok(("fu-1".to_string(), String::new()))
+    }
+
+    async fn publish(
+        &mut self,
+        _app_id: &str,
+        _app_name: &str,
+        _function_ids: std::collections::HashMap<String, String>,
+        _definition_ids: std::collections::HashMap<String, String>,
+        state: AppState,
+    ) -> Result<String> {
+        let app_state = match state {
+            AppState::Ephemeral => "ephemeral",
+            AppState::Deployed => "deployed",
+        };
+        self.requests.push(PlannedRequest::AppPublish { app_state });
+        Ok(String::new())
+    }
 }
 
 impl crate::App {
     /// Render the RUN manifest for `entrypoint` WITHOUT any network (the additive P8
-    /// dump). Mirrors [`crate::remote::ensure_function`]'s ordering and feeds the
-    /// SAME pure builders, so the returned [`Manifest`] is exactly what `.remote()`
-    /// WOULD send (cargo cache volume, secrets, user volumes, client+source+python
-    /// mounts, image, precreate, FILE-mode `FunctionCreate`, ephemeral `AppPublish`).
+    /// dump). It is literally `provision(RecordingControlPlane, …, RUN_BOUNDARY)`, so
+    /// the returned [`Manifest`] is exactly what `.remote()` WOULD send (cargo cache
+    /// volume, secrets, user volumes, client+source+python mounts, image, precreate,
+    /// FILE-mode `FunctionCreate`, ephemeral `AppPublish`) — it cannot drift from the
+    /// live path because it drives the SAME [`provision`] sequence.
     ///
     /// Sync + offline: it never connects and never sends. It resolves the decorator
     /// config via [`config_for`](crate::App::config_for) exactly as `.remote()` does,
     /// so the dumped gpu/timeout/secrets/volumes match the wire. Additive — does NOT
     /// change [`remote`](crate::Function::remote).
-    ///
-    /// `config` is the base [`RemoteConfig`] (e.g. [`RemoteConfig::default`]); the
-    /// per-entrypoint decorator gpu/timeout/cache/secrets/volumes are folded in the
-    /// SAME way `resolve_function` does.
     pub fn dry_run(&self, entrypoint: &str, config: &RemoteConfig) -> Result<Manifest> {
         // Fold the decorator config exactly as `App::resolve_function` does, so the
         // dumped manifest matches what `.remote()` would send for this entrypoint.
@@ -339,114 +405,45 @@ impl crate::App {
         // back to the config package (a bare, unconnected App has no app name).
         let app_name = self.dump_app_name(&cfg.package);
 
-        let mut sink = PlanningSink::new();
-
-        // 0. AppCreate (the ephemeral RUN app). The live ephemeral app is created at
-        //    connect time (`App::connect`), but the dump renders the full set the RUN
-        //    flow implies, so it leads with the ephemeral AppCreate.
-        sink.push(PlannedRequest::AppCreate {
-            description: app_name.clone(),
-        });
-
-        // 1. Cargo-cache volume (P6), only when caching is on (V2 + create).
-        let cache_vol_id = if cfg.cache {
-            Some(sink.volume(CACHE_VOLUME_NAME, true))
-        } else {
-            None
+        // ONE RUN entrypoint per provision call (the live path memoizes per entrypoint).
+        let timeout = cfg.options.timeout_secs.unwrap_or(cfg.timeout_secs);
+        let entrypoints = [Entrypoint {
+            name: entrypoint.to_string(),
+            options: cfg.options.clone(),
+            timeout_secs: timeout,
+        }];
+        let inputs = ProvisionInputs {
+            app_name: &app_name,
+            app_id: None,
+            source: SourceInputs {
+                local_root: &cfg.local_root,
+                package: &cfg.package,
+                use_cargo_scoping: cfg.use_cargo_scoping,
+                modalignore_name: &cfg.modalignore_name,
+                remote_src: &cfg.remote_src,
+            },
+            base_image: &cfg.base_image,
+            install_rust: cfg.install_rust,
+            cache: cfg.cache,
+            entrypoints: &entrypoints,
         };
 
-        // 1b. User secrets (from_name lookup), in order.
-        let secret_ids: Vec<String> = cfg.options.secrets.iter().map(|n| sink.secret(n)).collect();
-
-        // 1c. User volumes (V1, create), in order. A `/cache` collision is rejected by
-        //     the live path; the dump surfaces the same error.
-        let mut user_volume_mounts: Vec<(String, String)> =
-            Vec::with_capacity(cfg.options.volumes.len());
-        for (mount_path, name) in &cfg.options.volumes {
-            if cfg.cache && mount_path == CACHE_MOUNT {
-                return Err(Error::config(format!(
-                    "user volume mount path {CACHE_MOUNT:?} collides with the cargo-cache \
-                     volume; choose a different mount path (or disable the cache)"
-                )));
-            }
-            let vid = sink.volume(name, false);
-            user_volume_mounts.push((vid, mount_path.clone()));
-        }
-
-        // 2. Client mount.
-        let client_mount_id = sink.mount(MountRole::Client);
-        // 3. Source mount (uploaded crate, mounted at /src).
-        let source_mount_id = sink.mount(MountRole::Source);
-        // 3b. Python-standalone mount.
-        let py_mount_id = sink.mount(MountRole::PythonStandalone);
-
-        // 4. Run image (layer 0): rust base + add_python + the baked wrapper. Built
-        //    the SAME way `ensure_function` builds it.
-        let mut spec = ImageSpec::from_registry(cfg.base_image.clone())
-            .with_add_python(PYTHON_SERIES)
-            .with_python_standalone_mount_id(py_mount_id);
-        if cfg.install_rust {
-            spec = spec.with_rust_toolchain();
-        }
-        let spec = spec
-            .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src())
-            .with_command(run_wrapper_config_env(
-                &cfg.package,
-                cfg.cache,
-                &cfg.remote_src,
-            ))
-            .with_command("ENV RUST_BACKTRACE=1")
-            .with_command("ENTRYPOINT []");
-        let image_id = sink.image(&spec, 0);
-
-        // 5. Precreate under the PER-ENTRYPOINT object tag (the sanitized entrypoint),
-        //    exactly as `ensure_function` does — so the dump matches the wire.
-        let object_tag = crate::remote::sanitize_object_tag(entrypoint);
-        sink.push(PlannedRequest::FunctionPrecreate {
-            function_name: object_tag.clone(),
-        });
-        let precreate_id = "fu-pre-1";
-
-        // 6. FunctionCreate (FILE mode) — build the SAME FunctionSpec the live path
-        //    builds (object tag = entrypoint; in-container callable = WRAPPER_CALLABLE),
-        //    then project it through the SDK builder.
-        let timeout = cfg.options.timeout_secs.unwrap_or(cfg.timeout_secs);
-        let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
-            .with_app_function_name(&object_tag)
-            .with_mount_ids(vec![client_mount_id, source_mount_id])
-            .with_mount_client_dependencies(true)
-            .with_timeout_secs(timeout)
-            .with_gpu(cfg.options.gpu.clone())?;
-        if let Some(vid) = cache_vol_id {
-            fn_spec = fn_spec.with_volume_mount(vid, CACHE_MOUNT);
-        }
-        for (vid, mount_path) in user_volume_mounts {
-            fn_spec = fn_spec.with_volume_mount(vid, mount_path);
-        }
-        if !secret_ids.is_empty() {
-            fn_spec = fn_spec.with_secret_ids(secret_ids);
-        }
-        record_function_create(&mut sink, &fn_spec, precreate_id);
-
-        // 7. AppPublish (EPHEMERAL on the RUN path).
-        sink.push(PlannedRequest::AppPublish {
-            app_state: "ephemeral",
-        });
-
+        let requests = record_provision(&inputs, &RUN_BOUNDARY)?;
         Ok(Manifest {
             mode: RunMode::Run,
             app_name,
-            requests: sink.requests,
+            requests,
         })
     }
 
-    /// Render the DEPLOY manifest WITHOUT any network (the additive P8 dump). Mirrors
-    /// [`crate::deploy::deploy_function`]'s ordering and feeds the SAME pure builders,
-    /// so the returned [`Manifest`] is exactly what `deploy` WOULD send: client +
+    /// Render the DEPLOY manifest WITHOUT any network (the additive P8 dump). It is
+    /// literally `provision(RecordingControlPlane, …, DEPLOY_BOUNDARY)`, so the
+    /// returned [`Manifest`] is exactly what `deploy` WOULD send: client +
     /// source(build context) + python mounts, the persistent `AppGetOrCreate`, TWO
-    /// image layers (the top layer carries `cargo build --release`), precreate, the
-    /// CLIENT-mount-only `FunctionCreate` (the deploy build boundary), and the
-    /// persistent `AppPublish`.
+    /// image layers (the top layer carries `cargo build --release`), per-entrypoint
+    /// precreate + the CLIENT-mount-only `FunctionCreate` (the deploy build boundary),
+    /// and the persistent `AppPublish` — driven by the SAME [`provision`] sequence as
+    /// the live path, so it cannot drift.
     ///
     /// Sync + offline. Additive — does NOT change [`deploy`](crate::App::deploy).
     pub fn dump_deploy_manifest(&self, config: &DeployConfig) -> Result<Manifest> {
@@ -455,88 +452,80 @@ impl crate::App {
         // function per entrypoint (object tag = entrypoint) with its OWN config; the
         // manual/no-decorator path falls back to a single default function.
         let plan = self.deploy_entrypoints_for_dump(&config);
+        let entrypoints: Vec<Entrypoint> = plan
+            .iter()
+            .map(|ep| Entrypoint {
+                name: ep.name.clone(),
+                options: ep.options.clone(),
+                timeout_secs: ep.options.timeout_secs.unwrap_or(config.timeout_secs),
+            })
+            .collect();
 
-        let mut sink = PlanningSink::new();
+        let inputs = ProvisionInputs {
+            app_name: &config.app_name,
+            app_id: None,
+            source: SourceInputs {
+                local_root: &config.local_root,
+                package: &config.package,
+                use_cargo_scoping: config.use_cargo_scoping,
+                modalignore_name: &config.modalignore_name,
+                remote_src: DEPLOY_SRC,
+            },
+            base_image: &config.base_image,
+            install_rust: config.install_rust,
+            cache: false,
+            entrypoints: &entrypoints,
+        };
 
-        // 1. Client mount.
-        let client_mount_id = sink.mount(MountRole::Client);
-        // 2. Source mount (the image BUILD CONTEXT — lands at /app/src).
-        let source_mount_id = sink.mount(MountRole::Source);
-        // 2b. Python-standalone mount.
-        let py_mount_id = sink.mount(MountRole::PythonStandalone);
-
-        // 3. Persistent named app.
-        sink.push(PlannedRequest::AppGetOrCreate {
-            app_name: config.app_name.clone(),
-        });
-
-        // 4. Two image layers — base (add_python) then top (source COPY + cargo
-        //    build). Built the SAME way `deploy_function` builds them.
-        let mut base_spec = ImageSpec::from_registry(config.base_image.clone())
-            .with_add_python(PYTHON_SERIES)
-            .with_python_standalone_mount_id(py_mount_id);
-        if config.install_rust {
-            base_spec = base_spec.with_rust_toolchain();
-        }
-        let base_image_id = sink.image(&base_spec, 0);
-
-        let top_spec = ImageSpec::from_registry(String::new())
-            .with_base_image(&base_image_id)
-            .with_wrapper_module(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC)
-            .with_context_mount(&source_mount_id)
-            .with_command("COPY . /")
-            .with_command(format!(
-                "RUN cd {DEPLOY_SRC} && cargo build --release -p {} --bin modal_runner",
-                config.package
-            ))
-            .with_command(format!(
-                "RUN cp {DEPLOY_SRC}/target/release/modal_runner /app/modal_runner \
-                 && chmod +x /app/modal_runner"
-            ))
-            .with_command("ENV RUST_BACKTRACE=1")
-            .with_command("ENTRYPOINT []");
-        let image_id = sink.image(&top_spec, 1);
-
-        // 5/6. ONE precreate + FunctionCreate PER ENTRYPOINT over the shared image
-        //      (object tag = the entrypoint, its OWN config). CLIENT mount ONLY (NO
-        //      source mount: the binary is baked in the image layer) — the deploy
-        //      invariant. Built the SAME way `deploy_function` builds each function.
-        for ep in &plan {
-            let object_tag = crate::remote::sanitize_object_tag(&ep.name);
-            sink.push(PlannedRequest::FunctionPrecreate {
-                function_name: object_tag.clone(),
-            });
-            let precreate_id = "fu-pre-1";
-            let timeout = ep.options.timeout_secs.unwrap_or(config.timeout_secs);
-            let mut fn_spec =
-                FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
-                    .with_app_function_name(&object_tag)
-                    .with_mount_ids(vec![client_mount_id.clone()])
-                    .with_mount_client_dependencies(true)
-                    .with_timeout_secs(timeout)
-                    .with_gpu(ep.options.gpu.clone())?;
-            let secret_ids: Vec<String> =
-                ep.options.secrets.iter().map(|n| sink.secret(n)).collect();
-            if !secret_ids.is_empty() {
-                fn_spec = fn_spec.with_secret_ids(secret_ids);
-            }
-            for (mount_path, name) in &ep.options.volumes {
-                let vid = sink.volume(name, false);
-                fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
-            }
-            record_function_create(&mut sink, &fn_spec, precreate_id);
-        }
-
-        // 7. Persistent AppPublish (the UNION of every per-entrypoint function).
-        sink.push(PlannedRequest::AppPublish {
-            app_state: "deployed",
-        });
-
+        let requests = record_provision(&inputs, &DEPLOY_BOUNDARY)?;
         Ok(Manifest {
             mode: RunMode::Deploy,
             app_name: config.app_name.clone(),
-            requests: sink.requests,
+            requests,
         })
+    }
+}
+
+/// Drive the ONE [`provision`] sequence over a [`RecordingControlPlane`] and return
+/// the recorded [`PlannedRequest`]s, in send order — the manifest body. Offline +
+/// sync-from-the-caller's-view (the futures the recording impl returns are all
+/// already-ready, so `block_on` a current-thread runtime never touches the network).
+fn record_provision(
+    inputs: &ProvisionInputs<'_>,
+    boundary: &Boundary,
+) -> Result<Vec<PlannedRequest>> {
+    let mut cp = RecordingControlPlane::new();
+    let mut published = Published::default();
+    // The recording impl performs NO I/O — every method body returns a ready future —
+    // so a minimal current-thread executor drives it to completion synchronously,
+    // keeping `dry_run` / `dump_deploy_manifest` non-async (no network, no tokio rt).
+    block_on_ready(provision(&mut cp, inputs, boundary, &mut published))?;
+    Ok(cp.requests)
+}
+
+/// Drive an I/O-free future to completion on the current thread with a no-op waker.
+/// The [`RecordingControlPlane`] never yields `Poll::Pending` (it does no real I/O),
+/// so a single `poll` resolves it — letting the dump stay a synchronous, offline API.
+fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop_raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            noop_raw_waker()
+        }
+        let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(std::ptr::null(), vtable)
+    }
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            // The recording control plane does no real I/O, so it never parks; a busy
+            // re-poll is correct and terminates immediately in practice.
+            Poll::Pending => continue,
+        }
     }
 }
 

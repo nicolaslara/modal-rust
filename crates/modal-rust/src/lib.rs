@@ -103,6 +103,7 @@ pub mod __private {
 }
 
 mod app;
+mod control_plane;
 mod deploy;
 mod dump;
 mod error;

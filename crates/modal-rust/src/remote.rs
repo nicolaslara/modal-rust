@@ -16,10 +16,9 @@
 
 use base64::Engine;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use modal_rust_sdk::{FunctionSpec, ImageSpec, ModalClient};
+use modal_rust_sdk::ModalClient;
 
 use crate::{Error, FunctionOptions, Result, RunnerError};
 
@@ -73,39 +72,6 @@ pub(crate) const CACHE_MOUNT: &str = "/cache";
 pub(crate) const CACHE_ARCHIVE_NAME: &str = "cache.tar.zst";
 /// Deployment name of the persistent V2 cargo-cache volume (knowledge.md §C item 4).
 pub(crate) const CACHE_VOLUME_NAME: &str = "modal-rust-cargo-cache";
-
-/// Cumulative set of RUN-path functions published into ONE ephemeral app. Because
-/// `AppPublish` is a SET-STATE publish (it REPLACES the app's function set, not
-/// appends), creating a second per-entrypoint function and re-publishing must carry
-/// the UNION of every function created so far — otherwise the second publish would
-/// de-invoke the first entrypoint. Keyed by object tag (entrypoint) → function_id,
-/// plus the function_id → definition_id side map [`AppPublish`] needs.
-#[derive(Debug, Default)]
-pub(crate) struct PublishedFunctions {
-    /// Object tag (sanitized entrypoint) → invokable `function_id`.
-    function_ids: HashMap<String, String>,
-    /// `function_id` → `definition_id` (only for functions that returned one).
-    definition_ids: HashMap<String, String>,
-}
-
-impl PublishedFunctions {
-    /// Record a freshly-created function under its object tag and return the FULL
-    /// (cumulative) `(function_ids, definition_ids)` maps to publish.
-    fn record(
-        &mut self,
-        object_tag: &str,
-        function_id: &str,
-        definition_id: &str,
-    ) -> (HashMap<String, String>, HashMap<String, String>) {
-        self.function_ids
-            .insert(object_tag.to_string(), function_id.to_string());
-        if !definition_id.is_empty() {
-            self.definition_ids
-                .insert(function_id.to_string(), definition_id.to_string());
-        }
-        (self.function_ids.clone(), self.definition_ids.clone())
-    }
-}
 
 /// The env var carrying the base64-encoded JSON config read by [`WRAPPER_SRC`].
 pub(crate) const WRAPPER_CONFIG_ENV: &str = "MODAL_RUST_RUN_CONFIG_JSON_B64";
@@ -341,7 +307,7 @@ fn discover_cache() -> bool {
 /// `true`. Default OFF. When ON (and caching is on) the facade bakes the same var
 /// into the image ENV so the remote wrapper packs/unpacks `target/` too — the local
 /// process env does NOT otherwise reach the Modal container.
-fn discover_cache_target() -> bool {
+pub(crate) fn discover_cache_target() -> bool {
     std::env::var("MODAL_RUST_CACHE_TARGET")
         .map(|v| {
             matches!(
@@ -390,220 +356,66 @@ pub(crate) async fn ensure_function(
     app_name: &str,
     entrypoint: &str,
     config: &RemoteConfig,
-    published: &mut PublishedFunctions,
+    published: &mut crate::control_plane::Published,
 ) -> Result<String> {
-    // 1. Cargo-cache volume (P6, RUN path only): resolve the persistent V2 volume
-    //    (create-if-missing) when caching is on, so we can attach it below. When
-    //    caching is off (decorator `cache=false` / `MODAL_RUST_NO_CACHE`) we resolve
-    //    NO volume and pass `cache=false` in the wrapper config — wire-identical to
-    //    pre-P6. The DEPLOY path never reaches here (it has its own build at
-    //    image-build time and never attaches a volume).
-    let cache_vol_id: Option<String> = if config.cache {
-        Some(
-            client
-                .volume_get_or_create(
-                    CACHE_VOLUME_NAME,
-                    true, /* v2 */
-                    true, /* create */
-                    None,
-                )
-                .await?,
-        )
-    } else {
-        None
+    use crate::control_plane::{
+        provision, Entrypoint, LiveControlPlane, ProvisionInputs, SourceInputs, RUN_BOUNDARY,
     };
 
-    // 1b. User secrets (USER-facing `#[function(secrets=..)]`): resolve each named
-    //     Modal secret to a secret_id (pure lookup via from_name semantics) so it can
-    //     be attached below. Modal injects the secret's key/values as ENV VARS in the
-    //     container. EMPTY ⇒ no secrets ⇒ wire-identical to before. Values never
-    //     logged. SEPARATE concern from the cargo cache.
-    let mut secret_ids: Vec<String> = Vec::with_capacity(config.options.secrets.len());
-    for name in &config.options.secrets {
-        secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
-    }
-
-    // 1c. User volumes (USER-facing `#[function(volumes=["/mount=name"])]`): resolve
-    //     each named Modal volume to a volume_id (create-if-missing) so it can be
-    //     attached at its mount_path below. These are DISTINCT mounts from the P6
-    //     cargo cache (`/cache`) — both coexist. User volumes use V1 (server default;
-    //     general-purpose persistent storage), not the V2 the cargo cache needs. A
-    //     user mount at `/cache` would collide with the cargo cache, so reject it.
-    let mut user_volume_mounts: Vec<(String, String)> =
-        Vec::with_capacity(config.options.volumes.len());
-    for (mount_path, name) in &config.options.volumes {
-        if config.cache && mount_path == CACHE_MOUNT {
-            return Err(Error::config(format!(
-                "user volume mount path {CACHE_MOUNT:?} collides with the cargo-cache \
-                 volume; choose a different mount path (or disable the cache)"
-            )));
-        }
-        let vid = client
-            .volume_get_or_create(name, false /* v1 */, true /* create */, None)
-            .await?;
-        user_volume_mounts.push((vid, mount_path.clone()));
-    }
-
-    // 2. Client mount (modal source importable in the FILE-mode container).
-    let client_mount_id = client.client_mount_id(None).await?;
-
-    // 3. Source mount (UPLOAD the user's crate; `cargo build` reads it at /src).
-    //    PRIMARY: cargo-metadata scoping uploads only the target package's
-    //    workspace-member dependency-closure crate dirs + the workspace
-    //    Cargo.toml/Cargo.lock. FALLBACK (cargo metadata unavailable): the whole
-    //    `local_root` minus ignored files. Both prune via `.modalignore` >
-    //    `.gitignore` > built-in defaults (resolved in the SDK).
-    let source_mount_id = match (
-        config.use_cargo_scoping,
-        crate::scope::workspace_closure(&config.local_root, &config.package),
-    ) {
-        (true, Some(closure)) => {
-            let spec = modal_rust_sdk::WorkspaceClosureSpec {
-                workspace_root: &config.local_root,
-                crate_dirs: &closure.dirs,
-                extra_files: &closure.extra_files,
-                extra_inline_files: &closure.inline_files,
-                modalignore_name: &config.modalignore_name,
-            };
-            client
-                .mount_workspace_closure(&spec, &config.remote_src, None)
-                .await?
-        }
-        _ => {
-            client
-                .mount_local_dir(
-                    &config.local_root,
-                    &config.remote_src,
-                    &config.modalignore_name,
-                    None,
-                )
-                .await?
-        }
-    };
-
-    // 3b. Python-standalone mount (the HOSTED python-build-standalone, resolved by
-    //     name exactly like the client mount). Supplies `/python` to the image's
-    //     `COPY /python/. /usr/local`.
-    let py_mount_id = client
-        .python_standalone_mount_id(PYTHON_SERIES, None)
-        .await?;
-
-    // 4. Run image: rust base + add_python(standalone) + the baked wrapper.
+    // The RUN path provisions exactly ONE Modal function per entrypoint (the caller
+    // memoizes per entrypoint + threads the cumulative publish union via `published`).
+    // It carries this entrypoint's effective config; the object TAG = the entrypoint
+    // (unique per app, its own gpu/timeout/cache/secrets/volumes), while the
+    // in-container callable stays the shared dispatch "handler" (decoupled in the SDK
+    // FunctionCreate builder). The whole AppCreate(at connect)→cache→secrets/volumes→
+    // mounts→ImageGetOrCreate→Precreate→Create→ephemeral AppPublish sequence lives in
+    // the ONE `provision()` driver; this only assembles the inputs + the RUN boundary.
     //
-    // We provision Python the way the official client does — via the python-build-
-    // standalone mount (`add_python`), NOT apt. The rendered image emits
-    // `COPY /python/. /usr/local`, an auto `RUN ln -s /usr/local/bin/python3
-    // /usr/local/bin/python` for series < 3.13 (the client-equivalent of
-    // `python-is-python3`: a symlink against the standalone install, not an apt
-    // package — so Modal's bare `python` entrypoint resolves), and the TERMINFO ENV.
-    // The standalone interpreter is relocatable and NOT PEP-668 externally-managed,
-    // so `--break-system-packages` is moot. The modal client SOURCE rides the client
-    // mount; its dep closure is injected by the worker at container start
-    // (FunctionSpec defaults `mount_client_dependencies = true`) — so there is NO apt
-    // layer and NO `pip install modal`. (apt+pip is retained as a documented fallback
-    // in the SDK, selected only when `add_python` is unset.)
-    // When the base image carries NO Rust (a CUDA-devel Tier-1 base set via
-    // `MODAL_RUST_BASE_IMAGE` + `MODAL_RUST_INSTALL_RUST`), add the rustup + CUDA-env
-    // step so the in-body `cargo build` finds a toolchain on PATH. The default
-    // `rust:1-slim` base never sets this (byte-identical default render).
-    let mut spec = ImageSpec::from_registry(config.base_image.clone())
-        .with_add_python(PYTHON_SERIES)
-        .with_python_standalone_mount_id(py_mount_id);
-    if config.install_rust {
-        spec = spec.with_rust_toolchain();
-    }
-    let mut spec = spec
-        .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src())
-        .with_command(run_wrapper_config_env(
-            &config.package,
-            config.cache,
-            &config.remote_src,
-        ))
-        .with_command("ENV RUST_BACKTRACE=1");
-    // P6: target/ caching is opt-in via `MODAL_RUST_CACHE_TARGET` (default OFF: in v0
-    // only CARGO_HOME — registry index + crate tarballs — is archived). The wrapper
-    // reads this var from the CONTAINER env, but the local process env does NOT cross
-    // to Modal, so when caching is on AND the var is set locally we BAKE it into the
-    // image ENV. This is what makes the warm build skip recompilation (cargo sees a
-    // restored `target/` → `Fresh`, not `Compiling`), which is the dominant warm win
-    // on a heavy crate. Default path (var unset) renders byte-identical to pre-P6.
-    if config.cache && discover_cache_target() {
-        spec = spec.with_command("ENV MODAL_RUST_CACHE_TARGET=1");
-    }
-    let spec = spec.with_command("ENTRYPOINT []");
-    let image_id = client.image_get_or_create(app_id, &spec).await?;
-
-    // 5. Precreate the function under the PER-ENTRYPOINT object tag (the sanitized
-    //    entrypoint name), NOT the shared "handler" callable — so each entrypoint
-    //    registers a DISTINCT Modal function and divergent configs never collide.
-    let object_tag = sanitize_object_tag(entrypoint);
-    let precreate_id = client.function_precreate(app_id, &object_tag).await?;
-
-    // 6. FunctionCreate (FILE mode): both mounts attach via Function.mount_ids.
-    //    `mount_client_dependencies` defaults true (set explicitly here) so the
-    //    worker injects the modal client's dep closure at container start — the
-    //    add_python image carries no `pip install modal` layer.
-    // Decorator config: a `timeout` decorator OVERRIDES the path default literally
-    // (Python honors it literally too). DOC: RUN-path timeouts must budget for the
-    // cold in-body `cargo build`; a too-small decorator timeout can starve the first
-    // cold build (no floor is imposed). `with_gpu(None)` is a CPU no-op (gpu_config
-    // stays unset → CPU wire bytes identical).
+    // `cargo build` runs IN THE FUNCTION BODY at execution time (the RUN boundary) —
+    // the run image carries NO cargo line; that divergence is isolated to the boundary
+    // + `control_plane::build_image_spec`.
     let timeout = config.options.timeout_secs.unwrap_or(config.timeout_secs);
-    // Object TAG = the entrypoint (unique per app, its own config); IN-CONTAINER
-    // callable stays WRAPPER_CALLABLE ("handler"), rolled onto `implementation_name`.
-    let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
-        .with_app_function_name(&object_tag)
-        .with_mount_ids(vec![client_mount_id, source_mount_id])
-        .with_mount_client_dependencies(true)
-        .with_timeout_secs(timeout)
-        .with_gpu(config.options.gpu.clone())?;
-    // P6: attach the resolved cargo-cache volume at /cache with background commits
-    // ENABLED. Only when caching is on (else `cache_vol_id` is None ⇒ no volume ⇒
-    // wire-identical to pre-P6).
-    if let Some(vid) = cache_vol_id {
-        fn_spec = fn_spec.with_volume_mount(vid, CACHE_MOUNT);
-    }
-    // USER volumes: attach each resolved (volume_id, mount_path) at its DISTINCT
-    // mount path — SEPARATE from the cargo cache above (both coexist). Empty ⇒ no-op.
-    for (vid, mount_path) in user_volume_mounts {
-        fn_spec = fn_spec.with_volume_mount(vid, mount_path);
-    }
-    // USER secrets: attach the resolved secret ids → Function.secret_ids (Modal
-    // injects their key/values as ENV VARS). Empty ⇒ no-op (wire-identical).
-    if !secret_ids.is_empty() {
-        fn_spec = fn_spec.with_secret_ids(secret_ids);
-    }
-    let created = client
-        .function_create(app_id, &precreate_id, &fn_spec)
-        .await?;
+    let entrypoints = [Entrypoint {
+        name: entrypoint.to_string(),
+        options: config.options.clone(),
+        timeout_secs: timeout,
+    }];
+    let inputs = ProvisionInputs {
+        app_name,
+        app_id: Some(app_id),
+        source: SourceInputs {
+            local_root: &config.local_root,
+            package: &config.package,
+            use_cargo_scoping: config.use_cargo_scoping,
+            modalignore_name: &config.modalignore_name,
+            remote_src: &config.remote_src,
+        },
+        base_image: &config.base_image,
+        install_rust: config.install_rust,
+        cache: config.cache,
+        entrypoints: &entrypoints,
+    };
 
-    // 7. AppPublish with APP_STATE_EPHEMERAL. Publishing is REQUIRED to make the
-    //    created function INVOKABLE (without it, FunctionMap fails "function not
-    //    found" — live-verified 2026-06-04). The EPHEMERAL state keeps the app
-    //    throwaway: it is "discharged when the client disconnects" (proto), so the
-    //    RUN path leaves NO lingering deploy. PERSISTENT (DEPLOYED) publish is
-    //    DEPLOY-only (`crate::deploy`). Mirrors Modal Python's `runner.py`, which
-    //    publishes ephemeral runs and deploys alike, differing only in state.
-    //
-    //    Publish the CUMULATIVE union of every entrypoint created on this app under
-    //    its OWN object tag: `AppPublish` REPLACES the function set, so a second
-    //    per-entrypoint create must re-publish the first one too or it would be
-    //    de-invoked. The function is keyed by the entrypoint object tag, not the
-    //    shared "handler" callable, so distinct entrypoints coexist as distinct
-    //    functions.
-    let (function_ids, definition_ids) =
-        published.record(&object_tag, &created.function_id, &created.definition_id);
-    client
-        .app_publish_ephemeral(app_id, app_name, function_ids, definition_ids)
-        .await?;
+    let mut cp = LiveControlPlane { client };
+    // The RUN path needs only the threaded `published` union (its function id) — the
+    // returned image id / publish url are DEPLOY-facing, so discard them here.
+    let _ = provision(&mut cp, &inputs, &RUN_BOUNDARY, published).await?;
 
-    // 8. Invoke via the FunctionCreate `function_id` DIRECTLY — NOT `from_name`.
-    //    `from_name`/`FunctionGet` is the DEPLOYED lookup; an EPHEMERAL app is not
-    //    name-resolvable in the environment (live-verified 2026-06-04: from_name on
-    //    the ephemeral app failed "App '...' not found in environment 'main'").
-    //    Modal Python's ephemeral `app.run()` likewise invokes the loaded function
-    //    handle by its `object_id`, never re-resolving by name.
-    Ok(created.function_id)
+    // Invoke via the FunctionCreate `function_id` DIRECTLY — NOT `from_name`.
+    // `from_name`/`FunctionGet` is the DEPLOYED lookup; an EPHEMERAL app is not
+    // name-resolvable in the environment (live-verified 2026-06-04: from_name on
+    // the ephemeral app failed "App '...' not found in environment 'main'"). Modal
+    // Python's ephemeral `app.run()` likewise invokes by `object_id`, never by name.
+    let object_tag = sanitize_object_tag(entrypoint);
+    published
+        .function_ids
+        .get(&object_tag)
+        .cloned()
+        .ok_or_else(|| {
+            Error::config(format!(
+                "provision did not yield a function id for {entrypoint:?}"
+            ))
+        })
 }
 
 /// Parse the runner's one-line JSON envelope into `Result<Out, Error>`, mirroring
@@ -672,22 +484,6 @@ mod tests {
         assert_eq!(sanitize_object_tag("a b/c"), "a_b_c");
         // An empty/all-mapped name never yields an empty tag.
         assert_eq!(sanitize_object_tag(""), WRAPPER_CALLABLE);
-    }
-
-    #[test]
-    fn published_functions_accumulate_union_for_set_state_publish() {
-        // AppPublish REPLACES the function set, so a second per-entrypoint create must
-        // re-publish the UNION (else the first entrypoint is de-invoked).
-        let mut pubd = PublishedFunctions::default();
-        let (fns, defs) = pubd.record("add", "fu-1", "de-1");
-        assert_eq!(fns.get("add"), Some(&"fu-1".to_string()));
-        assert_eq!(defs.get("fu-1"), Some(&"de-1".to_string()));
-        // Second entrypoint: both are present (cumulative).
-        let (fns, defs) = pubd.record("add_gpu", "fu-2", "de-2");
-        assert_eq!(fns.len(), 2);
-        assert_eq!(fns.get("add"), Some(&"fu-1".to_string()));
-        assert_eq!(fns.get("add_gpu"), Some(&"fu-2".to_string()));
-        assert_eq!(defs.len(), 2);
     }
 
     #[test]

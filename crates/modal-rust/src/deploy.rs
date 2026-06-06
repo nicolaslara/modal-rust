@@ -25,9 +25,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use modal_rust_sdk::{FunctionSpec, ImageSpec, ModalClient};
+use modal_rust_sdk::ModalClient;
 
-use crate::remote::{RemoteConfig, PYTHON_SERIES};
+use crate::remote::RemoteConfig;
 use crate::{Error, FunctionOptions, Result};
 
 /// Fixed importable module name for the baked DEPLOY wrapper
@@ -185,60 +185,6 @@ pub struct DeployedApp {
     pub url: String,
 }
 
-/// Render the DEPLOY BASE layer (layer 1): `rust:1-slim` + `add_python` (the hosted
-/// python-build-standalone mount). This layer owns the standalone mount as its build
-/// CONTEXT so its `COPY /python/. /usr/local` has a source; it carries no wrapper and
-/// no source. The TOP layer ([`deploy_top_layer_spec`]) bases on it via `FROM base`.
-///
-/// Two layers are REQUIRED because an `Image` has ONE `context_mount_id`: the source
-/// (top layer) and the standalone (base layer) each need their own. This mirrors the
-/// official client's image layering (`base_images={"base": self}`).
-fn deploy_base_layer_spec(
-    python_standalone_mount_id: &str,
-    base_image: &str,
-    install_rust: bool,
-) -> ImageSpec {
-    // The rust toolchain + CUDA env ride the BASE layer (which already owns
-    // add_python) so the toolchain + CUDA headers are present BEFORE the TOP layer's
-    // `cargo build` runs. Default base never sets this (byte-identical default render).
-    let mut spec = ImageSpec::from_registry(base_image.to_string())
-        .with_add_python(PYTHON_SERIES)
-        .with_python_standalone_mount_id(python_standalone_mount_id);
-    if install_rust {
-        spec = spec.with_rust_toolchain();
-    }
-    spec
-}
-
-/// Render the DEPLOY TOP layer (layer 2): bases on the add_python layer via
-/// `FROM base` ([`ImageSpec::with_base_image`]), bakes the deploy wrapper, then COPYs
-/// the SOURCE (this layer's build CONTEXT) and runs the cargo build + `cp`/bake. cargo
-/// runs AT image-build time against the rust+python from layer 1; the deployed runtime
-/// never repeats it.
-///
-/// Python comes from layer 1 (`add_python`), NOT apt — same provisioning as the RUN
-/// path. The auto `ln -s python3 python` (series < 3.13, emitted in layer 1) satisfies
-/// Modal's bare `python` entrypoint.
-fn deploy_top_layer_spec(base_image_id: &str, source_mount_id: &str, package: &str) -> ImageSpec {
-    ImageSpec::from_registry(String::new()) // FROM is replaced by `FROM base` (layered).
-        .with_base_image(base_image_id)
-        .with_wrapper_module(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC)
-        .with_context_mount(source_mount_id)
-        // Context root → /, so the /app/src-prefixed tree lands at /app/src (§A4 Primary).
-        .with_command("COPY . /")
-        // cargo build AT IMAGE-BUILD time; -p disambiguates the shared modal_runner bin.
-        .with_command(format!(
-            "RUN cd {DEPLOY_SRC} && cargo build --release -p {package} --bin modal_runner"
-        ))
-        // Bake the freshly built binary to the fixed path the deployed body execs.
-        .with_command(format!(
-            "RUN cp {DEPLOY_SRC}/target/release/modal_runner {DEPLOY_RUNNER} \
-             && chmod +x {DEPLOY_RUNNER}"
-        ))
-        .with_command("ENV RUST_BACKTRACE=1")
-        .with_command("ENTRYPOINT []")
-}
-
 /// One entrypoint to deploy: its NAME (the Modal object tag) plus its effective
 /// per-entrypoint deploy config (gpu/timeout/secrets/volumes). Built by
 /// [`App::deploy_with`](crate::App::deploy_with) from each decorated entrypoint's
@@ -252,12 +198,6 @@ pub(crate) struct DeployEntrypoint {
     pub name: String,
     /// Owned per-entrypoint Modal options.
     pub options: FunctionOptions,
-}
-
-/// Sanitize an entrypoint name into a Modal object TAG (deploy parity with the RUN
-/// path's [`crate::remote::sanitize_object_tag`]).
-fn deploy_object_tag(entrypoint: &str) -> String {
-    crate::remote::sanitize_object_tag(entrypoint)
 }
 
 /// Deploy (persistently) ONE Modal function PER ENTRYPOINT under the STABLE app name
@@ -281,142 +221,61 @@ pub(crate) async fn deploy_function(
     config: &DeployConfig,
     entrypoints: &[DeployEntrypoint],
 ) -> Result<DeployedApp> {
-    // 1. Client mount (modal source importable in the FILE-mode container).
-    let client_mount_id = client.client_mount_id(None).await?;
-
-    // 2. Source mount — UPLOAD the user's crate as the image BUILD CONTEXT (lands
-    //    at /app/src/<rel>; the COPY . / drops it at /app/src). Same scoping as the
-    //    RUN path: PRIMARY = cargo-metadata closure of the target package + the
-    //    workspace Cargo.toml/Cargo.lock; FALLBACK = whole local_root minus ignored
-    //    files. Both prune via `.modalignore` > `.gitignore` > built-in defaults.
-    let source_mount_id = match (
-        config.use_cargo_scoping,
-        crate::scope::workspace_closure(&config.local_root, &config.package),
-    ) {
-        (true, Some(closure)) => {
-            let spec = modal_rust_sdk::WorkspaceClosureSpec {
-                workspace_root: &config.local_root,
-                crate_dirs: &closure.dirs,
-                extra_files: &closure.extra_files,
-                extra_inline_files: &closure.inline_files,
-                modalignore_name: &config.modalignore_name,
-            };
-            client
-                .mount_workspace_closure(&spec, DEPLOY_SRC, None)
-                .await?
-        }
-        _ => {
-            client
-                .mount_local_dir(
-                    &config.local_root,
-                    DEPLOY_SRC,
-                    &config.modalignore_name,
-                    None,
-                )
-                .await?
-        }
+    use crate::control_plane::{
+        provision, Entrypoint, LiveControlPlane, ProvisionInputs, Published, SourceInputs,
+        DEPLOY_BOUNDARY,
     };
 
-    // 2b. Python-standalone mount (HOSTED, resolved by name) → the BASE layer's
-    //     build context for `add_python`.
-    let py_mount_id = client
-        .python_standalone_mount_id(PYTHON_SERIES, None)
-        .await?;
-
-    // 3. PERSISTENT named app id (deploy-only; re-deploys REPLACE under this name).
-    let app_id = client.app_get_or_create_id(&config.app_name, None).await?;
-
-    // 4. Build the deploy image as TWO LAYERS — cargo runs HERE, AT image-build time
-    //    (the build logs stream `Compiling`/`cargo build --release` via
-    //    ImageJoinStreaming). Two layers are required because an Image has ONE
-    //    context_mount_id: layer 1 (add_python) owns the standalone mount; layer 2
-    //    (source + cargo build) owns the source mount. This mirrors the official
-    //    client's image layering and provisions Python via add_python, NOT apt/pip.
-    let base_spec = deploy_base_layer_spec(&py_mount_id, &config.base_image, config.install_rust);
-    let base_image_id = client.image_get_or_create(&app_id, &base_spec).await?;
-    let spec = deploy_top_layer_spec(&base_image_id, &source_mount_id, &config.package);
-    let image_id = client.image_get_or_create(&app_id, &spec).await?;
-
-    // 5/6. ONE Modal function PER ENTRYPOINT over the SHARED image. The deployed
-    //      `modal_runner` handles every entrypoint by dispatch, so each entrypoint is
-    //      its OWN Modal function (object tag = the entrypoint) carrying its OWN config
-    //      (gpu/timeout/secrets/volumes). Divergent per-entrypoint configs thus coexist
-    //      instead of being rejected. The manual/no-decorator path (`entrypoints`
-    //      empty) falls back to ONE function under the wrapper callable — byte-identical
-    //      to the pre-fix single-function deploy.
-    //
-    //      All functions attach the CLIENT mount ONLY — NO source mount (the binary is
-    //      baked in the image layer). That absence IS the deploy invariant.
-    let plan: Vec<DeployEntrypoint> = if entrypoints.is_empty() {
-        vec![DeployEntrypoint {
+    // ONE Modal function PER ENTRYPOINT over the SHARED image: the deployed
+    // `modal_runner` handles every entrypoint by dispatch, so each entrypoint is its
+    // OWN Modal function (object tag = the entrypoint) carrying its OWN config. The
+    // manual/no-decorator path (`entrypoints` empty) falls back to ONE function under
+    // the wrapper callable — byte-identical to the pre-fix single-function deploy.
+    let plan: Vec<Entrypoint> = if entrypoints.is_empty() {
+        vec![Entrypoint {
             name: DEPLOY_WRAPPER_CALLABLE.to_string(),
             options: config.options.clone(),
+            timeout_secs: config.timeout_secs,
         }]
     } else {
-        entrypoints.to_vec()
+        entrypoints
+            .iter()
+            .map(|ep| Entrypoint {
+                name: ep.name.clone(),
+                options: ep.options.clone(),
+                timeout_secs: ep.options.timeout_secs.unwrap_or(config.timeout_secs),
+            })
+            .collect()
     };
+    let first_tag = crate::remote::sanitize_object_tag(&plan[0].name);
 
-    let mut function_ids: HashMap<String, String> = HashMap::new();
-    let mut definition_ids: HashMap<String, String> = HashMap::new();
-    for ep in &plan {
-        let object_tag = deploy_object_tag(&ep.name);
-        // 5. Precreate under the PER-ENTRYPOINT object tag (NOT the shared callable),
-        //    so each entrypoint registers a DISTINCT function.
-        let precreate_id = client.function_precreate(&app_id, &object_tag).await?;
+    // The whole MountGetOrCreate→persistent AppGetOrCreate→TWO image layers (the top
+    // layer's `cargo build --release` at image-build time)→per-entrypoint Precreate+
+    // Create (CLIENT mount ONLY)→deployed AppPublish sequence lives in the ONE
+    // `provision()` driver. The DEPLOY divergence (source COPIED into the image build
+    // context, cargo in a Dockerfile RUN layer, persistent app/publish) is isolated to
+    // the boundary + `control_plane::build_image_spec` / `build_deploy_top_layer_spec`.
+    let inputs = ProvisionInputs {
+        app_name: &config.app_name,
+        app_id: None, // resolved via AppGetOrCreate inside provision (persistent).
+        source: SourceInputs {
+            local_root: &config.local_root,
+            package: &config.package,
+            use_cargo_scoping: config.use_cargo_scoping,
+            modalignore_name: &config.modalignore_name,
+            remote_src: DEPLOY_SRC,
+        },
+        base_image: &config.base_image,
+        install_rust: config.install_rust,
+        cache: false, // DEPLOY builds at image-build time — no run-path cargo cache.
+        entrypoints: &plan,
+    };
+    let mut published = Published::default();
+    let mut cp = LiveControlPlane { client };
+    let provisioned = provision(&mut cp, &inputs, &DEPLOY_BOUNDARY, &mut published).await?;
 
-        // 6. FunctionCreate (FILE mode): CLIENT mount ONLY. Object TAG = the entrypoint;
-        //    IN-CONTAINER callable stays DEPLOY_WRAPPER_CALLABLE ("handler") on
-        //    `implementation_name`. `mount_client_dependencies = true` (default,
-        //    explicit) so the worker injects the modal client dep closure at start.
-        let timeout = ep.options.timeout_secs.unwrap_or(config.timeout_secs);
-        let mut fn_spec =
-            FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
-                .with_app_function_name(&object_tag)
-                .with_mount_ids(vec![client_mount_id.clone()])
-                .with_mount_client_dependencies(true)
-                .with_timeout_secs(timeout)
-                .with_gpu(ep.options.gpu.clone())?;
-        // 6b. USER secrets: resolve each named secret to an id and attach →
-        //     Function.secret_ids (Modal injects their key/values as ENV VARS). Values
-        //     never logged. Empty ⇒ no-op.
-        let mut secret_ids: Vec<String> = Vec::with_capacity(ep.options.secrets.len());
-        for name in &ep.options.secrets {
-            secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
-        }
-        if !secret_ids.is_empty() {
-            fn_spec = fn_spec.with_secret_ids(secret_ids);
-        }
-        // 6c. USER volumes: resolve each named volume (create-if-missing, V1) and attach
-        //     at its mount_path. DEPLOY has no cargo cache, so no `/cache` collision.
-        for (mount_path, name) in &ep.options.volumes {
-            let vid = client
-                .volume_get_or_create(name, false /* v1 */, true /* create */, None)
-                .await?;
-            fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
-        }
-        let created = client
-            .function_create(&app_id, &precreate_id, &fn_spec)
-            .await?;
-        function_ids.insert(object_tag.clone(), created.function_id.clone());
-        if !created.definition_id.is_empty() {
-            definition_ids.insert(created.function_id.clone(), created.definition_id.clone());
-        }
-    }
-
-    // 7. PERSISTENT AppPublish carrying the UNION of every per-entrypoint function, so
-    //    the deploy survives and `from_name(app, entrypoint)` resolves each one.
-    let published = client
-        .app_publish_deployed(
-            &app_id,
-            &config.app_name,
-            function_ids.clone(),
-            definition_ids,
-        )
-        .await?;
-
-    // 8. Resolve ONE invokable function_id (the first entrypoint) to prove from_name
-    //    works post-deploy. `call(app, entrypoint)` re-resolves the right one by tag.
-    let first_tag = deploy_object_tag(&plan[0].name);
+    // Resolve ONE invokable function_id (the first entrypoint) to prove from_name
+    // works post-deploy. `call(app, entrypoint)` re-resolves the right one by tag.
     let function_id = client
         .function_from_name(&config.app_name, &first_tag, None)
         .await?;
@@ -424,8 +283,8 @@ pub(crate) async fn deploy_function(
     Ok(DeployedApp {
         name: config.app_name.clone(),
         function_id,
-        image_id,
-        url: published.url,
+        image_id: provisioned.image_id,
+        url: provisioned.publish_url,
     })
 }
 
@@ -443,7 +302,7 @@ pub(crate) async fn call_function(
 ) -> Result<String> {
     // Resolve the PER-ENTRYPOINT deployed function by its object tag (the entrypoint),
     // NOT the shared wrapper callable — each entrypoint is its own Modal function now.
-    let object_tag = deploy_object_tag(entrypoint);
+    let object_tag = crate::remote::sanitize_object_tag(entrypoint);
     let function_id = client
         .function_from_name(app_name, &object_tag, None)
         .await?;
@@ -503,74 +362,6 @@ mod tests {
         );
         // No {{PACKAGE}} placeholder — the package was chosen at image-build time.
         assert!(!src.contains("{{PACKAGE}}"));
-    }
-
-    #[test]
-    fn deploy_base_layer_provisions_python_via_add_python() {
-        // Layer 1: add_python(3.12) on the rust base, with the standalone mount as
-        // the build context. NO apt, NO pip — Python comes from the standalone mount.
-        let base = deploy_base_layer_spec("mo-py-standalone", "rust:1-slim", false);
-        assert_eq!(base.base_image, "rust:1-slim");
-        assert_eq!(base.add_python.as_deref(), Some("3.12"));
-        assert_eq!(
-            base.python_standalone_mount_id.as_deref(),
-            Some("mo-py-standalone")
-        );
-        // No apt/pip fallback on the base layer.
-        assert!(base.pre_bake_commands.is_empty());
-        assert!(!base.pip_install_modal);
-        // Default base layer (install_rust=false) carries no rust install. The actual
-        // rendered-command suppression is asserted SDK-side
-        // (image::tests::default_path_renders_none_of_the_rust_toolchain_steps), since
-        // `dockerfile_commands` is private to the SDK crate; here we assert the public
-        // field the facade controls.
-        assert!(!base.install_rust, "default base layer has no rust install");
-    }
-
-    #[test]
-    fn deploy_base_layer_installs_rust_for_cuda_base() {
-        // CUDA Tier-1 deploy: a `nvidia/cuda:<ver>-devel` base + add_python +
-        // with_rust_toolchain on the BASE layer, so the rust toolchain + CUDA headers
-        // are present before the TOP layer's `cargo build`. The base layer owns
-        // add_python (its standalone mount as build context), so the rustup + CUDA env
-        // render before any top-layer cargo build. The rendered ordering (add_python
-        // COPY < rustup < PATH/CUDA_PATH ENV < bake) is asserted SDK-side
-        // (image::tests::rust_toolchain_renders_after_add_python_and_before_bakes);
-        // here we assert the public fields the facade controls.
-        let base = deploy_base_layer_spec(
-            "mo-py-standalone",
-            "nvidia/cuda:12.6.3-devel-ubuntu22.04",
-            true,
-        );
-        assert_eq!(base.base_image, "nvidia/cuda:12.6.3-devel-ubuntu22.04");
-        assert_eq!(base.add_python.as_deref(), Some("3.12"));
-        assert!(base.install_rust, "CUDA base layer installs rust");
-    }
-
-    #[test]
-    fn deploy_top_layer_rides_source_on_the_build_context() {
-        // Layer 2: bases on layer 1 (FROM base), the source rides this layer's build
-        // CONTEXT (proto field 15) so cargo compiles it AT image-build time. The
-        // COPY/cargo/cp dockerfile ordering is asserted in the SDK-side image.rs
-        // test; here we assert the public fields the facade controls.
-        let spec = deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add");
-        assert_eq!(spec.base_image_id.as_deref(), Some("im-layer1"));
-        assert_eq!(spec.context_mount_id.as_deref(), Some("mo-deploy-src"));
-        // The cargo-build RUN (an extra command) names the package and target bin.
-        assert!(spec
-            .extra_commands
-            .iter()
-            .any(|c| c.contains("cargo build --release -p example-add --bin modal_runner")));
-        // The cp/bake RUN bakes the binary to the fixed deployed path.
-        assert!(spec
-            .extra_commands
-            .iter()
-            .any(|c| c.contains("cp /app/src/target/release/modal_runner /app/modal_runner")));
-        // The COPY brings the context into a layer.
-        assert!(spec.extra_commands.iter().any(|c| c.contains("COPY . /")));
-        // No apt/pip on the top layer either (Python is inherited from layer 1).
-        assert!(spec.pre_bake_commands.is_empty());
-        assert!(!spec.pip_install_modal);
     }
 
     #[test]
