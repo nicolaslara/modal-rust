@@ -88,6 +88,10 @@ run "quickstart: --describe lists add" '"name":"add"' \
 run "add-macro: add(40, 2)" '{"ok":true,"value":42}' \
   "cd examples/add-macro && cargo run -q --bin modal_runner -- --entrypoint add --input-json '{\"a\":40,\"b\":2}'"
 
+# custom-types — a function over YOUR OWN structs (macro infers I/O from the signature)
+run "custom-types: score(Player) -> Scored" '{"ok":true,"value":{"accuracy_pct":70,"name":"Ada","points":700}}' \
+  "cd examples/custom-types && cargo run -q --bin modal_runner -- --entrypoint score --input-json '{\"name\":\"Ada\",\"hits\":7,\"shots\":10}'"
+
 # add — manual / no-macro path ({sum} output)
 run "add (manual): add(40, 2)" '{"ok":true,"value":{"sum":42}}' \
   "cd examples/add && cargo run -q --bin modal_runner -- --entrypoint add --input-json '{\"a\":40,\"b\":2}'"

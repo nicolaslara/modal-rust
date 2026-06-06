@@ -19,6 +19,7 @@ members = [
     "examples/quickstart",
     "examples/add",
     "examples/add-macro",
+    "examples/custom-types",
     "examples/orchestrate",
     "examples/cuda-vector-add",
     "examples/burn-add",
@@ -40,6 +41,7 @@ default-members = [
     "examples/quickstart",
     "examples/add",
     "examples/add-macro",
+    "examples/custom-types",
     "examples/orchestrate",
     "examples/cuda-vector-add",
 ]
