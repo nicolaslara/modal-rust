@@ -1902,6 +1902,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-custom-base"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "example-custom-types"
 version = "0.0.0"
 dependencies = [

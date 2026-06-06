@@ -142,6 +142,15 @@ run "volumes: --describe (mounted volume rides through inventory)" '"volumes":[[
 run "timeout-and-cache: --describe (timeout + cache ride through inventory)" '"timeout_secs":1800,"cache":true' \
   "cd examples/timeout-and-cache && cargo run -q --bin modal_runner -- --describe"
 
+# custom-base — pick the RUN base image + install the Rust toolchain through the
+# EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
+# MODAL_RUST_BASE_IMAGE / MODAL_RUST_INSTALL_RUST env vars — NOT decorator config).
+# Proven OFFLINE: the driver dry-runs a CUDA-devel base config and prints the rendered
+# image dockerfile FROM line (a mock test in tests/manifest.rs asserts the full
+# dockerfile — the FROM + the rustup install RUN). No new feature, only exposed knobs.
+run "custom-base: dry-run renders a CUDA-devel base FROM line" 'base:   FROM nvidia/cuda:12.6.3-devel-ubuntu22.04' \
+  "cargo run -q -p example-custom-base --bin custom_base"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"

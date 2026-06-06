@@ -28,6 +28,7 @@ members = [
     "examples/secrets",
     "examples/volumes",
     "examples/timeout-and-cache",
+    "examples/custom-base",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -57,6 +58,7 @@ default-members = [
     "examples/secrets",
     "examples/volumes",
     "examples/timeout-and-cache",
+    "examples/custom-base",
     "examples/cuda-vector-add",
 ]
 
