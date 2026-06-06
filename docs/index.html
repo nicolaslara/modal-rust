@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>modal-rust — documentation index</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#5c6770; --line:#e3e6ea; --accent:#2563c0; --localbg:#fff8ec; --localbd:#e7c98a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:var(--fg); background:#fafbfc; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.9rem; margin: 0 0 .25rem; }
+  .lede { color: var(--muted); margin: 0 0 2rem; }
+  h2 { font-size: 1.05rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 2.2rem 0 .8rem; border-bottom: 1px solid var(--line); padding-bottom: .4rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: .8rem; }
+  a.card { display:block; text-decoration:none; color:inherit; border:1px solid var(--line); border-radius:10px; padding:.85rem 1rem; background:#fff; transition:border-color .12s, transform .12s; }
+  a.card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  a.card .t { font-weight: 650; color: var(--accent); }
+  a.card .d { color: var(--muted); font-size: .9rem; margin-top: .2rem; }
+  .tag { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing:.03em; padding:.1rem .4rem; border-radius:5px; vertical-align: middle; margin-left:.4rem; }
+  .tag.html { background:#eaf1fb; color:#2563c0; }
+  .tag.md { background:#eef1f3; color:#5c6770; }
+  .local { background: var(--localbg); border-color: var(--localbd); }
+  .note { color: var(--muted); font-size: .85rem; margin:.4rem 0 0; }
+  code { background:#eef1f3; padding:.05em .35em; border-radius:4px; font-size:.85em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>modal-rust documentation</h1>
+  <p class="lede">Run ordinary Rust functions on Modal — write a function, <code>app.add(2,3).remote().await?</code>.
+     This is the index for everything under <code>docs/</code>.</p>
+
+  <h2>Start here</h2>
+  <div class="grid">
+    <a class="card" href="getting-started.md"><div class="t">Getting Started <span class="tag md">md</span></div><div class="d">Zero → write a function → <code>.local()</code> → <code>.remote()</code> → deploy + call. Token setup, core concepts, Python→Rust cheat sheet, troubleshooting.</div></a>
+    <a class="card" href="architecture.html"><div class="t">Architecture overview <span class="tag html">html</span></div><div class="d">Contributor-depth tour: crate map, the Registry/<code>typed!</code> seam, the run-vs-deploy boundary, the run &amp; deploy flows, with citations into the code.</div></a>
+    <a class="card" href="https://github.com/nicolaslara/modal-rust/blob/main/README.md"><div class="t">Project README ↗</div><div class="d">The repo front page: install, the macro path, the library API, examples. (Repo root, on GitHub.)</div></a>
+  </div>
+
+  <h2>Reference</h2>
+  <div class="grid">
+    <a class="card" href="PARITY.md"><div class="t">Feature parity <span class="tag md">md</span></div><div class="d">Have / Partial / Missing vs the Modal Python client, with a prioritized gap list.</div></a>
+    <a class="card" href="ROADMAP.md"><div class="t">Roadmap &amp; tech debt <span class="tag md">md</span></div><div class="d">Next steps (cheap + big parity features), and the real vs cosmetic tech-debt backlog.</div></a>
+    <a class="card" href="architecture-review.md"><div class="t">Architecture review <span class="tag md">md</span></div><div class="d">Good / weak / improve across readability, abstractions, domain separation, APIs, comments, file sizes; prioritized cleanups.</div></a>
+    <a class="card" href="https://github.com/nicolaslara/modal-rust/blob/main/crates/modal-rust-sdk/README.md"><div class="t">SDK gRPC coverage ↗</div><div class="d">The lean first-party Modal gRPC client: which of the ~200 RPCs are implemented, with a coverage matrix.</div></a>
+    <a class="card" href="https://github.com/nicolaslara/modal-rust/blob/main/benchmarks/README.md"><div class="t">Benchmarks plan ↗</div><div class="d">The A/B-vs-Python benchmark scenarios (plan-only for now).</div></a>
+  </div>
+
+  <h2>Deep dives <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.8rem;color:var(--muted)">— local-only, not committed to the repo (<code>docs/local/</code> &amp; uncommitted)</span></h2>
+  <div class="grid">
+    <a class="card local" href="local/data-user-flows.html"><div class="t">Data &amp; user flows <span class="tag html">html</span></div><div class="d">Step-by-step run / deploy / call flows with SVG diagrams. (Anchor: <code>#deploy-flow</code>.)</div></a>
+    <a class="card local" href="local/architecture-issues.html"><div class="t">Architecture issues <span class="tag html">html</span></div><div class="d">Ranked issues + root-cause clusters. #1 (per-entrypoint config) is now marked RESOLVED; #2/#4/#6 (owned <code>FunctionOptions</code>) remain.</div></a>
+    <a class="card local" href="local/examples-catalogue.md"><div class="t">Examples catalogue <span class="tag md">md</span></div><div class="d">The intended example set and what each demonstrates.</div></a>
+    <a class="card local" href="testing-strategy.md"><div class="t">Testing strategy <span class="tag md">md</span></div><div class="d">Offline-testing design: pure request builders, the in-process mock backend, snapshots; why we built our own vs reusing the Python mock.</div></a>
+    <a class="card local" href="ergonomics-and-docs-review.md"><div class="t">Ergonomics &amp; docs review <span class="tag md">md</span></div><div class="d">Prioritized API-friction + newcomer-docs findings (the source of the ergonomics-hardening work).</div></a>
+  </div>
+
+  <p class="note">Served locally (e.g. <code>python3 -m http.server 8765 --directory docs</code>). Markdown opens raw in the
+     browser; it renders formatted on GitHub. <span style="color:#9a7a2e">Highlighted</span> cards are local-only working
+     notes — they are not in the repository, so they will not exist in a fresh clone.</p>
+</div>
+</body>
+</html>
