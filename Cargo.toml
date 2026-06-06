@@ -25,6 +25,7 @@ members = [
     "examples/fan-out-map",
     "examples/background-jobs",
     "examples/error-handling",
+    "examples/secrets",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -51,6 +52,7 @@ default-members = [
     "examples/fan-out-map",
     "examples/background-jobs",
     "examples/error-handling",
+    "examples/secrets",
     "examples/cuda-vector-add",
 ]
 

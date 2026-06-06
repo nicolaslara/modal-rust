@@ -124,6 +124,11 @@ run "error-handling: structured error -> details + branch" 'branch:     short by
 run "error-handling: anyhow error -> function_error, details:null" '"kind":"function_error","message":"insufficient funds: asked 150, have 100"' \
   "cd examples/error-handling && cargo run -q --bin modal_runner -- --entrypoint withdraw --input-json '{\"amount\":150,\"balance\":100}'"
 
+# secrets — decorator-is-config: a named secret rides through inventory, proven
+# OFFLINE via --describe (a mock test asserts it rides into the FunctionCreate manifest).
+run "secrets: --describe (named secret rides through inventory)" '"secrets":["my-api-key"]' \
+  "cd examples/secrets && cargo run -q --bin modal_runner -- --describe"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
