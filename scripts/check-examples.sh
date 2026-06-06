@@ -104,6 +104,10 @@ run "orchestrate: local tour" 'add(2, 3) -> 5' \
 run "ways-to-call: .local() tour" 'local:  square(6) -> 36' \
   "cargo run -q -p example-ways-to-call --bin ways_to_call"
 
+# fan-out-map — embarrassingly-parallel scale-out; OFFLINE runs the local fan-out
+run "fan-out-map: local fan-out (results in input order)" 'intro -> 8 words, 1 min' \
+  "cargo run -q -p example-fan-out-map --bin fan_out_map"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
@@ -119,6 +123,7 @@ elif ! has_creds; then
   echo "   automatically. The commands they would run:"
   echo "     orchestrate     RUN_REMOTE=1 cargo run -p example-orchestrate"
   echo "     ways-to-call    RUN_REMOTE=1 cargo run -p example-ways-to-call --bin ways_to_call"
+  echo "     fan-out-map     RUN_REMOTE=1 cargo run -p example-fan-out-map --bin fan_out_map"
   echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
   echo
@@ -135,6 +140,12 @@ else
     'remote: square(6) -> 36' \
     'spawn:  square(7) -> 49' \
     'map:    square([2, 3, 4]) -> [4, 9, 16]'
+
+  # LIVE (CPU): fan-out-map fans the per-record analyze() out over N docs via .map().
+  live "fan-out-map: live .map([..]) fan-out (CPU)" \
+    "RUN_REMOTE=1 cargo run -q -p example-fan-out-map --bin fan_out_map" \
+    'remote .map([..]) over 3 docs (results in input order):' \
+    'intro -> 8 words, 1 min'
 
   if [[ "${RUN_GPU:-}" == "1" ]]; then
     # GPU: cuda-vector-add on a T4 via the RUN path (in-body build, Tier 0).

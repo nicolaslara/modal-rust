@@ -22,6 +22,7 @@ members = [
     "examples/custom-types",
     "examples/orchestrate",
     "examples/ways-to-call",
+    "examples/fan-out-map",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -45,6 +46,7 @@ default-members = [
     "examples/custom-types",
     "examples/orchestrate",
     "examples/ways-to-call",
+    "examples/fan-out-map",
     "examples/cuda-vector-add",
 ]
 
