@@ -24,9 +24,35 @@ use crate::{Error, Result, RunnerError};
 /// Fixed importable module name for the baked run wrapper
 /// (`/root/modal_rust_run_wrapper.py`).
 pub(crate) const WRAPPER_MODULE: &str = "modal_rust_run_wrapper";
-/// Fixed callable within the wrapper module. ONE Modal function serves EVERY
-/// entrypoint in the crate; the user entrypoint is a per-call invoke arg.
+/// Fixed IN-CONTAINER callable within the wrapper module. EVERY entrypoint shares
+/// this one dispatch callable — `handler(entrypoint, input_json)` routes by the
+/// per-call entrypoint arg. It is the FILE-mode `getattr` target (Modal's
+/// `implementation_name`), DECOUPLED from the per-entrypoint Modal object TAG (see
+/// [`sanitize_object_tag`]). This stays frozen — the runner wire is unchanged.
 pub(crate) const WRAPPER_CALLABLE: &str = "handler";
+
+/// Sanitize an entrypoint name into a Modal object TAG (the app-namespace function
+/// name that makes a created function unique within an app). Rust fn names are
+/// already tag-safe (`[A-Za-z0-9_]`); this only defends against an unusual manual
+/// registry name by mapping any other byte to `_`. An empty result falls back to the
+/// shared callable so a tag is never empty.
+pub(crate) fn sanitize_object_tag(entrypoint: &str) -> String {
+    let tag: String = entrypoint
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if tag.is_empty() {
+        WRAPPER_CALLABLE.to_string()
+    } else {
+        tag
+    }
+}
 /// Where the uploaded source mount lands inside the container.
 pub(crate) const REMOTE_SRC: &str = "/src";
 /// Rust base image major version tag (`rust:{ver}-slim`).
@@ -45,6 +71,39 @@ pub(crate) const CACHE_MOUNT: &str = "/cache";
 pub(crate) const CACHE_ARCHIVE_NAME: &str = "cache.tar.zst";
 /// Deployment name of the persistent V2 cargo-cache volume (knowledge.md §C item 4).
 pub(crate) const CACHE_VOLUME_NAME: &str = "modal-rust-cargo-cache";
+
+/// Cumulative set of RUN-path functions published into ONE ephemeral app. Because
+/// `AppPublish` is a SET-STATE publish (it REPLACES the app's function set, not
+/// appends), creating a second per-entrypoint function and re-publishing must carry
+/// the UNION of every function created so far — otherwise the second publish would
+/// de-invoke the first entrypoint. Keyed by object tag (entrypoint) → function_id,
+/// plus the function_id → definition_id side map [`AppPublish`] needs.
+#[derive(Debug, Default)]
+pub(crate) struct PublishedFunctions {
+    /// Object tag (sanitized entrypoint) → invokable `function_id`.
+    function_ids: HashMap<String, String>,
+    /// `function_id` → `definition_id` (only for functions that returned one).
+    definition_ids: HashMap<String, String>,
+}
+
+impl PublishedFunctions {
+    /// Record a freshly-created function under its object tag and return the FULL
+    /// (cumulative) `(function_ids, definition_ids)` maps to publish.
+    fn record(
+        &mut self,
+        object_tag: &str,
+        function_id: &str,
+        definition_id: &str,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        self.function_ids
+            .insert(object_tag.to_string(), function_id.to_string());
+        if !definition_id.is_empty() {
+            self.definition_ids
+                .insert(function_id.to_string(), definition_id.to_string());
+        }
+        (self.function_ids.clone(), self.definition_ids.clone())
+    }
+}
 
 /// The FILE-mode run wrapper, ported from `workpads/prototype/dev_app.py`'s
 /// `run_entrypoint`. The `{{PACKAGE}}` placeholder is substituted per package by
@@ -471,12 +530,23 @@ fn discover_cache_target() -> bool {
         .unwrap_or(false)
 }
 
-/// Ensure the run function exists on Modal and return its invokable `function_id`.
+/// Ensure the run function for `entrypoint` exists on Modal and return its invokable
+/// `function_id`.
 ///
 /// Runs the full create sequence (client mount, uploaded source mount, run image,
 /// precreate, FunctionCreate FILE, **EPHEMERAL** AppPublish, from_name).
 /// Idempotent at the Modal level (get-or-create semantics); callers memoize the
-/// result per App so it runs at most once per process.
+/// result per (App, entrypoint-config) so it runs at most once per process.
+///
+/// ## One Modal function PER ENTRYPOINT (the object-tag decoupling)
+///
+/// Each entrypoint is created as a DISTINCT Modal function whose object TAG is the
+/// (sanitized) entrypoint name, carrying its OWN config (gpu/timeout/cache/secrets/
+/// volumes). The IN-CONTAINER callable stays the shared `handler(entrypoint,
+/// input_json)` dispatch ([`WRAPPER_CALLABLE`], rolled onto `implementation_name`),
+/// so divergent per-entrypoint configs COEXIST instead of clobbering one shared
+/// `"handler"` tag in the same app. Same-config entrypoints still single-flight via
+/// the caller's per-key memo.
 ///
 /// ## RUN publishes EPHEMERAL, not DEPLOYED
 ///
@@ -496,7 +566,9 @@ pub(crate) async fn ensure_function(
     client: &mut ModalClient,
     app_id: &str,
     app_name: &str,
+    entrypoint: &str,
     config: &RemoteConfig,
+    published: &mut PublishedFunctions,
 ) -> Result<String> {
     // 1. Cargo-cache volume (P6, RUN path only): resolve the persistent V2 volume
     //    (create-if-missing) when caching is on, so we can attach it below. When
@@ -636,8 +708,11 @@ pub(crate) async fn ensure_function(
     let spec = spec.with_command("ENTRYPOINT []");
     let image_id = client.image_get_or_create(app_id, &spec).await?;
 
-    // 5. Precreate the function (name = the wrapper callable, "handler").
-    let precreate_id = client.function_precreate(app_id, WRAPPER_CALLABLE).await?;
+    // 5. Precreate the function under the PER-ENTRYPOINT object tag (the sanitized
+    //    entrypoint name), NOT the shared "handler" callable — so each entrypoint
+    //    registers a DISTINCT Modal function and divergent configs never collide.
+    let object_tag = sanitize_object_tag(entrypoint);
+    let precreate_id = client.function_precreate(app_id, &object_tag).await?;
 
     // 6. FunctionCreate (FILE mode): both mounts attach via Function.mount_ids.
     //    `mount_client_dependencies` defaults true (set explicitly here) so the
@@ -649,7 +724,10 @@ pub(crate) async fn ensure_function(
     // cold build (no floor is imposed). `with_gpu(None)` is a CPU no-op (gpu_config
     // stays unset → CPU wire bytes identical).
     let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
+    // Object TAG = the entrypoint (unique per app, its own config); IN-CONTAINER
+    // callable stays WRAPPER_CALLABLE ("handler"), rolled onto `implementation_name`.
     let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
+        .with_app_function_name(&object_tag)
         .with_mount_ids(vec![client_mount_id, source_mount_id])
         .with_mount_client_dependencies(true)
         .with_timeout_secs(timeout)
@@ -681,12 +759,15 @@ pub(crate) async fn ensure_function(
     //    RUN path leaves NO lingering deploy. PERSISTENT (DEPLOYED) publish is
     //    DEPLOY-only (`crate::deploy`). Mirrors Modal Python's `runner.py`, which
     //    publishes ephemeral runs and deploys alike, differing only in state.
-    let mut function_ids = HashMap::new();
-    function_ids.insert(WRAPPER_CALLABLE.to_string(), created.function_id.clone());
-    let mut definition_ids = HashMap::new();
-    if !created.definition_id.is_empty() {
-        definition_ids.insert(created.function_id.clone(), created.definition_id.clone());
-    }
+    //
+    //    Publish the CUMULATIVE union of every entrypoint created on this app under
+    //    its OWN object tag: `AppPublish` REPLACES the function set, so a second
+    //    per-entrypoint create must re-publish the first one too or it would be
+    //    de-invoked. The function is keyed by the entrypoint object tag, not the
+    //    shared "handler" callable, so distinct entrypoints coexist as distinct
+    //    functions.
+    let (function_ids, definition_ids) =
+        published.record(&object_tag, &created.function_id, &created.definition_id);
     client
         .app_publish_ephemeral(app_id, app_name, function_ids, definition_ids)
         .await?;
@@ -753,6 +834,36 @@ fn reconstruct_runner_error(error: &serde_json::Value) -> RunnerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_object_tag_passes_rust_fn_names_and_maps_others() {
+        // Rust fn names are already tag-safe (alphanumeric + `_`).
+        assert_eq!(sanitize_object_tag("add"), "add");
+        assert_eq!(sanitize_object_tag("add_gpu"), "add_gpu");
+        assert_eq!(sanitize_object_tag("Train2"), "Train2");
+        // `-` and `.` are allowed verbatim.
+        assert_eq!(sanitize_object_tag("my-fn.v2"), "my-fn.v2");
+        // Anything else maps to `_`.
+        assert_eq!(sanitize_object_tag("a b/c"), "a_b_c");
+        // An empty/all-mapped name never yields an empty tag.
+        assert_eq!(sanitize_object_tag(""), WRAPPER_CALLABLE);
+    }
+
+    #[test]
+    fn published_functions_accumulate_union_for_set_state_publish() {
+        // AppPublish REPLACES the function set, so a second per-entrypoint create must
+        // re-publish the UNION (else the first entrypoint is de-invoked).
+        let mut pubd = PublishedFunctions::default();
+        let (fns, defs) = pubd.record("add", "fu-1", "de-1");
+        assert_eq!(fns.get("add"), Some(&"fu-1".to_string()));
+        assert_eq!(defs.get("fu-1"), Some(&"de-1".to_string()));
+        // Second entrypoint: both are present (cumulative).
+        let (fns, defs) = pubd.record("add_gpu", "fu-2", "de-2");
+        assert_eq!(fns.len(), 2);
+        assert_eq!(fns.get("add"), Some(&"fu-1".to_string()));
+        assert_eq!(fns.get("add_gpu"), Some(&"fu-2".to_string()));
+        assert_eq!(defs.len(), 2);
+    }
 
     #[test]
     fn wrapper_src_substitutes_package_and_is_pythonish() {

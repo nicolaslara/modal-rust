@@ -22,3 +22,5 @@ CLI.
 | Modal CLI `run` reference | https://modal.com/docs/reference/cli/run | 2026-06-03 | CLI accepts a file/module ref; relevant to whether static shims must be materialized or importable |
 | Modal apps guide | https://modal.com/docs/guide/apps | 2026-06-03 | `@app.local_entrypoint()` flag binding and app/function authoring model |
 | Modal images reference | https://modal.com/docs/reference/modal.Image | 2026-06-03 | `add_local_dir`, `copy`, `ignore`, `run_commands`; config fields needed at module import time |
+| Facade RUN/deploy config memoization | crates/modal-rust/src/app.rs | 2026-06-05 | `RemoteHandle.function_ids` is keyed by effective RUN config; deploy rejects divergent deploy-time configs |
+| Per-entrypoint config regression | crates/modal-rust/tests/mock_table.rs | 2026-06-05 | Offline testkit repro for CPU-first then GPU-second order dependence against captured `FunctionCreate` |

@@ -92,7 +92,10 @@ async fn remote_add_against_mock_records_manifest_and_decodes_output() {
         "FILE-mode XOR invariant: function_data is unset"
     );
     assert_eq!(function.module_name, "modal_rust_run_wrapper"); // WRAPPER_MODULE
-    assert_eq!(function.function_name, "handler"); // WRAPPER_CALLABLE
+                                                                // Object TAG = the entrypoint name (so per-entrypoint configs never collide); the
+                                                                // in-container "handler" callable moves to `implementation_name`.
+    assert_eq!(function.function_name, "add");
+    assert_eq!(function.implementation_name, "handler");
     assert_eq!(
         function.mount_ids.len(),
         2,

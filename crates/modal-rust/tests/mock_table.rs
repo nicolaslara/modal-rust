@@ -64,6 +64,34 @@ fn configs_for(case: &Case) -> BTreeMap<String, FunctionConfig> {
     m
 }
 
+/// Build two per-entrypoint decorator configs for one app. The CPU entrypoint has
+/// no GPU; the GPU entrypoint requests T4. Both disable cache so the captured
+/// FunctionCreate sequence stays focused on the config keying bug.
+fn divergent_entrypoint_configs() -> BTreeMap<String, FunctionConfig> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        "add".to_string(),
+        FunctionConfig {
+            gpu: None,
+            timeout_secs: Some(600),
+            cache: Some(false),
+            secrets: &[],
+            volumes: &[],
+        },
+    );
+    m.insert(
+        "add_gpu".to_string(),
+        FunctionConfig {
+            gpu: Some("T4"),
+            timeout_secs: Some(1800),
+            cache: Some(false),
+            secrets: &[],
+            volumes: &[],
+        },
+    );
+    m
+}
+
 #[tokio::test]
 async fn function_create_manifest_table() {
     let cases = [
@@ -142,6 +170,233 @@ async fn function_create_manifest_table() {
 
         let _ = fs::remove_dir_all(&tmp);
     }
+}
+
+/// Regression: one connected App with two entrypoints must not let whichever
+/// entrypoint runs first freeze the wrapper config for every later entrypoint.
+/// Calling CPU first then GPU second must produce a second FunctionCreate carrying
+/// the GPU config.
+#[tokio::test]
+async fn divergent_entrypoint_configs_create_distinct_run_wrappers() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp =
+        std::env::temp_dir().join(format!("modal-rust-mock-divergent-{}", std::process::id()));
+    let app = App::connect_at_with_configs(
+        "divergent-app",
+        modal_registry(),
+        divergent_entrypoint_configs(),
+        mock.url(),
+        tiny_source_config(&tmp),
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("cpu remote");
+    let _: serde_json::Value = app
+        .function("add_gpu")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("gpu remote");
+
+    let creates = mock.requests::<FunctionCreateRequest>();
+    assert_eq!(
+        creates.len(),
+        2,
+        "CPU-first then GPU-second must create two wrapper functions, not reuse the CPU wrapper"
+    );
+
+    let cpu = creates[0]
+        .function
+        .as_ref()
+        .expect("cpu FunctionCreate function");
+    // DISTINCT object tag = the entrypoint (NOT the shared "handler"): this is what
+    // makes the two functions coexist in one app instead of clobbering each other.
+    assert_eq!(cpu.function_name, "add", "cpu object tag = entrypoint");
+    assert_eq!(
+        cpu.implementation_name, "handler",
+        "in-container callable stays the shared dispatch handler"
+    );
+    assert_eq!(cpu.timeout_secs, 600);
+    assert!(
+        cpu.resources
+            .as_ref()
+            .and_then(|r| r.gpu_config.as_ref())
+            .is_none(),
+        "first entrypoint is CPU (gpu=None)"
+    );
+
+    let gpu = creates[1]
+        .function
+        .as_ref()
+        .expect("gpu FunctionCreate function");
+    assert_eq!(gpu.function_name, "add_gpu", "gpu object tag = entrypoint");
+    assert_eq!(gpu.implementation_name, "handler");
+    assert_eq!(gpu.timeout_secs, 1800);
+    let gpu_config = gpu
+        .resources
+        .as_ref()
+        .and_then(|r| r.gpu_config.as_ref())
+        .expect("second entrypoint requested GPU");
+    assert_eq!(gpu_config.gpu_type, "T4");
+
+    // The two object tags are DISTINCT — no override on the platform.
+    assert_ne!(
+        cpu.function_name, gpu.function_name,
+        "distinct Modal object tags per entrypoint (no clobber)"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// DEPLOY counterpart: deploying one app with two divergent-config entrypoints must
+/// publish BOTH (distinct object tags + correct per-function gpu/timeout) — the
+/// divergent-config rejection is GONE. Asserts two FunctionCreate requests over one
+/// shared deploy image, each tagged by its entrypoint and carrying its own config.
+#[tokio::test]
+async fn divergent_entrypoint_configs_deploy_distinct_functions() {
+    use modal_rust::DeployConfig;
+
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!(
+        "modal-rust-mock-deploy-divergent-{}",
+        std::process::id()
+    ));
+    // Reuse the RUN tiny-source config for local_root/package; deploy reads them for
+    // the build context. The divergent decorator configs drive the per-entrypoint plan.
+    let run_cfg = tiny_source_config(&tmp);
+    let app = App::connect_at_with_configs(
+        "divergent-deploy-app",
+        modal_registry(),
+        divergent_entrypoint_configs(),
+        mock.url(),
+        run_cfg.clone(),
+    )
+    .await
+    .expect("connect");
+
+    let deploy_cfg = DeployConfig {
+        app_name: "divergent-deploy-app".to_string(),
+        local_root: run_cfg.local_root.clone(),
+        package: run_cfg.package.clone(),
+        use_cargo_scoping: false,
+        modalignore_name: run_cfg.modalignore_name.clone(),
+        base_image: run_cfg.base_image.clone(),
+        timeout_secs: 300,
+        gpu: None,
+        timeout_override_secs: None,
+        install_rust: false,
+        secrets: Vec::new(),
+        volumes: Vec::new(),
+    };
+    let _deployed = app.deploy_with(deploy_cfg).await.expect("deploy ok");
+
+    let creates = mock.requests::<FunctionCreateRequest>();
+    assert_eq!(
+        creates.len(),
+        2,
+        "deploy must publish ONE function per entrypoint (no divergent-config rejection)"
+    );
+
+    // BTreeMap orders configs by name: "add" (CPU, 600) then "add_gpu" (T4, 1800).
+    let add = creates[0].function.as_ref().expect("add function");
+    assert_eq!(add.function_name, "add", "add object tag = entrypoint");
+    assert_eq!(add.implementation_name, "handler");
+    assert_eq!(add.timeout_secs, 600);
+    assert!(
+        add.resources
+            .as_ref()
+            .and_then(|r| r.gpu_config.as_ref())
+            .is_none(),
+        "add is CPU (gpu=None)"
+    );
+
+    let add_gpu = creates[1].function.as_ref().expect("add_gpu function");
+    assert_eq!(add_gpu.function_name, "add_gpu");
+    assert_eq!(add_gpu.implementation_name, "handler");
+    assert_eq!(add_gpu.timeout_secs, 1800);
+    assert_eq!(
+        add_gpu
+            .resources
+            .as_ref()
+            .and_then(|r| r.gpu_config.as_ref())
+            .expect("add_gpu requested GPU")
+            .gpu_type,
+        "T4"
+    );
+    assert_ne!(add.function_name, add_gpu.function_name);
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// Invoke ROUTING: each entrypoint's `.remote()` must target ITS OWN function_id,
+/// not whichever was created first. Drives a mock that returns a DISTINCT function_id
+/// per created object tag (`fu-<tag>`), then asserts the two recorded `FunctionMap`
+/// requests targeted the matching per-entrypoint function_ids.
+#[tokio::test]
+async fn divergent_entrypoint_invoke_routes_to_own_function_id() {
+    // Return a function_id derived from the created object tag so routing is
+    // observable: `add` -> `fu-add`, `add_gpu` -> `fu-add_gpu`.
+    let mock = MockModal::builder()
+        .on_function_create(|req| {
+            let tag = req
+                .function
+                .as_ref()
+                .map(|f| f.function_name.clone())
+                .unwrap_or_default();
+            Ok(FunctionCreateResponse {
+                function_id: format!("fu-{tag}"),
+                handle_metadata: Some(FunctionHandleMetadata {
+                    definition_id: format!("de-{tag}"),
+                    function_name: tag,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        })
+        .start()
+        .await
+        .expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-routing-{}", std::process::id()));
+    let app = App::connect_at_with_configs(
+        "routing-app",
+        modal_registry(),
+        divergent_entrypoint_configs(),
+        mock.url(),
+        tiny_source_config(&tmp),
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("cpu remote");
+    let _: serde_json::Value = app
+        .function("add_gpu")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("gpu remote");
+
+    let maps = mock.requests::<FunctionMapRequest>();
+    assert_eq!(maps.len(), 2, "two invokes => two FunctionMap requests");
+    // FunctionMap fires in call order: `add` first, then `add_gpu`. Each routed to
+    // ITS OWN function_id — no shared "handler" clobber.
+    assert_eq!(
+        maps[0].function_id, "fu-add",
+        "add routed to its own function"
+    );
+    assert_eq!(
+        maps[1].function_id, "fu-add_gpu",
+        "add_gpu routed to its own function (not the CPU one)"
+    );
+    assert_ne!(maps[0].function_id, maps[1].function_id);
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// Row 6 (P6 cache, table form) — cache ON vs OFF across a 2-row table, each on its

@@ -1062,3 +1062,54 @@ modal-rust delivers its full vision, every piece proven LIVE on Modal via our ow
 workload, with fan-out (`.map`/`.spawn`), a build cache (on by default), secrets, and volumes. The image +
 upload match the official client (add_python / CUDA-devel + rustup; cargo-metadata-scoped uploads with
 `.modalignore`>`.gitignore`>defaults). See the dated sections above for each milestone's live evidence.
+
+---
+
+### ✅ Correctness fix — per-entrypoint RUN config memoization (2026-06-05)
+
+Bug: `App::remote()` memoized exactly one RUN wrapper `function_id` per connected app. That made
+per-entrypoint decorator config order-dependent: if a CPU/default entrypoint ran first, a later GPU/timeout/
+secret/volume entrypoint reused the CPU wrapper and silently lost its config; if the GPU entrypoint ran first,
+the CPU entrypoint could inherit GPU/secrets/volumes.
+
+Repro added: `crates/modal-rust/tests/mock_table.rs::divergent_entrypoint_configs_create_distinct_run_wrappers`
+connects one app with `add` (CPU, timeout 600) and `add_gpu` (T4, timeout 1800), calls CPU first then GPU, and
+asserts two `FunctionCreate` requests with the second carrying `Resources.gpu_config = T4`. Before the fix:
+
+```text
+cargo test -p modal-rust --test mock_table divergent_entrypoint_configs_create_distinct_run_wrappers -- --nocapture
+left: 1
+right: 2
+```
+
+Fix: `RemoteHandle` now stores `function_ids: Mutex<BTreeMap<RunFunctionKey, Arc<OnceCell<String>>>>`, where
+`RunFunctionKey` is the effective gpu/timeout/cache/secrets/volumes config. Identical configs still share one
+Modal wrapper; divergent configs create distinct wrappers and keep the existing per-key single-flight behavior.
+The runner protocol and wrapper callable are unchanged.
+
+Deploy stance: deploy still publishes one named wrapper (`handler`) for the whole app, so divergent deploy-time
+configs cannot be represented correctly yet. `App::deploy_with` now rejects divergent gpu/timeout/secrets/volumes
+configs before contacting Modal instead of selecting the first arbitrary config. Identical deploy configs remain
+allowed; run-only `cache` is ignored for deploy divergence.
+
+Evidence:
+
+```text
+cargo test -p modal-rust --test mock_table divergent_entrypoint_configs_create_distinct_run_wrappers -- --nocapture
+=> ok; two FunctionCreate requests, second gpu_type="T4"
+
+cargo test -p modal-rust --test mock_table
+=> 3 passed
+
+cargo test -p modal-rust app::tests
+=> 8 passed
+
+cargo fmt --check
+=> ok
+
+cargo test
+=> ok
+
+cargo clippy --all-targets -- -D warnings
+=> ok
+```

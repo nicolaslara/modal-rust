@@ -5,6 +5,9 @@
 //! real `sdk::ModalClient` for the future remote path, but no unit/integration
 //! test calls it, so the offline gates stay green.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::deploy::{self, DeployConfig, DeployedApp};
@@ -16,6 +19,21 @@ use crate::{Error, Function, Registry, Result};
 /// `kwargs` is the empty map. Aliased to keep [`App::remote_map`]'s annotation
 /// readable (clippy `type_complexity`).
 type MapInput<'a> = ((&'a str, String), std::collections::HashMap<String, ()>);
+
+/// Memo key for created RUN-path Modal functions. Each ENTRYPOINT gets its OWN Modal
+/// function (object tag = the entrypoint) carrying its OWN effective config, so the
+/// key is the entrypoint name PLUS its effective gpu/timeout/cache/secrets/volumes.
+/// Including the config means a (hypothetical) per-call config change re-creates
+/// rather than silently reusing a stale wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RunFunctionKey {
+    entrypoint: String,
+    gpu: Option<String>,
+    timeout_secs: u32,
+    cache: bool,
+    secrets: Vec<String>,
+    volumes: Vec<(String, String)>,
+}
 
 /// The user-facing application handle.
 ///
@@ -51,9 +69,20 @@ struct RemoteHandle {
     app_id: String,
     /// App name — needed for the EPHEMERAL `app_publish` + `from_name` resolution.
     app_name: String,
-    /// Memoized invokable `function_id` for the single wrapper function that serves
-    /// every entrypoint. `get_or_try_init` gives correct single-flight create.
-    function_id: OnceCell<String>,
+    /// Memoized invokable `function_id`s keyed by ENTRYPOINT + effective wrapper
+    /// config. Each entrypoint is created as its OWN Modal function (object tag =
+    /// the entrypoint), carrying its own gpu/timeout/cache/secrets/volumes, so
+    /// divergent per-entrypoint configs COEXIST instead of clobbering one shared
+    /// `"handler"`. Keying by entrypoint (not just config) keeps the memo 1:1 with
+    /// the created function; the config rides in the key so a future config change to
+    /// the same entrypoint would key distinctly. Each value is a `OnceCell` so
+    /// concurrent first calls to the same key single-flight create.
+    function_ids: Mutex<BTreeMap<RunFunctionKey, Arc<OnceCell<String>>>>,
+    /// Cumulative published RUN functions for this ephemeral app. `AppPublish` is a
+    /// SET-STATE publish, so each per-entrypoint create re-publishes the UNION of all
+    /// functions created so far (else the prior entrypoint is de-invoked). Guarded by
+    /// its own `Mutex` so the publish set stays consistent under concurrent creates.
+    published: Mutex<remote::PublishedFunctions>,
     /// RUN-path knobs (source dir, package, image, timeout, ignore set).
     config: RemoteConfig,
 }
@@ -207,7 +236,8 @@ impl App {
                 client: Mutex::new(client),
                 app_id,
                 app_name: name.to_string(),
-                function_id: OnceCell::new(),
+                function_ids: Mutex::new(BTreeMap::new()),
+                published: Mutex::new(remote::PublishedFunctions::default()),
                 config: run_config,
             }),
         })
@@ -282,9 +312,9 @@ impl App {
         self.configs.get(name).cloned().unwrap_or_default()
     }
 
-    /// Drive the RUN path for one entrypoint: ensure the wrapper function exists on
-    /// Modal (once per App, single-flighted via the `function_id` [`OnceCell`]),
-    /// then invoke it with `(entrypoint, input_json)` and return the runner's
+    /// Drive the RUN path for one entrypoint: ensure a wrapper function exists on
+    /// Modal for that entrypoint's effective config (single-flighted per config
+    /// key), then invoke it with `(entrypoint, input_json)` and return the runner's
     /// one-line JSON envelope string. The caller ([`Function::remote`]) parses it.
     ///
     /// `cargo build` runs in the function body at invoke time (the RUN boundary);
@@ -316,18 +346,18 @@ impl App {
     /// memoize) the invokable wrapper `function_id` for `entrypoint`, applying its
     /// decorator gpu/timeout, and compute the output-poll `deadline`.
     ///
-    /// Resolves the invoked entrypoint's decorator config (gpu/timeout) and applies
-    /// it to a per-call clone of the path config BEFORE `ensure_function`. NOTE: the
-    /// wrapper `function_id` is memoized in a `OnceCell`, so the create (and thus
-    /// this config) is BOUND at the FIRST RUN-path call on this App. Acceptable for
-    /// the single-GPU required path: one app typically targets one GPU class.
+    /// Resolves the invoked entrypoint's decorator config and applies it to a
+    /// per-call clone of the path config BEFORE `ensure_function`. The created
+    /// wrapper is memoized by effective config, so entrypoints with identical
+    /// gpu/timeout/cache/secrets/volumes share a Modal function while divergent
+    /// entrypoints get separate functions.
     ///
     /// The deadline must cover the cold in-body `cargo build` (the RUN boundary):
     /// the first call to a fresh container compiles the whole dep tree, which can
     /// take many minutes — far past the SDK's 600s default. Match the function's own
     /// container timeout (honoring the decorator override, the same value
-    /// `ensure_function` sets) plus a small queue/schedule buffer. spawn/map hit the
-    /// SAME wrapper, so the SAME deadline applies.
+    /// `ensure_function` sets) plus a small queue/schedule buffer. spawn/map use
+    /// the same keyed resolution path, so the deadline tracks the selected wrapper.
     async fn resolve_function(
         &self,
         handle: &RemoteHandle,
@@ -350,25 +380,52 @@ impl App {
             .map(|(m, n)| (m.to_string(), n.to_string()))
             .collect();
 
-        // Resolve (and memoize) the invokable function_id. `get_or_try_init`
-        // single-flights the create sequence under concurrent RUN-path calls.
-        let function_id = handle
-            .function_id
+        let effective_cache = cfg_cache.unwrap_or(handle.config.cache);
+        let effective_timeout = cfg_timeout.unwrap_or(handle.config.timeout_secs);
+        let key = RunFunctionKey {
+            entrypoint: entrypoint.to_string(),
+            gpu: cfg_gpu.clone(),
+            timeout_secs: effective_timeout,
+            cache: effective_cache,
+            secrets: cfg_secrets.clone(),
+            volumes: cfg_volumes.clone(),
+        };
+        // Resolve (and memoize) the invokable function_id for this effective
+        // config. The map lock is held only long enough to fetch/create the cell;
+        // `get_or_try_init` then single-flights the Modal create for this key.
+        let cell = {
+            let mut function_ids = handle.function_ids.lock().await;
+            function_ids
+                .entry(key)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let function_id = cell
             .get_or_try_init(|| async {
                 let mut run_config = handle.config.clone();
                 run_config.gpu = cfg_gpu.clone();
                 run_config.timeout_override_secs = cfg_timeout;
-                run_config.cache = cfg_cache.unwrap_or(run_config.cache);
+                run_config.cache = effective_cache;
                 run_config.secrets = cfg_secrets.clone();
                 run_config.volumes = cfg_volumes.clone();
                 let mut client = handle.client.lock().await;
-                remote::ensure_function(&mut client, &handle.app_id, &handle.app_name, &run_config)
-                    .await
+                // The publish set is the cumulative union across entrypoints (AppPublish
+                // REPLACES the set), so lock it across the create so each per-entrypoint
+                // create re-publishes every prior one too.
+                let mut published = handle.published.lock().await;
+                remote::ensure_function(
+                    &mut client,
+                    &handle.app_id,
+                    &handle.app_name,
+                    entrypoint,
+                    &run_config,
+                    &mut published,
+                )
+                .await
             })
             .await?
             .clone();
 
-        let effective_timeout = cfg_timeout.unwrap_or(handle.config.timeout_secs);
         let deadline = std::time::Duration::from_secs(effective_timeout as u64 + 120);
         Ok((function_id, deadline))
     }
@@ -485,44 +542,62 @@ impl App {
     /// As [`App::deploy`], with an explicit [`DeployConfig`] (STABLE app name,
     /// source root, package, base image, ignore set).
     ///
-    /// One Modal wrapper serves EVERY entrypoint, so the decorator gpu/timeout is
-    /// resolved for the single decorated entrypoint (P4 deploy targets one app/one
-    /// wrapper) and threaded onto the [`DeployConfig`]. The manual path (no
-    /// decorator config) leaves the deploy defaults untouched.
-    pub async fn deploy_with(&self, mut config: DeployConfig) -> Result<DeployedApp> {
+    /// Deploy now publishes ONE Modal function PER ENTRYPOINT (each named by its
+    /// entrypoint, carrying its OWN gpu/timeout/secrets/volumes), over a single shared
+    /// image that bakes the one `modal_runner` handling all entrypoints. Divergent
+    /// per-entrypoint configs COEXIST — they are no longer rejected. The manual path
+    /// (no decorator config) deploys a single default function, unchanged.
+    pub async fn deploy_with(&self, config: DeployConfig) -> Result<DeployedApp> {
         let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
-        // Resolve the decorated entrypoint's config. P4 deploy serves one wrapper,
-        // so pick the single decorated entrypoint (the first registered name with a
-        // non-default config; else the first name). Manual path => default (no-op).
-        if let Some(cfg) = self.deploy_target_config() {
-            config.gpu = cfg.gpu.map(|s| s.to_string());
-            config.timeout_override_secs = cfg.timeout_secs;
-            config.secrets = cfg.secrets.iter().map(|s| s.to_string()).collect();
-            config.volumes = cfg
-                .volumes
-                .iter()
-                .map(|(m, n)| (m.to_string(), n.to_string()))
-                .collect();
-        }
+        // Each decorated entrypoint becomes its OWN deployed function (object tag = the
+        // entrypoint) with its OWN effective config. No divergence rejection.
+        let entrypoints = self.deploy_entrypoints();
         let mut client = handle.client.lock().await;
-        deploy::deploy_function(&mut client, &config).await
+        deploy::deploy_function(&mut client, &config, &entrypoints).await
     }
 
-    /// Pick the decorator config to apply at deploy time. Returns the first
-    /// entrypoint config that sets ANY extra (gpu/timeout/secrets/volumes) — the
-    /// typical single-decorated-fn deploy; falls back to the first registered config,
-    /// else `None` (manual path => deploy defaults).
-    fn deploy_target_config(&self) -> Option<modal_rust_runtime::FunctionConfig> {
-        self.configs
-            .values()
-            .find(|c| {
-                c.gpu.is_some()
-                    || c.timeout_secs.is_some()
-                    || !c.secrets.is_empty()
-                    || !c.volumes.is_empty()
+    /// Build the per-entrypoint deploy plan: one [`deploy::DeployEntrypoint`] per
+    /// entrypoint (object tag = the entrypoint), carrying its effective
+    /// gpu/timeout/secrets/volumes so `call(app, entrypoint)` resolves the right one.
+    ///
+    /// Source precedence: the decorator [`FunctionConfig`]s when present (the
+    /// `#[function(...)]` path); else the registered handler NAMES with default config
+    /// each (the manual `connect_with_registry` path — so each registered entrypoint
+    /// is deployed under its own name). EMPTY only when there are NEITHER configs NOR
+    /// handlers (the truly headless manifest path), where [`deploy::deploy_function`]
+    /// falls back to a single default function under the wrapper callable. The
+    /// run-only `cache` knob is irrelevant to deploy (image-build-time build).
+    fn deploy_entrypoints(&self) -> Vec<deploy::DeployEntrypoint> {
+        if !self.configs.is_empty() {
+            return self
+                .configs
+                .iter()
+                .map(|(name, cfg)| deploy::DeployEntrypoint {
+                    name: name.clone(),
+                    gpu: cfg.gpu.map(|s| s.to_string()),
+                    timeout_secs: cfg.timeout_secs,
+                    secrets: cfg.secrets.iter().map(|s| s.to_string()).collect(),
+                    volumes: cfg
+                        .volumes
+                        .iter()
+                        .map(|(m, n)| (m.to_string(), n.to_string()))
+                        .collect(),
+                })
+                .collect();
+        }
+        // Manual path (registry handlers, no decorator config): deploy each registered
+        // entrypoint under its own name with default config, so `call(app, name)`
+        // resolves it.
+        self.known_names()
+            .into_iter()
+            .map(|name| deploy::DeployEntrypoint {
+                name,
+                gpu: None,
+                timeout_secs: None,
+                secrets: Vec::new(),
+                volumes: Vec::new(),
             })
-            .or_else(|| self.configs.values().next())
-            .cloned()
+            .collect()
     }
 
     /// CALL a DEPLOYED function by app name + entrypoint, returning the typed
@@ -591,12 +666,27 @@ impl App {
             .unwrap_or_else(|| fallback.to_string())
     }
 
-    /// The decorator config the offline DEPLOY dump ([`App::dump_deploy_manifest`])
-    /// applies — the SAME selection [`App::deploy_with`] uses. NO network.
-    pub(crate) fn deploy_target_config_for_dump(
+    /// The per-entrypoint deploy plan the offline DEPLOY dump
+    /// ([`App::dump_deploy_manifest`]) renders — the SAME plan [`App::deploy_with`]
+    /// passes to [`deploy::deploy_function`], with the empty-fallback applied so the
+    /// dump shows the concrete functions (the manual path renders ONE default
+    /// function under the wrapper callable). NO network.
+    pub(crate) fn deploy_entrypoints_for_dump(
         &self,
-    ) -> Option<modal_rust_runtime::FunctionConfig> {
-        self.deploy_target_config()
+        config: &DeployConfig,
+    ) -> Vec<deploy::DeployEntrypoint> {
+        let entrypoints = self.deploy_entrypoints();
+        if entrypoints.is_empty() {
+            vec![deploy::DeployEntrypoint {
+                name: deploy::DEPLOY_WRAPPER_CALLABLE.to_string(),
+                gpu: config.gpu.clone(),
+                timeout_secs: config.timeout_override_secs,
+                secrets: config.secrets.clone(),
+                volumes: config.volumes.clone(),
+            }]
+        } else {
+            entrypoints
+        }
     }
 }
 
@@ -633,12 +723,62 @@ mod tests {
         let bare = app.config_for("add");
         assert!(bare.secrets.is_empty());
         assert!(bare.volumes.is_empty());
-        // The deploy-target selector picks `add_extras` (it sets extras) even though it
-        // has no gpu/timeout — proving secrets/volumes count as a decorated target.
-        let target = app
-            .deploy_target_config()
-            .expect("a decorated config exists");
-        assert!(!target.secrets.is_empty() || !target.volumes.is_empty());
+    }
+
+    #[test]
+    fn deploy_publishes_distinct_function_per_divergent_entrypoint() {
+        // NEW correct behavior (was `deploy_rejects_divergent_per_entrypoint_configs`):
+        // deploy now publishes ONE Modal function PER ENTRYPOINT, each with its OWN
+        // config, so divergent gpu/timeout are NO LONGER rejected — they coexist.
+        let app = App::from_manifest([
+            (
+                "cpu".to_string(),
+                modal_rust_runtime::FunctionConfig::default(),
+            ),
+            (
+                "gpu".to_string(),
+                modal_rust_runtime::FunctionConfig {
+                    gpu: Some("T4"),
+                    timeout_secs: Some(1800),
+                    cache: None,
+                    secrets: &[],
+                    volumes: &[],
+                },
+            ),
+        ]);
+        let plan = app.deploy_entrypoints();
+        assert_eq!(plan.len(), 2, "one deploy function per entrypoint");
+        // BTreeMap orders by name: "cpu" then "gpu".
+        let cpu = plan.iter().find(|e| e.name == "cpu").expect("cpu in plan");
+        let gpu = plan.iter().find(|e| e.name == "gpu").expect("gpu in plan");
+        // Each carries its OWN divergent config — no clobber, no rejection.
+        assert_eq!(cpu.gpu, None);
+        assert_eq!(cpu.timeout_secs, None);
+        assert_eq!(gpu.gpu.as_deref(), Some("T4"));
+        assert_eq!(gpu.timeout_secs, Some(1800));
+    }
+
+    #[test]
+    fn deploy_plan_carries_identical_per_entrypoint_configs() {
+        let cfg = modal_rust_runtime::FunctionConfig {
+            gpu: Some("T4"),
+            timeout_secs: Some(1800),
+            cache: Some(false), // deploy ignores run-cache config
+            secrets: &["my-secret"],
+            volumes: &[("/data", "my-vol")],
+        };
+        let app = App::from_manifest([
+            ("train".to_string(), cfg.clone()),
+            ("eval".to_string(), cfg.clone()),
+        ]);
+        let plan = app.deploy_entrypoints();
+        assert_eq!(plan.len(), 2);
+        for ep in &plan {
+            assert_eq!(ep.gpu.as_deref(), Some("T4"));
+            assert_eq!(ep.timeout_secs, Some(1800));
+            assert_eq!(ep.secrets, &["my-secret".to_string()]);
+            assert_eq!(ep.volumes, &[("/data".to_string(), "my-vol".to_string())]);
+        }
     }
 
     #[test]

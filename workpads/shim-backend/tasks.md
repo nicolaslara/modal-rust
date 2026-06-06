@@ -230,6 +230,21 @@ Status: pending
 - fallback: retain the static shim materialized to an OS cache dir (Option 5E) — not the user
   project — if a per-project file proves unavoidable.
 
+## P-fix-per-entrypoint-config — RUN path must not memoize first entrypoint config
+
+Status: ✅ DONE (2026-06-05)
+
+- **Boundary crossed:** facade/runtime correctness after P4/P6/secrets-volumes — one Rust app can
+  expose multiple entrypoints with divergent decorator config, and `.remote()` must apply the
+  invoked entrypoint's effective gpu/timeout/cache/secrets/volumes instead of silently reusing the
+  first-created wrapper.
+- **acceptance:** an offline `modal-rust-testkit` regression reproduces CPU-first then GPU-second
+  order dependence against `FunctionCreate`; the fix keys created RUN wrappers by effective
+  entrypoint config (sharing only identical configs) and the regression passes. Deploy must also
+  reject divergent deploy-time configs or otherwise make the limitation explicit.
+- **evidence:** failing test command + fixed test command; focused cargo fmt/clippy/test results;
+  knowledge note explaining the key/limitation.
+
 ## P-harden — image + upload robustness pass (2026-06-04, user-requested)
 
 Status: ✅ DONE (workflow `harden-image-upload`) — both tracks proven live; 3/3 reviews PASS.

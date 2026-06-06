@@ -126,8 +126,25 @@ impl FunctionVolumeMount {
 pub struct FunctionSpec {
     /// Importable module name (e.g. the baked wrapper, `"spike_wrapper"`).
     pub module_name: String,
-    /// Callable name within the module (e.g. `"handler"`).
+    /// Callable name within the module — the IN-CONTAINER `getattr` target Modal
+    /// resolves in FILE mode (e.g. the shared dispatch callable `"handler"`). This is
+    /// the *implementation* attribute, which may DIFFER from the app-namespace object
+    /// tag ([`app_function_name`](FunctionSpec::app_function_name)). The wrapper
+    /// dispatches by the per-call entrypoint arg, so every entrypoint shares ONE
+    /// in-container callable while carrying its OWN object tag.
     pub function_name: String,
+    /// The Modal app-namespace object TAG — the name that makes a function unique
+    /// within an app (used by `FunctionPrecreate`, `AppPublish`, and `FunctionGet`).
+    /// `None` ⇒ defaults to [`function_name`](FunctionSpec::function_name) (the
+    /// single-callable shape: object tag == in-container callable). Set this to the
+    /// ENTRYPOINT NAME so divergent per-entrypoint configs coexist as DISTINCT Modal
+    /// functions instead of colliding on one shared `"handler"` tag.
+    ///
+    /// When set AND different from `function_name`, the built [`Function`] carries
+    /// `function_name = app_function_name` (the object tag) and
+    /// `implementation_name = function_name` (the module attribute), mirroring
+    /// Modal's `@app.function(name=...)` mechanism.
+    pub app_function_name: Option<String>,
     /// Built image id ([`ModalClient::image_get_or_create`]).
     pub image_id: String,
     /// Mount ids to attach — MUST include the client mount
@@ -170,6 +187,7 @@ impl FunctionSpec {
         Self {
             module_name: module_name.into(),
             function_name: function_name.into(),
+            app_function_name: None,
             image_id: image_id.into(),
             mount_ids: Vec::new(),
             timeout_secs: 300,
@@ -178,6 +196,26 @@ impl FunctionSpec {
             volume_mounts: Vec::new(),
             secret_ids: Vec::new(),
         }
+    }
+
+    /// Set the Modal app-namespace object TAG (the unique-within-an-app name used by
+    /// precreate/publish/from_name), DECOUPLED from the in-container
+    /// [`function_name`](FunctionSpec::function_name) callable. Set this to the
+    /// ENTRYPOINT NAME so distinct entrypoints become distinct Modal functions (each
+    /// carrying its own config) instead of clobbering one shared `"handler"` tag.
+    pub fn with_app_function_name(mut self, name: impl Into<String>) -> Self {
+        self.app_function_name = Some(name.into());
+        self
+    }
+
+    /// The effective Modal object TAG: [`app_function_name`](FunctionSpec::app_function_name)
+    /// when set, else [`function_name`](FunctionSpec::function_name). This is the name
+    /// to feed `FunctionPrecreate` / `AppPublish` / `FunctionGet` so the registered
+    /// tag matches the created function.
+    pub fn object_tag(&self) -> &str {
+        self.app_function_name
+            .as_deref()
+            .unwrap_or(&self.function_name)
     }
 
     /// Attach mount ids (e.g. the client mount). Replaces any existing list.
@@ -313,9 +351,23 @@ pub fn build_function_create_request(
     precreate_function_id: &str,
     spec: &FunctionSpec,
 ) -> FunctionCreateRequest {
+    // Object tag vs in-container callable: `Function.function_name` is the
+    // app-namespace object TAG (unique within the app). When the caller decoupled it
+    // (set `app_function_name` to the entrypoint), the in-container `getattr` target
+    // moves to `implementation_name` (Modal's `@app.function(name=..)` mechanism), so
+    // every entrypoint shares ONE callable (`spec.function_name`, e.g. "handler") while
+    // owning a DISTINCT tag + config. When NOT decoupled (single-callable shape), the
+    // tag == the callable and `implementation_name` stays empty — byte-identical wire.
+    let object_tag = spec.object_tag().to_string();
+    let implementation_name = if object_tag == spec.function_name {
+        String::new()
+    } else {
+        spec.function_name.clone()
+    };
     let function = Function {
         module_name: spec.module_name.clone(),
-        function_name: spec.function_name.clone(),
+        function_name: object_tag,
+        implementation_name,
         mount_ids: spec.mount_ids.clone(),
         image_id: spec.image_id.clone(),
         function_serialized: Vec::new(), // FILE mode: empty.
@@ -736,6 +788,54 @@ mod tests {
         assert!(function.volume_mounts.is_empty(), "no volume mounts");
         assert!(function.secret_ids.is_empty(), "no secrets");
         assert!(req.function_data.is_none(), "XOR holds for CPU too");
+    }
+
+    #[test]
+    fn object_tag_defaults_to_function_name() {
+        // Not decoupled: the object tag IS the in-container callable (single-callable
+        // shape) — keeps single-function apps wire-identical.
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert_eq!(spec.object_tag(), "handler");
+        assert!(spec.app_function_name.is_none());
+    }
+
+    #[test]
+    fn with_app_function_name_decouples_tag_from_callable() {
+        // Decoupled: object tag = entrypoint name, in-container callable stays "handler".
+        let spec = FunctionSpec::new("m", "handler", "im-1").with_app_function_name("add_gpu");
+        assert_eq!(spec.object_tag(), "add_gpu");
+        assert_eq!(spec.function_name, "handler");
+    }
+
+    #[test]
+    fn build_function_create_decoupled_tag_sets_implementation_name() {
+        // Per-entrypoint object tag: `Function.function_name` becomes the entrypoint
+        // (the unique app tag) and the in-container callable moves to
+        // `implementation_name` (Modal's `name=` mechanism). Two entrypoints sharing one
+        // "handler" callable thus become DISTINCT Modal functions, not a clobber.
+        let spec = FunctionSpec::new("modal_rust_run_wrapper", "handler", "im-1")
+            .with_app_function_name("add_gpu");
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+        let function = req.function.expect("function set");
+        // Object tag = entrypoint; implementation = the shared dispatch callable.
+        assert_eq!(function.function_name, "add_gpu");
+        assert_eq!(function.implementation_name, "handler");
+        // The importlib module is unchanged (the wrapper still resolves there).
+        assert_eq!(function.module_name, "modal_rust_run_wrapper");
+    }
+
+    #[test]
+    fn build_function_create_non_decoupled_leaves_implementation_empty() {
+        // Single-callable shape (no app_function_name): tag == callable and
+        // `implementation_name` stays EMPTY — byte-identical to before this fix.
+        let spec = FunctionSpec::new("modal_rust_run_wrapper", "handler", "im-1");
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+        let function = req.function.expect("function set");
+        assert_eq!(function.function_name, "handler");
+        assert!(
+            function.implementation_name.is_empty(),
+            "non-decoupled keeps implementation_name unset (wire-identical)"
+        );
     }
 
     #[test]

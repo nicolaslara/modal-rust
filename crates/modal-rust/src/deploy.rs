@@ -256,9 +256,44 @@ fn deploy_top_layer_spec(base_image_id: &str, source_mount_id: &str, package: &s
         .with_command("ENTRYPOINT []")
 }
 
-/// Deploy (persistently) the wrapper function under the STABLE app name and return
-/// a [`DeployedApp`]. PERSISTENT: this is the ONLY path that uses `AppPublish` into
-/// a named, get-or-created app.
+/// One entrypoint to deploy: its NAME (the Modal object tag) plus its effective
+/// per-entrypoint deploy config (gpu/timeout/secrets/volumes). Built by
+/// [`App::deploy_with`](crate::App::deploy_with) from each decorated entrypoint's
+/// [`FunctionConfig`]. The shared deploy IMAGE bakes the one `modal_runner` that
+/// handles ALL entrypoints (it dispatches by the per-call entrypoint arg), so each
+/// of these becomes a DISTINCT Modal function over the SAME image, carrying its OWN
+/// config — divergent gpu/timeout/secrets/volumes coexist instead of being rejected.
+#[derive(Debug, Clone)]
+pub(crate) struct DeployEntrypoint {
+    /// The entrypoint name = the Modal object TAG (`from_name` resolves it at call).
+    pub name: String,
+    /// GPU spec for this entrypoint (`None` = CPU).
+    pub gpu: Option<String>,
+    /// Per-entrypoint timeout override (else the [`DeployConfig`] default).
+    pub timeout_secs: Option<u32>,
+    /// Named Modal secrets to attach (resolved to ids, injected as ENV VARS).
+    pub secrets: Vec<String>,
+    /// User volumes `(mount_path, volume_name)` to attach.
+    pub volumes: Vec<(String, String)>,
+}
+
+/// Sanitize an entrypoint name into a Modal object TAG (deploy parity with the RUN
+/// path's [`crate::remote::sanitize_object_tag`]).
+fn deploy_object_tag(entrypoint: &str) -> String {
+    crate::remote::sanitize_object_tag(entrypoint)
+}
+
+/// Deploy (persistently) ONE Modal function PER ENTRYPOINT under the STABLE app name
+/// and return a [`DeployedApp`]. PERSISTENT: this is the ONLY path that uses
+/// `AppPublish` into a named, get-or-created app.
+///
+/// The deploy IMAGE is built ONCE (it bakes the single `modal_runner` that handles
+/// every entrypoint by dispatch); then each entrypoint in `entrypoints` is created
+/// as a DISTINCT Modal function (object tag = the entrypoint), carrying its OWN
+/// gpu/timeout/secrets/volumes. A single persistent `AppPublish` carries the UNION
+/// so `call(app, entrypoint)` resolves the RIGHT function. When `entrypoints` is
+/// empty (the manual/no-decorator path) a single default function is published under
+/// the wrapper callable, byte-identical to the pre-fix single-function deploy.
 ///
 /// Reuses the proven ops verbatim; the structural difference vs RUN is that the
 /// source rides the image build CONTEXT (so cargo builds at image-build time) and
@@ -267,6 +302,7 @@ fn deploy_top_layer_spec(base_image_id: &str, source_mount_id: &str, package: &s
 pub(crate) async fn deploy_function(
     client: &mut ModalClient,
     config: &DeployConfig,
+    entrypoints: &[DeployEntrypoint],
 ) -> Result<DeployedApp> {
     // 1. Client mount (modal source importable in the FILE-mode container).
     let client_mount_id = client.client_mount_id(None).await?;
@@ -324,66 +360,91 @@ pub(crate) async fn deploy_function(
     let spec = deploy_top_layer_spec(&base_image_id, &source_mount_id, &config.package);
     let image_id = client.image_get_or_create(&app_id, &spec).await?;
 
-    // 5. Precreate the function (name = the wrapper callable, "handler").
-    let precreate_id = client
-        .function_precreate(&app_id, DEPLOY_WRAPPER_CALLABLE)
-        .await?;
+    // 5/6. ONE Modal function PER ENTRYPOINT over the SHARED image. The deployed
+    //      `modal_runner` handles every entrypoint by dispatch, so each entrypoint is
+    //      its OWN Modal function (object tag = the entrypoint) carrying its OWN config
+    //      (gpu/timeout/secrets/volumes). Divergent per-entrypoint configs thus coexist
+    //      instead of being rejected. The manual/no-decorator path (`entrypoints`
+    //      empty) falls back to ONE function under the wrapper callable — byte-identical
+    //      to the pre-fix single-function deploy.
+    //
+    //      All functions attach the CLIENT mount ONLY — NO source mount (the binary is
+    //      baked in the image layer). That absence IS the deploy invariant.
+    let plan: Vec<DeployEntrypoint> = if entrypoints.is_empty() {
+        vec![DeployEntrypoint {
+            name: DEPLOY_WRAPPER_CALLABLE.to_string(),
+            gpu: config.gpu.clone(),
+            timeout_secs: config.timeout_override_secs,
+            secrets: config.secrets.clone(),
+            volumes: config.volumes.clone(),
+        }]
+    } else {
+        entrypoints.to_vec()
+    };
 
-    // 6. FunctionCreate (FILE mode): CLIENT mount ONLY — NO source mount (the
-    //    binary is baked in the image layer). This absence IS the deploy invariant.
-    //    `mount_client_dependencies = true` (default, explicit) so the worker injects
-    //    the modal client dep closure at start — the add_python image has no pip layer.
-    // Decorator config: gpu rides into Resources.gpu_config; a `timeout` decorator
-    // overrides the deploy default. Deploy has no in-body build, so its timeout is
-    // purely the function's. `with_gpu(None)` is a CPU no-op (wire bytes identical).
-    let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
-    let mut fn_spec = FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
-        .with_mount_ids(vec![client_mount_id])
-        .with_mount_client_dependencies(true)
-        .with_timeout_secs(timeout)
-        .with_gpu(config.gpu.clone())?;
-    // 6b. USER secrets (`#[function(secrets=..)]`): resolve each named secret to an
-    //     id (from_name lookup) and attach → Function.secret_ids (Modal injects their
-    //     key/values as ENV VARS). Empty ⇒ no-op (wire-identical to before). Values
-    //     never logged. The DEPLOY runtime never builds, so secrets are purely the
-    //     function's runtime env — consistent with the RUN path.
-    let mut secret_ids: Vec<String> = Vec::with_capacity(config.secrets.len());
-    for name in &config.secrets {
-        secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
-    }
-    if !secret_ids.is_empty() {
-        fn_spec = fn_spec.with_secret_ids(secret_ids);
-    }
-    // 6c. USER volumes (`#[function(volumes=["/mount=name"])]`): resolve each named
-    //     volume (create-if-missing, V1) and attach at its mount_path. DEPLOY has no
-    //     cargo cache, so no `/cache` collision concern. Empty ⇒ no-op.
-    for (mount_path, name) in &config.volumes {
-        let vid = client
-            .volume_get_or_create(name, false /* v1 */, true /* create */, None)
+    let mut function_ids: HashMap<String, String> = HashMap::new();
+    let mut definition_ids: HashMap<String, String> = HashMap::new();
+    for ep in &plan {
+        let object_tag = deploy_object_tag(&ep.name);
+        // 5. Precreate under the PER-ENTRYPOINT object tag (NOT the shared callable),
+        //    so each entrypoint registers a DISTINCT function.
+        let precreate_id = client.function_precreate(&app_id, &object_tag).await?;
+
+        // 6. FunctionCreate (FILE mode): CLIENT mount ONLY. Object TAG = the entrypoint;
+        //    IN-CONTAINER callable stays DEPLOY_WRAPPER_CALLABLE ("handler") on
+        //    `implementation_name`. `mount_client_dependencies = true` (default,
+        //    explicit) so the worker injects the modal client dep closure at start.
+        let timeout = ep.timeout_secs.unwrap_or(config.timeout_secs);
+        let mut fn_spec =
+            FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
+                .with_app_function_name(&object_tag)
+                .with_mount_ids(vec![client_mount_id.clone()])
+                .with_mount_client_dependencies(true)
+                .with_timeout_secs(timeout)
+                .with_gpu(ep.gpu.clone())?;
+        // 6b. USER secrets: resolve each named secret to an id and attach →
+        //     Function.secret_ids (Modal injects their key/values as ENV VARS). Values
+        //     never logged. Empty ⇒ no-op.
+        let mut secret_ids: Vec<String> = Vec::with_capacity(ep.secrets.len());
+        for name in &ep.secrets {
+            secret_ids.push(client.secret_get_or_create(name, &[], None).await?);
+        }
+        if !secret_ids.is_empty() {
+            fn_spec = fn_spec.with_secret_ids(secret_ids);
+        }
+        // 6c. USER volumes: resolve each named volume (create-if-missing, V1) and attach
+        //     at its mount_path. DEPLOY has no cargo cache, so no `/cache` collision.
+        for (mount_path, name) in &ep.volumes {
+            let vid = client
+                .volume_get_or_create(name, false /* v1 */, true /* create */, None)
+                .await?;
+            fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
+        }
+        let created = client
+            .function_create(&app_id, &precreate_id, &fn_spec)
             .await?;
-        fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
+        function_ids.insert(object_tag.clone(), created.function_id.clone());
+        if !created.definition_id.is_empty() {
+            definition_ids.insert(created.function_id.clone(), created.definition_id.clone());
+        }
     }
-    let created = client
-        .function_create(&app_id, &precreate_id, &fn_spec)
-        .await?;
 
-    // 7. PERSISTENT AppPublish so the deploy survives and from_name resolves it.
-    let mut function_ids = HashMap::new();
-    function_ids.insert(
-        DEPLOY_WRAPPER_CALLABLE.to_string(),
-        created.function_id.clone(),
-    );
-    let mut definition_ids = HashMap::new();
-    if !created.definition_id.is_empty() {
-        definition_ids.insert(created.function_id.clone(), created.definition_id.clone());
-    }
+    // 7. PERSISTENT AppPublish carrying the UNION of every per-entrypoint function, so
+    //    the deploy survives and `from_name(app, entrypoint)` resolves each one.
     let published = client
-        .app_publish_deployed(&app_id, &config.app_name, function_ids, definition_ids)
+        .app_publish_deployed(
+            &app_id,
+            &config.app_name,
+            function_ids.clone(),
+            definition_ids,
+        )
         .await?;
 
-    // 8. Resolve the invokable function_id (proves from_name works post-deploy).
+    // 8. Resolve ONE invokable function_id (the first entrypoint) to prove from_name
+    //    works post-deploy. `call(app, entrypoint)` re-resolves the right one by tag.
+    let first_tag = deploy_object_tag(&plan[0].name);
     let function_id = client
-        .function_from_name(&config.app_name, DEPLOY_WRAPPER_CALLABLE, None)
+        .function_from_name(&config.app_name, &first_tag, None)
         .await?;
 
     Ok(DeployedApp {
@@ -406,8 +467,11 @@ pub(crate) async fn call_function(
     entrypoint: &str,
     input_json: String,
 ) -> Result<String> {
+    // Resolve the PER-ENTRYPOINT deployed function by its object tag (the entrypoint),
+    // NOT the shared wrapper callable — each entrypoint is its own Modal function now.
+    let object_tag = deploy_object_tag(entrypoint);
     let function_id = client
-        .function_from_name(app_name, DEPLOY_WRAPPER_CALLABLE, None)
+        .function_from_name(app_name, &object_tag, None)
         .await?;
     let empty_kwargs: HashMap<String, ()> = HashMap::new();
     let envelope: String = client

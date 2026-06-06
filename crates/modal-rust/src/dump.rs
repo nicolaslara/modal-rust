@@ -398,16 +398,20 @@ impl crate::App {
             .with_command("ENTRYPOINT []");
         let image_id = sink.image(&spec, 0);
 
-        // 5. Precreate.
+        // 5. Precreate under the PER-ENTRYPOINT object tag (the sanitized entrypoint),
+        //    exactly as `ensure_function` does — so the dump matches the wire.
+        let object_tag = crate::remote::sanitize_object_tag(entrypoint);
         sink.push(PlannedRequest::FunctionPrecreate {
-            function_name: WRAPPER_CALLABLE.to_string(),
+            function_name: object_tag.clone(),
         });
         let precreate_id = "fu-pre-1";
 
         // 6. FunctionCreate (FILE mode) — build the SAME FunctionSpec the live path
-        //    builds, then project it through the SDK builder.
+        //    builds (object tag = entrypoint; in-container callable = WRAPPER_CALLABLE),
+        //    then project it through the SDK builder.
         let timeout = cfg.timeout_override_secs.unwrap_or(cfg.timeout_secs);
         let mut fn_spec = FunctionSpec::new(WRAPPER_MODULE, WRAPPER_CALLABLE, &image_id)
+            .with_app_function_name(&object_tag)
             .with_mount_ids(vec![client_mount_id, source_mount_id])
             .with_mount_client_dependencies(true)
             .with_timeout_secs(timeout)
@@ -445,18 +449,11 @@ impl crate::App {
     ///
     /// Sync + offline. Additive — does NOT change [`deploy`](crate::App::deploy).
     pub fn dump_deploy_manifest(&self, config: &DeployConfig) -> Result<Manifest> {
-        // Fold the decorator config exactly as `App::deploy_with` does.
-        let mut config = config.clone();
-        if let Some(cfg) = self.deploy_target_config_for_dump() {
-            config.gpu = cfg.gpu.map(|s| s.to_string());
-            config.timeout_override_secs = cfg.timeout_secs;
-            config.secrets = cfg.secrets.iter().map(|s| s.to_string()).collect();
-            config.volumes = cfg
-                .volumes
-                .iter()
-                .map(|(m, n)| (m.to_string(), n.to_string()))
-                .collect();
-        }
+        let config = config.clone();
+        // Per-entrypoint deploy plan, exactly as `App::deploy_with` builds it: one
+        // function per entrypoint (object tag = entrypoint) with its OWN config; the
+        // manual/no-decorator path falls back to a single default function.
+        let plan = self.deploy_entrypoints_for_dump(&config);
 
         let mut sink = PlanningSink::new();
 
@@ -499,32 +496,36 @@ impl crate::App {
             .with_command("ENTRYPOINT []");
         let image_id = sink.image(&top_spec, 1);
 
-        // 5. Precreate.
-        sink.push(PlannedRequest::FunctionPrecreate {
-            function_name: DEPLOY_WRAPPER_CALLABLE.to_string(),
-        });
-        let precreate_id = "fu-pre-1";
-
-        // 6. FunctionCreate (FILE mode) — CLIENT mount ONLY (NO source mount: the
-        //    binary is baked in the image layer). This absence IS the deploy invariant.
-        let timeout = config.timeout_override_secs.unwrap_or(config.timeout_secs);
-        let mut fn_spec =
-            FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
-                .with_mount_ids(vec![client_mount_id])
-                .with_mount_client_dependencies(true)
-                .with_timeout_secs(timeout)
-                .with_gpu(config.gpu.clone())?;
-        let secret_ids: Vec<String> = config.secrets.iter().map(|n| sink.secret(n)).collect();
-        if !secret_ids.is_empty() {
-            fn_spec = fn_spec.with_secret_ids(secret_ids);
+        // 5/6. ONE precreate + FunctionCreate PER ENTRYPOINT over the shared image
+        //      (object tag = the entrypoint, its OWN config). CLIENT mount ONLY (NO
+        //      source mount: the binary is baked in the image layer) — the deploy
+        //      invariant. Built the SAME way `deploy_function` builds each function.
+        for ep in &plan {
+            let object_tag = crate::remote::sanitize_object_tag(&ep.name);
+            sink.push(PlannedRequest::FunctionPrecreate {
+                function_name: object_tag.clone(),
+            });
+            let precreate_id = "fu-pre-1";
+            let timeout = ep.timeout_secs.unwrap_or(config.timeout_secs);
+            let mut fn_spec =
+                FunctionSpec::new(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_CALLABLE, &image_id)
+                    .with_app_function_name(&object_tag)
+                    .with_mount_ids(vec![client_mount_id.clone()])
+                    .with_mount_client_dependencies(true)
+                    .with_timeout_secs(timeout)
+                    .with_gpu(ep.gpu.clone())?;
+            let secret_ids: Vec<String> = ep.secrets.iter().map(|n| sink.secret(n)).collect();
+            if !secret_ids.is_empty() {
+                fn_spec = fn_spec.with_secret_ids(secret_ids);
+            }
+            for (mount_path, name) in &ep.volumes {
+                let vid = sink.volume(name, false);
+                fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
+            }
+            record_function_create(&mut sink, &fn_spec, precreate_id);
         }
-        for (mount_path, name) in &config.volumes {
-            let vid = sink.volume(name, false);
-            fn_spec = fn_spec.with_volume_mount(vid, mount_path.clone());
-        }
-        record_function_create(&mut sink, &fn_spec, precreate_id);
 
-        // 7. Persistent AppPublish.
+        // 7. Persistent AppPublish (the UNION of every per-entrypoint function).
         sink.push(PlannedRequest::AppPublish {
             app_state: "deployed",
         });
@@ -682,10 +683,14 @@ mod tests {
             !render.contains("b64decode("),
             "render hides the raw base64 blob"
         );
+        // Object TAG = the entrypoint ("add"), so per-entrypoint configs never collide;
+        // the in-container "handler" callable rides on `implementation_name` (not shown).
         assert!(render.contains(
-            "FunctionCreate         module=\"modal_rust_run_wrapper\" function=\"handler\" \
+            "FunctionCreate         module=\"modal_rust_run_wrapper\" function=\"add\" \
              mount_ids=2 gpu=Some(\"T4\") timeout=1800s"
         ));
+        // Precreate is registered under the same per-entrypoint object tag.
+        assert!(render.contains("FunctionPrecreate      function=\"add\""));
         assert!(render.contains("AppPublish             state=ephemeral"));
     }
 
@@ -834,6 +839,87 @@ mod tests {
         assert!(manifest.requests.iter().any(
             |r| matches!(r, PlannedRequest::AppPublish { app_state } if *app_state == "deployed")
         ));
+        // Single entrypoint => the object tag is the entrypoint name.
+        let names: Vec<String> = manifest
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                PlannedRequest::FunctionCreate { function, .. } => Some(function.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["add".to_string()], "object tag = entrypoint");
+    }
+
+    #[test]
+    fn dump_deploy_manifest_renders_one_function_per_divergent_entrypoint() {
+        // DEPLOY now publishes one function PER ENTRYPOINT: two divergent-config
+        // entrypoints render TWO precreate+FunctionCreate pairs (distinct object tags,
+        // each its own gpu/timeout) over ONE shared image — the rejection is gone.
+        let app = App::from_manifest([
+            (
+                "cpu".to_string(),
+                modal_rust_runtime::FunctionConfig::default(),
+            ),
+            (
+                "gpu".to_string(),
+                modal_rust_runtime::FunctionConfig {
+                    gpu: Some("A100"),
+                    timeout_secs: Some(900),
+                    ..modal_rust_runtime::FunctionConfig::default()
+                },
+            ),
+        ]);
+        let dcfg = DeployConfig {
+            app_name: "multi-deploy".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: false,
+            ..DeployConfig::for_app("multi-deploy")
+        };
+        let manifest = app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+
+        // ONE base + ONE top image layer (shared), then a precreate+create per
+        // entrypoint, then ONE deployed publish.
+        assert_eq!(
+            variants(&manifest.requests),
+            vec![
+                "MountGetOrCreate", // client
+                "MountGetOrCreate", // source (build context)
+                "MountGetOrCreate", // python-standalone
+                "AppGetOrCreate",
+                "ImageGetOrCreate",  // base layer (shared)
+                "ImageGetOrCreate",  // top layer (shared, cargo build)
+                "FunctionPrecreate", // cpu
+                "FunctionCreate",    // cpu
+                "FunctionPrecreate", // gpu
+                "FunctionCreate",    // gpu
+                "AppPublish",
+            ]
+        );
+
+        // Two FunctionCreates, distinct object tags + their OWN configs (BTreeMap
+        // orders "cpu" then "gpu").
+        let creates: Vec<(String, Option<String>, u32)> = manifest
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                PlannedRequest::FunctionCreate {
+                    function,
+                    gpu,
+                    timeout_secs,
+                    ..
+                } => Some((function.clone(), gpu.clone(), *timeout_secs)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates.len(), 2, "one FunctionCreate per entrypoint");
+        assert_eq!(creates[0].0, "cpu");
+        assert_eq!(creates[0].1, None, "cpu has no gpu");
+        assert_eq!(creates[1].0, "gpu");
+        assert_eq!(creates[1].1.as_deref(), Some("A100"));
+        assert_eq!(creates[1].2, 900);
+        assert_ne!(creates[0].0, creates[1].0, "distinct object tags");
     }
 
     #[test]

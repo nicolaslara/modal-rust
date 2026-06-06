@@ -55,10 +55,11 @@ impl<'a> Function<'a> {
     ///
     /// Requires a connected App ([`App::connect`](crate::App::connect)) — otherwise
     /// [`Error::NotConnected`]. On first call the App ensures the wrapper function
-    /// exists (uploads the source crate as a mount, builds the run image, creates +
-    /// publishes the FILE-mode function); subsequent calls reuse the memoized
-    /// `function_id`. The user's Rust crate is `cargo build`-ed IN THE FUNCTION
-    /// BODY at invoke time (the run boundary), then `modal_runner` execs the
+    /// exists for this entrypoint's effective config (uploads the source crate as a
+    /// mount, builds the run image, creates + publishes the FILE-mode function);
+    /// later calls with the same config reuse the memoized `function_id`. The user's
+    /// Rust crate is `cargo build`-ed IN THE FUNCTION BODY at invoke time (the run
+    /// boundary), then `modal_runner` execs the
     /// registered handler and emits the same JSON envelope `.local()` produces.
     ///
     /// # Errors
@@ -84,9 +85,9 @@ impl<'a> Function<'a> {
     /// waiting for the output. Fetch the result later with [`FunctionCall::get`].
     ///
     /// Mirrors Modal Python's `Function.spawn`. The FIRST spawn on a fresh App
-    /// ensures the wrapper function exists (upload + create + publish), exactly as
-    /// `.remote()`; the spawned input pays the cold in-body `cargo build` when its
-    /// container first handles it (covered by the `get` poll deadline).
+    /// ensures a config-keyed wrapper function exists (upload + create + publish),
+    /// exactly as `.remote()`; the spawned input pays the cold in-body `cargo build`
+    /// when its container first handles it (covered by the `get` poll deadline).
     ///
     /// # Errors
     /// - [`Error::NotConnected`] if the App was not connected.
