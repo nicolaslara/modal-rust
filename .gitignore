@@ -28,3 +28,6 @@ __pycache__/
 
 # Workflow scripts are local-only (kept on disk, not tracked — they are bulky one-shots)
 .claude/workflows/
+
+# Local-only helper/analysis docs (not part of the published repo)
+docs/local/
