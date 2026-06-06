@@ -26,6 +26,7 @@ members = [
     "examples/background-jobs",
     "examples/error-handling",
     "examples/secrets",
+    "examples/volumes",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -53,6 +54,7 @@ default-members = [
     "examples/background-jobs",
     "examples/error-handling",
     "examples/secrets",
+    "examples/volumes",
     "examples/cuda-vector-add",
 ]
 

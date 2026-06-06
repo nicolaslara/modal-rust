@@ -1950,6 +1950,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-volumes"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "example-ways-to-call"
 version = "0.0.0"
 dependencies = [

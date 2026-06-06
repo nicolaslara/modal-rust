@@ -1,0 +1,23 @@
+[package]
+name = "example-volumes"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: mount a Modal Volume on the decorator (`#[modal_rust::function(volumes = [\"/data=my-vol\"])]`) and persist a file across calls. The body writes then reads `/data/visits.log` with plain `std::fs`; the decorator IS the config — the facade resolves the named volume and rides its mount into the FunctionCreate manifest, so the file survives between calls."
+publish = false
+
+[lib]
+name = "example_volumes"
+path = "src/lib.rs"
+
+[[bin]]
+# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

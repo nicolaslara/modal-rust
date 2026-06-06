@@ -129,6 +129,12 @@ run "error-handling: anyhow error -> function_error, details:null" '"kind":"func
 run "secrets: --describe (named secret rides through inventory)" '"secrets":["my-api-key"]' \
   "cd examples/secrets && cargo run -q --bin modal_runner -- --describe"
 
+# volumes — decorator-is-config: a named volume mounts at /data and rides through
+# inventory, proven OFFLINE via --describe (a mock test asserts the mount rides into
+# the FunctionCreate manifest). The body persists a file across calls under the mount.
+run "volumes: --describe (mounted volume rides through inventory)" '"volumes":[["/data","my-vol"]]' \
+  "cd examples/volumes && cargo run -q --bin modal_runner -- --describe"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"

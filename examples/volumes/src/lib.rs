@@ -1,0 +1,74 @@
+//! `examples/volumes` — mount a Modal Volume, persist a file across calls.
+//!
+//! Teaching ONE concept: name a Modal Volume on the decorator
+//! (`#[modal_rust::function(volumes = ["/data=my-vol"])]`) and read/write files
+//! under its mount path with plain `std::fs`. The decorator IS the config — at run /
+//! deploy time the facade resolves the named volume and rides its mount into the
+//! `FunctionCreate` manifest, so the directory `/data` is backed by persistent
+//! storage that survives between calls. The function body never names Modal; it just
+//! does `std::fs::write` / `std::fs::read_to_string`, exactly like any Rust program
+//! touching the filesystem.
+//!
+//! A Modal Volume named `my-vol` is durable storage (e.g. `modal volume create
+//! my-vol`); mounted at `/data`, anything written there is committed and visible to
+//! later calls — including a fresh container. Here each call appends one line to
+//! `/data/visits.log` and reports how many lines the file now holds, so a second
+//! call sees the first call's write.
+//!
+//! `src/bin/modal_runner.rs` is the one-line runner; `tests/manifest.rs` proves
+//! OFFLINE (no live Modal) that the named volume rides into the planned
+//! `FunctionCreate` manifest at its mount path.
+
+use modal_rust::function;
+use serde::{Deserialize, Serialize};
+
+/// Input for [`record_visit`] — the label to append for this visit.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Visit {
+    /// A short label recorded for this visit (e.g. a request id or user name).
+    pub label: String,
+}
+
+/// Output for [`record_visit`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Visits {
+    /// The number of visits the persisted log now holds — `1` on the very first
+    /// call against a fresh volume, growing by one each subsequent call. A value
+    /// greater than `1` is proof the previous call's write survived on the volume.
+    pub count: usize,
+    /// The label this call appended (echoed back from the input).
+    pub recorded: String,
+}
+
+/// Append this visit to the persisted log on the mounted volume, then read the whole
+/// log back and report how many visits it now holds.
+///
+/// The decorator mounts the Modal Volume `my-vol` at `/data`, so `/data/visits.log`
+/// is durable: the line this call appends is committed to the volume and visible to
+/// the next call (even in a fresh container). The body is plain `std::fs` — the
+/// persistence comes entirely from the mount the decorator declares.
+#[function(volumes = ["/data=my-vol"])]
+pub fn record_visit(visit: Visit) -> anyhow::Result<Visits> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    // `/data` is the volume mount; create it if the volume is freshly attached so the
+    // first call has somewhere to write.
+    std::fs::create_dir_all("/data")?;
+    let log = std::path::Path::new("/data").join("visits.log");
+
+    // Append one line for this visit.
+    let mut f = OpenOptions::new().create(true).append(true).open(&log)?;
+    writeln!(f, "{}", visit.label)?;
+    drop(f);
+
+    // Read the persisted log back: its line count is the running visit total. On a
+    // second call it includes the first call's line — that is the persistence proof.
+    let contents = std::fs::read_to_string(&log)?;
+    let count = contents.lines().count();
+
+    Ok(Visits {
+        count,
+        recorded: visit.label,
+    })
+}
