@@ -265,11 +265,12 @@ A new helper used by `cmd_run_programmatic` / `cmd_deploy_programmatic`:
   `{"ok":..}` and mirror it to exit 0/1.
 - **`deploy <e> --app <name>`** (PERSISTENT; mirrors `App::deploy_with`):
   build + describe (C.3) → `DeployConfig { ..DeployConfig::for_app(app), local_root, package }`
-  (deploy.rs:142) → `App::connect_from_manifest(...)` → `app.deploy_with(deploy_config)`. The
-  decorated-entrypoint gpu/timeout is resolved INSIDE `deploy_with` via `deploy_target_config()`
-  (app.rs:239–242, 251–257) — the CLI passes the full manifest configs and lets the existing
-  logic pick. Print the `DeployedApp` summary to stderr (informational) and a success line to
-  stdout. (Preserve current semantics: entrypoint is informational at deploy time, main.rs:259.)
+  (deploy.rs) → `App::connect_from_manifest(...)` → `app.deploy_with(deploy_config)`. The
+  CLI passes the full manifest configs; current `deploy_with` publishes one Modal function per
+  entrypoint over a shared image, so each entrypoint's gpu/timeout/secrets/volumes ride on its
+  own object tag. Print the `DeployedApp` summary to stderr (informational) and a success line
+  to stdout. The CLI's selected entrypoint is validated for typo parity with `run`, but deploy
+  publishes every described entrypoint.
 - **`call <e> --app <name> --input <json>`** (`from_name` + invoke; NO build, NO upload):
   SKIP C.3 entirely (no per-call config; the deployed wrapper already carries its config) —
   matching the current shim `call` which passes empty package (main.rs:272). Build an empty

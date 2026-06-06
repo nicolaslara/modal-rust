@@ -1065,7 +1065,7 @@ upload match the official client (add_python / CUDA-devel + rustup; cargo-metada
 
 ---
 
-### ✅ Correctness fix — per-entrypoint RUN config memoization (2026-06-05)
+### ✅ Correctness fix — per-entrypoint Modal functions (2026-06-05/06)
 
 Bug: `App::remote()` memoized exactly one RUN wrapper `function_id` per connected app. That made
 per-entrypoint decorator config order-dependent: if a CPU/default entrypoint ran first, a later GPU/timeout/
@@ -1083,23 +1083,26 @@ right: 2
 ```
 
 Fix: `RemoteHandle` now stores `function_ids: Mutex<BTreeMap<RunFunctionKey, Arc<OnceCell<String>>>>`, where
-`RunFunctionKey` is the effective gpu/timeout/cache/secrets/volumes config. Identical configs still share one
-Modal wrapper; divergent configs create distinct wrappers and keep the existing per-key single-flight behavior.
-The runner protocol and wrapper callable are unchanged.
+`RunFunctionKey` is the entrypoint name plus the effective gpu/timeout/cache/secrets/volumes config. Each
+entrypoint is created as its own Modal function object tag (`add`, `add_gpu`, etc.), while the in-container
+callable stays the shared `handler(entrypoint, input_json)` via `implementation_name`. That decoupling is the
+load-bearing part: divergent configs coexist in one app and calls route to the function id for the selected
+entrypoint instead of whichever wrapper was created first. The runner protocol and wrapper callable are unchanged.
 
-Deploy stance: deploy still publishes one named wrapper (`handler`) for the whole app, so divergent deploy-time
-configs cannot be represented correctly yet. `App::deploy_with` now rejects divergent gpu/timeout/secrets/volumes
-configs before contacting Modal instead of selecting the first arbitrary config. Identical deploy configs remain
-allowed; run-only `cache` is ignored for deploy divergence.
+Deploy stance: deploy now uses the same object-tag model. `App::deploy_with` publishes one function per
+entrypoint over one shared deploy image (the image still builds the single `modal_runner` at image-build time).
+Each deployed function carries that entrypoint's gpu/timeout/secrets/volumes, and `call(app, entrypoint)` resolves
+the per-entrypoint object tag. The earlier "reject divergent deploy-time configs" fallback was superseded by this
+proper fix.
 
 Evidence:
 
 ```text
 cargo test -p modal-rust --test mock_table divergent_entrypoint_configs_create_distinct_run_wrappers -- --nocapture
-=> ok; two FunctionCreate requests, second gpu_type="T4"
+=> ok; two FunctionCreate requests, object tags "add" and "add_gpu", second gpu_type="T4"
 
 cargo test -p modal-rust --test mock_table
-=> 3 passed
+=> 5 passed (run create, deploy create, invoke routing, cache table, manifest table)
 
 cargo test -p modal-rust app::tests
 => 8 passed

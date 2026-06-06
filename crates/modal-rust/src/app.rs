@@ -348,9 +348,9 @@ impl App {
     ///
     /// Resolves the invoked entrypoint's decorator config and applies it to a
     /// per-call clone of the path config BEFORE `ensure_function`. The created
-    /// wrapper is memoized by effective config, so entrypoints with identical
-    /// gpu/timeout/cache/secrets/volumes share a Modal function while divergent
-    /// entrypoints get separate functions.
+    /// wrapper is memoized by entrypoint plus effective config, so each entrypoint
+    /// has its own Modal object tag and a future config change cannot silently reuse
+    /// a stale function.
     ///
     /// The deadline must cover the cold in-body `cargo build` (the RUN boundary):
     /// the first call to a fresh container compiles the whole dep tree, which can

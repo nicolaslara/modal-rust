@@ -273,8 +273,9 @@ pub async fn cmd_deploy_programmatic(
     app_name: &str,
 ) -> Result<i32> {
     let (manifest, root, package) = build_and_describe(project)?;
-    // `entrypoint` is informational at deploy time (one wrapper serves every
-    // entrypoint), but validate it exists so a typo fails fast — parity with run.
+    // Deploy publishes every manifest entrypoint as its own Modal function over one
+    // shared image. The selected `entrypoint` is still not the only deployed
+    // function, but validate it exists so a typo fails fast — parity with run.
     let _ = manifest.entry(entrypoint)?;
     eprintln!(
         "modal-rust: note: entrypoint {entrypoint:?} is bound at call time, not deploy time."

@@ -57,9 +57,9 @@ impl<'a> Function<'a> {
     /// [`Error::NotConnected`]. On first call the App ensures the wrapper function
     /// exists for this entrypoint's effective config (uploads the source crate as a
     /// mount, builds the run image, creates + publishes the FILE-mode function);
-    /// later calls with the same config reuse the memoized `function_id`. The user's
-    /// Rust crate is `cargo build`-ed IN THE FUNCTION BODY at invoke time (the run
-    /// boundary), then `modal_runner` execs the
+    /// later calls to the same entrypoint with the same config reuse the memoized
+    /// `function_id`. The user's Rust crate is `cargo build`-ed IN THE FUNCTION
+    /// BODY at invoke time (the run boundary), then `modal_runner` execs the
     /// registered handler and emits the same JSON envelope `.local()` produces.
     ///
     /// # Errors

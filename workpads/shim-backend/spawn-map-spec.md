@@ -2,9 +2,9 @@
 
 Implements `Function::spawn` / `FunctionCall::get` / `Function::map` (and the SDK
 ops they need) by EXTENDING the proven invoke path. No new RPCs, no new control
-plane. The single wrapper function already serves every entrypoint; spawn/map/get
-reuse `ensure_function` + the same `(entrypoint, input_json)` CBOR args tuple that
-`.remote()` sends.
+plane. Current code resolves the same per-entrypoint Modal function id as `.remote()`
+(object tag = entrypoint, shared in-container `handler` callable), then reuses the
+same `(entrypoint, input_json)` CBOR args tuple that `.remote()` sends.
 
 ## 0. What is already proven (reuse verbatim)
 

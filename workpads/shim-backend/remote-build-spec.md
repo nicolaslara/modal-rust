@@ -324,7 +324,9 @@ def handler(entrypoint, input_json):
 The `{{PACKAGE}}` placeholder is substituted (plain `str::replace`) before
 `with_wrapper_module`. Store this as a `const WRAPPER_SRC: &str` + a fn
 `run_wrapper_src(package: &str) -> String` in the facade (`crates/modal-rust/src/
-remote.rs`) — one wrapper for the whole run path, never per-project.
+remote.rs`) — one shared wrapper source module for the run path, never a
+per-project generated file. Current code may create multiple Modal function
+objects over that same wrapper module, one per entrypoint object tag.
 
 ### 3.5 The run IMAGE
 - **Base:** `rust:{RUST_VER}-slim` (`RUST_VER="1"`) →
@@ -487,11 +489,13 @@ exists (`error.rs:27`); NO new envelope-path variant needed.
   `Default`, stored on `App`. One struct, all knobs, no per-project file.
 
 ### 4.6 Caching within a process (do NOT recreate per call)
-- The resolved invoke `function_id` is stable per App (one wrapper serves all
-  entrypoints), so key the memo on the App. Add `function_id:
-  tokio::sync::OnceCell<String>` to `RemoteHandle`; `get_or_try_init(async { steps
-  2-8 })` gives correct single-flight under concurrent `.remote()`. Subsequent calls
-  skip to step 9.
+> Superseded by the 2026-06-06 per-entrypoint config fix: the memo is no longer one
+> `function_id` per App. Current code uses `function_ids:
+> Mutex<BTreeMap<RunFunctionKey, Arc<OnceCell<String>>>>`, where `RunFunctionKey`
+> includes the entrypoint name plus effective gpu/timeout/cache/secrets/volumes. Each
+> entrypoint is created under its own Modal object tag and reuses only that
+> entrypoint+config cell; this preserves single-flight without first-call config
+> clobbering.
 - **Interior mutability:** `App::function` returns `Function<'_>` borrowing `&App`
   (`app.rs:78`), but `invoke_cbor` needs `&mut ModalClient`. Change `RemoteHandle.client`
   from owned `ModalClient` to `tokio::sync::Mutex<ModalClient>`; `.remote()` locks it for

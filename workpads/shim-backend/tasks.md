@@ -239,9 +239,10 @@ Status: ✅ DONE (2026-06-05)
   invoked entrypoint's effective gpu/timeout/cache/secrets/volumes instead of silently reusing the
   first-created wrapper.
 - **acceptance:** an offline `modal-rust-testkit` regression reproduces CPU-first then GPU-second
-  order dependence against `FunctionCreate`; the fix keys created RUN wrappers by effective
-  entrypoint config (sharing only identical configs) and the regression passes. Deploy must also
-  reject divergent deploy-time configs or otherwise make the limitation explicit.
+  order dependence against `FunctionCreate`; the fix keys created RUN wrappers by entrypoint +
+  effective config so each entrypoint gets its own Modal object tag. Deploy publishes one function
+  per entrypoint over one shared image, so divergent deploy-time configs coexist instead of
+  being first-wins or rejected.
 - **evidence:** failing test command + fixed test command; focused cargo fmt/clippy/test results;
   knowledge note explaining the key/limitation.
 

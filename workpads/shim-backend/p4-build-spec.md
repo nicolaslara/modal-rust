@@ -266,28 +266,22 @@ pub(crate) fn config_for(&self, name: &str) -> modal_rust_runtime::FunctionConfi
 Returns `FunctionConfig::default()` (all `None`) for the manual path and unknown names → defaults apply.
 
 ### 3.4 Thread the per-entrypoint config into ensure/deploy
-ONE Modal wrapper function serves EVERY entrypoint (remote.rs:26-29; deploy.rs:36-38). The per-entrypoint
-`FunctionConfig` must be resolved for the SPECIFIC entrypoint and threaded onto that single wrapper's
-`FunctionSpec`. **Chosen approach (single-GPU required path): pass the resolved config down via two new
-`RemoteConfig`/`DeployConfig` fields (§4).**
+> Superseded by the 2026-06-06 per-entrypoint Modal-function fix. The old
+> "single wrapper function serves every entrypoint" plan was the source of the
+> first-call config clobbering bug. Current code keeps one shared in-container
+> callable (`handler(entrypoint, input_json)`) but creates one Modal function object
+> tag per entrypoint. The memo key is entrypoint + effective gpu/timeout/cache/
+> secrets/volumes.
 
-- **RUN** — `remote_invoke` (app.rs:108-152) memoizes the wrapper `function_id` in a `OnceCell`
-  (app.rs:46,118-130), so the create runs once, bound at FIRST `.remote()`. Resolve the invoked
-  entrypoint's config and set it on a per-call clone of `handle.config` BEFORE calling `ensure_function`:
-  ```rust
-  // inside get_or_try_init, before ensure_function:
-  let cfg = self.config_for(entrypoint);              // entrypoint is in scope (remote_invoke arg)
-  let mut run_config = handle.config.clone();
-  run_config.gpu = cfg.gpu.map(|s| s.to_string());
-  run_config.timeout_override_secs = cfg.timeout_secs;
-  remote::ensure_function(&mut client, &handle.app_id, &handle.app_name, &run_config).await
-  ```
-  **Caveat to DOC:** config is bound at first `.remote()` (OnceCell). Acceptable for single-GPU (one app
-  typically targets one GPU class).
-- **DEPLOY** — `App::deploy_with` (app.rs ~165+) calls `deploy::deploy_function`. The deploy wrapper also
-  serves all entrypoints; pick the target entrypoint's config (P4 deploy targets one app/one wrapper — use
-  the single decorated entrypoint's config, or the named target's). Set `DeployConfig.gpu` /
-  `.timeout_override_secs` from `config_for(<entrypoint>)` before `deploy_function`.
+- **RUN** — `remote_invoke` resolves the invoked entrypoint's config, folds it into
+  a per-call clone of `RemoteConfig`, and calls `ensure_function(entrypoint, ...)`.
+  `RemoteHandle.function_ids` is a `BTreeMap<RunFunctionKey, OnceCell<_>>`, so
+  each entrypoint+config is single-flighted without binding the whole app to the
+  first entrypoint's config.
+- **DEPLOY** — `App::deploy_with` builds a per-entrypoint deploy plan and
+  `deploy::deploy_function` publishes one Modal function per entrypoint over one
+  shared deploy image. Each function carries its own gpu/timeout/secrets/volumes;
+  `call(app, entrypoint)` resolves that entrypoint's object tag.
 
 ### 3.5 Manual `App::new` path preserved
 EMPTY `configs` → `config_for` returns default → §4 uses `FunctionResources::default()` +
