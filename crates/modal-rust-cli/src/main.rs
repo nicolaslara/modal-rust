@@ -52,16 +52,18 @@ enum Commands {
         /// Also check cargo/rustc and the release `panic = "abort"` profile.
         #[arg(long)]
         rust: bool,
-        /// Project directory whose manifest chain is inspected (defaults to cwd).
-        #[arg(long, default_value = "examples/add")]
+        /// Project directory whose manifest chain is inspected (defaults to the
+        /// current directory).
+        #[arg(long, default_value = ".")]
         project: PathBuf,
     },
     /// Run the entrypoint with a RUNTIME build (programmatic ephemeral run).
     Run {
         /// The registered entrypoint name (e.g. `add`).
         entrypoint: String,
-        /// Project directory (the cargo workspace root is detected from here).
-        #[arg(long, default_value = "examples/add")]
+        /// Project directory, the crate to run (the cargo workspace root is detected
+        /// from here). Defaults to the current directory.
+        #[arg(long, default_value = ".")]
         project: PathBuf,
         #[command(flatten)]
         input: InputArg,
@@ -74,8 +76,9 @@ enum Commands {
     Deploy {
         /// The registered entrypoint name (informational; bound at call time).
         entrypoint: String,
-        /// Project directory (the cargo workspace root is detected from here).
-        #[arg(long, default_value = "examples/add")]
+        /// Project directory, the crate to deploy (the cargo workspace root is
+        /// detected from here). Defaults to the current directory.
+        #[arg(long, default_value = ".")]
         project: PathBuf,
         /// The persistent Modal app name to deploy under.
         #[arg(long, default_value = DEFAULT_DEPLOY_APP)]
