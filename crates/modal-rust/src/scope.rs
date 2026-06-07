@@ -162,6 +162,29 @@ pub(crate) fn workspace_closure(
     Ok(build_closure_upload(&metadata, package, dirs))
 }
 
+/// The cargo-metadata dependency-closure crate dirs of `package` rooted at
+/// `workspace_root` — exactly the set of directories whose `.rs`/`Cargo.toml` source can
+/// change what the runner's `--describe` emits (the registry + per-entrypoint configs).
+///
+/// This is the LENIENT closure (it tolerates out-of-workspace path-deps, like the
+/// `--describe` shadow build), but it returns ONLY the `dirs` — no rewritten manifests or
+/// `Cargo.lock` — because the sole consumer (the CLI's describe MANIFEST CACHE) hashes
+/// source files itself. Returns `None` on the soft-fallback conditions (metadata
+/// unavailable / target not a workspace member), in which case the CLI simply does not
+/// cache (build-every-time, the prior behavior).
+///
+/// `pub` (re-exported by `lib.rs`) so the `modal-rust` CLI reuses the facade's ONE
+/// closure resolution instead of re-shelling `cargo metadata`.
+pub fn describe_cache_inputs(workspace_root: &Path, package: &str) -> Option<Vec<PathBuf>> {
+    let manifest = workspace_root.join("Cargo.toml");
+    if !manifest.is_file() {
+        return None;
+    }
+    let metadata = run_cargo_metadata(&manifest)?;
+    let ClosureResult { dirs, .. } = closure_from_metadata(&metadata, package)?;
+    Some(dirs)
+}
+
 /// Like [`workspace_closure`] but LENIENT toward out-of-workspace path-deps: it returns
 /// the closure even when a normal path-dep escapes the workspace, because the LOCAL
 /// `--describe` SHADOW build (the sole caller) CAN resolve such deps against the user's

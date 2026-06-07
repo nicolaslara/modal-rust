@@ -15,6 +15,7 @@
 //!   - `deploy <entrypoint>` — programmatic persistent deploy.
 //!   - `call <entrypoint>` — programmatic `from_name` + invoke.
 
+mod describe_cache;
 mod doctor;
 mod programmatic;
 mod workspace;

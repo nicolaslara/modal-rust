@@ -138,6 +138,11 @@ pub use runner_gen::{
     injected_runner_rel_path, materialize_shadow, render_runner_main, resolve_runner_target,
     RunnerTarget,
 };
+// The describe MANIFEST CACHE inputs (P-A.3): the dependency-closure crate dirs whose
+// source can change the runner's `--describe` output. The `modal-rust` CLI hashes these
+// (+ `Cargo.lock`) to key the cached manifest, reusing the facade's ONE closure
+// resolution instead of re-shelling `cargo metadata`. LIGHT (scope.rs has no SDK dep).
+pub use scope::describe_cache_inputs;
 
 /// Shared lock serializing the unit tests that mutate the SHARED process env
 /// (`MODAL_RUST_*`). `cargo test` runs a binary's tests in parallel threads, so two

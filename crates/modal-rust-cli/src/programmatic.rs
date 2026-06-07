@@ -3,19 +3,26 @@
 //! Instead of rendering a Python shim and shelling out to the official `modal` CLI,
 //! the CLI drives the proven SDK/facade orchestration directly:
 //!
-//! 1. `cargo build --release -p <package> --bin modal_runner` (cwd = workspace root)
-//!    — the SAME `-p <pkg>` the shims used. This LOCAL build is for the manifest
+//! 1. `cargo build -p <package> --bin modal_runner` (DEBUG; cwd = workspace root) —
+//!    the SAME `-p <pkg>` the shims used. DEBUG (not `--release`) so it REUSES the
+//!    user's normal `cargo build`/`cargo check` debug artifacts instead of paying a
+//!    cold release compile in a throwaway target. This LOCAL build is for the manifest
 //!    ONLY; the REMOTE build still happens per the frozen build boundary (in-body for
-//!    `run`, at image-build for `deploy`). The CLI does NOT upload this local binary.
-//! 2. Run `<workspace_root>/target/release/modal_runner --describe`, parse the
-//!    `modal-rust/describe@1` manifest (entrypoints + per-entrypoint `FunctionOptions`).
+//!    `run`, at image-build for `deploy`, both `--release`). The CLI does NOT upload
+//!    this local binary.
+//! 2. Run `<target>/debug/modal_runner --describe`, parse the `modal-rust/describe@1`
+//!    manifest (entrypoints + per-entrypoint `FunctionOptions`).
+//!
+//! A MANIFEST CACHE (`describe_cache`) keyed on the closure source + `Cargo.lock` short-
+//! circuits steps 1+2 entirely on a hit (0s): the manifest is the only thing the CLI
+//! needs from the local build, so a cached copy is a complete substitute.
 //! 3. Drive the facade `App`: `run` = ephemeral app (`remote_envelope`), `deploy` =
 //!    persistent (`deploy_with`), `call` = `from_name` + invoke (`call_envelope`).
 //!
 //! It emits NO generated `.py` and spawns NO `modal` subprocess. The only
 //! subprocesses are `cargo` (build) and the user's `modal_runner` (`--describe`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +30,7 @@ use serde::Deserialize;
 
 use modal_rust::{App, DeployConfig, FunctionOptions, RemoteConfig};
 
+use crate::describe_cache;
 use crate::workspace;
 
 /// The `--describe` manifest schema this CLI understands. The CLI warns-and-proceeds
@@ -105,14 +113,22 @@ fn check_schema(schema: &str) -> Result<()> {
 /// temp shadow, which is local-build-only and removed before return.
 ///
 /// Auto-detect (inject-bin, design B):
-/// - If the target crate ALREADY ships a `modal_runner` bin → build it at the real
-///   workspace root and run `target/release/modal_runner --describe` (today's path,
-///   backward-compatible, byte-identical).
+/// - If the target crate ALREADY ships a `modal_runner` bin → build it DEBUG at the
+///   real workspace root and run `<target>/debug/modal_runner --describe` (today's
+///   path, backward-compatible, byte-identical manifest — only the profile changed).
 /// - Otherwise GENERATE: materialize a temp SHADOW copy of the crate's cargo
 ///   dependency closure with the generated `src/bin/modal_runner.rs` injected, build
-///   `-p <pkg> --bin modal_runner` THERE (cwd = shadow root), and run the shadow's
-///   `target/release/modal_runner --describe`. The user's on-disk `src/` is never
-///   touched; the shadow resolves `modal-rust` identically to the real upload.
+///   `-p <pkg> --bin modal_runner` (DEBUG) THERE (cwd = shadow root) but with
+///   `CARGO_TARGET_DIR` pointed at the USER's shared target so the ~190 dep crates are
+///   CACHE HITS (only the copied lib + the tiny generated bin recompile, ~0.5s), then
+///   run the shared target's `debug/modal_runner --describe`. The user's on-disk `src/`
+///   is never touched; the shadow resolves `modal-rust` identically to the real upload.
+///
+/// A debug profile (not `--release`) is correct because `--describe` only reads the
+/// inventory registry + per-entrypoint `FunctionOptions` and serializes JSON — the
+/// manifest is profile-independent. Debug lets the local build reuse the user's warm
+/// debug artifacts; the REMOTE runner is built remotely (`--release`), so the local
+/// binary is throwaway either way.
 fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, String)> {
     let root = workspace::workspace_root(project)?;
     // `-p <pkg>` disambiguates the shared `modal_runner` bin across workspace members
@@ -124,6 +140,30 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
     // target manifest the upload path uses, so the decision cannot drift.
     let target = modal_rust::resolve_runner_target(&root, &package);
     let generate = target.as_ref().map(|t| t.is_generatable()).unwrap_or(false);
+
+    // The user's REAL target dir (honoring a custom `CARGO_TARGET_DIR`, else
+    // `<root>/target`). This is where BOTH the own-bin build (via cwd=root) and the
+    // shadow build (via the env we set below) deposit artifacts, and where the manifest
+    // cache lives — so describe artifacts reuse the user's warm deps and travel with the
+    // gitignored `target/`.
+    let shared_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+
+    // MANIFEST CACHE consult: a hit returns the parsed manifest with NO build + NO exec
+    // (0s). The key cannot be computed (→ `None`) when metadata is unavailable, in which
+    // case we fall through to building, exactly the prior behavior. The stored bytes are
+    // re-validated through the SAME parse + schema check the live path uses, so a corrupt
+    // entry degrades to a rebuild, never a bad manifest.
+    let cache_key = describe_cache::key(&root, &package, generate);
+    if let Some(key) = &cache_key {
+        if let Some(bytes) = describe_cache::load(&shared_target, key) {
+            if let Ok(manifest) = parse_and_check(&bytes) {
+                eprintln!("modal-rust: describe cache hit ({package}); skipping build");
+                return Ok((manifest, root, package));
+            }
+        }
+    }
 
     // Pick the BUILD root: a temp shadow when generating, else the real root. Held in
     // an Option so the shadow temp dir is cleaned up on EVERY exit path.
@@ -146,21 +186,22 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
 
     // 1. LOCAL build (manifest-only; NOT uploaded). cwd = the build root, inheriting
     //    stderr so the compile log streams. `Command::new("cargo")` — NOT `modal`.
+    //    DEBUG (no `--release`) to reuse the user's warm artifacts. For the SHADOW build,
+    //    point `CARGO_TARGET_DIR` at the user's shared target so the dep crates resolve
+    //    against the user's warm fingerprints (cache hits). The own-bin build already
+    //    deposits into the user's target via cwd=root (inheriting their CARGO_TARGET_DIR).
     if generate {
         eprintln!("modal-rust: generating {package} modal_runner (shadow build) for --describe …");
     } else {
         eprintln!("modal-rust: building {package} modal_runner (cargo) for --describe …");
     }
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "-p",
-            &package,
-            "--bin",
-            "modal_runner",
-        ])
-        .current_dir(build_root)
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", &package, "--bin", "modal_runner"])
+        .current_dir(build_root);
+    if generate {
+        cmd.env("CARGO_TARGET_DIR", &shared_target);
+    }
+    let status = cmd
         .status()
         .context("failed to spawn `cargo` (is it on $PATH? run `modal-rust doctor --rust`)")?;
     if !status.success() {
@@ -170,11 +211,15 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
         );
     }
 
-    // 2. Run `modal_runner --describe`, capture stdout, parse the manifest.
-    let runner_bin = build_root
-        .join("target")
-        .join("release")
-        .join("modal_runner");
+    // 2. Run `modal_runner --describe`, capture stdout, parse the manifest. The shadow
+    //    build deposits into the SHARED target (via the env above); the own-bin build
+    //    deposits into the build root's own target (= the shared target, since cwd=root).
+    let target_dir = if generate {
+        shared_target.clone()
+    } else {
+        build_root.join("target")
+    };
+    let runner_bin = target_dir.join("debug").join("modal_runner");
     let out = Command::new(&runner_bin)
         .arg("--describe")
         .output()
@@ -187,14 +232,29 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let manifest: Manifest = serde_json::from_slice(&out.stdout)
-        .context("failed to parse `modal_runner --describe` manifest JSON")?;
-    check_schema(&manifest.schema)?;
+    let manifest = parse_and_check(&out.stdout)?;
+
+    // Store the verbatim manifest bytes for the next invocation (best-effort; a read-only
+    // target or an uncomputable key silently skips the write — never an error).
+    if let Some(key) = &cache_key {
+        describe_cache::store(&shared_target, key, &out.stdout);
+    }
 
     // The shadow (if any) is dropped here, removing the temp tree. The returned
     // `root` is the REAL workspace root (the upload root), not the shadow.
     drop(shadow);
     Ok((manifest, root, package))
+}
+
+/// Parse `--describe` stdout into a [`Manifest`] and validate its schema. The SAME
+/// validation runs on both the live build's stdout AND the cached bytes, so a corrupt or
+/// schema-incompatible cache file degrades to `Err` (→ the caller rebuilds), never a bad
+/// manifest.
+fn parse_and_check(bytes: &[u8]) -> Result<Manifest> {
+    let manifest: Manifest = serde_json::from_slice(bytes)
+        .context("failed to parse `modal_runner --describe` manifest JSON")?;
+    check_schema(&manifest.schema)?;
+    Ok(manifest)
 }
 
 /// A temp shadow build dir removed on drop (so `build_and_describe` cleans up on every
