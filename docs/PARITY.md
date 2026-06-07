@@ -103,9 +103,9 @@ Our `ImageSpec` (`ops/image.rs`) is a single-builder recipe, not a chainable
 |---|---|---|
 | `from_registry` (2084) | **Have** | `ImageSpec::from_registry`. |
 | `add_python` provisioning | **Have** | python-build-standalone `COPY`/`ln`/`ENV` branch, `_image.py:2041-2059`. `ImageSpec::with_add_python`. |
-| `run_commands` (1893) | **Have** | `ImageSpec::with_command` (raw `RUN`/`ENV`/`COPY` lines). |
-| `apt_install` (2508) | **Partial** | `ImageSpec::with_apt` exists but renders into `pre_bake_commands`, intended as a runtime-provisioning fallback, not a general chainable step. |
-| `pip_install` (992) | **Partial** | Only `with_pip_install_modal()` — installs `modal` itself, not arbitrary packages. No general `pip_install(["pkg", ...])`. Medium effort. |
+| `run_commands` (1893) | **Have** | `ImageSpec::with_run_commands([..])` (a general chainable build step, each → `RUN <cmd>`), plus the raw `ImageSpec::with_command` escape hatch. Exposed via `RemoteConfig::image_steps` / `DeployConfig::image_steps` as `ImageStep::run`. |
+| `apt_install` (2508) | **Have** | `ImageSpec::with_apt_install([..])` — a general chainable step (`RUN apt-get update && install … && clean`). Exposed via `ImageStep::apt`. (`with_apt` still targets `pre_bake_commands` for the bake-runtime fallback.) |
+| `pip_install` (992) | **Have** | `ImageSpec::with_pip_install([..])` — arbitrary Python packages (`RUN python3 -m pip install --no-cache-dir …`). Exposed via `ImageStep::pip`. (`with_pip_install_modal()` still provisions the modal client closure.) |
 | context mount + `COPY` (`add_local_dir`/`copy=True`, 771) | **Have** | `with_context_mount` + a `COPY` command, used by the DEPLOY path. |
 | Rust/CUDA toolchain layer | **Have** | `with_rust_toolchain` (project-specific, no Modal analogue — that's fine). |
 | `dockerfile_commands` (1765) | **Partial** | We emit a `dockerfile_commands` list internally, but there is no public "give me a list of Dockerfile lines" builder method on a user-facing Image type. |
@@ -121,10 +121,13 @@ Our `ImageSpec` (`ops/image.rs`) is a single-builder recipe, not a chainable
 | `pip_install_private_repos` (1078) | **Missing** | |
 
 Net: we have the **registry + add_python + raw-commands + context-COPY + toolchain**
-slice that the Rust build path needs. The broad Python-ecosystem package-management
-surface (pip/uv/poetry/micromamba/requirements) is largely **Missing** — and mostly
-irrelevant to a Rust workload, except `pip_install`/`run_commands` for arbitrary
-system deps, which is the highest-value gap here.
+slice that the Rust build path needs, plus general chainable **`apt_install` /
+`pip_install` / `run_commands`** image-builder steps (exposed as
+`RemoteConfig::image_steps` / `DeployConfig::image_steps` `ImageStep`s; see
+`examples/pip-apt-image`) for arbitrary system/runtime deps a Rust binary may
+dynamically link. The remaining Python-ecosystem package-management surface
+(uv/poetry/micromamba/requirements) is **Missing** — and mostly irrelevant to a Rust
+workload.
 
 ---
 
@@ -274,8 +277,9 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
    (`FunctionResources`); only the macro/facade wiring is missing. Cheapest win.
 2. ~~**`retries`**~~ — DONE (int form): `#[function(retries = N)]` → `retry_policy`.
    Remaining: the `Retries(...)` struct form (custom backoff/initial/max delay).
-3. **General `pip_install` / `apt_install` / `run_commands` image steps** — lets
-   users add arbitrary system/runtime deps a Rust binary may dynamically link.
+3. ~~**General `pip_install` / `apt_install` / `run_commands` image steps**~~ — DONE:
+   `RemoteConfig::image_steps` / `DeployConfig::image_steps` carry ordered `ImageStep`s
+   (`apt`/`pip`/`run`) rendered into the image dockerfile; `examples/pip-apt-image`.
 4. **Inline `secrets = {dict}` / `required_keys`** — `required_keys` is a one-field
    macro addition (SDK-side done); inline dict needs facade resolve.
 5. **`min/max/buffer_containers` + `scaledown_window`** — basic autoscaling control.

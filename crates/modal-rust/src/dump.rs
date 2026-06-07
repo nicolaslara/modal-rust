@@ -433,6 +433,7 @@ impl crate::App {
             },
             base_image: &cfg.base_image,
             install_rust: cfg.install_rust,
+            image_steps: &cfg.image_steps,
             cache: cfg.options.cache.unwrap_or(cfg.cache),
             entrypoints: &entrypoints,
         };
@@ -482,6 +483,7 @@ impl crate::App {
             },
             base_image: &config.base_image,
             install_rust: config.install_rust,
+            image_steps: &config.image_steps,
             cache: false,
             entrypoints: &entrypoints,
         };
@@ -922,6 +924,116 @@ mod tests {
         assert_eq!(creates[1].1.as_deref(), Some("A100"));
         assert_eq!(creates[1].2, 900);
         assert_ne!(creates[0].0, creates[1].0, "distinct object tags");
+    }
+
+    #[test]
+    fn dry_run_image_steps_ride_into_the_run_image_dockerfile() {
+        // PARITY.md §3: apt_install / pip_install / run_commands ride the RUN image
+        // dockerfile (layer 0), in chain order, AFTER provisioning and BEFORE the
+        // (baked) wrapper. Build-path config on RemoteConfig, not the decorator.
+        use crate::ImageStep;
+        let app = App::from_manifest([("add".to_string(), FunctionConfig::default())]);
+        let cfg = RemoteConfig {
+            image_steps: vec![
+                ImageStep::apt(["libpng-dev"]),
+                ImageStep::pip(["numpy"]),
+                ImageStep::run(["echo hi > /opt/marker"]),
+            ],
+            ..run_cfg()
+        };
+        let manifest = app.dry_run("add", &cfg).expect("dry_run");
+        let img = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::ImageGetOrCreate {
+                    dockerfile_commands,
+                    layer: 0,
+                } => Some(dockerfile_commands.clone()),
+                _ => None,
+            })
+            .expect("RUN image (layer 0)");
+
+        let apt = img
+            .iter()
+            .position(|c| c.contains("apt-get install") && c.contains("libpng-dev"))
+            .expect("apt_install rendered");
+        let pip = img
+            .iter()
+            .position(|c| c == "RUN python3 -m pip install --no-cache-dir numpy")
+            .expect("pip_install rendered");
+        let run = img
+            .iter()
+            .position(|c| c == "RUN echo hi > /opt/marker")
+            .expect("run_commands rendered");
+        let copy = img
+            .iter()
+            .position(|c| c == "COPY /python/. /usr/local")
+            .expect("add_python provisioning present");
+        let bake = img
+            .iter()
+            .position(|c| c.contains("b64decode("))
+            .expect("wrapper bake present");
+
+        assert!(
+            apt < pip && pip < run,
+            "chain order preserved (apt<pip<run)"
+        );
+        assert!(copy < apt, "provisioning precedes the image steps");
+        assert!(run < bake, "image steps precede the wrapper bake");
+        // RUN image still has no cargo build (builds in-body).
+        assert!(!img.iter().any(|c| c.contains("cargo build")));
+    }
+
+    #[test]
+    fn dump_deploy_image_steps_ride_into_the_base_layer_not_the_top() {
+        // The DEPLOY base layer (layer 0) carries the image steps so the TOP layer's
+        // image-build-time cargo build inherits the deps; the top layer (layer 1) keeps
+        // the COPY + cargo build, with NO image-step duplication.
+        use crate::ImageStep;
+        let app = App::from_manifest([("add".to_string(), FunctionConfig::default())]);
+        let dcfg = DeployConfig {
+            app_name: "dep".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: false,
+            image_steps: vec![ImageStep::apt(["libssl-dev"]), ImageStep::pip(["requests"])],
+            ..DeployConfig::for_app("dep")
+        };
+        let manifest = app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+        let layer = |n: u8| {
+            manifest
+                .requests
+                .iter()
+                .find_map(|r| match r {
+                    PlannedRequest::ImageGetOrCreate {
+                        dockerfile_commands,
+                        layer,
+                    } if *layer == n => Some(dockerfile_commands.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("layer {n} image present"))
+        };
+        let base = layer(0);
+        let top = layer(1);
+
+        // Base layer carries the steps + provisioning, NO cargo build.
+        assert!(base
+            .iter()
+            .any(|c| c.contains("apt-get install") && c.contains("libssl-dev")));
+        assert!(base
+            .iter()
+            .any(|c| c == "RUN python3 -m pip install --no-cache-dir requests"));
+        assert!(!base.iter().any(|c| c.contains("cargo build")));
+
+        // Top layer keeps COPY + cargo build and does NOT duplicate the image steps.
+        assert!(top.iter().any(|c| c.contains("cargo build --release")));
+        assert!(top.iter().any(|c| c == "COPY . /"));
+        assert!(
+            !top.iter()
+                .any(|c| c.contains("libssl-dev") || c.contains("pip install")),
+            "image steps live ONLY on the base layer"
+        );
     }
 
     #[test]

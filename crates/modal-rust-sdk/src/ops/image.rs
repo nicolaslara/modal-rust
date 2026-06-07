@@ -82,6 +82,16 @@ pub struct ImageSpec {
     /// Wrapper modules to bake: `(module_name, python_source)`. Each is written to
     /// `/root/<module_name>.py` (an importable path inside the container).
     pub wrapper_modules: Vec<(String, String)>,
+    /// User image-builder steps (PARITY.md §3: `pip_install` / `apt_install` /
+    /// `run_commands`), already rendered to Dockerfile `RUN` lines, IN THE ORDER the
+    /// user chained them. Emitted AFTER the python/rust provisioning (so `pip`/`apt`
+    /// have a Python/toolchain on PATH) and BEFORE the wrapper bakes (so any system
+    /// lib a Rust binary dynamically links is present when the runner runs — and on
+    /// the DEPLOY base layer, present when `cargo build` runs at image-build time).
+    /// Default empty ⇒ NO rendered-command drift on the default path. See
+    /// [`ImageSpec::with_pip_install`], [`ImageSpec::with_apt_install`],
+    /// [`ImageSpec::with_run_commands`].
+    pub builder_steps: Vec<String>,
     /// Extra raw `RUN`/`ENV`/… Dockerfile commands appended after the bakes.
     pub extra_commands: Vec<String>,
     /// Off by default: append `RUN python3 -m pip install --no-cache-dir modal` to
@@ -145,6 +155,7 @@ impl ImageSpec {
             base_image: base_image.into(),
             pre_bake_commands: Vec::new(),
             wrapper_modules: Vec::new(),
+            builder_steps: Vec::new(),
             extra_commands: Vec::new(),
             pip_install_modal: false,
             context_mount_id: None,
@@ -202,6 +213,69 @@ impl ImageSpec {
     /// the modal *source* (see the module docs).
     pub fn with_pip_install_modal(mut self) -> Self {
         self.pip_install_modal = true;
+        self
+    }
+
+    /// Image-builder step (PARITY.md §3, Modal `_image.py:992` `pip_install`): install
+    /// arbitrary Python packages. Renders the canonical single `RUN` line:
+    ///
+    /// ```text
+    /// RUN python3 -m pip install --no-cache-dir <pkgs>
+    /// ```
+    ///
+    /// Appended to [`builder_steps`] in chain order (so it composes with
+    /// [`with_apt_install`](ImageSpec::with_apt_install) /
+    /// [`with_run_commands`](ImageSpec::with_run_commands), preserving the user's
+    /// ordering). No-op for an empty slice. `python3 -m pip` is the universal launcher
+    /// (works on the standalone interpreter `add_python` provisions and on stock
+    /// `python:` bases); `--no-cache-dir` keeps the throwaway build image lean.
+    ///
+    /// [`builder_steps`]: ImageSpec::builder_steps
+    pub fn with_pip_install(mut self, packages: &[&str]) -> Self {
+        if !packages.is_empty() {
+            let pkgs = packages.join(" ");
+            self.builder_steps
+                .push(format!("RUN python3 -m pip install --no-cache-dir {pkgs}"));
+        }
+        self
+    }
+
+    /// Image-builder step (PARITY.md §3, Modal `_image.py:2508` `apt_install`): install
+    /// arbitrary system packages. Renders the proven single `RUN` form (update +
+    /// install + clean) so quoting is correct and no apt cache is left in the layer:
+    ///
+    /// ```text
+    /// RUN apt-get update && apt-get install -y --no-install-recommends <pkgs> && rm -rf /var/lib/apt/lists/*
+    /// ```
+    ///
+    /// Appended to [`builder_steps`] in chain order. No-op for an empty slice. Unlike
+    /// [`with_apt`](ImageSpec::with_apt) (which targets `pre_bake_commands`, the
+    /// runtime the BAKE step itself needs), this is a general chainable image step that
+    /// composes with `pip_install` / `run_commands` in user order.
+    ///
+    /// [`builder_steps`]: ImageSpec::builder_steps
+    pub fn with_apt_install(mut self, packages: &[&str]) -> Self {
+        if !packages.is_empty() {
+            let pkgs = packages.join(" ");
+            self.builder_steps.push(format!(
+                "RUN apt-get update && apt-get install -y --no-install-recommends {pkgs} \
+                 && rm -rf /var/lib/apt/lists/*"
+            ));
+        }
+        self
+    }
+
+    /// Image-builder step (PARITY.md §3, Modal `_image.py:1893` `run_commands`): run
+    /// arbitrary shell commands at image-build time. Each command renders as one
+    /// `RUN <cmd>` line, appended to [`builder_steps`] in chain order. No-op for an
+    /// empty slice. The commands are emitted VERBATIM (the user owns the shell), so
+    /// they compose with `pip_install` / `apt_install` in the order chained.
+    ///
+    /// [`builder_steps`]: ImageSpec::builder_steps
+    pub fn with_run_commands(mut self, commands: &[&str]) -> Self {
+        for cmd in commands {
+            self.builder_steps.push(format!("RUN {cmd}"));
+        }
         self
     }
 
@@ -366,6 +440,14 @@ impl ImageSpec {
             );
             cmds.push("ENV CUDA_PATH=/usr/local/cuda".to_string());
         }
+
+        // User image-builder steps (pip_install / apt_install / run_commands), in the
+        // order chained. Rendered AFTER the python/rust provisioning (so pip/apt find a
+        // Python/toolchain on PATH) and BEFORE the wrapper bakes — so a system lib a
+        // Rust binary dynamically links is present at runtime (RUN path) and at
+        // image-build time (DEPLOY base layer feeds the top layer's `cargo build`).
+        // Empty by default ⇒ byte-identical default path.
+        cmds.extend(self.builder_steps.iter().cloned());
 
         for (module_name, source) in &self.wrapper_modules {
             cmds.push(bake_command(module_name, source));
@@ -838,6 +920,84 @@ mod tests {
         assert!(cmds[1].contains("python3 -m pip install"));
         assert!(cmds[1].contains("--break-system-packages"));
         assert!(cmds[1].ends_with(" modal"));
+    }
+
+    #[test]
+    fn builder_steps_render_after_provisioning_in_chain_order_before_bake() {
+        // PARITY.md §3: pip_install / apt_install / run_commands as general chainable
+        // image-builder steps. They render AFTER the add_python provisioning and BEFORE
+        // the wrapper bake, preserving the user's chain order across the three kinds.
+        let cmds = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py-standalone")
+            .with_apt_install(&["libpng-dev", "libjpeg-dev"])
+            .with_pip_install(&["numpy", "pillow"])
+            .with_run_commands(&["echo built > /opt/marker"])
+            .with_wrapper_module(
+                "modal_rust_run_wrapper",
+                "def handler(e, i):\n    return i\n",
+            )
+            .with_command("ENTRYPOINT []")
+            .dockerfile_commands();
+
+        // The exact rendered lines.
+        let apt = "RUN apt-get update && apt-get install -y --no-install-recommends \
+                   libpng-dev libjpeg-dev && rm -rf /var/lib/apt/lists/*";
+        let pip = "RUN python3 -m pip install --no-cache-dir numpy pillow";
+        let run = "RUN echo built > /opt/marker";
+
+        let pos = |needle: &str| {
+            cmds.iter()
+                .position(|c| c == needle)
+                .unwrap_or_else(|| panic!("missing dockerfile command {needle:?} in {cmds:?}"))
+        };
+        let copy = cmds
+            .iter()
+            .position(|c| c == "COPY /python/. /usr/local")
+            .expect("add_python COPY present");
+        let apt_i = pos(apt);
+        let pip_i = pos(pip);
+        let run_i = pos(run);
+        let bake = cmds
+            .iter()
+            .position(|c| c.contains("/root/modal_rust_run_wrapper.py"))
+            .expect("wrapper bake present");
+
+        // Chain order is preserved: apt < pip < run_commands.
+        assert!(
+            apt_i < pip_i,
+            "apt_install precedes pip_install (chain order)"
+        );
+        assert!(
+            pip_i < run_i,
+            "pip_install precedes run_commands (chain order)"
+        );
+        // Provisioning precedes the steps; the steps precede the wrapper bake.
+        assert!(
+            copy < apt_i,
+            "add_python provisioning precedes the builder steps"
+        );
+        assert!(run_i < bake, "the builder steps precede the wrapper bake");
+    }
+
+    #[test]
+    fn empty_builder_steps_render_byte_identical_default_path() {
+        // No image-builder steps chained ⇒ NO extra RUN lines: the default add_python
+        // path is byte-identical to before this addition (purely additive feature).
+        let with = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py")
+            .with_apt_install(&[]) // empty ⇒ no-op
+            .with_pip_install(&[]) // empty ⇒ no-op
+            .with_run_commands(&[]) // empty ⇒ no-op
+            .with_wrapper_module("m", "x = 1\n")
+            .dockerfile_commands();
+        let without = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py")
+            .with_wrapper_module("m", "x = 1\n")
+            .dockerfile_commands();
+        assert_eq!(with, without, "empty steps render no commands");
     }
 
     #[test]

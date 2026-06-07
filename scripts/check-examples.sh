@@ -173,6 +173,15 @@ run "scheduled-job: --describe (cron schedule rides through inventory)" '"schedu
 run "custom-base: dry-run renders a CUDA-devel base FROM line" 'base:   FROM nvidia/cuda:12.6.3-devel-ubuntu22.04' \
   "cargo run -q -p example-custom-base --bin custom_base"
 
+# pip-apt-image — add arbitrary system/Python deps with real image-builder STEPS
+# (RemoteConfig.image_steps: ImageStep::apt / ::pip / ::run, mirroring Modal's
+# apt_install / pip_install / run_commands — NOT decorator config). Proven OFFLINE: the
+# driver dry-runs a config with the three steps and prints the rendered image dockerfile
+# pip line (a mock test in tests/manifest.rs asserts the full dockerfile — apt/pip/run
+# lines, in chain order, after provisioning and before the build).
+run "pip-apt-image: dry-run renders a pip install image-builder step" 'pip: RUN python3 -m pip install --no-cache-dir numpy pillow' \
+  "cargo run -q -p example-pip-apt-image --bin pip_apt_image"
+
 # deploy-and-call — the run-vs-deploy build boundary (the production model). The
 # offline driver dry-runs BOTH manifests and prints where each builds: .remote()
 # builds IN the body (RUN image carries no cargo build); deploy bakes the binary at

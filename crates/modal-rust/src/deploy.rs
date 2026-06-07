@@ -139,6 +139,13 @@ pub struct DeployConfig {
     /// [`for_app`](DeployConfig::for_app), so the `MODAL_RUST_INSTALL_RUST` env default
     /// flows through automatically (parity with `base_image`).
     pub install_rust: bool,
+    /// Ordered image-builder steps ([`ImageStep`](crate::ImageStep): `apt_install` /
+    /// `pip_install` / `run_commands`, PARITY.md §3) rendered into the deploy BASE
+    /// layer's dockerfile, in chain order — so the TOP layer's image-build-time
+    /// `cargo build` AND the deployed runtime inherit the installed deps. BUILD-path
+    /// config (like [`base_image`](DeployConfig::base_image)), not decorator config.
+    /// Default empty ⇒ byte-identical default path.
+    pub image_steps: Vec<crate::ImageStep>,
     /// Owned per-function Modal options used by the manual/no-decorator fallback
     /// function. Decorated entrypoints carry their own [`FunctionOptions`] in
     /// [`DeployEntrypoint`].
@@ -160,6 +167,7 @@ impl DeployConfig {
             base_image: base.base_image,
             timeout_secs: 300,
             install_rust: base.install_rust,
+            image_steps: base.image_steps,
             options: FunctionOptions::default(),
         }
     }
@@ -272,6 +280,7 @@ pub(crate) async fn deploy_function(
         },
         base_image: &config.base_image,
         install_rust: config.install_rust,
+        image_steps: &config.image_steps,
         cache: false, // DEPLOY builds at image-build time — no run-path cargo cache.
         entrypoints: &plan,
     };

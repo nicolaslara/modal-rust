@@ -140,6 +140,93 @@ pub(crate) fn run_wrapper_config_env(package: &str, cache: bool, remote_src: &st
 /// (highest → lowest): [`modalignore_name`](RemoteConfig::modalignore_name) (default
 /// `.modalignore`) → `.gitignore` → built-in defaults (`target/`, `.git/`,
 /// `**/*.rlib`). Both ignore files are read from the workspace root.
+///
+/// ## Image-builder steps (system / Python deps)
+///
+/// [`image_steps`](RemoteConfig::image_steps) carries ordered [`ImageStep`]s
+/// (`apt_install` / `pip_install` / `run_commands`, PARITY.md §3) the facade renders
+/// into the image dockerfile — for arbitrary system/runtime deps a Rust binary may
+/// dynamically link, or build-time tools the in-body (RUN) / image-build-time (DEPLOY)
+/// `cargo build` needs. Like [`base_image`](RemoteConfig::base_image), these are
+/// BUILD-path config (a property of HOW the crate is built), not decorator config (a
+/// property of WHAT one entrypoint computes). Default empty ⇒ byte-identical default
+/// path.
+/// One image-builder step (PARITY.md §3) — an arbitrary system/Python dependency or a
+/// raw build command rendered into the image dockerfile, IN THE ORDER chained on
+/// [`RemoteConfig::image_steps`] / [`DeployConfig::image_steps`](crate::DeployConfig::image_steps).
+/// Mirrors Modal's `_Image` builder methods (`apt_install` / `pip_install` /
+/// `run_commands`). Each variant maps to exactly one SDK `ImageSpec` builder call, so
+/// the rendered `dockerfile_commands` are the SDK's canonical forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageStep {
+    /// `apt_install([..])` — install system packages (Modal `_image.py:2508`). Renders
+    /// `RUN apt-get update && apt-get install -y --no-install-recommends <pkgs> && rm
+    /// -rf /var/lib/apt/lists/*`.
+    Apt(Vec<String>),
+    /// `pip_install([..])` — install Python packages (Modal `_image.py:992`). Renders
+    /// `RUN python3 -m pip install --no-cache-dir <pkgs>`.
+    Pip(Vec<String>),
+    /// `run_commands([..])` — run arbitrary shell commands at image-build time (Modal
+    /// `_image.py:1893`). Each renders as one `RUN <cmd>` line.
+    Run(Vec<String>),
+}
+
+impl ImageStep {
+    /// `apt_install`: a system-package step from string-like items.
+    pub fn apt<I, S>(packages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ImageStep::Apt(packages.into_iter().map(Into::into).collect())
+    }
+
+    /// `pip_install`: a Python-package step from string-like items.
+    pub fn pip<I, S>(packages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ImageStep::Pip(packages.into_iter().map(Into::into).collect())
+    }
+
+    /// `run_commands`: arbitrary shell commands from string-like items.
+    pub fn run<I, S>(commands: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        ImageStep::Run(commands.into_iter().map(Into::into).collect())
+    }
+
+    /// Apply this step to an [`ImageSpec`](modal_rust_sdk::ImageSpec), routing to the
+    /// matching SDK builder so the rendered dockerfile command is the SDK's canonical
+    /// form. Used by [`apply_image_steps`].
+    fn apply(&self, spec: modal_rust_sdk::ImageSpec) -> modal_rust_sdk::ImageSpec {
+        fn refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        match self {
+            ImageStep::Apt(pkgs) => spec.with_apt_install(&refs(pkgs)),
+            ImageStep::Pip(pkgs) => spec.with_pip_install(&refs(pkgs)),
+            ImageStep::Run(cmds) => spec.with_run_commands(&refs(cmds)),
+        }
+    }
+}
+
+/// Fold an ordered list of [`ImageStep`]s onto an [`ImageSpec`](modal_rust_sdk::ImageSpec),
+/// preserving the user's chain order. Empty ⇒ the spec is returned unchanged
+/// (byte-identical default path).
+pub(crate) fn apply_image_steps(
+    mut spec: modal_rust_sdk::ImageSpec,
+    steps: &[ImageStep],
+) -> modal_rust_sdk::ImageSpec {
+    for step in steps {
+        spec = step.apply(spec);
+    }
+    spec
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
     /// Directory uploaded as the source mount (defaults to the cargo workspace
@@ -171,6 +258,13 @@ pub struct RemoteConfig {
     /// `rust:1-slim` base already carries Rust). Env override:
     /// `MODAL_RUST_INSTALL_RUST` (`1`/`true`/`yes`/`on`).
     pub install_rust: bool,
+    /// Ordered image-builder steps ([`ImageStep`]: `apt_install` / `pip_install` /
+    /// `run_commands`, PARITY.md §3) rendered into the run image dockerfile, in chain
+    /// order, AFTER the python/rust provisioning and BEFORE the wrapper bake — so a
+    /// system lib a Rust binary dynamically links is present when the in-body runner
+    /// runs. BUILD-path config (like [`base_image`](RemoteConfig::base_image)), not
+    /// decorator config. Default empty ⇒ byte-identical default path.
+    pub image_steps: Vec<ImageStep>,
     /// Enable the P6 cargo build cache (one archive on a V2 volume at `/cache`).
     /// DEFAULT ON. Env opt-out: `MODAL_RUST_NO_CACHE` truthy. The decorator
     /// `#[function(cache=false)]` overrides this per-entrypoint (app.rs). A cache
@@ -225,6 +319,7 @@ impl Default for RemoteConfig {
             base_image: discover_base_image(),
             timeout_secs: REMOTE_TIMEOUT_SECS,
             install_rust: discover_install_rust(),
+            image_steps: Vec::new(),
             cache: discover_cache(),
             options: FunctionOptions::default(),
         }
@@ -397,6 +492,7 @@ pub(crate) async fn ensure_function(
         },
         base_image: &config.base_image,
         install_rust: config.install_rust,
+        image_steps: &config.image_steps,
         // `cache` flows from the per-function override (`options.cache`), falling back to
         // the run-level default (`config.cache`) — symmetric with `timeout` above. The
         // flat `config.cache` is the default only; it is never overwritten per entrypoint.
@@ -479,6 +575,53 @@ fn reconstruct_runner_error(error: &serde_json::Value) -> RunnerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rendered dockerfile commands a spec WOULD carry on the wire, via the SDK's
+    /// public planning projection (the private `dockerfile_commands` is SDK-internal).
+    fn rendered(spec: modal_rust_sdk::ImageSpec) -> Vec<String> {
+        modal_rust_sdk::planning::plan_image_request(&spec, "ap-1", "2025.06").dockerfile_commands
+    }
+
+    #[test]
+    fn image_steps_apply_to_spec_in_chain_order() {
+        // apply_image_steps folds apt/pip/run onto the SDK ImageSpec, routing each to
+        // the matching builder, in chain order. Asserted on the rendered dockerfile
+        // (the same list the wire carries), via the public planning projection.
+        let spec = modal_rust_sdk::ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py");
+        let steps = vec![
+            ImageStep::apt(["libssl-dev"]),
+            ImageStep::pip(["requests"]),
+            ImageStep::run(["echo ok"]),
+        ];
+        let cmds = rendered(apply_image_steps(spec, &steps));
+
+        let apt = cmds
+            .iter()
+            .position(|c| c.contains("apt-get install") && c.contains("libssl-dev"))
+            .expect("apt rendered");
+        let pip = cmds
+            .iter()
+            .position(|c| c == "RUN python3 -m pip install --no-cache-dir requests")
+            .expect("pip rendered");
+        let run = cmds
+            .iter()
+            .position(|c| c == "RUN echo ok")
+            .expect("run rendered");
+        assert!(apt < pip && pip < run, "chain order preserved");
+    }
+
+    #[test]
+    fn empty_image_steps_leave_the_spec_unchanged() {
+        // No steps ⇒ byte-identical dockerfile (purely additive default path).
+        let base = modal_rust_sdk::ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py");
+        let without = rendered(base.clone());
+        let with = rendered(apply_image_steps(base, &[]));
+        assert_eq!(with, without);
+    }
 
     #[test]
     fn sanitize_object_tag_passes_rust_fn_names_and_maps_others() {

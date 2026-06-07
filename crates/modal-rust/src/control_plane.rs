@@ -140,6 +140,12 @@ pub(crate) struct ProvisionInputs<'a> {
     /// Install the Rust toolchain (rustup) + CUDA env into the image (a non-Rust
     /// base, e.g. a CUDA-devel Tier-1 base).
     pub install_rust: bool,
+    /// Ordered image-builder steps (`apt_install` / `pip_install` / `run_commands`,
+    /// PARITY.md §3) rendered into the image dockerfile AFTER provisioning and BEFORE
+    /// the wrapper bake. Applies to BOTH paths: the RUN single layer and the DEPLOY
+    /// BASE layer (so the top layer's `cargo build` inherits the deps). Empty by
+    /// default ⇒ byte-identical default path.
+    pub image_steps: &'a [crate::remote::ImageStep],
     /// Enable the P6 cargo build cache (RUN path only; DEPLOY ignores it — it builds
     /// at image-build time).
     pub cache: bool,
@@ -188,6 +194,9 @@ pub(crate) fn build_image_spec(
             if inputs.install_rust {
                 spec = spec.with_rust_toolchain();
             }
+            // User image-builder steps (apt/pip/run), in chain order. The SDK renders
+            // them after provisioning and before the wrapper bake.
+            spec = crate::remote::apply_image_steps(spec, inputs.image_steps);
             let mut spec = spec
                 .with_wrapper_module(WRAPPER_MODULE, run_wrapper_src())
                 .with_command(run_wrapper_config_env(
@@ -215,7 +224,10 @@ pub(crate) fn build_image_spec(
             if inputs.install_rust {
                 spec = spec.with_rust_toolchain();
             }
-            spec
+            // User image-builder steps ride the DEPLOY BASE layer, so the TOP layer's
+            // image-build-time `cargo build` (and the deployed runtime) inherit the
+            // installed deps. The top layer (COPY + cargo) is rendered separately.
+            crate::remote::apply_image_steps(spec, inputs.image_steps)
         }
     }
 }
@@ -790,6 +802,7 @@ mod tests {
             },
             base_image,
             install_rust: false,
+            image_steps: &[],
             cache: true,
             entrypoints,
         }

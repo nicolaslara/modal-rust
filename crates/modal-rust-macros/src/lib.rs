@@ -1030,29 +1030,30 @@ fn parse_period_components(call: &syn::ExprCall) -> syn::Result<String> {
         // The value must be a numeric literal. `seconds` may be a float; all others
         // must be integers. We render the literal verbatim into the spec; the SDK
         // re-parses it.
-        let value =
-            match assign.right.as_ref() {
-                Expr::Lit(ExprLit {
-                    lit: Lit::Int(i), ..
-                }) => i.base10_digits().to_string(),
-                Expr::Lit(ExprLit {
-                    lit: Lit::Float(f), ..
-                }) if name == "seconds" => f.base10_digits().to_string(),
-                Expr::Lit(ExprLit {
-                    lit: Lit::Float(_), ..
-                }) => return Err(syn::Error::new_spanned(
+        let value = match assign.right.as_ref() {
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(i), ..
+            }) => i.base10_digits().to_string(),
+            Expr::Lit(ExprLit {
+                lit: Lit::Float(f), ..
+            }) if name == "seconds" => f.base10_digits().to_string(),
+            Expr::Lit(ExprLit {
+                lit: Lit::Float(_), ..
+            }) => {
+                return Err(syn::Error::new_spanned(
                     &assign.right,
                     format!(
                         "Period component {name:?} must be an integer (only `seconds` is a float)"
                     ),
-                )),
-                other => {
-                    return Err(syn::Error::new_spanned(
-                        other,
-                        format!("Period component {name:?} must be a numeric literal"),
-                    ))
-                }
-            };
+                ))
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    format!("Period component {name:?} must be a numeric literal"),
+                ))
+            }
+        };
         parts.push(format!("{name}={value}"));
     }
     Ok(format!("period:{}", parts.join(",")))

@@ -1,0 +1,30 @@
+[package]
+name = "example-pip-apt-image"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: add arbitrary system/Python dependencies to the build image with real image-builder steps (RemoteConfig.image_steps: ImageStep::apt / ImageStep::pip / ImageStep::run, mirroring Modal's apt_install / pip_install / run_commands). The steps render into the image dockerfile in chain order, AFTER provisioning and BEFORE the build — proven OFFLINE (dry_run) that the rendered dockerfile carries the apt-get install / pip install / RUN lines. Build-path config, not decorator config."
+publish = false
+
+[lib]
+name = "example_pip_apt_image"
+path = "src/lib.rs"
+
+[[bin]]
+# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[[bin]]
+# The offline driver: builds a RemoteConfig with apt/pip/run image-builder steps,
+# dry_runs, and prints the rendered image dockerfile lines. Pure projection — no
+# Modal, no credentials, no network.
+name = "pip_apt_image"
+path = "src/bin/pip_apt_image.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

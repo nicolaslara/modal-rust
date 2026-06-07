@@ -126,7 +126,7 @@ pub use registration::{
 };
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly.
-pub use remote::RemoteConfig;
+pub use remote::{ImageStep, RemoteConfig};
 
 /// Shared lock serializing the unit tests that mutate the SHARED process env
 /// (`MODAL_RUST_*`). `cargo test` runs a binary's tests in parallel threads, so two
