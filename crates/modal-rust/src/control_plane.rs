@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 
-use modal_rust_sdk::{FunctionSpec, ImageSpec, ModalClient};
+use modal_rust_sdk::{FunctionAutoscaler, FunctionSpec, ImageSpec, ModalClient};
 
 use crate::deploy::{
     DEPLOY_RUNNER, DEPLOY_SRC, DEPLOY_WRAPPER_CALLABLE, DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC,
@@ -321,7 +321,17 @@ fn build_function_spec(
         // schedule rides into Function.schedule (Cron/Period). `None` leaves the field
         // unset, so an unset decorator is byte-identical; a malformed spec is rejected
         // up front (mirrors `with_gpu`).
-        .with_schedule(ep.options.schedule.as_deref())?;
+        .with_schedule(ep.options.schedule.as_deref())?
+        // autoscaling rides into Function.autoscaler_settings (+ the legacy mirror
+        // fields). An all-`None` autoscaler emits nothing, so an unset decorator is
+        // byte-identical; invalid bounds (max < min, scaledown_window == 0) are
+        // rejected up front (mirrors `with_gpu`/`with_schedule`).
+        .with_autoscaler(FunctionAutoscaler {
+            min_containers: ep.options.min_containers,
+            max_containers: ep.options.max_containers,
+            buffer_containers: ep.options.buffer_containers,
+            scaledown_window: ep.options.scaledown_window,
+        })?;
     // P6 cargo-cache volume at /cache (RUN only; `cache_vol_id` is None otherwise).
     if let Some(vid) = &res.cache_vol_id {
         fn_spec = fn_spec.with_volume_mount(vid.clone(), CACHE_MOUNT);

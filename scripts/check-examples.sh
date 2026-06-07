@@ -164,6 +164,15 @@ run "retries: --describe (retry count rides through inventory)" '"retries":5' \
 run "scheduled-job: --describe (cron schedule rides through inventory)" '"schedule":"cron:UTC:0 9 * * 1"' \
   "cd examples/scheduled-job && cargo run -q --bin modal_runner -- --describe"
 
+# autoscaling — decorator-is-config: control warm capacity + scale-to-zero with the
+# autoscaler knobs (`min_containers`/`max_containers`/`buffer_containers` +
+# `scaledown_window`). Proven OFFLINE via --describe (a mock test asserts they ride into
+# the FunctionCreate manifest's autoscaler_settings, field 79). The body just does its
+# work; the decorator tells Modal how many containers to keep warm and when to scale to
+# zero.
+run "autoscaling: --describe (autoscaler knobs ride through inventory)" '"min_containers":1,"max_containers":10,"buffer_containers":2,"scaledown_window":120' \
+  "cd examples/autoscaling && cargo run -q --bin modal_runner -- --describe"
+
 # custom-base — pick the RUN base image + install the Rust toolchain through the
 # EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
 # MODAL_RUST_BASE_IMAGE / MODAL_RUST_INSTALL_RUST env vars — NOT decorator config).

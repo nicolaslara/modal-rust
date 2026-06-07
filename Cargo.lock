@@ -1868,6 +1868,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-autoscaling"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "example-background-jobs"
 version = "0.0.0"
 dependencies = [

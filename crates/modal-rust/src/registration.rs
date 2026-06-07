@@ -52,6 +52,19 @@ pub struct FunctionConfig {
     /// when the facade builds the `FunctionCreate`; const-valid in the `static`
     /// `inventory::submit!` initializer (like `gpu`).
     pub schedule: Option<&'static str>,
+    /// Autoscaler floor (`min_containers = N`): minimum containers to keep running, so
+    /// requests never wait for a cold start. `None` => scale to zero. Plain
+    /// `Option<u32>`, const-valid in the `static` `inventory::submit!` initializer.
+    pub min_containers: Option<u32>,
+    /// Autoscaler ceiling (`max_containers = N`): cap on concurrent containers. `None`
+    /// => no client-set ceiling.
+    pub max_containers: Option<u32>,
+    /// Warm buffer (`buffer_containers = N`): extra idle containers kept beyond demand
+    /// to absorb bursts. `None` => no buffer.
+    pub buffer_containers: Option<u32>,
+    /// Idle-before-scaledown window in seconds (`scaledown_window = N`): how long an
+    /// idle container waits before being scaled down. `None` => server default.
+    pub scaledown_window: Option<u32>,
 }
 
 impl FunctionConfig {
@@ -68,6 +81,10 @@ impl FunctionConfig {
             volumes: &[],
             retries: None,
             schedule: None,
+            min_containers: None,
+            max_containers: None,
+            buffer_containers: None,
+            scaledown_window: None,
         }
     }
 }
@@ -109,6 +126,19 @@ pub struct FunctionOptions {
     /// when building the `FunctionCreate`.
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Autoscaler floor (`min_containers`). `None` => scale to zero.
+    #[serde(default)]
+    pub min_containers: Option<u32>,
+    /// Autoscaler ceiling (`max_containers`). `None` => no client-set ceiling.
+    #[serde(default)]
+    pub max_containers: Option<u32>,
+    /// Warm buffer (`buffer_containers`). `None` => no buffer.
+    #[serde(default)]
+    pub buffer_containers: Option<u32>,
+    /// Idle-before-scaledown window in seconds (`scaledown_window`). `None` => server
+    /// default.
+    #[serde(default)]
+    pub scaledown_window: Option<u32>,
 }
 
 impl FunctionOptions {
@@ -141,6 +171,10 @@ impl From<&FunctionConfig> for FunctionOptions {
                 .collect(),
             retries: config.retries,
             schedule: config.schedule.map(str::to_string),
+            min_containers: config.min_containers,
+            max_containers: config.max_containers,
+            buffer_containers: config.buffer_containers,
+            scaledown_window: config.scaledown_window,
         }
     }
 }
@@ -321,6 +355,10 @@ mod tests {
                 volumes: vec![("/data".to_string(), "my-vol".to_string())],
                 retries: Some(3),
                 schedule: Some("cron:UTC:0 9 * * 1".to_string()),
+                min_containers: Some(1),
+                max_containers: Some(5),
+                buffer_containers: Some(2),
+                scaledown_window: Some(120),
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -346,10 +384,19 @@ mod tests {
         );
         assert_eq!(eps[0]["config"]["retries"], 3);
         assert_eq!(eps[0]["config"]["schedule"], "cron:UTC:0 9 * * 1");
+        assert_eq!(eps[0]["config"]["min_containers"], 1);
+        assert_eq!(eps[0]["config"]["max_containers"], 5);
+        assert_eq!(eps[0]["config"]["buffer_containers"], 2);
+        assert_eq!(eps[0]["config"]["scaledown_window"], 120);
         assert_eq!(eps[1]["name"], "other");
         assert_eq!(eps[1]["config"]["gpu"], serde_json::Value::Null);
         assert_eq!(eps[1]["config"]["secrets"], serde_json::json!([]));
         assert_eq!(eps[1]["config"]["schedule"], serde_json::Value::Null);
+        assert_eq!(eps[1]["config"]["min_containers"], serde_json::Value::Null);
+        assert_eq!(
+            eps[1]["config"]["scaledown_window"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -373,6 +420,10 @@ mod tests {
             volumes: &[("/data", "my-vol")],
             retries: Some(3),
             schedule: Some("cron:UTC:0 9 * * 1"),
+            min_containers: Some(1),
+            max_containers: Some(5),
+            buffer_containers: Some(2),
+            scaledown_window: Some(120),
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -387,6 +438,10 @@ mod tests {
         );
         assert_eq!(options.retries, Some(3));
         assert_eq!(options.schedule.as_deref(), Some("cron:UTC:0 9 * * 1"));
+        assert_eq!(options.min_containers, Some(1));
+        assert_eq!(options.max_containers, Some(5));
+        assert_eq!(options.buffer_containers, Some(2));
+        assert_eq!(options.scaledown_window, Some(120));
     }
 
     #[test]

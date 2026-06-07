@@ -582,6 +582,117 @@ async fn run_without_schedule_is_wire_identical() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// autoscaling rides into FunctionCreate.autoscaler_settings. A RUN with
+/// `min_containers = 1`, `max_containers = 5`, `buffer_containers = 2`,
+/// `scaledown_window = 120` on the decorator rides into `Function.autoscaler_settings`
+/// (proto field 79) AND the deprecated mirror fields Modal still sets
+/// (`warm_pool_size`/`concurrency_limit`/`_experimental_buffer_containers`/
+/// `task_idle_timeout_secs`). ADDITIVE: an unset decorator leaves all of them unset
+/// (negative test below).
+#[tokio::test]
+async fn run_with_autoscaling_rides_into_function_create() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-scale-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false; // keep the manifest minimal
+    let app = App::connect_at_with_configs(
+        "scale-app",
+        modal_registry(),
+        configs_for_add(FunctionConfig {
+            cache: Some(false),
+            min_containers: Some(1),
+            max_containers: Some(5),
+            buffer_containers: Some(2),
+            scaledown_window: Some(120),
+            ..FunctionConfig::default()
+        }),
+        mock.url(),
+        rc,
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+
+    // The modern autoscaler_settings carries every knob.
+    let settings = function
+        .autoscaler_settings
+        .expect("autoscaling set ⇒ autoscaler_settings on the manifest");
+    assert_eq!(settings.min_containers, Some(1), "min_containers rode in");
+    assert_eq!(settings.max_containers, Some(5), "max_containers rode in");
+    assert_eq!(
+        settings.buffer_containers,
+        Some(2),
+        "buffer_containers rode in"
+    );
+    assert_eq!(
+        settings.scaledown_window,
+        Some(120),
+        "scaledown_window rode in"
+    );
+
+    // Modal also populates the deprecated mirror fields from the same values.
+    assert_eq!(function.warm_pool_size, 1, "min -> warm_pool_size");
+    assert_eq!(function.concurrency_limit, 5, "max -> concurrency_limit");
+    assert_eq!(
+        function.experimental_buffer_containers, 2,
+        "buffer -> _experimental_buffer_containers"
+    );
+    assert_eq!(
+        function.task_idle_timeout_secs, 120,
+        "scaledown_window -> task_idle_timeout_secs"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// autoscaling NEGATIVE — an unset decorator leaves `autoscaler_settings` unset AND
+/// every legacy mirror at 0, so the FunctionCreate is wire-identical to before the
+/// feature. Pins the additive guarantee.
+#[tokio::test]
+async fn run_without_autoscaling_is_wire_identical() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-noscale-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false;
+    let app = App::connect_at_with("noscale-app", modal_registry(), mock.url(), rc)
+        .await
+        .expect("connect");
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    assert!(
+        function.autoscaler_settings.is_none(),
+        "unset autoscaling => no autoscaler_settings (wire-identical)"
+    );
+    assert_eq!(function.warm_pool_size, 0, "unset => legacy min 0");
+    assert_eq!(function.concurrency_limit, 0, "unset => legacy max 0");
+    assert_eq!(
+        function.experimental_buffer_containers, 0,
+        "unset => legacy buffer 0"
+    );
+    assert_eq!(
+        function.task_idle_timeout_secs, 0,
+        "unset => legacy window 0"
+    );
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Row 5 — user volume rides into FunctionCreate. A RUN with
 /// `volumes=[("/data","my-vol")]` resolves VolumeGetOrCreate (V1, create) before
 /// FunctionCreate; the id mounts at `/data`.

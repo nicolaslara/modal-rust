@@ -35,7 +35,11 @@
 //! `retries` is the automatic retry COUNT (an int; mirrors Modal's bare-int `retries`
 //! kwarg → a fixed-interval retry policy); `schedule` is a run cadence for a DEPLOYED
 //! function — `Cron("expr"[, "tz"])` or `Period(days = 1, hours = 4, ..)`, mirroring
-//! Modal's `Cron`/`Period`.
+//! Modal's `Cron`/`Period`. `min_containers`/`max_containers`/`buffer_containers` (ints)
+//! and `scaledown_window` (idle seconds, int) are AUTOSCALER controls mirroring Modal's
+//! `min_containers`/`max_containers`/`buffer_containers`/`scaledown_window` kwargs: they
+//! ride into `FunctionCreate.autoscaler_settings` (warm-capacity floor/ceiling/buffer +
+//! scale-to-zero window).
 //!
 //! ## User-facing secrets + volumes
 //!
@@ -198,6 +202,10 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut memory_mb: Option<u32> = None; // memory = 4096 (MiB)
     let mut retries: Option<u32> = None; // retries = 3 (retry count)
     let mut schedule: Option<String> = None; // schedule = Cron("..") / Period(..) -> spec string
+    let mut min_containers: Option<u32> = None; // min_containers = 1 (autoscaler floor)
+    let mut max_containers: Option<u32> = None; // max_containers = 5 (autoscaler ceiling)
+    let mut buffer_containers: Option<u32> = None; // buffer_containers = 2 (warm buffer)
+    let mut scaledown_window: Option<u32> = None; // scaledown_window = 120 (idle secs)
     let mut secrets: Vec<String> = Vec::new(); // secrets = ["a", "b"]
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     if !attr.is_empty() {
@@ -247,6 +255,31 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // initializer (exactly like `gpu`).
                 schedule = Some(parse_schedule_to_spec(meta.value()?)?);
                 Ok(())
+            } else if meta.path.is_ident("min_containers") {
+                // min_containers = <N> — autoscaler floor (minimum warm containers,
+                // mirroring Modal's `min_containers`, pka `keep_warm`). A plain
+                // `Option<u32>` const-valid in the `static` initializer (like timeout).
+                let lit: LitInt = meta.value()?.parse()?;
+                min_containers = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("max_containers") {
+                // max_containers = <N> — autoscaler ceiling (max concurrent containers,
+                // mirroring Modal's `max_containers`, pka `concurrency_limit`).
+                let lit: LitInt = meta.value()?.parse()?;
+                max_containers = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("buffer_containers") {
+                // buffer_containers = <N> — extra warm containers kept beyond demand,
+                // mirroring Modal's `buffer_containers`.
+                let lit: LitInt = meta.value()?.parse()?;
+                buffer_containers = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("scaledown_window") {
+                // scaledown_window = <secs> — idle seconds before scaledown, mirroring
+                // Modal's `scaledown_window` (pka `container_idle_timeout`).
+                let lit: LitInt = meta.value()?.parse()?;
+                scaledown_window = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
             } else if meta.path.is_ident("secrets") {
                 // secrets = ["my-secret", "other"] — a bracketed list of string
                 // literals. Each is a Modal secret deployment-name the facade
@@ -291,6 +324,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                      `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
                      `cache = <bool>`, `cpu = <cores>`, `memory = <MiB>`, \
                      `retries = <count>`, `schedule = Cron(\"..\")/Period(..)`, \
+                     `min_containers = <N>`, `max_containers = <N>`, \
+                     `buffer_containers = <N>`, `scaledown_window = <secs>`, \
                      `secrets = [\"name\", ..]`, `volumes = [\"/mount=name\", ..]`",
                 ))
             }
@@ -374,6 +409,10 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             memory_mb,
             retries,
             schedule.as_deref(),
+            min_containers,
+            max_containers,
+            buffer_containers,
+            scaledown_window,
             &secrets,
             &volumes,
         );
@@ -498,6 +537,10 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         memory_mb,
         retries,
         schedule.as_deref(),
+        min_containers,
+        max_containers,
+        buffer_containers,
+        scaledown_window,
         &secrets,
         &volumes,
     );
@@ -604,6 +647,10 @@ fn emit_registration(
     memory_mb: Option<u32>,
     retries: Option<u32>,
     schedule: Option<&str>,
+    min_containers: Option<u32>,
+    max_containers: Option<u32>,
+    buffer_containers: Option<u32>,
+    scaledown_window: Option<u32>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> TokenStream {
@@ -618,6 +665,10 @@ fn emit_registration(
         memory_mb,
         retries,
         schedule,
+        min_containers,
+        max_containers,
+        buffer_containers,
+        scaledown_window,
         secrets,
         volumes,
     );
@@ -658,6 +709,10 @@ fn build_registration(
     memory_mb: Option<u32>,
     retries: Option<u32>,
     schedule: Option<&str>,
+    min_containers: Option<u32>,
+    max_containers: Option<u32>,
+    buffer_containers: Option<u32>,
+    scaledown_window: Option<u32>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> proc_macro2::TokenStream {
@@ -694,6 +749,17 @@ fn build_registration(
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
+    // Each autoscaler knob is a plain `Option<u32>` const-valid in the `static`
+    // initializer (exactly like `timeout`/`retries`). `None` emits `None` =>
+    // byte-identical to a bare decorator (no autoscaler_settings on the wire).
+    let opt_u32_tok = |v: Option<u32>| match v {
+        Some(n) => quote! { ::core::option::Option::Some(#n) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let min_containers_tok = opt_u32_tok(min_containers);
+    let max_containers_tok = opt_u32_tok(max_containers);
+    let buffer_containers_tok = opt_u32_tok(buffer_containers);
+    let scaledown_window_tok = opt_u32_tok(scaledown_window);
     // `schedule` is canonicalized to a `&'static str` SPEC string (the facade hands it
     // to the SDK's `parse_schedule`), so it stays const-valid in the `static`
     // initializer exactly like `gpu`. `None` emits `None` => byte-identical to a bare
@@ -729,6 +795,10 @@ fn build_registration(
                     memory_mb: #memory_mb_tok,
                     retries: #retries_tok,
                     schedule: #schedule_tok,
+                    min_containers: #min_containers_tok,
+                    max_containers: #max_containers_tok,
+                    buffer_containers: #buffer_containers_tok,
+                    scaledown_window: #scaledown_window_tok,
                     secrets: #secrets_tok,
                     volumes: #volumes_tok,
                 },

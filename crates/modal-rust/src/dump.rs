@@ -119,6 +119,14 @@ pub enum PlannedRequest {
         retries: Option<u32>,
         /// A human-readable summary of the run schedule, if set; `None` = no schedule.
         schedule: Option<String>,
+        /// Autoscaler floor (`min_containers`); `None` = unset (scale to zero).
+        min_containers: Option<u32>,
+        /// Autoscaler ceiling (`max_containers`); `None` = unset.
+        max_containers: Option<u32>,
+        /// Warm buffer (`buffer_containers`); `None` = unset.
+        buffer_containers: Option<u32>,
+        /// Idle-before-scaledown seconds (`scaledown_window`); `None` = unset.
+        scaledown_window: Option<u32>,
         /// The FILE-mode XOR invariant: `function_data` is unset.
         function_data_is_none: bool,
     },
@@ -208,6 +216,10 @@ impl Manifest {
                     secret_count,
                     retries,
                     schedule,
+                    min_containers,
+                    max_containers,
+                    buffer_containers,
+                    scaledown_window,
                     function_data_is_none,
                 } => format!(
                     "FunctionCreate         module={module:?} function={function:?} \
@@ -215,6 +227,9 @@ impl Manifest {
                      memory={memory_mb}MiB timeout={timeout_secs}s \
                      volumes={volume_mounts:?} secrets={secret_count} \
                      retries={retries:?} schedule={schedule:?} \
+                     min_containers={min_containers:?} max_containers={max_containers:?} \
+                     buffer_containers={buffer_containers:?} \
+                     scaledown_window={scaledown_window:?} \
                      function_data_is_none={function_data_is_none}"
                 ),
                 PlannedRequest::AppPublish { app_state } => {
@@ -363,6 +378,10 @@ impl ControlPlane for RecordingControlPlane {
             secret_count: planned.secret_ids_count,
             retries: planned.retries,
             schedule: planned.schedule,
+            min_containers: planned.min_containers,
+            max_containers: planned.max_containers,
+            buffer_containers: planned.buffer_containers,
+            scaledown_window: planned.scaledown_window,
             function_data_is_none: planned.function_data_is_none,
         });
         // A deterministic function id keeps the cumulative publish union non-empty;
@@ -590,6 +609,7 @@ mod tests {
             volumes: &[],
             retries: None,
             schedule: None,
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([("add".to_string(), cfg)]);
         let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");

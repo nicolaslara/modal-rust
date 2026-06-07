@@ -246,9 +246,10 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
 ```
 
 The decorator is the config. Everything Modal needs to create the function lives
-on the attribute — `gpu`, `cpu`, `memory`, `timeout`, `retries`, `schedule`, `cache`,
-`secrets`, and `volumes` — and is read from the registry at call time (there are no
-extra CLI flags):
+on the attribute — `gpu`, `cpu`, `memory`, `timeout`, `retries`, `schedule`,
+autoscaling (`min_containers`/`max_containers`/`buffer_containers`/`scaledown_window`),
+`cache`, `secrets`, and `volumes` — and is read from the registry at call time (there
+are no extra CLI flags):
 
 ```rust
 use modal_rust::function;
@@ -533,9 +534,10 @@ pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
 ```
 
 Everything on `#[function(...)]` — `gpu`, `cpu`, `memory`, `timeout`, `retries`,
-`schedule`, `cache`, `secrets`, `volumes` — is sourced from the registry at call time.
-The decorator is the config; there are no extra CLI flags. (Non-macro users can set the same fields
-on `RemoteConfig` / `DeployConfig`.)
+`schedule`, autoscaling (`min_containers`/`max_containers`/`buffer_containers`/
+`scaledown_window`), `cache`, `secrets`, `volumes` — is sourced from the registry at
+call time. The decorator is the config; there are no extra CLI flags. (Non-macro users
+can set the same fields on `RemoteConfig` / `DeployConfig`.)
 
 ## Development
 

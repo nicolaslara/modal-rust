@@ -64,7 +64,9 @@ pub use error::{Error, Result};
 
 // Typed control-plane operation surface (the FILE-mode recipe).
 pub use ops::app::PublishedApp;
-pub use ops::function::{CreatedFunction, FunctionResources, FunctionSpec, FunctionVolumeMount};
+pub use ops::function::{
+    CreatedFunction, FunctionAutoscaler, FunctionResources, FunctionSpec, FunctionVolumeMount,
+};
 pub use ops::image::ImageSpec;
 pub use ops::invoke::Invocation;
 pub use ops::local_dir::{WorkspaceClosureSpec, DEFAULT_IGNORE_PATTERNS, DEFAULT_MODALIGNORE_NAME};

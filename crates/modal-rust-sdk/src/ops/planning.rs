@@ -60,6 +60,17 @@ pub struct PlannedFunction {
     /// `"period(<components>)"` for a [`Period`]. Mirrors what the wire carries
     /// without leaking the proto oneof across the crate boundary.
     pub schedule: Option<String>,
+    /// Autoscaler floor — `Function.autoscaler_settings.min_containers`; `None` = unset
+    /// (scale to zero).
+    pub min_containers: Option<u32>,
+    /// Autoscaler ceiling — `Function.autoscaler_settings.max_containers`; `None` =
+    /// unset.
+    pub max_containers: Option<u32>,
+    /// Warm buffer — `Function.autoscaler_settings.buffer_containers`; `None` = unset.
+    pub buffer_containers: Option<u32>,
+    /// Idle-before-scaledown seconds — `Function.autoscaler_settings.scaledown_window`;
+    /// `None` = unset.
+    pub scaledown_window: Option<u32>,
     /// The FILE-mode XOR invariant: `FunctionCreateRequest.function_data` is unset.
     pub function_data_is_none: bool,
 }
@@ -113,6 +124,13 @@ pub fn plan_function_request(
         .as_ref()
         .and_then(|s| s.schedule_oneof.as_ref())
         .map(render_schedule);
+    // Project the modern autoscaler knobs (the legacy mirror fields carry the same
+    // values, so the settings is the single source of truth for the dump).
+    let autoscaler = function.autoscaler_settings.as_ref();
+    let min_containers = autoscaler.and_then(|a| a.min_containers);
+    let max_containers = autoscaler.and_then(|a| a.max_containers);
+    let buffer_containers = autoscaler.and_then(|a| a.buffer_containers);
+    let scaledown_window = autoscaler.and_then(|a| a.scaledown_window);
     PlannedFunction {
         module_name: function.module_name.clone(),
         function_name: function.function_name.clone(),
@@ -125,6 +143,10 @@ pub fn plan_function_request(
         secret_ids_count: function.secret_ids.len(),
         retries: function.retry_policy.map(|p| p.retries),
         schedule,
+        min_containers,
+        max_containers,
+        buffer_containers,
+        scaledown_window,
         function_data_is_none,
     }
 }
@@ -191,7 +213,14 @@ mod tests {
             .with_memory_mb(Some(4096))
             .with_retries(Some(3))
             .with_schedule(Some("cron:UTC:0 9 * * 1"))
-            .expect("valid schedule");
+            .expect("valid schedule")
+            .with_autoscaler(crate::ops::function::FunctionAutoscaler {
+                min_containers: Some(1),
+                max_containers: Some(5),
+                buffer_containers: Some(2),
+                scaledown_window: Some(120),
+            })
+            .expect("valid autoscaler");
         let planned = plan_function_request("ap-1", "fu-pre-1", &spec);
         assert_eq!(planned.module_name, "modal_rust_run_wrapper");
         // Object tag = the entrypoint ("add"), decoupled from the "handler" callable.
@@ -204,6 +233,10 @@ mod tests {
         assert_eq!(planned.secret_ids_count, 0);
         assert_eq!(planned.retries, Some(3));
         assert_eq!(planned.schedule.as_deref(), Some("cron(0 9 * * 1 @ UTC)"));
+        assert_eq!(planned.min_containers, Some(1));
+        assert_eq!(planned.max_containers, Some(5));
+        assert_eq!(planned.buffer_containers, Some(2));
+        assert_eq!(planned.scaledown_window, Some(120));
         assert!(
             planned.function_data_is_none,
             "FILE-mode XOR: function_data is None"

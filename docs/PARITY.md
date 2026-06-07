@@ -135,7 +135,8 @@ workload.
 
 Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 (`modal-rust-macros/src/lib.rs`) carries: `gpu`, `timeout_secs`, `cache`, `milli_cpu`,
-`memory_mb`, `retries`, `schedule`, `secrets`, `volumes`. `cache` is
+`memory_mb`, `retries`, `schedule`, `min_containers`, `max_containers`,
+`buffer_containers`, `scaledown_window`, `secrets`, `volumes`. `cache` is
 **modal-rust-specific** (cargo build cache toggle), not a Modal concept.
 
 | Modal kwarg (`app.py`) | Status | Note |
@@ -150,8 +151,8 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `memory` (791) | **Partial** | Same: `FunctionResources.memory_mb` exists but is not settable from the decorator. Modal supports `int` or `(request, limit)`. |
 | `retries` (798) | **Have** (int form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), riding into `Function.retry_policy`. Mirrors `_parse_retries(int)`. The `Retries(...)` struct form (custom backoff/delays) is not yet exposed. `ops/function.rs` `with_retries`. |
 | `schedule` (783) | **Have** | `#[function(schedule = Cron("..")/Period(..))]` → `Function.schedule` (field 72) as a `Schedule.Cron`/`Schedule.Period`, mirroring `schedule.py:12/61`. The macro canonicalizes the call form to a spec the SDK's `parse_schedule` parses; `with_schedule` rides it into the deploy FunctionCreate. See §8. |
-| `min_containers` / `max_containers` / `buffer_containers` (793-795) | **Missing** | Autoscaler floor/ceiling/warm buffer (replaces old `keep_warm`/`concurrency_limit`). |
-| `scaledown_window` (796) | **Missing** | Idle-before-scaledown (old `container_idle_timeout`). |
+| `min_containers` / `max_containers` / `buffer_containers` (793-795) | **Have** | `#[function(min_containers = .., max_containers = .., buffer_containers = ..)]` → `Function.autoscaler_settings` (field 79) + the deprecated mirror fields Modal still sets (`warm_pool_size`/`concurrency_limit`/`_experimental_buffer_containers`), mirroring `_functions.py:764-768,1019-1021`. Validated like Modal (`max >= min`). `ops/function.rs` `with_autoscaler`; `examples/autoscaling`. |
+| `scaledown_window` (796) | **Have** | `#[function(scaledown_window = <secs>)]` → `Function.autoscaler_settings.scaledown_window` + the legacy `task_idle_timeout_secs`, mirroring `_functions.py:768,1022`. Validated `> 0` (Modal `_functions.py:761`). `with_autoscaler`. |
 | `@concurrent` (input concurrency) | **Missing** | `_partial_function.py:700` `_concurrent` (replaces `allow_concurrent_inputs`); sets `max_concurrent_inputs`. We run one input per container. |
 | `@batched` | **Missing** | `_partial_function.py:639` `_batched` — server-side input batching. |
 | `region` (804) / `cloud` (803) | **Missing** | Region/cloud placement (`scheduler_placement.py`). |
@@ -166,9 +167,10 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `max_inputs` / `single_use_containers` (815) | **Missing** | Single-use containers. |
 | Clustered (`i6pn`, `cluster_size`, `rdma`) | **Missing** | Multi-node clustered functions (`_clustered_functions.py`, experimental). |
 
-The high-value, cheap wins here were **`cpu` / `memory`** and **`retries`** — all
-three are now **Have** (int-form `retries`); the remaining cheap win is the
-`Retries(...)` struct form for custom backoff/delays.
+The high-value, cheap wins here were **`cpu` / `memory`**, **`retries`**, and
+**autoscaling** (`min`/`max`/`buffer_containers` + `scaledown_window`) — all now
+**Have** (int-form `retries`); the remaining cheap win is the `Retries(...)` struct
+form for custom backoff/delays.
 
 ---
 
@@ -248,7 +250,7 @@ a warm container, which our exec-a-binary-per-input runner does not currently do
 | **`Queue`** (distributed queue) | **Missing** | `queue.py` (`put`/`get`/`get_many`/partitions). |
 | **Schedules** — `Cron` / `Period` | **Have** | `schedule.py:12` / `61`; wired via the `schedule=` decorator field (§4) → `Function.schedule`. `examples/scheduled-job` is a deployed cron function. |
 | **`Proxy`** (static-egress proxy) | **Missing** | `proxy.py`. |
-| **Scaling / autoscaler control** | **Missing** | `min/max/buffer_containers`, `update_autoscaler` (§4/§6). |
+| **Scaling / autoscaler control** | **Partial** | Static config `min/max/buffer_containers` + `scaledown_window` are **Have** (§4) → `Function.autoscaler_settings`. Live `update_autoscaler` (§6) is still Missing. |
 | **Tunnels** (`forward`) | **Missing** | `_tunnel.py`. |
 | **Cls-based memory snapshot / checkpointing** | **Missing** | `snapshot.py`. |
 | **Logs streaming / `modal logs`** | **Partial** | We stream image-build logs (`ImageJoinStreaming`) and function-output logs inline; no general `app logs` / live function log tail API. |
@@ -282,7 +284,9 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
    (`apt`/`pip`/`run`) rendered into the image dockerfile; `examples/pip-apt-image`.
 4. **Inline `secrets = {dict}` / `required_keys`** — `required_keys` is a one-field
    macro addition (SDK-side done); inline dict needs facade resolve.
-5. **`min/max/buffer_containers` + `scaledown_window`** — basic autoscaling control.
+5. ~~**`min/max/buffer_containers` + `scaledown_window`**~~ — DONE: static autoscaling
+   control via `#[function(min_containers = .., max_containers = .., buffer_containers =
+   .., scaledown_window = ..)]` → `Function.autoscaler_settings`; `examples/autoscaling`.
 6. ~~**`schedule` (`Cron`/`Period`)**~~ — DONE: `#[function(schedule = Cron(..)/Period(..))]`
    → `Function.schedule`; `examples/scheduled-job` is a deployed cron job.
 7. **`starmap` / `for_each` / `spawn_map`** — natural extensions of the map family

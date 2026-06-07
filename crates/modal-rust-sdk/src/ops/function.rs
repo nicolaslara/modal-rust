@@ -18,8 +18,8 @@ use crate::error::{Error, Result};
 use crate::proto::api::function::{DefinitionType, FunctionType};
 use crate::proto::api::schedule::{Cron, Period, ScheduleOneof};
 use crate::proto::api::{
-    DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
-    FunctionRetryPolicy, GpuConfig, Resources, Schedule, VolumeMount,
+    AutoscalerSettings, DataFormat, Function, FunctionCreateRequest, FunctionGetRequest,
+    FunctionPrecreateRequest, FunctionRetryPolicy, GpuConfig, Resources, Schedule, VolumeMount,
 };
 
 /// Default backoff coefficient for the bare integer `retries = N` form, mirroring
@@ -202,6 +202,58 @@ impl FunctionVolumeMount {
     }
 }
 
+/// Autoscaler controls for a function → `Function.autoscaler_settings` (proto field
+/// 79) plus the deprecated mirror fields Modal still sets. Each knob is `Option<u32>`
+/// (unset = leave to the server). DEFAULT all-`None`: an autoscaler with no knobs set
+/// emits NOTHING (the spec leaves `autoscaler_settings` and every legacy mirror at
+/// their zero/unset default), so the create is byte-identical to before for every
+/// function that does not configure autoscaling.
+///
+/// Mirrors Modal's `app.function(min_containers, max_containers, buffer_containers,
+/// scaledown_window)` (`_functions.py:660-768,1019-1022`): the modern
+/// `AutoscalerSettings` carries the values, and Modal ALSO populates the legacy
+/// `warm_pool_size` / `concurrency_limit` / `_experimental_buffer_containers` /
+/// `task_idle_timeout_secs` fields from the same values for server-side
+/// backward-compatibility — so we set both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionAutoscaler {
+    /// Minimum containers to keep running (scale-to-zero floor; Modal `min_containers`,
+    /// pka `keep_warm`/`warm_pool_size`). `None` = scale to zero.
+    pub min_containers: Option<u32>,
+    /// Maximum concurrent containers (ceiling; Modal `max_containers`, pka
+    /// `concurrency_limit`). `None` = no client-set ceiling.
+    pub max_containers: Option<u32>,
+    /// Extra warm containers to keep beyond demand (Modal `buffer_containers`). `None`
+    /// = no buffer.
+    pub buffer_containers: Option<u32>,
+    /// Seconds an idle container waits before scaling down (Modal `scaledown_window`,
+    /// pka `container_idle_timeout`). `None` = server default.
+    pub scaledown_window: Option<u32>,
+}
+
+impl FunctionAutoscaler {
+    /// `true` when NO knob is set — the spec then leaves the wire byte-identical to
+    /// before (no `autoscaler_settings`, no legacy mirror fields).
+    fn is_empty(&self) -> bool {
+        self.min_containers.is_none()
+            && self.max_containers.is_none()
+            && self.buffer_containers.is_none()
+            && self.scaledown_window.is_none()
+    }
+
+    /// Project to the modern `AutoscalerSettings` proto (the optional knobs ride
+    /// through verbatim; Flash-only fields stay unset).
+    fn to_settings(&self) -> AutoscalerSettings {
+        AutoscalerSettings {
+            min_containers: self.min_containers,
+            max_containers: self.max_containers,
+            buffer_containers: self.buffer_containers,
+            scaledown_window: self.scaledown_window,
+            ..Default::default()
+        }
+    }
+}
+
 /// Declarative spec for a FILE-mode function create.
 ///
 /// FILE mode carries NO serialized bytecode: the function is identified by
@@ -271,6 +323,14 @@ pub struct FunctionSpec {
     /// `#[function(schedule = Cron(..)/Period(..))]` path sets this; Modal then runs the
     /// DEPLOYED function automatically on that cadence (no caller).
     pub schedule: Option<Schedule>,
+    /// Autoscaler controls → `Function.autoscaler_settings` (proto field 79) + the
+    /// deprecated mirror fields. DEFAULT all-`None`: an autoscaler with no knobs set
+    /// emits nothing, so the create is byte-identical to before for every function that
+    /// does not configure autoscaling. The USER-facing
+    /// `#[function(min_containers = .., max_containers = .., buffer_containers = ..,
+    /// scaledown_window = ..)]` path sets these; Modal then controls warm capacity and
+    /// scale-to-zero accordingly.
+    pub autoscaler: FunctionAutoscaler,
 }
 
 impl FunctionSpec {
@@ -294,6 +354,7 @@ impl FunctionSpec {
             secret_ids: Vec::new(),
             retry_policy: None,
             schedule: None,
+            autoscaler: FunctionAutoscaler::default(),
         }
     }
 
@@ -441,6 +502,31 @@ impl FunctionSpec {
         self.schedule = spec.map(parse_schedule).transpose()?;
         Ok(self)
     }
+
+    /// Set autoscaler controls (`#[function(min_containers = .., max_containers = ..,
+    /// buffer_containers = .., scaledown_window = ..)]`). An all-`None`
+    /// [`FunctionAutoscaler`] (the default) leaves the wire byte-identical to before
+    /// (no `autoscaler_settings`, no legacy mirror fields).
+    ///
+    /// Mirrors Modal's validation (`_functions.py:755-762`): `max_containers` must be
+    /// >= `min_containers` when both are set, and `scaledown_window` (when set) must be
+    /// > 0. A violation returns [`Error::build`] (Modal's `InvalidError`).
+    pub fn with_autoscaler(mut self, autoscaler: FunctionAutoscaler) -> Result<Self> {
+        if let (Some(min), Some(max)) = (autoscaler.min_containers, autoscaler.max_containers) {
+            if max < min {
+                return Err(Error::build(format!(
+                    "`min_containers` ({min}) cannot be greater than `max_containers` ({max})"
+                )));
+            }
+        }
+        if let Some(window) = autoscaler.scaledown_window {
+            if window == 0 {
+                return Err(Error::build("`scaledown_window` must be > 0".to_string()));
+            }
+        }
+        self.autoscaler = autoscaler;
+        Ok(self)
+    }
 }
 
 /// Result of [`ModalClient::function_create`].
@@ -509,6 +595,21 @@ pub(crate) fn build_function_create_request(
     } else {
         spec.function_name.clone()
     };
+    // Autoscaler: the modern `autoscaler_settings` carries the knobs; when ANY knob is
+    // set, Modal ALSO populates the deprecated mirror fields from the same values
+    // (`_functions.py:1019-1022`) for server-side backward-compat. An all-`None`
+    // autoscaler leaves `autoscaler_settings` unset AND every legacy field at `0` ⇒
+    // prost omits them ⇒ byte-identical to before for non-autoscaling callers.
+    let autoscaler_empty = spec.autoscaler.is_empty();
+    let autoscaler_settings = if autoscaler_empty {
+        None
+    } else {
+        Some(spec.autoscaler.to_settings())
+    };
+    let warm_pool_size = spec.autoscaler.min_containers.unwrap_or(0);
+    let concurrency_limit = spec.autoscaler.max_containers.unwrap_or(0);
+    let experimental_buffer_containers = spec.autoscaler.buffer_containers.unwrap_or(0);
+    let task_idle_timeout_secs = spec.autoscaler.scaledown_window.unwrap_or(0);
     let function = Function {
         module_name: spec.module_name.clone(),
         function_name: object_tag,
@@ -541,6 +642,16 @@ pub(crate) fn build_function_create_request(
         // (no-schedule) callers. The user `#[function(schedule = Cron(..)/Period(..))]`
         // path sets a Cron/Period here so Modal runs the DEPLOYED function on a cadence.
         schedule: spec.schedule.clone(),
+        // Autoscaler: modern `autoscaler_settings` (field 79) + the deprecated mirror
+        // fields Modal still sets (`warm_pool_size`/`concurrency_limit`/
+        // `_experimental_buffer_containers`/`task_idle_timeout_secs`). An all-`None`
+        // autoscaler leaves `autoscaler_settings` = None AND every legacy field at `0`,
+        // so prost omits all of them ⇒ byte-identical for non-autoscaling callers.
+        autoscaler_settings,
+        warm_pool_size,
+        concurrency_limit,
+        experimental_buffer_containers,
+        task_idle_timeout_secs,
         ..Default::default()
     };
 
@@ -829,6 +940,122 @@ mod tests {
     }
 
     #[test]
+    fn autoscaler_defaults_empty() {
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(
+            spec.autoscaler.is_empty(),
+            "autoscaler must default empty (wire-identical to before autoscaling)"
+        );
+    }
+
+    #[test]
+    fn with_autoscaler_sets_settings_and_legacy_mirror_fields() {
+        // All four knobs ride into `autoscaler_settings` AND the deprecated mirror
+        // fields Modal still populates (`_functions.py:1019-1022`).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_autoscaler(FunctionAutoscaler {
+                min_containers: Some(1),
+                max_containers: Some(5),
+                buffer_containers: Some(2),
+                scaledown_window: Some(120),
+            })
+            .expect("valid autoscaler");
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+        let function = req.function.expect("function set");
+
+        let settings = function
+            .autoscaler_settings
+            .expect("autoscaler_settings set when a knob is configured");
+        assert_eq!(settings.min_containers, Some(1));
+        assert_eq!(settings.max_containers, Some(5));
+        assert_eq!(settings.buffer_containers, Some(2));
+        assert_eq!(settings.scaledown_window, Some(120));
+
+        // Legacy mirror fields carry the same values (Modal sets both).
+        assert_eq!(function.warm_pool_size, 1, "min -> warm_pool_size");
+        assert_eq!(function.concurrency_limit, 5, "max -> concurrency_limit");
+        assert_eq!(
+            function.experimental_buffer_containers, 2,
+            "buffer -> _experimental_buffer_containers"
+        );
+        assert_eq!(
+            function.task_idle_timeout_secs, 120,
+            "scaledown_window -> task_idle_timeout_secs"
+        );
+    }
+
+    #[test]
+    fn with_autoscaler_partial_leaves_unset_knobs_none() {
+        // Only `min_containers` set: the modern settings carries Some(2) for min and
+        // None for the rest; the unset legacy mirrors stay 0.
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_autoscaler(FunctionAutoscaler {
+                min_containers: Some(2),
+                ..Default::default()
+            })
+            .expect("valid autoscaler");
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        let settings = function.autoscaler_settings.expect("settings set");
+        assert_eq!(settings.min_containers, Some(2));
+        assert_eq!(settings.max_containers, None);
+        assert_eq!(settings.buffer_containers, None);
+        assert_eq!(settings.scaledown_window, None);
+        assert_eq!(function.warm_pool_size, 2);
+        assert_eq!(function.concurrency_limit, 0, "unset max => legacy 0");
+        assert_eq!(
+            function.task_idle_timeout_secs, 0,
+            "unset window => legacy 0"
+        );
+    }
+
+    #[test]
+    fn empty_autoscaler_is_wire_identical() {
+        // A default (all-None) autoscaler emits NOTHING: no autoscaler_settings, every
+        // legacy mirror at 0 — byte-identical to before the feature.
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        assert!(
+            function.autoscaler_settings.is_none(),
+            "empty autoscaler => autoscaler_settings unset (wire-identical)"
+        );
+        assert_eq!(function.warm_pool_size, 0);
+        assert_eq!(function.concurrency_limit, 0);
+        assert_eq!(function.experimental_buffer_containers, 0);
+        assert_eq!(function.task_idle_timeout_secs, 0);
+    }
+
+    #[test]
+    fn with_autoscaler_rejects_invalid_bounds() {
+        // max < min is rejected up front (mirrors Modal InvalidError).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_autoscaler(FunctionAutoscaler {
+                min_containers: Some(5),
+                max_containers: Some(2),
+                ..Default::default()
+            })
+            .is_err());
+        // scaledown_window == 0 is rejected (Modal requires > 0).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_autoscaler(FunctionAutoscaler {
+                scaledown_window: Some(0),
+                ..Default::default()
+            })
+            .is_err());
+        // min == max is allowed (a fixed pool).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_autoscaler(FunctionAutoscaler {
+                min_containers: Some(3),
+                max_containers: Some(3),
+                ..Default::default()
+            })
+            .is_ok());
+    }
+
+    #[test]
     fn with_secret_ids_attaches_and_flows_to_proto() {
         // Builder appends; the resolved ids flow into Function.secret_ids (field 10).
         let spec = FunctionSpec::new("m", "handler", "im-1")
@@ -1096,6 +1323,15 @@ mod tests {
         assert!(
             function.schedule.is_none(),
             "no schedule ⇒ Function.schedule unset (wire-identical)"
+        );
+        assert!(
+            function.autoscaler_settings.is_none(),
+            "no autoscaling ⇒ autoscaler_settings unset (wire-identical)"
+        );
+        assert_eq!(function.warm_pool_size, 0, "no autoscaling ⇒ legacy min 0");
+        assert_eq!(
+            function.concurrency_limit, 0,
+            "no autoscaling ⇒ legacy max 0"
         );
         assert!(req.function_data.is_none(), "XOR holds for CPU too");
     }

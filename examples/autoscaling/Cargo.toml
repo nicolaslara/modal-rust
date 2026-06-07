@@ -1,0 +1,23 @@
+[package]
+name = "example-autoscaling"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: control warm capacity + scale-to-zero with the autoscaler decorator knobs (`#[modal_rust::function(min_containers = 1, max_containers = 10, buffer_containers = 2, scaledown_window = 120)]`). The decorator IS the config — the facade rides these into the FunctionCreate manifest's `autoscaler_settings` (floor/ceiling/warm buffer + idle-before-scaledown window), mirroring Modal's `min_containers`/`max_containers`/`buffer_containers`/`scaledown_window` kwargs, so Modal keeps a warm floor for instant responses and scales to zero when idle."
+publish = false
+
+[lib]
+name = "example_autoscaling"
+path = "src/lib.rs"
+
+[[bin]]
+# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

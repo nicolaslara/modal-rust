@@ -708,6 +708,10 @@ mod tests {
                 volumes: &[],
                 retries: Some(3),
                 schedule: Some("cron:UTC:0 9 * * 1"),
+                min_containers: None,
+                max_containers: None,
+                buffer_containers: None,
+                scaledown_window: None,
             },
             package: "modal-rust",
         }
@@ -727,6 +731,10 @@ mod tests {
                 volumes: &[("/data", "my-vol")],
                 retries: None,
                 schedule: None,
+                min_containers: None,
+                max_containers: None,
+                buffer_containers: None,
+                scaledown_window: None,
             },
             package: "modal-rust",
         }
@@ -790,6 +798,10 @@ mod tests {
                     volumes: &[],
                     retries: None,
                     schedule: None,
+                    min_containers: None,
+                    max_containers: None,
+                    buffer_containers: None,
+                    scaledown_window: None,
                 },
             ),
         ]);
@@ -817,6 +829,10 @@ mod tests {
             volumes: &[("/data", "my-vol")],
             retries: None,
             schedule: None,
+            min_containers: None,
+            max_containers: None,
+            buffer_containers: None,
+            scaledown_window: None,
         };
         let app = App::from_manifest([
             ("train".to_string(), cfg.clone()),
@@ -885,6 +901,10 @@ mod tests {
             volumes: &[("/data", "my-vol")],
             retries: Some(5),
             schedule: Some("period:days=1"),
+            min_containers: None,
+            max_containers: None,
+            buffer_containers: None,
+            scaledown_window: None,
         };
         let app = App::from_manifest([("add".to_string(), cfg.clone())]);
         assert_eq!(app.config_for("add"), FunctionOptions::from(&cfg));
