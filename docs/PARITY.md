@@ -37,8 +37,10 @@ dispatches to the registered Rust handler over a JSON envelope. There is **no Ru
 equivalent of cloudpickle**, and Modal's container entrypoint
 (`_container_entrypoint.py`) is Python-callable-shaped, so a "serialized Rust
 closure" mode is not on the table. This is a deliberate, foundational choice, not a
-gap to close — but it explains why several Modal surfaces (web endpoints, `Cls`
-lifecycle, generators) do not map cleanly.
+gap to close — but it explains why several Modal surfaces (web endpoints, generators,
+and the deeper `Cls` lifecycle bits like `@exit`) do not map cleanly. The core `Cls`
+load-once-serve-many pattern still landed in FILE mode (a per-method dotted
+entrypoint + a warm-container `--serve` loop — see §7).
 
 ---
 
@@ -221,21 +223,39 @@ We do attach + mount; we do **not** offer any of Modal's volume *data* API
 
 ## 7. Classes / `Cls` and lifecycle
 
-Entirely **Missing**. Modal's `Cls` (`cls.py:446` `_Cls`) plus the partial-function
+**Have (v0, Shape A)** for the core load-once-serve-many pattern; the rest of the
+lifecycle is deferred. Modal's `Cls` (`cls.py:446` `_Cls`) plus the partial-function
 decorators in `_partial_function.py`:
 
 | Modal feature | Status | Ref |
 |---|---|---|
-| `@app.cls(...)` stateful classes | **Missing** | `cls.py`, `@cls` (885). |
-| `@method` | **Missing** | `_partial_function.py:282`. |
-| `@enter` / `@exit` lifecycle hooks | **Missing** | `_partial_function.py:588` / `616`. |
-| `modal.parameter(...)` class params | **Missing** | `cls.py:935`. |
+| `@app.cls(...)` stateful classes | **Have** (v0, Shape A: `#[cls]` on an `impl` block) | `cls.py`, `@cls` (885). |
+| `@method` | **Have** | per-method dotted entrypoint + merged class/method config; `_partial_function.py:282`. |
+| `@enter` | **Have** | load-once `OnceLock` singleton + `modal_runner --serve`; `_partial_function.py:588`. |
+| `@exit` | **Missing** (deferred to Shape B) | marker reserved; emits a `compile_error` for now. `_partial_function.py:616`. |
+| `modal.parameter(...)` class params | **Missing** (deferred to Shape B) | use `#[cls(secrets=[..])]` + `std::env` in `#[enter]` for now. `cls.py:935`. |
 | `@concurrent` / `@batched` on methods | **Missing** | `_partial_function.py:700` / `639`. |
 
-This is the biggest single missing surface after web endpoints — it underpins
-expensive-init-then-many-calls patterns (load a model once in `@enter`, serve from
-`@method`). A Rust analogue would need a way to keep state across invocations within
-a warm container, which our exec-a-binary-per-input runner does not currently do.
+The Rust shape: a plain struct holds the state, and a `#[cls(gpu=.., timeout=..)]`
+attribute on its `impl` block carries the class-level config. Inside, `#[enter] fn
+load() -> anyhow::Result<Self>` builds the expensive state ONCE per warm container —
+the macro moves the built value into a process-lifetime `OnceLock` singleton and adds
+an additive `modal_runner --serve` loop so a warm container loads once and serves
+many inputs. Each `#[method(gpu=..)] fn embed(&self, ..)` becomes its OWN per-method
+entrypoint under the **dotted `"<Class>.<method>"` name** (e.g. `Embedder.embed`),
+carrying its fully-resolved class-default + method-override config. The dotted object
+tag is **live-confirmed on a T4** — Modal accepts it on both `run` and `deploy`.
+Callers use a generated `EmbedderHandle` + `EmbedderCls` extension trait (brought in
+with `use <crate>::*;`): `app.embedder().embed("hi".into()).remote().await?` (or
+`.local()?`). See `examples/stateful-class` and `crates/modal-rust/tests/cls.rs`.
+
+Caveat: two methods with DIFFERENT effective config become DIFFERENT Modal functions
+(different containers), so warm load-once reuse holds across methods that share the
+same effective config (the common all-inherit case).
+
+Deferred to Shape B: `#[exit]` (the marker is reserved but emits a `compile_error`)
+and class parameters (`modal.parameter`). Until then, inject config via
+`#[cls(secrets=[..])]` + `std::env` reads in `#[enter]`.
 
 ---
 
@@ -294,6 +314,11 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
    proven `.map`/`.spawn` plumbing + SDK `spawn_map_cbor`); `examples/spawn-map-foreach`.
    `starmap` is single-arg-framed (each item IS the one named-object input); true
    multi-arg positional spread is still gated on multi-arg.
-8. **Bigger subsystems** (`Cls`/lifecycle, web endpoints, Sandboxes, Dict, Queue) —
-   each is a milestone-sized effort; `Cls` is the highest-leverage because it
-   enables the load-once-serve-many model.
+8. ~~**`Cls` (load-once-serve-many)**~~ — DONE (v0, Shape A): `#[cls]` on an `impl`
+   block with `#[enter]` (load-once `OnceLock` + `modal_runner --serve`) and per-method
+   dotted `"<Class>.<method>"` entrypoints with merged config; live-confirmed on a T4.
+   `examples/stateful-class`. Deferred to Shape B: `#[exit]` + `modal.parameter` class
+   params (see §7).
+9. **Bigger subsystems** (web endpoints, Sandboxes, Dict, Queue) — each is a
+   milestone-sized effort. With `Cls` v0 landed, **web endpoints** are now the largest
+   remaining gap.

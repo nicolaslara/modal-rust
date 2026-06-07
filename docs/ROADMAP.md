@@ -48,8 +48,14 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   autoscaling, `starmap`. Each is small and ships with mock tests.
 
 ### Big parity (need real design)
-- `Cls` (stateful classes: load-once `@enter` + `@method`), web endpoints
-  (`@fastapi_endpoint`/`@asgi_app`), then `Dict`/`Queue`/`Sandbox`/NFS.
+- ~~`Cls` (stateful classes: load-once `@enter` + `@method`)~~ — DONE (v0, Shape A):
+  `#[modal_rust::cls]` on an `impl` block with `#[enter]` (load-once `OnceLock` +
+  `modal_runner --serve`) and per-method dotted `"<Class>.<method>"` entrypoints with
+  merged class/method config; live-confirmed on a T4. `examples/stateful-class`.
+  Deferred to Shape B: `#[exit]` (marker reserved, emits `compile_error`) +
+  `modal.parameter` class params (use `#[cls(secrets=[..])]` + `std::env` for now).
+- Web endpoints (`@fastapi_endpoint`/`@asgi_app`) — now the largest remaining gap —
+  then `Dict`/`Queue`/`Sandbox`/NFS.
 
 ### Infra / quality
 - **Benchmarks runnable** — wire the plan-only A/B-vs-Python harness (cold/warm build, deploy,

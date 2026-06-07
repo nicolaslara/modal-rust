@@ -443,6 +443,91 @@ exactly as shown for the macro path. Non-macro users set the same per-function
 config (`gpu`, `timeout`, `cache`, `secrets`, `volumes`) on `RemoteConfig` /
 `DeployConfig` instead of on the decorator.
 
+### Stateful classes (`Cls`) — load once, serve many
+
+Some workloads pay a large fixed cost before they can do any work: loading model
+weights, opening a connection pool, warming a cache. A plain `#[function]` pays that
+cost on *every* call. `#[modal_rust::cls]` pays it **once per warm container** and
+reuses the result — mirroring Python's `@app.cls` + `@enter` + `@method`. You write a
+plain struct for the state and a `#[cls(..)]` `impl` block for the behavior:
+
+```rust
+use modal_rust::cls;
+
+pub struct Embedder {
+    model: Model,
+}
+
+#[cls(gpu = "T4", timeout = 600)] // CLASS-LEVEL default config -> inherited by every #[method].
+impl Embedder {
+    /// Runs ONCE per warm container (mirrors `@modal.enter()`). The macro moves the
+    /// built value into a process-lifetime singleton, so this expensive step happens a
+    /// single time no matter how many method calls the warm container serves.
+    #[enter]
+    fn load() -> anyhow::Result<Self> {
+        Ok(Embedder {
+            model: Model::load(),
+        })
+    }
+
+    /// Reuse the already-loaded model by `&self`. `#[method(gpu = "A10G")]` OVERRIDES the
+    /// class default gpu (`T4`) for this method only; `timeout = 600` is still inherited.
+    #[method(gpu = "A10G")]
+    fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
+        Ok(self.model.embed(&text))
+    }
+
+    /// Bare `#[method]` — inherits BOTH `gpu = "T4"` and `timeout = 600` from `#[cls]`.
+    #[method]
+    fn dim(&self) -> anyhow::Result<usize> {
+        Ok(self.model.dim())
+    }
+}
+```
+
+The macro generates an `EmbedderHandle` and an `EmbedderCls` extension trait (carrying
+`app.embedder()`); bring them into scope with one glob (`use my_crate::*;`) and call a
+method like any other typed function. `#[enter]` runs lazily on the first method call
+in a warm container; every later call — same or different method — reuses the same
+in-memory singleton, so the model is **loaded once and served many** (the runner adds
+an additive `modal_runner --serve` loop to keep the process warm across inputs):
+
+```rust
+use modal_rust::App;
+use my_crate::*; // brings the generated `EmbedderCls` trait (and `app.embedder()`) into scope
+
+async fn example() -> anyhow::Result<()> {
+    let app = App::local();
+
+    // `.local()` runs in-process — no Modal, no network.
+    let d: usize = app.embedder().dim().local()?;
+
+    // `.remote()` runs on Modal; the model loads once per warm container, served many.
+    let app = App::connect("my-rust-app").await?;
+    let v: Vec<f32> = app.embedder().embed("hi".into()).remote().await?;
+    Ok(())
+}
+```
+
+Each `#[method]` becomes its OWN Modal entrypoint under the dotted `"<Class>.<method>"`
+name (`Embedder.embed` / `Embedder.dim`), carrying its fully-resolved class-default +
+method-override config. Two methods with *different* effective config become different
+Modal functions (different containers), so warm load-once reuse holds across methods
+that share the same effective config (the common all-inherit case). The dotted entrypoint
+name is what you pass to the CLI — run the live [`examples/stateful-class`](examples/stateful-class)
+method on a GPU with:
+
+```bash
+modal-rust run Embedder.embed --project examples/stateful-class --input '{"text":"hello"}'
+```
+
+Like the other talk-to-Modal surface, `.remote()` / `deploy` / `call` on a `Cls` method
+need the `client` feature (see [The `client` feature](#the-client-feature-talking-to-modal-vs-authoring));
+a `Cls`-authoring crate that only uses `.local()` (and is run via the CLI) stays light.
+**Deferred (Shape B):** `#[exit]` (the marker is reserved but currently emits a
+`compile_error`) and `modal.parameter` class params — for now inject config with
+`#[cls(secrets = [..])]` + `std::env` reads in `#[enter]`.
+
 ## How It Works
 
 Every user function is erased into a static handler table:
@@ -625,6 +710,7 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/error-handling` | **(macro)** How a failure crosses the boundary: a plain `anyhow::Result` error is opaque (`details: null`), while a `Serialize` error type rides through as machine-readable `details` the caller can deserialize and branch on. Same frozen `function_error` kind, different `details`. |
 | `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
+| `examples/stateful-class` | **(macro / `Cls`)** Load-once-serve-many: a `#[modal_rust::cls]` impl with `#[enter]` (load an embedding model ONCE per warm container) + `#[method]`s reusing it by `&self`, called `app.embedder().embed("hi".into()).remote().await?`. Each method is its own dotted `Embedder.embed` / `Embedder.dim` entrypoint; live-confirmed on a T4. |
 
 Every example runs offline (in-process, no Modal). Run them all and check their
 output with `bash scripts/check-examples.sh`, or one at a time from the repo root:
