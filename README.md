@@ -91,6 +91,32 @@ The `#[modal_rust::function]` macro routes its generated code through the
 `modal-rust` facade, so you never add `modal-rust-runtime` or `inventory`
 directly — just like `serde_derive` routes through `serde`.
 
+### The `client` feature (talking to Modal vs. authoring)
+
+The default `modal-rust` dependency is **light**: it pulls in only ~9 crates and
+compiles in a couple of seconds. That is everything you need to author
+`#[function]`s, call `.local()`, and let the `modal-rust` CLI run/deploy your crate.
+
+The gRPC control-plane client (tonic/hyper/prost/reqwest — ~150 crates) lives behind
+a **non-default `client` feature**. You only need it when your *own code* talks to
+Modal directly — `App::connect(..)`, `.remote()`/`.spawn()`/`.map()`, `deploy`/`call`,
+or the offline `dry_run`/`dump_deploy_manifest` dump:
+
+```toml
+# Function-only crate (authoring + .local() + `modal-rust run`/`deploy`): nothing to add.
+modal-rust = { git = "..." }
+
+# Orchestration code (your binary/tests call .remote()/deploy/connect): add the feature.
+modal-rust = { git = "...", features = ["client"] }
+```
+
+If you forget the feature, the talk-to-Modal methods still compile — they return a
+clear error at runtime telling you to add `features = ["client"]`. **You almost never
+need it:** the `modal-rust` CLI enables `client` itself, so a normal `#[function]`
+library that you `modal-rust run`/`deploy` stays light. Keeping orchestration calls in
+a `[[bin]]` or `tests/` (with `client` on a `[dev-dependencies]` edge) keeps the
+library itself tonic-free, so the in-container runner build stays fast too.
+
 For live Modal calls, configure Modal credentials with either `~/.modal.toml` or
 the `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` environment variables.
 
@@ -478,6 +504,25 @@ costs time; it never changes the result. Disable it per function with
 `#[function(cache = false)]`, or globally with `MODAL_RUST_NO_CACHE=1`. (`deploy`
 builds once at image-build time, so the cache applies to the `run` path only.)
 
+### Speeding up local builds
+
+The default `modal-rust` build is **light**: the gRPC client (tonic/hyper/prost/
+reqwest) is behind the non-default `client` feature (see [Install](#the-client-feature-talking-to-modal-vs-authoring)),
+so authoring a `#[function]` crate, `.local()`, and the in-container `modal_runner`
+build never compile it — that collapses a ~150-crate tree down to ~9 and a ~30s cold
+build to ~2-3s. A `rust-toolchain.toml` pins the channel so Cargo's fingerprints (and
+any shared cache) stay stable across runs.
+
+For teams that want even faster cold builds across machines, point Cargo at a shared
+[`sccache`](https://github.com/mozilla/sccache):
+
+```bash
+cargo install sccache
+export RUSTC_WRAPPER=sccache   # in your shell profile or CI env
+```
+
+That is purely local hygiene — it never changes wire bytes or build outputs.
+
 ## Architecture
 
 The workspace is split into focused crates:
@@ -487,7 +532,7 @@ The workspace is split into focused crates:
 | `modal-rust` | User-facing `App`, `Function`, `.local()`, `.remote()`, deploy, and call API |
 | `modal-rust-runtime` | Handler registry, typed wrappers, runner protocol, and error envelopes |
 | `modal-rust-macros` | `#[modal_rust::function]` registration macro |
-| `modal-rust-sdk` | First-party Rust gRPC client for Modal control-plane operations |
+| `modal-rust-sdk` | First-party Rust gRPC client for Modal control-plane operations (optional dep behind the facade's `client` feature) |
 | `modal-rust-cli` | Command-line interface for `doctor`, `run`, `deploy`, and `call` |
 
 The facade uses static dispatch where possible. The registry stores function

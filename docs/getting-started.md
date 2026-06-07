@@ -156,6 +156,21 @@ time**, and runs the freshly built runner. The first call to a fresh container
 compiles the dependency tree (this can take a few minutes — a cold build); later
 calls reuse the warm container and a persistent cargo cache.
 
+> **Enable the `client` feature for orchestration code.** The default `modal-rust`
+> dependency is light (no gRPC client) — perfect for the function-only library above
+> and for `modal-rust run`/`deploy` (the CLI enables the client for you, section 8).
+> The moment *your own code* calls `App::connect`/`.remote()`/`.spawn()`/`.map()`/
+> `deploy`/`call`, add the feature on that crate:
+>
+> ```toml
+> modal-rust = { git = "...", features = ["client"] }
+> ```
+>
+> Keeping orchestration in a `[[bin]]` or `tests/` (with `client` on a
+> `[dev-dependencies]` edge) lets your `#[function]` library stay light, so the
+> in-container runner build stays fast. Without the feature these calls still
+> compile — they return a clear "requires the `client` feature" error at runtime.
+
 ```rust
 use modal_rust::App;
 use my_app::AddCall;

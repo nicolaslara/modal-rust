@@ -98,6 +98,19 @@ dispatch):
    marker/type-state, `cfg` features — over `dyn Trait`. Reach for `dyn` only when
    the set of implementations is genuinely open/unbounded. (The handler registry is
    the one open set; it erases user functions to `fn` pointers, not `Box<dyn>`.)
+4. **Default-light authoring; the gRPC client is opt-in.** The `modal-rust` facade's
+   gRPC client (`modal-rust-sdk` = tonic/hyper/prost/reqwest) is an OPTIONAL dep behind
+   a non-default `client` feature. The DEFAULT build is light (~9 crates): authoring
+   `#[function]`s, `.local()`, the macro, and the in-container `modal_runner` build all
+   compile tonic-free. Only TALKING to Modal needs `client` — `App::connect*`,
+   `.remote()`/`.spawn()`/`.map()`, `deploy`/`call`, and the offline `dry_run` dump. The
+   talk-to-Modal surface has erroring stubs at default features (a function-only crate
+   always compiles); the `modal-rust` CLI enables `client` itself. The macro-generated
+   typed methods delegate to always-present facade fns (real under `client`, erroring
+   stub otherwise) — the macro never emits the facade's `cfg(feature=...)`. The facade
+   MUST build/clippy/test BOTH ways (default light, `--features client`) and keep
+   `--all-features` green; this is the key correctness gate. The feature-gate changes
+   only WHAT compiles, never the wire bytes.
 
 ## Runner Protocol (do not break)
 
@@ -153,6 +166,13 @@ contract is the stable seam — guard it across every change. See
   dep + `#[function]` fns (and any driver bin for crates that demo calling the API).
   They are run via `modal-rust run/deploy/call/local/describe`. The tooling generates
   the runner automatically.
+- **`client` feature on examples:** a pure-function / `.local()`-only example stays
+  DEFAULT (light). An example whose code actually references the talk-to-Modal surface
+  (`App::connect`/`.remote()`/`.spawn()`/`.map()`/`deploy`/`call`/`dry_run`) adds
+  `modal-rust = { ..., features = ["client"] }` — in `[dependencies]` if its LIB or a
+  `[[bin]]` references it, or in `[dev-dependencies]` (a second edge) if ONLY its
+  `tests/` do, which keeps the LIB light so the in-container `modal_runner` build stays
+  tonic-free. Decide per crate by where the client call actually lives.
 - **CLI auto-detect:** if a target crate already ships a `modal_runner` bin (detected
   via `cargo metadata` target `kind = "bin"`, `name = "modal_runner"`), the tooling
   uses it as-is (backward-compatible). Otherwise the tooling generates a temporary
