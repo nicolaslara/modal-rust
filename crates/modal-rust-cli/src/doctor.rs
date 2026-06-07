@@ -20,6 +20,10 @@ use serde_json::{json, Value};
 enum Check {
     /// The check passed; the string is a human-readable detail line.
     Ok(String),
+    /// A NON-FATAL advisory: printed as `[warn]` but does NOT change the exit code.
+    /// Used where a condition is very likely a mistake but not provably fatal (e.g.
+    /// a duplicated identity crate that would empty the inventory registry).
+    Warn(String),
     /// A fatal failure with an actionable structured error (the runner-envelope
     /// shape). The process will exit non-zero. Per boundaries.md §6 the
     /// `panic = "abort"` profile is a FAIL (the correctness gate for the `panic`
@@ -227,6 +231,87 @@ fn release_profile_panic(text: &str) -> Option<String> {
     None
 }
 
+/// Identity-critical crates whose DUPLICATION splits the `inventory` registry.
+/// `#[modal_rust::function]` routes its `inventory::submit!` through
+/// `modal-rust`'s re-export of `modal-rust-runtime`'s `inventory::collect!(Registration)`.
+/// If two semver-incompatible instances of ANY of these end up in one build, the
+/// `submit!`s land in a different distributed slice than the generated runner's
+/// `collect!`, so the build SUCCEEDS but the runner sees an EMPTY registry ("no
+/// entrypoints"). This mirrors the universal `serde`/`serde_derive` rule.
+const FACADE_IDENTITY_CRATES: &[&str] = &["modal-rust", "modal-rust-runtime", "inventory"];
+
+/// From a `cargo metadata` value, return each identity-critical crate that appears
+/// as 2+ DISTINCT instances (keyed by `version (source)`), with a label per instance.
+/// Pure (no I/O) so it is unit-testable against synthetic metadata.
+fn duplicate_facade_instances(metadata: &Value) -> Vec<(String, Vec<String>)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if let Some(pkgs) = metadata["packages"].as_array() {
+        for p in pkgs {
+            let name = p["name"].as_str().unwrap_or_default();
+            if !FACADE_IDENTITY_CRATES.contains(&name) {
+                continue;
+            }
+            let version = p["version"].as_str().unwrap_or("?");
+            // `source` is null for a path/workspace dep, a string for registry/git.
+            let source = p["source"].as_str().unwrap_or("path/local");
+            by_name
+                .entry(name.to_string())
+                .or_default()
+                .insert(format!("{version} ({source})"));
+        }
+    }
+    by_name
+        .into_iter()
+        .filter(|(_, set)| set.len() > 1)
+        .map(|(n, set)| (n, set.into_iter().collect()))
+        .collect()
+}
+
+/// Check (`--rust`): no identity-critical crate is duplicated in the resolved graph.
+/// Runs `cargo metadata` (the full graph, including deps) and inspects it. Skips
+/// gracefully (as `Ok`) when cargo metadata is unavailable/unparseable — this is a
+/// best-effort guard, never a hard requirement.
+fn check_duplicate_facade(project_dir: &std::path::Path) -> Check {
+    let out = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--quiet"])
+        .current_dir(project_dir)
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            return Check::Ok(
+                "duplicate-modal-rust check skipped (cargo metadata unavailable)".to_string(),
+            )
+        }
+    };
+    let meta: Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            return Check::Ok(
+                "duplicate-modal-rust check skipped (unparseable cargo metadata)".to_string(),
+            )
+        }
+    };
+    let dups = duplicate_facade_instances(&meta);
+    if dups.is_empty() {
+        Check::Ok("single modal-rust in the resolved graph (registrations will link)".to_string())
+    } else {
+        let detail = dups
+            .iter()
+            .map(|(n, insts)| format!("{n} = {}", insts.join(" + ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Check::Warn(format!(
+            "duplicate identity crate(s) resolved — {detail}. #[function] registrations route \
+             through one instance and the generated runner collects from the other, so functions \
+             may NOT register (a silently empty registry → \"no entrypoints\"). Pin a single \
+             modal-rust major, and don't also depend on modal-rust-runtime/inventory directly at a \
+             different version."
+        ))
+    }
+}
+
 /// Run the full `doctor` preflight. `with_rust` enables the `--rust` checks.
 /// `project_dir` is the directory whose manifest chain is inspected for the
 /// `panic = "abort"` profile check (the cwd for a bare `doctor`).
@@ -254,12 +339,14 @@ pub fn run(with_rust: bool, project_dir: &std::path::Path) -> i32 {
         checks.push(check_cargo());
         checks.push(check_rustc());
         checks.push(check_panic_profile(project_dir));
+        checks.push(check_duplicate_facade(project_dir));
     }
 
     let mut first_failure: Option<Value> = None;
     for check in &checks {
         match check {
             Check::Ok(msg) => println!("  [ok]   {msg}"),
+            Check::Warn(msg) => println!("  [warn] {msg}"),
             Check::Fail(env) => {
                 let msg = env["error"]["message"]
                     .as_str()
@@ -350,5 +437,33 @@ mod tests {
         .unwrap();
         assert!(matches!(check_panic_profile(&dir), Check::Ok(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_two_modal_rust_instances() {
+        let meta = json!({
+            "packages": [
+                {"name": "modal-rust", "version": "0.1.0", "source": null},
+                {"name": "modal-rust", "version": "0.2.0",
+                 "source": "registry+https://github.com/rust-lang/crates.io-index"},
+                {"name": "serde", "version": "1.0.0", "source": "registry+..."}
+            ]
+        });
+        let dups = duplicate_facade_instances(&meta);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].0, "modal-rust");
+        assert_eq!(dups[0].1.len(), 2);
+    }
+
+    #[test]
+    fn single_modal_rust_is_not_a_duplicate() {
+        let meta = json!({
+            "packages": [
+                {"name": "modal-rust", "version": "0.1.0", "source": null},
+                {"name": "modal-rust-runtime", "version": "0.0.0", "source": null},
+                {"name": "inventory", "version": "0.3.24", "source": "registry+..."}
+            ]
+        });
+        assert!(duplicate_facade_instances(&meta).is_empty());
     }
 }
