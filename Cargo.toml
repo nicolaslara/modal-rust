@@ -30,6 +30,7 @@ members = [
     "examples/timeout-and-cache",
     "examples/custom-base",
     "examples/deploy-and-call",
+    "examples/cli-workflow",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -61,6 +62,7 @@ default-members = [
     "examples/timeout-and-cache",
     "examples/custom-base",
     "examples/deploy-and-call",
+    "examples/cli-workflow",
     "examples/cuda-vector-add",
 ]
 

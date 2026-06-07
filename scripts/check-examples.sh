@@ -161,6 +161,14 @@ run "custom-base: dry-run renders a CUDA-devel base FROM line" 'base:   FROM nvi
 run "deploy-and-call: deploy builds once, call invokes with no rebuild" 'boundary: deploy builds ONCE at image-build, call invokes with no rebuild' \
   "cargo run -q -p example-deploy-and-call --bin deploy_and_call"
 
+# cli-workflow — drive a crate from the generic `modal-rust` CLI, no driver binary.
+# The OFFLINE-tested verb is `doctor`: the preflight that needs no Modal (it prints
+# its banner to stdout regardless of credentials, then checks them). The run/deploy/
+# call verbs require Modal and are documented compile/listed-only (their build is
+# covered by `cargo build`). Asserts the OFFLINE preflight banner the doctor prints.
+run "cli-workflow: doctor offline preflight (no driver binary)" 'modal-rust doctor — preflight (OFFLINE)' \
+  "cargo run -q -p modal-rust-cli -- doctor --rust --project examples/cli-workflow"
+
 # cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
 run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
   "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
@@ -180,6 +188,9 @@ elif ! has_creds; then
   echo "     background-jobs RUN_REMOTE=1 cargo run -p example-background-jobs --bin background_jobs"
   echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
+  echo "     cli-workflow    cargo run -p modal-rust-cli -- run summarize --project examples/cli-workflow --input '{\"text\":\"the quick brown fox\"}'"
+  echo "                     cargo run -p modal-rust-cli -- deploy summarize --project examples/cli-workflow --app modal-rust-cli-workflow-example"
+  echo "                     cargo run -p modal-rust-cli -- call summarize --app modal-rust-cli-workflow-example --input '{\"text\":\"the quick brown fox\"}'"
   echo
 else
   # LIVE (CPU): one orchestrate run drives .remote() + deploy + call.

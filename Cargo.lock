@@ -1891,6 +1891,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-cli-workflow"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "example-cuda-vector-add"
 version = "0.0.0"
 dependencies = [

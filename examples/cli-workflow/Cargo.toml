@@ -1,0 +1,31 @@
+[package]
+name = "example-cli-workflow"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: drive your crate from the generic `modal-rust` CLI — no driver binary. You write a plain `#[function]` lib (and the one-line `modal_runner`); the CLI does the rest: `doctor` (offline preflight), `run`, `deploy`, `call`. Offline-tested via `modal-rust doctor --project examples/cli-workflow`; the run/deploy/call commands require Modal (documented, compile/listed only)."
+publish = false
+
+[lib]
+name = "example_cli_workflow"
+path = "src/lib.rs"
+
+[[bin]]
+# The ONLY binary an external user writes: the runner, one line. The `modal-rust`
+# CLI (`run`/`deploy`/`call`) builds THIS `--bin modal_runner` to read the entrypoint
+# manifest and to bake into the deploy image. There is NO hand-written driver binary
+# in this crate — driving the crate IS the CLI's job (that is the whole lesson).
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+# Test-only: the unit test that asserts the input decodes from a named JSON object.
+# Not part of the authoring surface — the runner does this decode for you at runtime.
+serde_json = "1"
