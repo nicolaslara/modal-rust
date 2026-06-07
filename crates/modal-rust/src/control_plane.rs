@@ -305,7 +305,11 @@ fn build_function_spec(
         .with_memory_mb(ep.options.memory_mb)
         // retries ride into Function.retry_policy. `None` leaves the field unset, so
         // an unset decorator is byte-identical to before.
-        .with_retries(ep.options.retries);
+        .with_retries(ep.options.retries)
+        // schedule rides into Function.schedule (Cron/Period). `None` leaves the field
+        // unset, so an unset decorator is byte-identical; a malformed spec is rejected
+        // up front (mirrors `with_gpu`).
+        .with_schedule(ep.options.schedule.as_deref())?;
     // P6 cargo-cache volume at /cache (RUN only; `cache_vol_id` is None otherwise).
     if let Some(vid) = &res.cache_vol_id {
         fn_spec = fn_spec.with_volume_mount(vid.clone(), CACHE_MOUNT);

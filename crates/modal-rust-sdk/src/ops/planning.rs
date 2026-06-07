@@ -55,6 +55,11 @@ pub struct PlannedFunction {
     /// The automatic retry COUNT, if a retry policy is set
     /// (`Function.retry_policy.retries`); `None` = no policy.
     pub retries: Option<u32>,
+    /// A human-readable summary of the run schedule, if set (`Function.schedule`);
+    /// `None` = no schedule. `"cron(<expr> @ <tz>)"` for a [`Cron`], or
+    /// `"period(<components>)"` for a [`Period`]. Mirrors what the wire carries
+    /// without leaking the proto oneof across the crate boundary.
+    pub schedule: Option<String>,
     /// The FILE-mode XOR invariant: `FunctionCreateRequest.function_data` is unset.
     pub function_data_is_none: bool,
 }
@@ -103,6 +108,11 @@ pub fn plan_function_request(
         .iter()
         .map(|m| (m.mount_path.clone(), m.volume_id.clone()))
         .collect();
+    let schedule = function
+        .schedule
+        .as_ref()
+        .and_then(|s| s.schedule_oneof.as_ref())
+        .map(render_schedule);
     PlannedFunction {
         module_name: function.module_name.clone(),
         function_name: function.function_name.clone(),
@@ -114,7 +124,36 @@ pub fn plan_function_request(
         volume_mounts,
         secret_ids_count: function.secret_ids.len(),
         retries: function.retry_policy.map(|p| p.retries),
+        schedule,
         function_data_is_none,
+    }
+}
+
+/// Render a `Schedule` oneof into a human-readable summary for the dump — keeps the
+/// proto oneof from leaking across the crate boundary.
+fn render_schedule(oneof: &crate::proto::api::schedule::ScheduleOneof) -> String {
+    use crate::proto::api::schedule::ScheduleOneof;
+    match oneof {
+        ScheduleOneof::Cron(c) => format!("cron({} @ {})", c.cron_string, c.timezone),
+        ScheduleOneof::Period(p) => {
+            // List only the non-zero components, in the natural large→small order.
+            let mut parts: Vec<String> = Vec::new();
+            let mut push = |name: &str, v: i32| {
+                if v != 0 {
+                    parts.push(format!("{name}={v}"));
+                }
+            };
+            push("years", p.years);
+            push("months", p.months);
+            push("weeks", p.weeks);
+            push("days", p.days);
+            push("hours", p.hours);
+            push("minutes", p.minutes);
+            if p.seconds != 0.0 {
+                parts.push(format!("seconds={}", p.seconds));
+            }
+            format!("period({})", parts.join(","))
+        }
     }
 }
 
@@ -150,7 +189,9 @@ mod tests {
             .expect("valid gpu")
             .with_milli_cpu(Some(2000))
             .with_memory_mb(Some(4096))
-            .with_retries(Some(3));
+            .with_retries(Some(3))
+            .with_schedule(Some("cron:UTC:0 9 * * 1"))
+            .expect("valid schedule");
         let planned = plan_function_request("ap-1", "fu-pre-1", &spec);
         assert_eq!(planned.module_name, "modal_rust_run_wrapper");
         // Object tag = the entrypoint ("add"), decoupled from the "handler" callable.
@@ -162,6 +203,7 @@ mod tests {
         assert_eq!(planned.timeout_secs, 1800);
         assert_eq!(planned.secret_ids_count, 0);
         assert_eq!(planned.retries, Some(3));
+        assert_eq!(planned.schedule.as_deref(), Some("cron(0 9 * * 1 @ UTC)"));
         assert!(
             planned.function_data_is_none,
             "FILE-mode XOR: function_data is None"

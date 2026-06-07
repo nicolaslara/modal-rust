@@ -25,15 +25,17 @@
 //! ## Optional per-function config
 //!
 //! `#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false, cpu = 2.0,
-//! memory = 4096, retries = 3)]` records a facade-owned
+//! memory = 4096, retries = 3, schedule = Cron("0 9 * * 1"))]` records a facade-owned
 //! [`modal_rust::FunctionConfig`] in the same inventory record as the handler. This is
 //! control-plane metadata only: the facade reads it when creating the Modal function
 //! (`Resources.gpu_config`, `timeout_secs`, `Resources.milli_cpu`,
-//! `Resources.memory_mb`, `retry_policy`), while runtime dispatch sees only `name` +
-//! `HandlerFn`. `cpu` is CPU CORES (a float, e.g. `2.0`; resolved to `milli_cpu =
-//! int(1000 * cpu)`, mirroring Modal); `memory` is MEBIBYTES (an int); `retries` is
-//! the automatic retry COUNT (an int; mirrors Modal's bare-int `retries` kwarg → a
-//! fixed-interval retry policy).
+//! `Resources.memory_mb`, `retry_policy`, `schedule`), while runtime dispatch sees only
+//! `name` + `HandlerFn`. `cpu` is CPU CORES (a float, e.g. `2.0`; resolved to
+//! `milli_cpu = int(1000 * cpu)`, mirroring Modal); `memory` is MEBIBYTES (an int);
+//! `retries` is the automatic retry COUNT (an int; mirrors Modal's bare-int `retries`
+//! kwarg → a fixed-interval retry policy); `schedule` is a run cadence for a DEPLOYED
+//! function — `Cron("expr"[, "tz"])` or `Period(days = 1, hours = 4, ..)`, mirroring
+//! Modal's `Cron`/`Period`.
 //!
 //! ## User-facing secrets + volumes
 //!
@@ -127,8 +129,8 @@ use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, FnArg, GenericArgument, ItemFn, Lit, LitBool, LitInt, LitStr, PatType,
-    PathArguments, ReturnType, Token, Type,
+    parse_macro_input, Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitBool, LitInt, LitStr,
+    PatType, PathArguments, ReturnType, Token, Type,
 };
 
 /// The Cargo package name of the facade crate the macro routes ALL paths through.
@@ -195,6 +197,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut milli_cpu: Option<u32> = None; // cpu = 2.0 (cores) -> milli_cpu = 2000
     let mut memory_mb: Option<u32> = None; // memory = 4096 (MiB)
     let mut retries: Option<u32> = None; // retries = 3 (retry count)
+    let mut schedule: Option<String> = None; // schedule = Cron("..") / Period(..) -> spec string
     let mut secrets: Vec<String> = Vec::new(); // secrets = ["a", "b"]
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     if !attr.is_empty() {
@@ -234,6 +237,15 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // `Option<u32>` const-valid in the `static` initializer (like timeout).
                 let lit: LitInt = meta.value()?.parse()?;
                 retries = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("schedule") {
+                // schedule = Cron("expr"[, "tz"])  OR  Period(days = 1, hours = 4, ..)
+                // A run cadence for a DEPLOYED function (Modal `Cron`/`Period`,
+                // schedule.py). Parsed into a const SPEC string the facade hands to the
+                // SDK's `parse_schedule`, so `FunctionConfig.schedule` stays an
+                // `Option<&'static str>` const-valid in the `inventory::submit!`
+                // initializer (exactly like `gpu`).
+                schedule = Some(parse_schedule_to_spec(meta.value()?)?);
                 Ok(())
             } else if meta.path.is_ident("secrets") {
                 // secrets = ["my-secret", "other"] — a bracketed list of string
@@ -278,8 +290,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "unsupported `#[modal_rust::function]` argument; recognized: \
                      `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
                      `cache = <bool>`, `cpu = <cores>`, `memory = <MiB>`, \
-                     `retries = <count>`, `secrets = [\"name\", ..]`, \
-                     `volumes = [\"/mount=name\", ..]`",
+                     `retries = <count>`, `schedule = Cron(\"..\")/Period(..)`, \
+                     `secrets = [\"name\", ..]`, `volumes = [\"/mount=name\", ..]`",
                 ))
             }
         });
@@ -361,6 +373,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             milli_cpu,
             memory_mb,
             retries,
+            schedule.as_deref(),
             &secrets,
             &volumes,
         );
@@ -484,6 +497,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         milli_cpu,
         memory_mb,
         retries,
+        schedule.as_deref(),
         &secrets,
         &volumes,
     );
@@ -589,6 +603,7 @@ fn emit_registration(
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
     retries: Option<u32>,
+    schedule: Option<&str>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> TokenStream {
@@ -602,6 +617,7 @@ fn emit_registration(
         milli_cpu,
         memory_mb,
         retries,
+        schedule,
         secrets,
         volumes,
     );
@@ -641,6 +657,7 @@ fn build_registration(
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
     retries: Option<u32>,
+    schedule: Option<&str>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> proc_macro2::TokenStream {
@@ -677,6 +694,14 @@ fn build_registration(
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
+    // `schedule` is canonicalized to a `&'static str` SPEC string (the facade hands it
+    // to the SDK's `parse_schedule`), so it stays const-valid in the `static`
+    // initializer exactly like `gpu`. `None` emits `None` => byte-identical to a bare
+    // decorator (no schedule on the wire).
+    let schedule_tok = match schedule {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
     // `secrets`/`volumes` are `&'static` slices on `FunctionConfig` (const-valid in
     // the `static` `inventory::submit!` initializer, exactly like `gpu`/`name`). An
     // empty list emits `&[]`, byte-identical to the bare default.
@@ -703,6 +728,7 @@ fn build_registration(
                     milli_cpu: #milli_cpu_tok,
                     memory_mb: #memory_mb_tok,
                     retries: #retries_tok,
+                    schedule: #schedule_tok,
                     secrets: #secrets_tok,
                     volumes: #volumes_tok,
                 },
@@ -879,6 +905,159 @@ fn parse_str_list(input: syn::parse::ParseStream) -> syn::Result<Vec<LitStr>> {
     Ok(items.into_iter().collect())
 }
 
+/// The seven `Period(..)` component names, in Modal's large→small order
+/// (`schedule.py:90`). `seconds` is the only float; the rest are integers.
+const PERIOD_COMPONENTS: &[&str] = &[
+    "years", "months", "weeks", "days", "hours", "minutes", "seconds",
+];
+
+/// Parse a `schedule = ..` value into a canonical SPEC string the SDK's
+/// `parse_schedule` understands. Two call-shaped forms mirror Modal's `Cron`/`Period`
+/// (`schedule.py`):
+///
+/// - `Cron("expr")` / `Cron("expr", "tz")` → `"cron:<tz>:<expr>"` (timezone defaults
+///   to `UTC`, matching `Cron(cron_string, timezone="UTC")`).
+/// - `Period(days = 1, hours = 4, seconds = 1.5)` → `"period:days=1,hours=4,seconds=1.5"`
+///   (only the named components; omitted ones default to `0`).
+///
+/// A malformed form (`gpu`-style) becomes a `compile_error!` so the user learns at
+/// compile time, never on the wire.
+fn parse_schedule_to_spec(input: syn::parse::ParseStream) -> syn::Result<String> {
+    let call: syn::ExprCall = input.parse().map_err(|_| {
+        syn::Error::new(
+            input.span(),
+            "`schedule` must be `Cron(\"expr\"[, \"tz\"])` or `Period(days = 1, ..)`",
+        )
+    })?;
+    // The callee is a path like `Cron` / `modal_rust::Cron` — take the last segment.
+    let kind = match call.func.as_ref() {
+        Expr::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default(),
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                "`schedule` must call `Cron(..)` or `Period(..)`",
+            ))
+        }
+    };
+
+    match kind.as_str() {
+        "Cron" => {
+            // Cron("expr") or Cron("expr", "tz") — string-literal args only.
+            let mut args = call.args.iter();
+            let cron_string = expect_str_lit(args.next(), &call, "Cron expects a cron string")?;
+            let timezone = match args.next() {
+                Some(a) => expect_str_lit(Some(a), &call, "Cron timezone must be a string")?,
+                None => "UTC".to_string(), // mirrors Cron(.., timezone="UTC")
+            };
+            if args.next().is_some() {
+                return Err(syn::Error::new_spanned(
+                    &call,
+                    "Cron takes at most two arguments: Cron(\"expr\"[, \"tz\"])",
+                ));
+            }
+            if cron_string.contains(':') || timezone.contains(':') {
+                // The spec is colon-delimited; a literal colon would corrupt it. Cron
+                // expressions and IANA timezones never contain a colon, so reject early.
+                return Err(syn::Error::new_spanned(
+                    &call,
+                    "Cron expression / timezone must not contain a ':'",
+                ));
+            }
+            Ok(format!("cron:{timezone}:{cron_string}"))
+        }
+        // Period(days = 1, hours = 4, ..) — `name = value` named components only.
+        "Period" => parse_period_components(&call),
+        other => Err(syn::Error::new_spanned(
+            &call.func,
+            format!("unknown schedule kind {other:?}; expected `Cron` or `Period`"),
+        )),
+    }
+}
+
+/// Extract a string-literal value from a call argument, or a clear `compile_error!`.
+fn expect_str_lit(arg: Option<&Expr>, call: &syn::ExprCall, msg: &str) -> syn::Result<String> {
+    match arg {
+        Some(Expr::Lit(ExprLit {
+            lit: Lit::Str(s), ..
+        })) => Ok(s.value()),
+        Some(other) => Err(syn::Error::new_spanned(other, msg)),
+        None => Err(syn::Error::new_spanned(call, msg)),
+    }
+}
+
+/// Parse `Period(days = 1, hours = 4, seconds = 1.5)` arguments into the canonical
+/// `period:..` spec. Each argument is `name = value`; `name` must be a known component
+/// and `value` an int (or a float for `seconds`).
+fn parse_period_components(call: &syn::ExprCall) -> syn::Result<String> {
+    if call.args.is_empty() {
+        return Err(syn::Error::new_spanned(
+            call,
+            "Period needs at least one component, e.g. `Period(days = 1)`",
+        ));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for arg in &call.args {
+        let Expr::Assign(assign) = arg else {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "Period components must be `name = value`, e.g. `hours = 4`",
+            ));
+        };
+        let Expr::Path(name_path) = assign.left.as_ref() else {
+            return Err(syn::Error::new_spanned(
+                &assign.left,
+                "Period component name must be a bare identifier (e.g. `days`)",
+            ));
+        };
+        let name = name_path
+            .path
+            .get_ident()
+            .map(|i| i.to_string())
+            .ok_or_else(|| {
+                syn::Error::new_spanned(&assign.left, "Period component name must be an identifier")
+            })?;
+        if !PERIOD_COMPONENTS.contains(&name.as_str()) {
+            return Err(syn::Error::new_spanned(
+                &assign.left,
+                format!("unknown Period component {name:?}; expected one of {PERIOD_COMPONENTS:?}"),
+            ));
+        }
+        // The value must be a numeric literal. `seconds` may be a float; all others
+        // must be integers. We render the literal verbatim into the spec; the SDK
+        // re-parses it.
+        let value =
+            match assign.right.as_ref() {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Int(i), ..
+                }) => i.base10_digits().to_string(),
+                Expr::Lit(ExprLit {
+                    lit: Lit::Float(f), ..
+                }) if name == "seconds" => f.base10_digits().to_string(),
+                Expr::Lit(ExprLit {
+                    lit: Lit::Float(_), ..
+                }) => return Err(syn::Error::new_spanned(
+                    &assign.right,
+                    format!(
+                        "Period component {name:?} must be an integer (only `seconds` is a float)"
+                    ),
+                )),
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        format!("Period component {name:?} must be a numeric literal"),
+                    ))
+                }
+            };
+        parts.push(format!("{name}={value}"));
+    }
+    Ok(format!("period:{}", parts.join(",")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,5 +1135,51 @@ mod tests {
         assert_eq!(to_pascal_case("add_gpu"), "AddGpu");
         assert_eq!(to_pascal_case("a_b_c"), "ABC");
         assert_eq!(to_pascal_case("already"), "Already");
+    }
+
+    #[test]
+    fn schedule_cron_and_period_canonicalize_to_spec() {
+        // Drive `parse_schedule_to_spec` through the real ParseStream path. The output
+        // is the canonical SPEC string the SDK's `parse_schedule` consumes.
+        let spec = |src: &str| -> String {
+            syn::parse::Parser::parse_str(parse_schedule_to_spec, src).expect("valid schedule")
+        };
+        // Cron with the default UTC timezone.
+        assert_eq!(spec(r#"Cron("0 9 * * 1")"#), "cron:UTC:0 9 * * 1");
+        // Cron with an explicit IANA timezone.
+        assert_eq!(
+            spec(r#"Cron("0 6 * * *", "America/New_York")"#),
+            "cron:America/New_York:0 6 * * *"
+        );
+        // A fully-qualified path still resolves by its last segment.
+        assert_eq!(
+            spec(r#"modal_rust::Cron("* * * * *")"#),
+            "cron:UTC:* * * * *"
+        );
+        // Period — only the named components, in the order written; `seconds` is float.
+        assert_eq!(spec("Period(days = 1)"), "period:days=1");
+        assert_eq!(
+            spec("Period(hours = 4, minutes = 30, seconds = 1.5)"),
+            "period:hours=4,minutes=30,seconds=1.5"
+        );
+    }
+
+    #[test]
+    fn schedule_rejects_malformed() {
+        let bad = |src: &str| syn::parse::Parser::parse_str(parse_schedule_to_spec, src).is_err();
+        // Not a call expression.
+        assert!(bad(r#""0 9 * * 1""#));
+        // Unknown kind.
+        assert!(bad(r#"Daily("0 9 * * 1")"#));
+        // Cron with a non-string arg.
+        assert!(bad("Cron(5)"));
+        // Period with no components.
+        assert!(bad("Period()"));
+        // Period with an unknown component.
+        assert!(bad("Period(fortnights = 2)"));
+        // Period with a float for a non-`seconds` component.
+        assert!(bad("Period(days = 1.5)"));
+        // A literal colon in the cron string would corrupt the colon-delimited spec.
+        assert!(bad(r#"Cron("0 9:30 * * 1")"#));
     }
 }

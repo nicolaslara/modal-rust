@@ -16,9 +16,10 @@
 use crate::client::ModalClient;
 use crate::error::{Error, Result};
 use crate::proto::api::function::{DefinitionType, FunctionType};
+use crate::proto::api::schedule::{Cron, Period, ScheduleOneof};
 use crate::proto::api::{
     DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
-    FunctionRetryPolicy, GpuConfig, Resources, VolumeMount,
+    FunctionRetryPolicy, GpuConfig, Resources, Schedule, VolumeMount,
 };
 
 /// Default backoff coefficient for the bare integer `retries = N` form, mirroring
@@ -57,6 +58,79 @@ fn parse_gpu_config(spec: &str) -> Result<GpuConfig> {
         gpu_type: type_part.to_uppercase(), // `.upper()`
         count,
         ..Default::default() // r#type (deprecated GPUType, field 1) stays 0
+    })
+}
+
+/// Parse a modal-rust schedule SPEC string into a [`Schedule`] proto, mirroring
+/// Modal's `Cron`/`Period` constructors (`schedule.py`). The spec is the canonical,
+/// const-string form the `#[function(schedule = ...)]` macro emits (a `&'static str`
+/// is const-valid in the `inventory::submit!` static initializer, exactly like `gpu`).
+///
+/// Two forms, discriminated by the leading tag:
+/// - `"cron:<timezone>:<cron_string>"` → `Schedule.Cron { cron_string, timezone }`.
+///   The timezone is first because a cron string contains spaces but never a colon
+///   (`split_once(':')` twice is unambiguous). An IANA timezone (`UTC`,
+///   `America/New_York`) likewise has no colon.
+/// - `"period:years=Y,months=M,weeks=W,days=D,hours=H,minutes=Mi,seconds=S"` →
+///   `Schedule.Period { .. }`. Components are comma-separated `key=value`; any subset
+///   may appear and omitted components default to `0` (only `seconds` is a float).
+///
+/// A malformed spec maps to [`Error::build`], mirroring Python's `InvalidError`.
+fn parse_schedule(spec: &str) -> Result<Schedule> {
+    let oneof = if let Some(rest) = spec.strip_prefix("cron:") {
+        // `<timezone>:<cron_string>` — timezone first (colon-free), cron string is the
+        // remainder verbatim (it contains spaces, never a colon).
+        let (timezone, cron_string) = rest.split_once(':').ok_or_else(|| {
+            Error::build(format!(
+                "Invalid cron schedule spec {spec:?}: expected \"cron:<timezone>:<cron_string>\""
+            ))
+        })?;
+        ScheduleOneof::Cron(Cron {
+            cron_string: cron_string.to_string(),
+            timezone: timezone.to_string(),
+        })
+    } else if let Some(rest) = spec.strip_prefix("period:") {
+        let mut period = Period::default();
+        // Empty component list (`"period:"`) is a zero period; otherwise parse each
+        // `key=value`. Unknown keys / bad numbers map to `Error::build`.
+        for part in rest.split(',').filter(|p| !p.is_empty()) {
+            let (key, value) = part.split_once('=').ok_or_else(|| {
+                Error::build(format!(
+                    "Invalid period component {part:?} in schedule spec {spec:?}: expected key=value"
+                ))
+            })?;
+            let parse_i32 = |v: &str| -> Result<i32> {
+                v.trim()
+                    .parse()
+                    .map_err(|_| Error::build(format!("Invalid integer {v:?} for period {key:?}")))
+            };
+            match key.trim() {
+                "years" => period.years = parse_i32(value)?,
+                "months" => period.months = parse_i32(value)?,
+                "weeks" => period.weeks = parse_i32(value)?,
+                "days" => period.days = parse_i32(value)?,
+                "hours" => period.hours = parse_i32(value)?,
+                "minutes" => period.minutes = parse_i32(value)?,
+                "seconds" => {
+                    period.seconds = value.trim().parse().map_err(|_| {
+                        Error::build(format!("Invalid float {value:?} for period \"seconds\""))
+                    })?
+                }
+                other => {
+                    return Err(Error::build(format!(
+                        "Unknown period component {other:?} in schedule spec {spec:?}"
+                    )))
+                }
+            }
+        }
+        ScheduleOneof::Period(period)
+    } else {
+        return Err(Error::build(format!(
+            "Invalid schedule spec {spec:?}: expected a \"cron:..\" or \"period:..\" prefix"
+        )));
+    };
+    Ok(Schedule {
+        schedule_oneof: Some(oneof),
     })
 }
 
@@ -191,6 +265,12 @@ pub struct FunctionSpec {
     /// USER-facing `#[function(retries = N)]` path sets this; Modal then automatically
     /// re-runs a failed call up to `retries` times.
     pub retry_policy: Option<FunctionRetryPolicy>,
+    /// Schedule → `Function.schedule` (proto field 72). DEFAULT `None`: an unset
+    /// schedule keeps prost from emitting field 72, so the create is byte-identical to
+    /// before for every function that does not set `schedule`. The USER-facing
+    /// `#[function(schedule = Cron(..)/Period(..))]` path sets this; Modal then runs the
+    /// DEPLOYED function automatically on that cadence (no caller).
+    pub schedule: Option<Schedule>,
 }
 
 impl FunctionSpec {
@@ -213,6 +293,7 @@ impl FunctionSpec {
             volume_mounts: Vec::new(),
             secret_ids: Vec::new(),
             retry_policy: None,
+            schedule: None,
         }
     }
 
@@ -350,6 +431,16 @@ impl FunctionSpec {
         });
         self
     }
+
+    /// Set a run schedule from a modal-rust schedule SPEC string
+    /// (`#[function(schedule = Cron("..")/Period(..))]`), parsed by [`parse_schedule`]
+    /// into Modal's `Schedule` (a `Cron`/`Period` oneof). `None` leaves the field UNSET
+    /// so the create is byte-identical to before (no `schedule` on the wire). A
+    /// malformed spec returns [`Error::build`].
+    pub fn with_schedule(mut self, spec: Option<&str>) -> Result<Self> {
+        self.schedule = spec.map(parse_schedule).transpose()?;
+        Ok(self)
+    }
 }
 
 /// Result of [`ModalClient::function_create`].
@@ -397,9 +488,9 @@ pub(crate) fn build_function_precreate_request(
 ///   `function_serialized` in FILE mode);
 /// - `function_serialized` empty, `definition_type = FILE`, `function_type = FUNCTION`;
 /// - `resources` ALWAYS set (fix #1);
-/// - empty `volume_mounts` / `secret_ids` and a `None` `retry_policy` ⇒ prost omits
-///   those fields ⇒ wire-identical to before P6 / before secrets / before retries for
-///   existing callers.
+/// - empty `volume_mounts` / `secret_ids` and a `None` `retry_policy` / `schedule` ⇒
+///   prost omits those fields ⇒ wire-identical to before P6 / before secrets / before
+///   retries / before schedule for existing callers.
 pub(crate) fn build_function_create_request(
     app_id: &str,
     precreate_function_id: &str,
@@ -446,6 +537,10 @@ pub(crate) fn build_function_create_request(
         // (no-retry) callers. The user `#[function(retries = N)]` path sets a
         // fixed-interval policy here so Modal auto-retries a failed call.
         retry_policy: spec.retry_policy,
+        // `None` ⇒ prost omits field 72 ⇒ byte-identical for all existing
+        // (no-schedule) callers. The user `#[function(schedule = Cron(..)/Period(..))]`
+        // path sets a Cron/Period here so Modal runs the DEPLOYED function on a cadence.
+        schedule: spec.schedule.clone(),
         ..Default::default()
     };
 
@@ -651,6 +746,89 @@ mod tests {
     }
 
     #[test]
+    fn schedule_defaults_none() {
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(
+            spec.schedule.is_none(),
+            "schedule must default None (wire-identical to before schedule)"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_cron_with_and_without_timezone() {
+        // `cron:<timezone>:<cron_string>` — the timezone is parsed first; the cron
+        // string is the colon-free remainder verbatim.
+        let utc = parse_schedule("cron:UTC:5 4 * * *").expect("valid cron");
+        match utc.schedule_oneof.expect("oneof") {
+            ScheduleOneof::Cron(c) => {
+                assert_eq!(c.cron_string, "5 4 * * *");
+                assert_eq!(c.timezone, "UTC");
+            }
+            other => panic!("expected Cron, got {other:?}"),
+        }
+        // A non-UTC IANA timezone (contains a `/`, never a `:`) round-trips.
+        let ny = parse_schedule("cron:America/New_York:0 6 * * *").expect("valid cron");
+        match ny.schedule_oneof.expect("oneof") {
+            ScheduleOneof::Cron(c) => {
+                assert_eq!(c.cron_string, "0 6 * * *");
+                assert_eq!(c.timezone, "America/New_York");
+            }
+            other => panic!("expected Cron, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_schedule_period_components() {
+        // Only the components present are set; the rest default to 0. `seconds` is float.
+        let p = parse_schedule("period:hours=4,minutes=30,seconds=1.5").expect("valid period");
+        match p.schedule_oneof.expect("oneof") {
+            ScheduleOneof::Period(p) => {
+                assert_eq!(p.hours, 4);
+                assert_eq!(p.minutes, 30);
+                assert_eq!(p.seconds, 1.5);
+                // Unset components stay 0 (byte-identical to a Modal Period default).
+                assert_eq!(p.years, 0);
+                assert_eq!(p.months, 0);
+                assert_eq!(p.weeks, 0);
+                assert_eq!(p.days, 0);
+            }
+            other => panic!("expected Period, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_schedule_rejects_malformed() {
+        // No tag prefix.
+        assert!(parse_schedule("4 * * * *").is_err());
+        // Cron missing the cron string after the timezone.
+        assert!(parse_schedule("cron:UTC").is_err());
+        // Period with an unknown component.
+        assert!(parse_schedule("period:fortnights=2").is_err());
+        // Period with a non-integer day count.
+        assert!(parse_schedule("period:days=many").is_err());
+    }
+
+    #[test]
+    fn with_schedule_sets_and_clears() {
+        // `Some(spec)` parses into the proto schedule; `None` leaves it unset
+        // (byte-identical to before schedule).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_schedule(Some("cron:UTC:0 9 * * 1"))
+            .expect("valid schedule");
+        assert!(spec.schedule.is_some());
+
+        let bare = FunctionSpec::new("m", "handler", "im-1")
+            .with_schedule(None)
+            .expect("none is valid");
+        assert!(bare.schedule.is_none());
+
+        // A malformed spec surfaces as an error (mirrors `with_gpu`).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_schedule(Some("nonsense"))
+            .is_err());
+    }
+
+    #[test]
     fn with_secret_ids_attaches_and_flows_to_proto() {
         // Builder appends; the resolved ids flow into Function.secret_ids (field 10).
         let spec = FunctionSpec::new("m", "handler", "im-1")
@@ -836,7 +1014,9 @@ mod tests {
             .expect("valid gpu")
             .with_volume_mount("vo-cache", "/cache")
             .with_secret_id("sc-1")
-            .with_retries(Some(3));
+            .with_retries(Some(3))
+            .with_schedule(Some("cron:UTC:0 9 * * 1"))
+            .expect("valid schedule");
         let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
 
         // XOR: function is set, function_data is NOT (fix #1).
@@ -875,6 +1055,19 @@ mod tests {
         assert_eq!(policy.backoff_coefficient, 1.0);
         assert_eq!(policy.initial_delay_ms, 1000);
         assert_eq!(policy.max_delay_ms, 60_000);
+        // The schedule rode into Function.schedule (field 72) as a Cron.
+        match function
+            .schedule
+            .as_ref()
+            .and_then(|s| s.schedule_oneof.as_ref())
+            .expect("schedule set")
+        {
+            ScheduleOneof::Cron(c) => {
+                assert_eq!(c.cron_string, "0 9 * * 1");
+                assert_eq!(c.timezone, "UTC");
+            }
+            other => panic!("expected Cron, got {other:?}"),
+        }
     }
 
     #[test]
@@ -899,6 +1092,10 @@ mod tests {
         assert!(
             function.retry_policy.is_none(),
             "no retries ⇒ retry_policy unset (wire-identical)"
+        );
+        assert!(
+            function.schedule.is_none(),
+            "no schedule ⇒ Function.schedule unset (wire-identical)"
         );
         assert!(req.function_data.is_none(), "XOR holds for CPU too");
     }

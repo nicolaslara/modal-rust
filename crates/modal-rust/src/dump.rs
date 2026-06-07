@@ -117,6 +117,8 @@ pub enum PlannedRequest {
         secret_count: usize,
         /// The automatic retry COUNT, if a retry policy is set; `None` = no policy.
         retries: Option<u32>,
+        /// A human-readable summary of the run schedule, if set; `None` = no schedule.
+        schedule: Option<String>,
         /// The FILE-mode XOR invariant: `function_data` is unset.
         function_data_is_none: bool,
     },
@@ -205,13 +207,14 @@ impl Manifest {
                     volume_mounts,
                     secret_count,
                     retries,
+                    schedule,
                     function_data_is_none,
                 } => format!(
                     "FunctionCreate         module={module:?} function={function:?} \
                      mount_ids={mount_ids_count} gpu={gpu:?} cpu={milli_cpu}m \
                      memory={memory_mb}MiB timeout={timeout_secs}s \
                      volumes={volume_mounts:?} secrets={secret_count} \
-                     retries={retries:?} \
+                     retries={retries:?} schedule={schedule:?} \
                      function_data_is_none={function_data_is_none}"
                 ),
                 PlannedRequest::AppPublish { app_state } => {
@@ -359,6 +362,7 @@ impl ControlPlane for RecordingControlPlane {
             volume_mounts: planned.volume_mounts,
             secret_count: planned.secret_ids_count,
             retries: planned.retries,
+            schedule: planned.schedule,
             function_data_is_none: planned.function_data_is_none,
         });
         // A deterministic function id keeps the cumulative publish union non-empty;
@@ -583,6 +587,7 @@ mod tests {
             secrets: &[],
             volumes: &[],
             retries: None,
+            schedule: None,
         };
         let app = App::from_manifest([("add".to_string(), cfg)]);
         let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");

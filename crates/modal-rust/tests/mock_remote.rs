@@ -500,6 +500,88 @@ async fn run_without_retries_is_wire_identical() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// schedule rides into FunctionCreate.schedule. A decorator
+/// `schedule = Cron("0 9 * * 1")` canonicalizes to the spec `"cron:UTC:0 9 * * 1"`,
+/// which the facade parses into Modal's `Schedule.Cron { cron_string, timezone }` and
+/// rides onto `Function.schedule` (proto field 72) in the FunctionCreate manifest.
+/// ADDITIVE: an unset decorator leaves `schedule` unset (negative test below).
+#[tokio::test]
+async fn run_with_schedule_rides_into_function_create() {
+    use modal_rust_testkit::prelude::schedule::ScheduleOneof;
+
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-sched-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false; // keep the manifest minimal
+    let app = App::connect_at_with_configs(
+        "schedule-app",
+        modal_registry(),
+        configs_for_add(FunctionConfig {
+            cache: Some(false),
+            schedule: Some("cron:UTC:0 9 * * 1"),
+            ..FunctionConfig::default()
+        }),
+        mock.url(),
+        rc,
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    let schedule = function
+        .schedule
+        .and_then(|s| s.schedule_oneof)
+        .expect("schedule set on the manifest");
+    match schedule {
+        ScheduleOneof::Cron(c) => {
+            assert_eq!(
+                c.cron_string, "0 9 * * 1",
+                "cron expr rode onto the manifest"
+            );
+            assert_eq!(c.timezone, "UTC", "timezone defaults to UTC");
+        }
+        other => panic!("expected a Cron schedule, got {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// schedule NEGATIVE — an unset decorator leaves `Function.schedule` unset, so the
+/// FunctionCreate is wire-identical to before the feature. Pins the additive guarantee.
+#[tokio::test]
+async fn run_without_schedule_is_wire_identical() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-nosched-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false;
+    let app = App::connect_at_with("nosched-app", modal_registry(), mock.url(), rc)
+        .await
+        .expect("connect");
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    assert!(
+        function.schedule.is_none(),
+        "unset schedule => no Function.schedule (wire-identical)"
+    );
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Row 5 — user volume rides into FunctionCreate. A RUN with
 /// `volumes=[("/data","my-vol")]` resolves VolumeGetOrCreate (V1, create) before
 /// FunctionCreate; the id mounts at `/data`.

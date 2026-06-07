@@ -156,6 +156,14 @@ run "cpu-memory: --describe (cpu + memory ride through inventory)" '"milli_cpu":
 run "retries: --describe (retry count rides through inventory)" '"retries":5' \
   "cd examples/retries && cargo run -q --bin modal_runner -- --describe"
 
+# scheduled-job — decorator-is-config: a DEPLOYED function that runs on a cron schedule
+# with NO caller (`schedule = Cron("0 9 * * 1")` -> Modal's Schedule.Cron). Proven
+# OFFLINE via --describe (a mock test asserts the cron rides into the FunctionCreate
+# manifest's schedule, field 72). The body just does its work; the decorator makes
+# Modal trigger it on the cadence after `modal-rust deploy`.
+run "scheduled-job: --describe (cron schedule rides through inventory)" '"schedule":"cron:UTC:0 9 * * 1"' \
+  "cd examples/scheduled-job && cargo run -q --bin modal_runner -- --describe"
+
 # custom-base — pick the RUN base image + install the Rust toolchain through the
 # EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
 # MODAL_RUST_BASE_IMAGE / MODAL_RUST_INSTALL_RUST env vars — NOT decorator config).

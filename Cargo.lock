@@ -1990,6 +1990,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-scheduled-job"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "example-secrets"
 version = "0.0.0"
 dependencies = [

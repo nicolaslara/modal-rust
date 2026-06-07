@@ -68,7 +68,8 @@ A short summary of the surface that is genuinely done:
 - **Volumes (user + cache)**: `#[function(volumes = ["/m=name"])]` →
   `VolumeGetOrCreate` → `Function.volume_mounts`, plus the on-by-default cargo
   build cache as a V2 volume. `ops/volume.rs`, `ops/function.rs`.
-- **Config**: `gpu`, `timeout`, `cache`, `secrets`, `volumes` on the decorator.
+- **Config**: `gpu`, `cpu`, `memory`, `timeout`, `retries`, `schedule`, `cache`,
+  `secrets`, `volumes` on the decorator.
 - **Source upload**: cargo-metadata-scoped, `.modalignore` > `.gitignore` >
   defaults, matching `mount.py`/`file_pattern_matcher.py` precedence intent.
 - **Transport**: first-party gRPC over our own vendored `api.proto` (auth, retries,
@@ -130,9 +131,9 @@ system deps, which is the highest-value gap here.
 ## 4. Function config (the decorator)
 
 Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
-(`modal-rust-macros/src/lib.rs`) carries exactly: `gpu`, `timeout_secs`, `cache`,
-`secrets`, `volumes`. `cache` is **modal-rust-specific** (cargo build cache toggle),
-not a Modal concept.
+(`modal-rust-macros/src/lib.rs`) carries: `gpu`, `timeout_secs`, `cache`, `milli_cpu`,
+`memory_mb`, `retries`, `schedule`, `secrets`, `volumes`. `cache` is
+**modal-rust-specific** (cargo build cache toggle), not a Modal concept.
 
 | Modal kwarg (`app.py`) | Status | Note |
 |---|---|---|
@@ -145,7 +146,7 @@ not a Modal concept.
 | `cpu` (790) | **Partial** | SDK `FunctionResources.milli_cpu` exists (`ops/function.rs:55`) and flows to `Resources`, but the **decorator cannot set it** (always server default). Modal supports `float` or `(request, limit)` tuple. |
 | `memory` (791) | **Partial** | Same: `FunctionResources.memory_mb` exists but is not settable from the decorator. Modal supports `int` or `(request, limit)`. |
 | `retries` (798) | **Have** (int form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), riding into `Function.retry_policy`. Mirrors `_parse_retries(int)`. The `Retries(...)` struct form (custom backoff/delays) is not yet exposed. `ops/function.rs` `with_retries`. |
-| `schedule` (783) | **Missing** | `Cron`/`Period` (`schedule.py:12/61`). See §8. |
+| `schedule` (783) | **Have** | `#[function(schedule = Cron("..")/Period(..))]` → `Function.schedule` (field 72) as a `Schedule.Cron`/`Schedule.Period`, mirroring `schedule.py:12/61`. The macro canonicalizes the call form to a spec the SDK's `parse_schedule` parses; `with_schedule` rides it into the deploy FunctionCreate. See §8. |
 | `min_containers` / `max_containers` / `buffer_containers` (793-795) | **Missing** | Autoscaler floor/ceiling/warm buffer (replaces old `keep_warm`/`concurrency_limit`). |
 | `scaledown_window` (796) | **Missing** | Idle-before-scaledown (old `container_idle_timeout`). |
 | `@concurrent` (input concurrency) | **Missing** | `_partial_function.py:700` `_concurrent` (replaces `allow_concurrent_inputs`); sets `max_concurrent_inputs`. We run one input per container. |
@@ -242,7 +243,7 @@ a warm container, which our exec-a-binary-per-input runner does not currently do
 | **Sandboxes** (`Sandbox.create`, `exec`, filesystem, tunnels, snapshots) | **Missing** | `sandbox.py:450`, `1605`, `1907`, `1427`. A large, self-contained subsystem. |
 | **`Dict`** (distributed key/value) | **Missing** | `dict.py` (`get`/`put`/`pop`/`keys`/...). |
 | **`Queue`** (distributed queue) | **Missing** | `queue.py` (`put`/`get`/`get_many`/partitions). |
-| **Schedules** — `Cron` / `Period` | **Missing** | `schedule.py:12` / `61`; wired via the `schedule=` kwarg (§4). |
+| **Schedules** — `Cron` / `Period` | **Have** | `schedule.py:12` / `61`; wired via the `schedule=` decorator field (§4) → `Function.schedule`. `examples/scheduled-job` is a deployed cron function. |
 | **`Proxy`** (static-egress proxy) | **Missing** | `proxy.py`. |
 | **Scaling / autoscaler control** | **Missing** | `min/max/buffer_containers`, `update_autoscaler` (§4/§6). |
 | **Tunnels** (`forward`) | **Missing** | `_tunnel.py`. |
@@ -278,7 +279,8 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
 4. **Inline `secrets = {dict}` / `required_keys`** — `required_keys` is a one-field
    macro addition (SDK-side done); inline dict needs facade resolve.
 5. **`min/max/buffer_containers` + `scaledown_window`** — basic autoscaling control.
-6. **`schedule` (`Cron`/`Period`)** — unlocks deployed cron jobs.
+6. ~~**`schedule` (`Cron`/`Period`)**~~ — DONE: `#[function(schedule = Cron(..)/Period(..))]`
+   → `Function.schedule`; `examples/scheduled-job` is a deployed cron job.
 7. **`starmap` / `for_each` / `spawn_map`** — natural extensions of the map family
    (gated on multi-arg support for `starmap`).
 8. **Bigger subsystems** (`Cls`/lifecycle, web endpoints, Sandboxes, Dict, Queue) —

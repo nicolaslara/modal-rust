@@ -707,6 +707,7 @@ mod tests {
                 secrets: &[],
                 volumes: &[],
                 retries: Some(3),
+                schedule: Some("cron:UTC:0 9 * * 1"),
             },
             package: "modal-rust",
         }
@@ -725,6 +726,7 @@ mod tests {
                 secrets: &["my-secret"],
                 volumes: &[("/data", "my-vol")],
                 retries: None,
+                schedule: None,
             },
             package: "modal-rust",
         }
@@ -743,10 +745,13 @@ mod tests {
         assert_eq!(gpu_cfg.memory_mb, Some(4096));
         // retries ride through config_for exactly like gpu/timeout.
         assert_eq!(gpu_cfg.retries, Some(3));
+        // schedule rides through config_for exactly like gpu/timeout.
+        assert_eq!(gpu_cfg.schedule.as_deref(), Some("cron:UTC:0 9 * * 1"));
         // The bare decorated entrypoint has the default (all-None) config.
         let bare = app.config_for("add");
         assert_eq!(bare, FunctionOptions::default());
         assert_eq!(bare.retries, None);
+        assert_eq!(bare.schedule, None);
     }
 
     #[test]
@@ -784,6 +789,7 @@ mod tests {
                     secrets: &[],
                     volumes: &[],
                     retries: None,
+                    schedule: None,
                 },
             ),
         ]);
@@ -810,6 +816,7 @@ mod tests {
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
             retries: None,
+            schedule: None,
         };
         let app = App::from_manifest([
             ("train".to_string(), cfg.clone()),
@@ -877,6 +884,7 @@ mod tests {
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
             retries: Some(5),
+            schedule: Some("period:days=1"),
         };
         let app = App::from_manifest([("add".to_string(), cfg.clone())]);
         assert_eq!(app.config_for("add"), FunctionOptions::from(&cfg));

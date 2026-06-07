@@ -46,6 +46,12 @@ pub struct FunctionConfig {
     /// facade builds the `FunctionCreate`. Plain `Option<u32>`, const-valid in the
     /// `static` `inventory::submit!` initializer (like `timeout`).
     pub retries: Option<u32>,
+    /// Run-SCHEDULE spec string (`schedule = Cron(..)/Period(..)`). `None` => no
+    /// schedule (the function is invoked only by callers). The macro canonicalizes the
+    /// `Cron`/`Period` form to a `&'static str` SPEC the SDK's `parse_schedule` reads
+    /// when the facade builds the `FunctionCreate`; const-valid in the `static`
+    /// `inventory::submit!` initializer (like `gpu`).
+    pub schedule: Option<&'static str>,
 }
 
 impl FunctionConfig {
@@ -61,6 +67,7 @@ impl FunctionConfig {
             secrets: &[],
             volumes: &[],
             retries: None,
+            schedule: None,
         }
     }
 }
@@ -97,6 +104,11 @@ pub struct FunctionOptions {
     /// Automatic retry COUNT (`retries = N`). `None` => no retry policy.
     #[serde(default)]
     pub retries: Option<u32>,
+    /// Run-SCHEDULE spec string (`schedule = Cron(..)/Period(..)`). `None` => no
+    /// schedule. Owned form of the `&'static str` spec; the facade hands it to the SDK
+    /// when building the `FunctionCreate`.
+    #[serde(default)]
+    pub schedule: Option<String>,
 }
 
 impl FunctionOptions {
@@ -128,6 +140,7 @@ impl From<&FunctionConfig> for FunctionOptions {
                 .map(|(mount_path, name)| (mount_path.to_string(), name.to_string()))
                 .collect(),
             retries: config.retries,
+            schedule: config.schedule.map(str::to_string),
         }
     }
 }
@@ -307,6 +320,7 @@ mod tests {
                 secrets: vec!["my-secret".to_string()],
                 volumes: vec![("/data".to_string(), "my-vol".to_string())],
                 retries: Some(3),
+                schedule: Some("cron:UTC:0 9 * * 1".to_string()),
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -331,9 +345,11 @@ mod tests {
             serde_json::json!([["/data", "my-vol"]])
         );
         assert_eq!(eps[0]["config"]["retries"], 3);
+        assert_eq!(eps[0]["config"]["schedule"], "cron:UTC:0 9 * * 1");
         assert_eq!(eps[1]["name"], "other");
         assert_eq!(eps[1]["config"]["gpu"], serde_json::Value::Null);
         assert_eq!(eps[1]["config"]["secrets"], serde_json::json!([]));
+        assert_eq!(eps[1]["config"]["schedule"], serde_json::Value::Null);
     }
 
     #[test]
@@ -356,6 +372,7 @@ mod tests {
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
             retries: Some(3),
+            schedule: Some("cron:UTC:0 9 * * 1"),
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -369,6 +386,7 @@ mod tests {
             vec![("/data".to_string(), "my-vol".to_string())]
         );
         assert_eq!(options.retries, Some(3));
+        assert_eq!(options.schedule.as_deref(), Some("cron:UTC:0 9 * * 1"));
     }
 
     #[test]
