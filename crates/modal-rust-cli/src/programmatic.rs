@@ -129,6 +129,44 @@ fn check_schema(schema: &str) -> Result<()> {
 /// manifest is profile-independent. Debug lets the local build reuse the user's warm
 /// debug artifacts; the REMOTE runner is built remotely (`--release`), so the local
 /// binary is throwaway either way.
+/// The clear, actionable error for a crate that `modal-rust run`/`deploy` CANNOT build a
+/// runner for: it is neither generatable (no `#[modal_rust::function]`/inventory) NOR
+/// ships a `modal_runner` bin. `bins` is THIS crate's real bin target(s) (from cargo
+/// metadata) — never an unrelated sibling's — so the "run it via its own bin" hint names
+/// the user's actual binary (e.g. `add-runner`), unlike cargo's confusing default help.
+fn unrunnable_crate_error(package: &str, bins: &[String]) -> String {
+    // Name the crate's own bin in the manual-registry hint when it ships exactly one;
+    // otherwise keep a generic `<bin>` placeholder (zero bins, or ambiguous with several).
+    let own_bin = match bins {
+        [only] => only.clone(),
+        _ => "<bin>".to_string(),
+    };
+    let ships = if bins.is_empty() {
+        "ships no bin targets".to_string()
+    } else {
+        format!("ships bin target(s): {}", bins.join(", "))
+    };
+    format!(
+        "cannot run crate '{package}': it exposes no #[modal_rust::function] entrypoints \
+         (so the CLI cannot generate a runner) and ships no `modal_runner` bin ({ships}). \
+         If this is a manual-registry crate, run it via its own bin (e.g. \
+         `cargo run -p {package} --bin {own_bin} -- --entrypoint <fn> --input-json <json>`). \
+         To use `modal-rust run`, add a #[modal_rust::function] (see examples/quickstart) \
+         or ship a `modal_runner` bin."
+    )
+}
+
+/// The clear error for a GENERATABLE crate whose `--describe` yielded ZERO entrypoints:
+/// it has a `modal-rust` dep (so the runner built) but defines no `#[modal_rust::function]`
+/// fns, so there is nothing to run or deploy.
+fn no_entrypoints_error(package: &str) -> String {
+    format!(
+        "no #[modal_rust::function] entrypoints found in crate '{package}': the runner built \
+         but reported zero entrypoints. Add a #[modal_rust::function] fn (see \
+         examples/quickstart) so `modal-rust run`/`deploy` has something to invoke."
+    )
+}
+
 fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, String)> {
     let root = workspace::workspace_root(project)?;
     // `-p <pkg>` disambiguates the shared `modal_runner` bin across workspace members
@@ -139,6 +177,20 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
     // generatable)? `resolve_runner_target` reads the SAME `cargo metadata` +
     // target manifest the upload path uses, so the decision cannot drift.
     let target = modal_rust::resolve_runner_target(&root, &package);
+
+    // Short-circuit BEFORE the doomed `cargo build -p <pkg> --bin modal_runner`: if the
+    // crate is NEITHER generatable (no `#[modal_rust::function]`/inventory for the CLI to
+    // synthesize a runner) NOR ships its OWN `modal_runner` bin, that build can only fail
+    // with cargo's confusing "no bin target named `modal_runner`" (whose "available bin
+    // in <pkg>" help points at an UNRELATED sibling crate). Emit a clear, actionable
+    // error naming THIS crate's real bin(s) instead. Skipped when `target` is `None`
+    // (metadata unavailable) so behavior is unchanged on the metadata-fallback path.
+    if let Some(t) = &target {
+        if !t.is_runnable() {
+            bail!("{}", unrunnable_crate_error(&package, &t.bin_targets));
+        }
+    }
+
     let generate = target.as_ref().map(|t| t.is_generatable()).unwrap_or(false);
 
     // The user's REAL target dir (honoring a custom `CARGO_TARGET_DIR`, else
@@ -159,6 +211,11 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
     if let Some(key) = &cache_key {
         if let Some(bytes) = describe_cache::load(&shared_target, key) {
             if let Ok(manifest) = parse_and_check(&bytes) {
+                // A cached EMPTY manifest gets the SAME clear "no entrypoints" error as a
+                // fresh build, rather than skipping the check on a cache hit.
+                if manifest.entrypoints.is_empty() {
+                    bail!("{}", no_entrypoints_error(&package));
+                }
                 eprintln!("modal-rust: describe cache hit ({package}); skipping build");
                 return Ok((manifest, root, package));
             }
@@ -233,6 +290,14 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
         );
     }
     let manifest = parse_and_check(&out.stdout)?;
+
+    // A generatable crate that --describes to ZERO entrypoints has a `modal-rust` dep but
+    // no `#[modal_rust::function]` fns: there is nothing to run/deploy. Surface this as a
+    // clear "no entrypoints" message rather than letting the later `manifest.entry(...)`
+    // emit a bare "unknown entrypoint; known: []".
+    if manifest.entrypoints.is_empty() {
+        bail!("{}", no_entrypoints_error(&package));
+    }
 
     // Store the verbatim manifest bytes for the next invocation (best-effort; a read-only
     // target or an uncomputable key silently skips the write — never an error).
@@ -465,6 +530,53 @@ mod tests {
         assert_eq!(c.cache, Some(true));
         assert_eq!(c.secrets, vec!["my-secret".to_string()]);
         assert_eq!(c.volumes, vec![("/data".to_string(), "my-vol".to_string())]);
+    }
+
+    #[test]
+    fn unrunnable_crate_error_names_real_bin() {
+        // The examples/add case: one real bin `add-runner`, no facade dep.
+        let msg = unrunnable_crate_error("example-add", &["add-runner".to_string()]);
+        // Names the crate and BOTH failure conditions.
+        assert!(msg.contains("cannot run crate 'example-add'"), "{msg}");
+        assert!(msg.contains("#[modal_rust::function]"), "{msg}");
+        assert!(msg.contains("modal_runner"), "{msg}");
+        // Lists the crate's REAL bin and uses it in the cargo-run hint…
+        assert!(msg.contains("ships bin target(s): add-runner"), "{msg}");
+        assert!(
+            msg.contains("cargo run -p example-add --bin add-runner"),
+            "{msg}"
+        );
+        // …and points at examples/quickstart for the macro path.
+        assert!(msg.contains("examples/quickstart"), "{msg}");
+        // It must NOT mention any unrelated sibling package (cargo's confusing default).
+        assert!(!msg.contains("own-runner-bin"), "{msg}");
+    }
+
+    #[test]
+    fn unrunnable_crate_error_handles_zero_and_multiple_bins() {
+        // Zero bins → generic <bin> placeholder + "ships no bin targets".
+        let none = unrunnable_crate_error("libonly", &[]);
+        assert!(none.contains("ships no bin targets"), "{none}");
+        assert!(none.contains("--bin <bin>"), "{none}");
+        // Several bins → list them all; keep a generic placeholder (ambiguous which).
+        let many =
+            unrunnable_crate_error("multi", &["a-runner".to_string(), "b-runner".to_string()]);
+        assert!(
+            many.contains("ships bin target(s): a-runner, b-runner"),
+            "{many}"
+        );
+        assert!(many.contains("--bin <bin>"), "{many}");
+    }
+
+    #[test]
+    fn no_entrypoints_error_is_clear() {
+        let msg = no_entrypoints_error("quickstart");
+        assert!(
+            msg.contains("no #[modal_rust::function] entrypoints found"),
+            "{msg}"
+        );
+        assert!(msg.contains("'quickstart'"), "{msg}");
+        assert!(msg.contains("examples/quickstart"), "{msg}");
     }
 
     #[test]

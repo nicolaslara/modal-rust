@@ -58,6 +58,12 @@ pub struct RunnerTarget {
     pub crate_rel: String,
     /// Auto-detect: the target already ships a `modal_runner` bin ⇒ skip generation.
     pub has_own_runner_bin: bool,
+    /// The names of THIS package's own `bin` targets (e.g. `["add-runner"]`), read from
+    /// `cargo metadata`. A SIBLING crate's `modal_runner` bin is NOT in this list — it is
+    /// scoped to the resolved package only. Surfaced so the CLI can name the crate's real
+    /// bin(s) in the "cannot run this crate" hint instead of cargo's confusing
+    /// "available bin in <unrelated-package>" help.
+    pub bin_targets: Vec<String>,
 }
 
 impl RunnerTarget {
@@ -65,6 +71,16 @@ impl RunnerTarget {
     /// its own bin AND we can spell the facade extern name.
     pub fn is_generatable(&self) -> bool {
         !self.has_own_runner_bin && self.facade_extern.is_some()
+    }
+
+    /// Is this target usable by `modal-rust run`/`deploy` at all? It is when the CLI can
+    /// either GENERATE a runner (an `#[modal_rust::function]`/inventory library) OR the
+    /// crate already ships its OWN `modal_runner` bin. When NEITHER holds (a manual-
+    /// registry crate that ships a differently-named bin, like `examples/add`'s
+    /// `add-runner`), the `cargo build -p <pkg> --bin modal_runner` line is doomed, so the
+    /// CLI must short-circuit with a clear hint BEFORE shelling out.
+    pub fn is_runnable(&self) -> bool {
+        self.is_generatable() || self.has_own_runner_bin
     }
 }
 
@@ -105,6 +121,7 @@ fn resolve_from_metadata(metadata: &scope::Metadata, package: &str) -> Option<Ru
 
     let lib_ident = lib_ident_of(pkg);
     let has_own_runner_bin = has_modal_runner_bin(pkg);
+    let bin_targets = bin_target_names(pkg);
     let crate_rel = crate_rel_of(&metadata.workspace_root, pkg);
 
     // The facade-extern name is read from the target's OWN Cargo.toml; a parse failure
@@ -119,6 +136,7 @@ fn resolve_from_metadata(metadata: &scope::Metadata, package: &str) -> Option<Ru
         facade_extern,
         crate_rel,
         has_own_runner_bin,
+        bin_targets,
     })
 }
 
@@ -139,6 +157,17 @@ fn has_modal_runner_bin(pkg: &scope::Package) -> bool {
     pkg.targets
         .iter()
         .any(|t| t.name == RUNNER_BIN_NAME && t.kind.iter().any(|k| k == "bin"))
+}
+
+/// The names of THIS package's own `bin` targets (`kind` CONTAINS `"bin"`). Used to name
+/// the crate's real bin(s) in the "cannot run this crate" hint — a sibling crate's bin is
+/// never included (this reads only `pkg.targets`).
+fn bin_target_names(pkg: &scope::Package) -> Vec<String> {
+    pkg.targets
+        .iter()
+        .filter(|t| t.kind.iter().any(|k| k == "bin"))
+        .map(|t| t.name.clone())
+        .collect()
 }
 
 /// The crate dir RELATIVE to the workspace root (POSIX), `""` when the crate IS the
@@ -680,6 +709,7 @@ mod tests {
             facade_extern: Some("modal_rust".to_string()),
             crate_rel: "examples/quickstart".to_string(),
             has_own_runner_bin: false,
+            bin_targets: vec![],
         };
         assert!(t.is_generatable());
         let body = render_runner_main(&t);
@@ -701,6 +731,7 @@ mod tests {
             facade_extern: Some("modal_rust_facade".to_string()),
             crate_rel: "examples/add-macro".to_string(),
             has_own_runner_bin: false,
+            bin_targets: vec![],
         };
         assert!(
             render_runner_main(&t).contains("modal_rust_facade::modal_runner!(example_add_macro);")
@@ -715,6 +746,7 @@ mod tests {
             facade_extern: Some("modal_rust".to_string()),
             crate_rel: String::new(),
             has_own_runner_bin: false,
+            bin_targets: vec![],
         };
         assert_eq!(injected_runner_rel_path(&t), "src/bin/modal_runner.rs");
     }
@@ -728,6 +760,7 @@ mod tests {
             facade_extern: Some("modal_rust".to_string()),
             crate_rel: "examples/own".to_string(),
             has_own_runner_bin: true,
+            bin_targets: vec!["modal_runner".to_string()],
         };
         assert!(!own_bin.is_generatable());
         // No facade dep → not generatable (must bring its own runner, the add case).
@@ -737,8 +770,46 @@ mod tests {
             facade_extern: None,
             crate_rel: "examples/add".to_string(),
             has_own_runner_bin: false,
+            bin_targets: vec!["add-runner".to_string()],
         };
         assert!(!no_facade.is_generatable());
+    }
+
+    #[test]
+    fn is_runnable_matrix() {
+        // Generatable library (inventory + facade dep) → runnable (CLI synthesizes a runner).
+        let generatable = RunnerTarget {
+            package: "quickstart".to_string(),
+            lib_ident: "quickstart".to_string(),
+            facade_extern: Some("modal_rust".to_string()),
+            crate_rel: "examples/quickstart".to_string(),
+            has_own_runner_bin: false,
+            bin_targets: vec![],
+        };
+        assert!(generatable.is_runnable());
+
+        // Ships its own `modal_runner` bin → runnable (today's own-bin path).
+        let own_bin = RunnerTarget {
+            package: "own-runner-bin".to_string(),
+            lib_ident: "own_runner_bin".to_string(),
+            facade_extern: Some("modal_rust".to_string()),
+            crate_rel: "examples/own-runner-bin".to_string(),
+            has_own_runner_bin: true,
+            bin_targets: vec!["modal_runner".to_string()],
+        };
+        assert!(own_bin.is_runnable());
+
+        // Manual-registry crate: no facade dep (not generatable) AND its only bin is
+        // `add-runner` (not `modal_runner`) → NOT runnable (the examples/add bug).
+        let manual = RunnerTarget {
+            package: "example-add".to_string(),
+            lib_ident: "example_add".to_string(),
+            facade_extern: None,
+            crate_rel: "examples/add".to_string(),
+            has_own_runner_bin: false,
+            bin_targets: vec!["add-runner".to_string()],
+        };
+        assert!(!manual.is_runnable());
     }
 
     #[test]
@@ -773,7 +844,9 @@ mod tests {
         assert_eq!(t.facade_extern.as_deref(), Some("modal_rust"));
         assert_eq!(t.crate_rel, "examples/quickstart");
         assert!(!t.has_own_runner_bin);
+        assert!(t.bin_targets.is_empty(), "pure library has no bin targets");
         assert!(t.is_generatable());
+        assert!(t.is_runnable());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -786,6 +859,68 @@ mod tests {
             packages: vec![],
         };
         assert!(resolve_from_metadata(&metadata, "nope").is_none());
+    }
+
+    #[test]
+    fn bin_target_names_lists_only_this_package_bins() {
+        // A manual-registry crate like examples/add: a lib + a differently-named bin.
+        let p = pkg(
+            "example-add",
+            "/ws/examples/add/Cargo.toml",
+            vec![lib_target("example_add"), bin_target("add-runner")],
+        );
+        assert_eq!(bin_target_names(&p), vec!["add-runner".to_string()]);
+        // Lib-only crate → no bins.
+        let lib_only = pkg("q", "/ws/q/Cargo.toml", vec![lib_target("q")]);
+        assert!(bin_target_names(&lib_only).is_empty());
+    }
+
+    #[test]
+    fn resolve_from_metadata_manual_crate_is_not_runnable() {
+        // Mirrors the examples/add bug: a MANUAL-registry crate (no `modal-rust` facade
+        // dep, so NOT generatable) whose only bin is `add-runner` (NOT `modal_runner`).
+        // `modal-rust run` must short-circuit, and the hint names the REAL bin.
+        let dir = std::env::temp_dir().join(format!("mr-runnergen-manual-{}", std::process::id()));
+        let crate_dir = dir.join("examples/add");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        let manifest = crate_dir.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"example-add\"\n[dependencies]\n\
+             modal-rust-runtime = { path = \"../../crates/modal-rust-runtime\" }\n",
+        )
+        .unwrap();
+
+        let metadata = Metadata {
+            workspace_root: dir.clone(),
+            workspace_members: vec!["example-add-id".to_string()],
+            packages: vec![Package {
+                id: "example-add-id".to_string(),
+                name: "example-add".to_string(),
+                manifest_path: manifest.clone(),
+                dependencies: vec![],
+                targets: vec![lib_target("example_add"), bin_target("add-runner")],
+            }],
+        };
+
+        let t = resolve_from_metadata(&metadata, "example-add").expect("resolved");
+        assert_eq!(t.facade_extern, None, "no `modal-rust` facade dep");
+        assert!(
+            !t.has_own_runner_bin,
+            "ships `add-runner`, not `modal_runner`"
+        );
+        assert!(!t.is_generatable());
+        assert!(
+            !t.is_runnable(),
+            "neither generatable nor a modal_runner bin → not runnable"
+        );
+        assert_eq!(
+            t.bin_targets,
+            vec!["add-runner".to_string()],
+            "hint should name the crate's REAL bin, not an unrelated package's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
