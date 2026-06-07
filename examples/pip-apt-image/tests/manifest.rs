@@ -125,8 +125,17 @@ fn no_image_steps_render_no_extra_lines() {
 #[test]
 fn body_is_a_plain_rust_fn() {
     // The macro emits the user fn verbatim, so it stays a plain Rust fn callable with
-    // no Modal in the loop — the image deps are build config, not behavior.
+    // no Modal in the loop — the image deps are build config, not behavior. The body does
+    // a real deterministic transform of its input, so the result is the computed digest
+    // (`mix(value)`), not an echo of the input.
     let out = example_pip_apt_image::render(example_pip_apt_image::Job { value: 9 })
         .expect("render runs locally");
-    assert_eq!(out.value, 9);
+    let expected = example_pip_apt_image::mix(9);
+    assert_eq!(out.digest, expected);
+    // The transform genuinely changes the value — it is not a pure echo.
+    assert_ne!(out.digest, 9, "render computes a digest, not an echo");
+    // And it is deterministic: the same input always yields the same digest.
+    let again = example_pip_apt_image::render(example_pip_apt_image::Job { value: 9 })
+        .expect("render runs locally");
+    assert_eq!(again.digest, expected, "render is deterministic");
 }

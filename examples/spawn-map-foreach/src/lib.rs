@@ -31,31 +31,39 @@
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
 
+mod delivery;
+
 /// One recipient to notify — the per-input unit of work. Plain user structs you own;
 /// the macro uses them AS the wire input/output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipient {
-    /// Who to notify; echoed into the receipt so a side effect is traceable.
+    /// Who to notify; carried into the receipt so a send is traceable.
     pub name: String,
     /// The channel to send on (e.g. "email", "sms").
     pub channel: String,
 }
 
-/// The per-recipient outcome — proof the notification was "sent". With `.for_each`
-/// and `.spawn_map` you do NOT collect these, but the function still returns one (so
-/// the SAME handler also works with `.map()` / `.remote()`).
+/// The per-recipient outcome — a receipt for the notification that was sent. With
+/// `.for_each` and `.spawn_map` you do NOT collect these, but the function still
+/// returns one (so the SAME handler also works with `.map()` / `.remote()`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     /// The recipient this receipt is for (carried through from the input).
     pub name: String,
-    /// A short, deterministic confirmation line describing the side effect.
+    /// The channel the notification was sent on (carried through from the input).
+    pub channel: String,
+    /// A stable id for this send, computed from `(name, channel)`. Same recipient on
+    /// the same channel always gets the same id; different inputs get different ids.
+    pub receipt_id: String,
+    /// A human-readable confirmation line describing the send.
     pub sent: String,
 }
 
-/// Notify ONE recipient — the whole per-input side effect. In a real app this would
-/// hit an email/SMS provider; here it formats a deterministic confirmation so the
-/// example is offline-runnable and assertable. Each call depends only on its own
-/// input, so a batch fans out cleanly with `.for_each` / `.spawn_map`.
+/// Notify ONE recipient — the whole per-input side effect. Delivers the notification
+/// and returns its receipt; the real per-send work (a stable id derived from the
+/// recipient plus a channel-resolved confirmation) lives in [`delivery::deliver`], so
+/// this file stays the clean modal surface. Each call depends only on its own input,
+/// so a batch fans out cleanly with `.for_each` / `.spawn_map`.
 ///
 /// Because the single parameter is one of your own structs, the macro uses
 /// `Recipient` AS the wire input and `Receipt` AS the wire output; the call site
@@ -63,8 +71,5 @@ pub struct Receipt {
 /// `app.function("notify").for_each(recipients).await?`.
 #[function]
 pub fn notify(r: Recipient) -> anyhow::Result<Receipt> {
-    Ok(Receipt {
-        sent: format!("notified {} via {}", r.name, r.channel),
-        name: r.name,
-    })
+    Ok(delivery::deliver(&r))
 }

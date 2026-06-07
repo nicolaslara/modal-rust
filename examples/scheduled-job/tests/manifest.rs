@@ -54,14 +54,29 @@ fn schedule_rides_into_function_create() {
 }
 
 #[test]
-fn body_produces_a_report_for_the_dataset() {
+fn body_rolls_up_the_events() {
     // The macro emits the user fn verbatim, so it stays a plain Rust fn. The cron
-    // cadence is metadata, not behavior, so the body itself just does its work.
+    // cadence is metadata, not behavior, so the body itself just does its real work:
+    // a roll-up over the tick's events.
+    use example_scheduled_job::report::Event;
+
+    let ev = |source: &str, count| Event {
+        source: source.to_string(),
+        count,
+    };
     let report = example_scheduled_job::weekly_report(example_scheduled_job::Tick {
         dataset: "events".to_string(),
+        events: vec![ev("api", 3), ev("web", 5), ev("api", 4)],
     })
     .expect("the report runs");
+
     assert_eq!(report.dataset, "events");
-    assert_eq!(report.rows, example_scheduled_job::ROWS_PER_RUN);
+    // rows is the REAL sum of the event counts (3 + 5 + 4), not a fixed value.
+    assert_eq!(report.rows, 12);
+    // Per-source group-by: api accumulated 3 + 4, web stands at 5.
+    assert_eq!(report.by_source.get("api"), Some(&7));
+    assert_eq!(report.by_source.get("web"), Some(&5));
+    // Busiest source is the one with the highest total.
+    assert_eq!(report.busiest.as_deref(), Some("api"));
     assert!(report.note.contains("events"));
 }

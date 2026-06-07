@@ -108,5 +108,23 @@ fn body_is_a_plain_rust_fn() {
     // no Modal in the loop — the base image is build config, not behavior.
     let report = example_custom_base::probe(example_custom_base::Probe { value: 7 })
         .expect("probe runs locally");
+
+    // The input is echoed back for traceability...
     assert_eq!(report.value, 7);
+
+    // ...and the body does REAL work: a deterministic FNV-1a checksum of the input,
+    // not an echo and not a constant. Same input -> same checksum; distinct inputs ->
+    // distinct checksums; the checksum is never just the input value back.
+    assert_eq!(
+        report.checksum,
+        example_custom_base::checksum::fnv1a_checksum(7),
+        "the body returns the FNV-1a checksum of its input"
+    );
+    assert_ne!(report.checksum, 7, "the checksum is real work, not an echo");
+    let other = example_custom_base::probe(example_custom_base::Probe { value: 8 })
+        .expect("probe runs locally");
+    assert_ne!(
+        report.checksum, other.checksum,
+        "distinct inputs produce distinct checksums"
+    );
 }

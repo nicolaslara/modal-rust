@@ -12,22 +12,29 @@
 //!   `target/` instead of recompiling every dependency from scratch.
 //!
 //! The decorator IS the config. The function body never names Modal, timeouts, or a
-//! cache — it is a plain Rust fn. The knobs are operational metadata the facade reads
-//! when CREATING the Modal function; they do not change what the function COMPUTES.
+//! cache — it is a plain Rust fn that runs a real deterministic fold (the workload
+//! lives in `src/compute.rs`, so this file stays the clean modal surface: the
+//! input/output types + the `#[function]`). The knobs are operational metadata the
+//! facade reads when CREATING the Modal function; they do not change what the function
+//! COMPUTES.
 //!
-//! `src/bin/modal_runner.rs` is the one-line runner; `tests/manifest.rs` proves
-//! OFFLINE (no live Modal) that BOTH knobs ride into the planned `FunctionCreate`
-//! manifest — `timeout_secs == 1800` and the `/cache` cargo-cache volume mount.
+//! The runner is generated automatically by the modal-rust tooling — no bin needed.
+//! `tests/manifest.rs` proves OFFLINE (no live Modal) that BOTH knobs ride into the
+//! planned `FunctionCreate` manifest — `timeout_secs == 1800` and the `/cache`
+//! cargo-cache volume mount; `tests/local.rs` proves the real fold OFFLINE via
+//! `.local()`.
 
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
 
-/// Input for [`spin`] — how many iterations of busy work to do. This is just a
-/// stand-in for a long-running job; the knobs (timeout, cache) are the lesson, not
-/// the workload.
+mod compute;
+
+/// Input for [`spin`] — how many iterations of the checksum fold to run. A bigger
+/// count is a longer CPU-only job; the knobs (timeout, cache) are the lesson, the
+/// workload is the real fold in [`compute::checksum`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Job {
-    /// Number of iterations of the busy loop to run.
+    /// Number of iterations of the checksum fold to run.
     pub iterations: u64,
 }
 
@@ -36,29 +43,23 @@ pub struct Job {
 pub struct Done {
     /// The number of iterations actually run (echoes the input).
     pub iterations: u64,
-    /// An accumulated checksum, so the work cannot be optimized away and the
-    /// envelope carries proof the loop ran.
+    /// The deterministic checksum the fold accumulated — proof the loop ran, and a
+    /// pure function of `iterations`.
     pub checksum: u64,
 }
 
-/// A deliberately long-ish, CPU-only job — the kind you give a generous `timeout` so
-/// Modal does not cut it off, and a `cache` so its image's deps are not rebuilt every
-/// run. The body is plain Rust: it just spins an accumulating loop and returns the
+/// A CPU-only job — the kind you give a generous `timeout` so Modal does not cut it
+/// off, and a `cache` so its image's deps are not rebuilt every run. The body is plain
+/// Rust: it runs the real deterministic fold in [`compute::checksum`] and returns the
 /// total. The `#[function(timeout = 1800, cache = true)]` decorator sets the
-/// operational knobs without touching this computation.
+/// operational knobs without touching what the function COMPUTES.
 ///
 /// Run `modal_runner --describe` to see `"timeout_secs":1800` and `"cache":true` ride
 /// on this entrypoint's config.
 #[function(timeout = 1800, cache = true)]
 pub fn spin(job: Job) -> anyhow::Result<Done> {
-    // A trivial accumulator so the work is observable and not elided. `wrapping_*`
-    // keeps it total over u64 regardless of `iterations`.
-    let mut checksum: u64 = 0;
-    for i in 0..job.iterations {
-        checksum = checksum.wrapping_add(i).wrapping_mul(2_654_435_761);
-    }
     Ok(Done {
         iterations: job.iterations,
-        checksum,
+        checksum: compute::checksum(job.iterations),
     })
 }

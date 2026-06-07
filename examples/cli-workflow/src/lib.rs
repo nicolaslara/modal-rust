@@ -23,6 +23,10 @@
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
 
+/// The real computation lives off the modal surface, in its own module; `lib.rs`
+/// stays the clean surface: the I/O types plus the `#[function]` that calls in here.
+mod summary;
+
 /// Input for `summarize`: the runner argument is always a single named JSON object
 /// (the `--input '{"text":"..."}'` you pass on the CLI decodes into this).
 #[derive(Debug, Deserialize)]
@@ -43,9 +47,10 @@ pub struct Summary {
     pub read_minutes: usize,
 }
 
-/// Summarize a document — a small, deterministic stand-in for "real work the
-/// deployed binary does". The point is not the arithmetic; it is that this exact
-/// function is what `modal-rust run` / `deploy` + `call` drive, with NO driver
+/// Summarize a document — real, deterministic word/character/read-time analysis of
+/// the input text. The actual computation lives in `summary::summarize_text`; this
+/// `#[function]` is the modal surface that decodes the request and calls it. This
+/// exact function is what `modal-rust run` / `deploy` + `call` drive, with NO driver
 /// binary in this crate.
 ///
 /// `#[function(name = "summarize")]` keeps the body a plain Rust fn (callable
@@ -54,14 +59,7 @@ pub struct Summary {
 /// `deploy` / `call` verbs address.
 #[function(name = "summarize")]
 pub fn summarize(doc: Doc) -> anyhow::Result<Summary> {
-    let words = doc.text.split_whitespace().count();
-    let chars = doc.text.chars().count();
-    let read_minutes = words.div_ceil(200).max(1);
-    Ok(Summary {
-        words,
-        chars,
-        read_minutes,
-    })
+    Ok(summary::summarize_text(&doc.text))
 }
 
 #[cfg(test)]
@@ -69,7 +67,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn summarize_counts_words_chars_and_read_time() {
+    fn summarize_wires_the_function_to_the_module() {
+        // The arithmetic itself is exercised in `summary.rs`; this asserts the
+        // `#[function]` surface decodes a `Doc` and returns the module's real result.
         let s = summarize(Doc {
             text: "the quick brown fox".to_string(),
         })

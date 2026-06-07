@@ -52,8 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sent = 0_usize;
     for r in &recipients {
         let receipt: Receipt = app.function("notify").local(r.clone())?;
-        // The side effect: here, just print the confirmation the function produced.
-        println!("  {}", receipt.sent);
+        // The side effect: print the confirmation, with the stable receipt id the
+        // function computed from this recipient (same input -> same id).
+        println!("  {} (receipt {})", receipt.sent, receipt.receipt_id);
         sent += 1;
     }
     println!("for_each (local mirror): notified {sent} recipients, results discarded");

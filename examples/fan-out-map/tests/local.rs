@@ -6,6 +6,7 @@
 //! against real Modal in the credential-gated tour (`RUN_REMOTE=1 cargo run -p
 //! example-fan-out-map --bin fan_out_map`).
 
+use example_fan_out_map::reading::analyze_body;
 use example_fan_out_map::{Document, Reading};
 use modal_rust::App;
 
@@ -38,6 +39,21 @@ fn local_fan_out_returns_results_in_input_order() {
     assert_eq!(out.iter().map(|r| r.words).collect::<Vec<_>>(), [3, 2, 1]);
     // Every short doc floors to one minute at 200 wpm.
     assert!(out.iter().all(|r| r.minutes == 1));
+}
+
+#[test]
+fn analyze_body_counts_words_and_reading_minutes() {
+    // The extracted computation is real and deterministic: whitespace-separated
+    // word count plus reading minutes at 200 wpm (rounded up, floored at one).
+    assert_eq!(analyze_body("one two three"), (3, 1)); // short doc floors to 1 min
+    assert_eq!(analyze_body(""), (0, 1)); //              empty still reads as 1 min
+    assert_eq!(analyze_body("a  b\tc\nd"), (4, 1)); //    whitespace runs are 1 split
+    assert_eq!(analyze_body(&"w ".repeat(450)), (450, 3)); // ceil(450 / 200) = 3 min
+                                                           // Deterministic: the same input always yields the same output.
+    assert_eq!(
+        analyze_body("repeatable input"),
+        analyze_body("repeatable input")
+    );
 }
 
 #[test]

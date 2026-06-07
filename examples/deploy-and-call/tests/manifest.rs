@@ -150,11 +150,37 @@ async fn deploy_builds_once_and_call_invokes_with_no_rebuild() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-/// The function body is a plain Rust fn — callable with no Modal in the loop. The
-/// deploy/call boundary is about WHEN the binary is built, not what it computes.
+/// The function body is a plain Rust fn — callable with no Modal in the loop — and
+/// it really computes Fibonacci. Asserts the REAL output properties (offline): the
+/// known base/sequence values, the additive recurrence holds, the build-time-baked
+/// result matches the call envelope (`fib(10) == 55`), and overflow past `u64` is a
+/// clean error rather than a wraparound.
 #[test]
-fn fib_is_a_plain_rust_fn() {
-    assert_eq!(example_deploy_and_call::fib(10).unwrap(), 55);
-    assert_eq!(example_deploy_and_call::fib(0).unwrap(), 0);
-    assert_eq!(example_deploy_and_call::fib(1).unwrap(), 1);
+fn fib_really_computes_fibonacci() {
+    use example_deploy_and_call::fib;
+
+    // Base cases and a few known values from the real sequence.
+    assert_eq!(fib(0).unwrap(), 0);
+    assert_eq!(fib(1).unwrap(), 1);
+    assert_eq!(fib(2).unwrap(), 1);
+    assert_eq!(fib(10).unwrap(), 55, "matches the deploy/call envelope");
+    assert_eq!(fib(20).unwrap(), 6765);
+
+    // The defining recurrence holds across the range: fib(k) = fib(k-1) + fib(k-2).
+    for k in 2..=90u32 {
+        assert_eq!(
+            fib(k).unwrap(),
+            fib(k - 1).unwrap() + fib(k - 2).unwrap(),
+            "fib({k}) breaks the recurrence"
+        );
+    }
+
+    // The largest value the loop returns before its checked add overflows u64
+    // (the loop always probes fib(n+1), so fib(92) is the last `Ok`), and a clean
+    // error rather than a wraparound once that probe exceeds u64::MAX.
+    assert_eq!(fib(92).unwrap(), 7_540_113_804_746_346_429);
+    assert!(
+        fib(93).is_err(),
+        "fib's checked add overflows u64 -> clean error"
+    );
 }

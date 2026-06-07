@@ -19,37 +19,49 @@
 //! the build config, not on `#[function(...)]`. The decorator stays config for the
 //! function (gpu/timeout/cache/secrets/volumes); the image is config for the build.
 //!
-//! The function below is a plain Rust fn that never names Modal, an image, or CUDA. It
-//! exists only to give the run image something to build. The lesson is the IMAGE the
-//! facade renders, proven OFFLINE by `tests/manifest.rs` (and printed by the
-//! `custom_base` driver): the dry-run RUN manifest's image layer starts
+//! The function below is a plain Rust fn that never names Modal, an image, or CUDA. Its
+//! workload is deliberately tiny — it exists to give the run image something to build —
+//! but it does real work: it returns a deterministic FNV-1a checksum of its input (see
+//! [`checksum`]), so the body is a genuine transform, not an echo. The lesson is still
+//! the IMAGE the facade renders, proven OFFLINE by `tests/manifest.rs` (and printed by
+//! the `custom_base` driver): the dry-run RUN manifest's image layer starts
 //! `FROM nvidia/cuda:12.6.3-devel-ubuntu22.04` and carries the rustup install RUN.
 
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
 
-/// Input for [`probe`] — a value to echo back. The workload is irrelevant; the base
-/// image (chosen via the build config, not this signature) is the lesson.
+/// The real (tiny) checksum computation, kept off this modal surface (see module docs).
+pub mod checksum;
+
+/// Input for [`probe`] — a value to checksum. The workload is intentionally small; the
+/// base image (chosen via the build config, not this signature) is the lesson.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Probe {
-    /// An arbitrary value echoed back so the envelope carries proof the body ran.
+    /// An arbitrary value the body checksums (and echoes back for traceability).
     pub value: u64,
 }
 
 /// Output for [`probe`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
-    /// Echoes the input value.
+    /// Echoes the input value, so a result is traceable to its input.
     pub value: u64,
+    /// The deterministic FNV-1a checksum of `value` — real work the body computed.
+    pub checksum: u64,
 }
 
 /// A plain Rust fn — no GPU, no Modal, no image. It compiles on ANY base that has a
 /// Rust toolchain, which is exactly the point: you pick the base image and ask for a
 /// toolchain through the build config (`RemoteConfig`/env), not by editing this body.
 ///
-/// Run the `custom_base` driver to see the rendered image dockerfile (`FROM
-/// nvidia/cuda:...` + the rustup install RUN) the CUDA-base build config produces.
+/// The body is just glue: it forwards `value` to [`checksum::fnv1a_checksum`] and packs
+/// the result (alongside the echoed input) into the output struct. Run the `custom_base`
+/// driver to see the rendered image dockerfile (`FROM nvidia/cuda:...` + the rustup
+/// install RUN) the CUDA-base build config produces.
 #[function]
 pub fn probe(input: Probe) -> anyhow::Result<Report> {
-    Ok(Report { value: input.value })
+    Ok(Report {
+        value: input.value,
+        checksum: checksum::fnv1a_checksum(input.value),
+    })
 }

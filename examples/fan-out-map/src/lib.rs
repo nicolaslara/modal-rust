@@ -23,6 +23,9 @@
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
 
+/// The real reading-time analysis, kept off this modal surface (see the module docs).
+pub mod reading;
+
 /// One record to process — a document with its title and body text. Plain user
 /// structs you own; the macro uses them AS the wire input/output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,11 +55,12 @@ pub struct Reading {
 /// `Document` AS the wire input and `Reading` AS the wire output; the call site names
 /// the entrypoint and hands it your struct directly:
 /// `app.function("analyze").local(doc)?` / `.map(docs).await?`.
+///
+/// The body is just glue: it forwards the document body to [`reading::analyze_body`]
+/// and labels the result with the document's title.
 #[function]
 pub fn analyze(doc: Document) -> anyhow::Result<Reading> {
-    let words = doc.body.split_whitespace().count() as u32;
-    // 200 wpm, rounded up, with a floor of one minute for any non-empty document.
-    let minutes = words.div_ceil(200).max(1);
+    let (words, minutes) = reading::analyze_body(&doc.body);
     Ok(Reading {
         title: doc.title,
         words,

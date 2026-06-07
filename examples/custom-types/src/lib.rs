@@ -8,9 +8,14 @@
 //!
 //! `tests/local.rs` proves the offline `.local()` round-trip through your structs.
 //! The runner is generated automatically by the modal-rust tooling — no bin needed.
+//!
+//! The actual scoring math lives in [`scoring`] so this file stays a clean surface:
+//! your input/output types plus the `#[function]` that hands its fields to the module.
 
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
+
+pub mod scoring;
 
 /// The function INPUT — a plain user struct you own.
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,14 +43,15 @@ pub struct Scored {
 /// own structs, the macro uses `Player` AS the wire input and `Scored` AS the wire
 /// output; the call site only ever names your structs:
 /// `app.function("score").local(player)?`.
+///
+/// The body is just glue: it forwards the input fields to [`scoring::score_player`]
+/// and packs the `(points, accuracy_pct)` it returns back into your output struct.
 #[function]
 pub fn score(p: Player) -> anyhow::Result<Scored> {
-    let accuracy_pct = (p.hits * 100 + p.shots / 2)
-        .checked_div(p.shots)
-        .unwrap_or(0);
+    let (points, accuracy_pct) = scoring::score_player(p.hits, p.shots);
     Ok(Scored {
         name: p.name,
-        points: p.hits * 100,
+        points,
         accuracy_pct,
     })
 }

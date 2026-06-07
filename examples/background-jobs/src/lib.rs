@@ -24,6 +24,9 @@
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
 
+/// The real per-job computation, kept off this modal surface (see the module docs).
+pub mod work;
+
 /// The job to run — a longer unit of work, sized by `rounds`. A plain user struct you
 /// own; the macro uses `Job` AS the wire input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,17 +58,14 @@ pub struct JobResult {
 /// the wire input and `JobResult` AS the wire output; the call site names the
 /// entrypoint and hands it your struct directly:
 /// `app.function("run_job").spawn(job).await?` then `handle.get(timeout).await?`.
+///
+/// The body is just glue: it forwards `rounds` to [`work::digest`] and labels the
+/// result with the job's label.
 #[function]
 pub fn run_job(job: Job) -> anyhow::Result<JobResult> {
-    // A deterministic fold (a small xorshift mix per round) — same input, same digest.
-    let mut digest: u64 = 0x9e37_79b9_7f4a_7c15;
-    for round in 0..job.rounds {
-        digest ^= round.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        digest = digest.rotate_left(13).wrapping_add(round);
-    }
     Ok(JobResult {
         label: job.label,
         rounds: job.rounds,
-        digest,
+        digest: work::digest(job.rounds),
     })
 }

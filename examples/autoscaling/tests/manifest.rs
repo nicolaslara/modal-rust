@@ -64,13 +64,46 @@ fn autoscaler_knobs_ride_into_function_create() {
 }
 
 #[test]
-fn body_is_a_plain_rust_fn() {
+fn body_is_a_plain_rust_fn_that_computes_a_real_embedding() {
     // The macro emits the user fn verbatim, so it stays a plain Rust fn with no scaling
-    // logic — autoscaling is metadata, not behavior. The body just maps input to output.
+    // logic — autoscaling is metadata, not behavior. The body runs the real embedding
+    // model: a fixed-width, unit-length feature vector, computed deterministically.
+    let text = "the quick brown fox";
     let out = example_autoscaling::embed(example_autoscaling::Document {
-        text: "the quick brown fox".to_string(),
+        text: text.to_string(),
     })
     .expect("embed succeeds");
-    assert_eq!(out.text, "the quick brown fox");
+
+    // The input is carried through; the vector is the model's real output.
+    assert_eq!(out.text, text);
+
+    // Fixed width: the vector is exactly EMBED_DIMENSIONS long, and `dimensions`
+    // reports its real length.
+    assert_eq!(out.vector.len(), example_autoscaling::EMBED_DIMENSIONS);
     assert_eq!(out.dimensions, example_autoscaling::EMBED_DIMENSIONS);
+
+    // Real compute, not an echo or a constant: a multi-word input produces a non-zero
+    // vector.
+    assert!(
+        out.vector.iter().any(|&x| x != 0.0),
+        "a non-empty text embeds to a non-zero vector"
+    );
+
+    // Unit length: for non-empty text the embedding is L2-normalized (sum of squares
+    // ~= 1.0).
+    let norm_sq: f32 = out.vector.iter().map(|x| x * x).sum();
+    assert!(
+        (norm_sq - 1.0).abs() < 1e-5,
+        "embedding is L2-normalized to unit length (sum of squares = {norm_sq})"
+    );
+
+    // Deterministic: embedding the same text again yields the identical vector.
+    let again = example_autoscaling::embed(example_autoscaling::Document {
+        text: text.to_string(),
+    })
+    .expect("embed succeeds");
+    assert_eq!(
+        out.vector, again.vector,
+        "embedding is deterministic across calls"
+    );
 }

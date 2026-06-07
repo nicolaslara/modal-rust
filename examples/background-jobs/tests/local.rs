@@ -6,6 +6,7 @@
 //! credential-gated tour (`RUN_REMOTE=1 cargo run -p example-background-jobs --bin
 //! background_jobs`).
 
+use example_background_jobs::work::digest;
 use example_background_jobs::{Job, JobResult};
 use modal_rust::App;
 
@@ -30,6 +31,33 @@ fn run_job_local_yields_the_deterministic_result() {
     assert_eq!(result.label, "nightly-report");
     assert_eq!(result.rounds, 250_000);
     assert_eq!(result.digest, EXPECTED_DIGEST);
+    // The handler is real glue over the extracted computation: its digest IS the fold
+    // over the job's rounds, not a fixed constant baked into the function.
+    assert_eq!(result.digest, digest(result.rounds));
+}
+
+#[test]
+fn the_digest_is_real_work_over_rounds() {
+    // The result is genuinely computed from `rounds`, not echoed or fixed: a job with
+    // more rounds folds to a different digest, and zero rounds is the untouched seed.
+    let app = App::local();
+    let one_round: JobResult = app
+        .function("run_job")
+        .local(Job {
+            label: "report".to_string(),
+            rounds: 1,
+        })
+        .unwrap();
+    let many_rounds: JobResult = app
+        .function("run_job")
+        .local(Job {
+            label: "report".to_string(),
+            rounds: 250_000,
+        })
+        .unwrap();
+    assert_ne!(one_round.digest, many_rounds.digest);
+    assert_eq!(one_round.digest, digest(1));
+    assert_eq!(digest(0), 0x9e37_79b9_7f4a_7c15); // zero rounds -> the untouched seed
 }
 
 #[test]

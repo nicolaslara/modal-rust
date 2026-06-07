@@ -22,9 +22,15 @@
 //! `src/bin/modal_runner.rs` is the one-line runner; `tests/manifest.rs` proves
 //! OFFLINE (no live Modal) that the knob rides into the planned `FunctionCreate`
 //! manifest — `retry_policy.retries == 5`.
+//!
+//! The flaky fetch itself lives in [`downstream`] so this file stays a clean surface:
+//! your input/output types plus the `#[function]` that hands its fields to the module.
 
 use modal_rust::function;
 use serde::{Deserialize, Serialize};
+
+/// The flaky downstream call, kept off this modal surface (see the module docs).
+pub mod downstream;
 
 /// Input for [`fetch`] — the resource to fetch and which attempt this is. `attempt`
 /// stands in for the real world: the flaky downstream fails on the first tries and
@@ -54,24 +60,15 @@ pub struct Payload {
 pub const SETTLES_AT: u32 = 3;
 
 /// Fetch `resource` from a FLAKY downstream. Early attempts fail with a transient
-/// error; from attempt [`SETTLES_AT`] on it succeeds. The body is plain Rust — it just
-/// returns `Err` on a transient failure. The `#[function(retries = 5)]` decorator
-/// makes Modal re-run the whole call automatically until it succeeds (or 5 retries are
-/// exhausted), so a flaky operation SELF-HEALS without any retry loop in your code.
+/// error; from attempt [`SETTLES_AT`] on it succeeds. The body is just glue — it
+/// forwards the request to [`downstream::try_fetch`], which returns `Err` on a
+/// transient failure and the [`Payload`] once the downstream recovers. The
+/// `#[function(retries = 5)]` decorator makes Modal re-run the whole call automatically
+/// until it succeeds (or 5 retries are exhausted), so a flaky operation SELF-HEALS
+/// without any retry loop in your code.
 ///
 /// Run `modal_runner --describe` to see `"retries":5` ride on this entrypoint's config.
 #[function(retries = 5)]
 pub fn fetch(req: Request) -> anyhow::Result<Payload> {
-    if req.attempt < SETTLES_AT {
-        // A transient failure — exactly what the retry policy exists to absorb.
-        anyhow::bail!(
-            "transient downstream failure fetching {:?} (attempt {})",
-            req.resource,
-            req.attempt
-        );
-    }
-    Ok(Payload {
-        resource: req.resource,
-        attempt: req.attempt,
-    })
+    downstream::try_fetch(&req.resource, req.attempt)
 }

@@ -25,9 +25,11 @@
 
 use modal_rust::function;
 
-/// A small, deterministic workload that stands in for "real work the deployed
-/// binary does". The point is not the arithmetic — it is that this exact compiled
-/// function is what a `call` invokes, with the build already done at deploy time.
+/// Returns the `n`th Fibonacci number, computed for real: an iterative `O(n)` loop
+/// with checked addition that surfaces a clean error instead of overflowing past
+/// `u64`. Small, CPU-only, and fully deterministic — and it is this exact compiled
+/// function a `call` invokes, with the build already done at deploy time, which is
+/// the whole point of the example.
 ///
 /// `#[function]` keeps the body a plain Rust fn (callable in-process and in tests),
 /// generates the JSON I/O plumbing, registers the entrypoint via `inventory`, and
@@ -39,7 +41,7 @@ pub fn fib(n: u32) -> anyhow::Result<u64> {
         (a, b) = (
             b,
             a.checked_add(b)
-                .ok_or_else(|| anyhow::anyhow!("overflow"))?,
+                .ok_or_else(|| anyhow::anyhow!("fib({n}) overflows u64"))?,
         );
     }
     Ok(a)

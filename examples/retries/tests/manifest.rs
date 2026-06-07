@@ -54,10 +54,11 @@ fn retries_ride_into_function_create() {
 
 #[test]
 fn body_self_heals_once_the_flaky_step_settles() {
-    // The macro emits the user fn verbatim, so it stays a plain Rust fn. Early attempts
-    // fail (transient); from SETTLES_AT on it succeeds — exactly the failure shape the
-    // retry policy absorbs. The retry COUNT is metadata, not behavior, so the body
-    // itself just returns Err then Ok across attempts.
+    // The macro emits the user fn verbatim, so it stays a plain Rust fn that just
+    // forwards to `downstream::try_fetch`. Early attempts fail (transient); from
+    // SETTLES_AT on it succeeds — exactly the failure shape the retry policy absorbs.
+    // The retry COUNT is metadata, not behavior, so the body itself just returns Err
+    // then Ok across attempts.
     let fail = example_retries::fetch(example_retries::Request {
         resource: "weights.bin".to_string(),
         attempt: 1,
@@ -69,6 +70,32 @@ fn body_self_heals_once_the_flaky_step_settles() {
         attempt: example_retries::SETTLES_AT,
     })
     .expect("the call heals once the flaky step settles");
+    // The REAL output: the fetched resource is carried through and the result records
+    // the attempt that finally succeeded.
     assert_eq!(ok.resource, "weights.bin");
     assert_eq!(ok.attempt, example_retries::SETTLES_AT);
+}
+
+#[test]
+fn downstream_fetch_is_deterministic_and_threshold_driven() {
+    use example_retries::downstream::try_fetch;
+    use example_retries::SETTLES_AT;
+
+    // Every attempt strictly before SETTLES_AT fails transiently...
+    for attempt in 1..SETTLES_AT {
+        assert!(
+            try_fetch("weights.bin", attempt).is_err(),
+            "attempt {attempt} is before SETTLES_AT and must fail transiently",
+        );
+    }
+    // ...and SETTLES_AT (and any later attempt) succeeds with the resource carried
+    // through and the succeeding attempt recorded.
+    let ok = try_fetch("weights.bin", SETTLES_AT).expect("settles at SETTLES_AT");
+    assert_eq!(ok.resource, "weights.bin");
+    assert_eq!(ok.attempt, SETTLES_AT);
+    assert!(try_fetch("weights.bin", SETTLES_AT + 9).is_ok());
+
+    // Pure + deterministic: same (resource, attempt) -> same outcome, every time.
+    assert!(try_fetch("a", 1).is_err());
+    assert!(try_fetch("a", 1).is_err());
 }
