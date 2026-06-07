@@ -69,7 +69,7 @@ pub use modal_rust_runtime::typed;
 //     attribute; `modal_runner!()` expands to the runner `main()` (the whole
 //     `src/bin/modal_runner.rs` in one line, with NO `__private` in user code).
 //     There is NO `app` macro — `modal_rust::App` is a struct.
-pub use modal_rust_macros::{function, modal_runner};
+pub use modal_rust_macros::{cls, function, modal_runner};
 
 /// Macro-support re-exports — NOT a stable public API (hidden from docs).
 ///

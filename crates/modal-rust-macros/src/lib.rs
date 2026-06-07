@@ -133,12 +133,20 @@ use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitBool, LitInt, LitStr,
-    PatType, PathArguments, ReturnType, Token, Type,
+    parse_macro_input, Expr, ExprLit, FnArg, GenericArgument, ImplItem, ItemFn, ItemImpl, Lit,
+    LitBool, LitInt, LitStr, PatType, PathArguments, ReturnType, Token, Type,
 };
 
 /// The Cargo package name of the facade crate the macro routes ALL paths through.
 const FACADE_PACKAGE: &str = "modal-rust";
+
+/// The separator joining a `Cls` class name and a method name into the entrypoint /
+/// Modal object tag (`"Embedder" + SEP + "embed" = "Embedder.embed"`). A SINGLE named
+/// constant so the live-spike fallback (if Modal's create RPC rejects a dotted object
+/// tag) is exactly ONE edit here. The dot round-trips `sanitize_object_tag`
+/// (allowlist `alnum | '_' | '-' | '.'`); the locked fallback is `"-"` (also in the
+/// allowlist). See cls-design.md §3.4 / cls-devx-design.md §3.
+const CLS_ENTRYPOINT_SEPARATOR: &str = ".";
 
 /// Resolve the leading path to the `modal-rust` FACADE crate as the USER crate spells
 /// it, so the macro can route every emitted path through the facade
@@ -551,6 +559,843 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         #registration
     }
     .into()
+}
+
+// ===========================================================================
+// `#[cls]` — load-once stateful classes (Cls v0, Shape A / Shape 1).
+// ===========================================================================
+
+/// The parsed decorator config shared by `#[cls(<class config>)]` and each inner
+/// `#[method(<override>)]` marker. Every field is optional; an unset class field
+/// inherits, an unset method field falls back to the class value. This is the SAME
+/// vocabulary the `#[function]` arg parser accepts (gpu/timeout/cache/cpu/memory/
+/// retries/schedule/autoscaler/secrets/volumes), parsed by the SAME helpers.
+#[derive(Default, Clone)]
+struct ClsConfig {
+    gpu: Option<LitStr>,
+    timeout_secs: Option<u64>,
+    cache: Option<bool>,
+    milli_cpu: Option<u32>,
+    memory_mb: Option<u32>,
+    retries: Option<u32>,
+    schedule: Option<String>,
+    min_containers: Option<u32>,
+    max_containers: Option<u32>,
+    buffer_containers: Option<u32>,
+    scaledown_window: Option<u32>,
+    // `None` = unset (inherit). `Some(vec)` = explicitly set (override, even if empty).
+    secrets: Option<Vec<String>>,
+    volumes: Option<Vec<(String, String)>>,
+}
+
+impl ClsConfig {
+    /// Merge a per-method override ON TOP of `self` (the class default), field by field:
+    /// a `Some` method value wins, otherwise the class value is inherited. This is done
+    /// at expansion time so the emitted `Registration` carries a fully-resolved config,
+    /// byte-identical in shape to what `#[function]` emits (cls-design.md §4).
+    fn merge_over(&self, over: &ClsConfig) -> ClsConfig {
+        ClsConfig {
+            gpu: over.gpu.clone().or_else(|| self.gpu.clone()),
+            timeout_secs: over.timeout_secs.or(self.timeout_secs),
+            cache: over.cache.or(self.cache),
+            milli_cpu: over.milli_cpu.or(self.milli_cpu),
+            memory_mb: over.memory_mb.or(self.memory_mb),
+            retries: over.retries.or(self.retries),
+            schedule: over.schedule.clone().or_else(|| self.schedule.clone()),
+            min_containers: over.min_containers.or(self.min_containers),
+            max_containers: over.max_containers.or(self.max_containers),
+            buffer_containers: over.buffer_containers.or(self.buffer_containers),
+            scaledown_window: over.scaledown_window.or(self.scaledown_window),
+            secrets: over.secrets.clone().or_else(|| self.secrets.clone()),
+            volumes: over.volumes.clone().or_else(|| self.volumes.clone()),
+        }
+    }
+}
+
+/// Parse a `(gpu = .., timeout = .., ..)` decorator argument list (the SAME grammar as
+/// `#[function]`, MINUS `name =` which a class/method does not accept) from a
+/// `proc_macro2::TokenStream` into a [`ClsConfig`]. Used for BOTH the outer
+/// `#[cls(..)]` attribute and each inner `#[method(..)]` marker, so they share the
+/// exact decorator vocabulary and diagnostics.
+fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> {
+    let mut cfg = ClsConfig::default();
+    if tokens.is_empty() {
+        return Ok(cfg);
+    }
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("gpu") {
+            cfg.gpu = Some(meta.value()?.parse()?);
+            Ok(())
+        } else if meta.path.is_ident("timeout") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.timeout_secs = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("cache") {
+            let lit: LitBool = meta.value()?.parse()?;
+            cfg.cache = Some(lit.value);
+            Ok(())
+        } else if meta.path.is_ident("cpu") {
+            cfg.milli_cpu = Some(parse_cpu_to_milli(meta.value()?)?);
+            Ok(())
+        } else if meta.path.is_ident("memory") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.memory_mb = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("retries") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.retries = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("schedule") {
+            cfg.schedule = Some(parse_schedule_to_spec(meta.value()?)?);
+            Ok(())
+        } else if meta.path.is_ident("min_containers") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.min_containers = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("max_containers") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.max_containers = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("buffer_containers") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.buffer_containers = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("scaledown_window") {
+            let lit: LitInt = meta.value()?.parse()?;
+            cfg.scaledown_window = Some(lit.base10_parse()?);
+            Ok(())
+        } else if meta.path.is_ident("secrets") {
+            cfg.secrets = Some(
+                parse_str_list(meta.value()?)?
+                    .iter()
+                    .map(|s| s.value())
+                    .collect(),
+            );
+            Ok(())
+        } else if meta.path.is_ident("volumes") {
+            let mut vols = Vec::new();
+            for s in parse_str_list(meta.value()?)? {
+                let raw = s.value();
+                let (mount, name) = raw.split_once('=').ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        &s,
+                        format!(
+                            "`volumes` entries must be \"MOUNT_PATH=VOLUME_NAME\", got {raw:?}"
+                        ),
+                    )
+                })?;
+                let mount = mount.trim();
+                let name = name.trim();
+                if mount.is_empty() || name.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &s,
+                        format!(
+                            "`volumes` entry {raw:?} must have a non-empty mount path AND name"
+                        ),
+                    ));
+                }
+                vols.push((mount.to_string(), name.to_string()));
+            }
+            cfg.volumes = Some(vols);
+            Ok(())
+        } else if meta.path.is_ident("name") {
+            Err(meta.error(
+                "`name` is not valid on `#[cls]`/`#[method]`: the entrypoint name is \
+                 derived as \"<Class>.<method>\". Rename the method instead.",
+            ))
+        } else {
+            Err(meta.error(
+                "unsupported `#[cls]`/`#[method]` argument; recognized: `gpu`, \
+                 `timeout`, `cache`, `cpu`, `memory`, `retries`, `schedule`, \
+                 `min_containers`, `max_containers`, `buffer_containers`, \
+                 `scaledown_window`, `secrets`, `volumes`",
+            ))
+        }
+    });
+    syn::parse::Parser::parse2(parser, tokens)?;
+    Ok(cfg)
+}
+
+/// One method collected from the `#[cls]` impl block: its `#[method(..)]` override
+/// config, the user's method `fn`, and its non-receiver params.
+struct ClsMethod {
+    /// The method ident (`embed`); the entrypoint name is `"<Class>.<embed>"`.
+    ident: syn::Ident,
+    /// Effective per-method config (class default merged with the method override).
+    config: ClsConfig,
+    /// `(ident, type)` for each non-receiver param, in declaration order.
+    params: Vec<(syn::Ident, Type)>,
+    /// The method's return type (`-> anyhow::Result<Vec<f32>>`), copied verbatim for
+    /// the shim so the `typed!` error specialization still selects the right path.
+    output: ReturnType,
+}
+
+/// `#[modal_rust::cls(<class config>)]` — the load-once stateful-class attribute.
+///
+/// Applied to an `impl` block, it parses the inner `#[enter]` / `#[method]` / `#[exit]`
+/// markers (inert; consumed by this macro) and, in ONE expansion, emits Shape A
+/// (cls-design.md): each `#[method]` becomes its OWN entrypoint `"<Class>.<method>"` in
+/// the frozen `Registry` (a `Registration` byte-identical to a free fn except the
+/// dotted name + a singleton-dispatch shim); the entered struct is a process-lifetime
+/// `OnceLock` singleton built by the `#[enter]` body and reused across calls via
+/// `modal_runner --serve`; and a borrowing `<Class>Handle` + `<Class>Cls` extension
+/// trait give the caller `app.<class>().<method>(..).local()/.remote()`.
+///
+/// ```ignore
+/// use modal_rust::cls;
+/// pub struct Embedder { model: Model }
+/// #[cls(gpu = "T4", timeout = 600)]
+/// impl Embedder {
+///     #[enter]               fn load() -> anyhow::Result<Self> { Ok(Embedder { model: Model::load()? }) }
+///     #[method(gpu = "A10G")] fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> { Ok(self.model.encode(&text)) }
+///     #[method]              fn dim(&self) -> anyhow::Result<usize> { Ok(self.model.dim()) }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn cls(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut item_impl = parse_macro_input!(item as ItemImpl);
+
+    // Parse the CLASS-level decorator config (the default inherited by each method).
+    let class_config = match parse_cls_config(attr.into()) {
+        Ok(c) => c,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    // The self type must be a bare path so we can name the class ident (`Embedder`).
+    let class_ident = match cls_self_ident(&item_impl) {
+        Ok(id) => id,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    // A trait impl (`impl Trait for T`) has no place for the class-config + handle; the
+    // markers belong on the inherent impl.
+    if item_impl.trait_.is_some() {
+        return syn::Error::new_spanned(
+            &item_impl,
+            "#[cls] applies to an INHERENT impl block (`impl Embedder { .. }`), not a \
+             trait impl",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if !item_impl.generics.params.is_empty() || item_impl.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(
+            &item_impl.generics,
+            "#[cls] does not support generic/lifetime params or where-clauses on the \
+             impl block in v0",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let facade = facade_path();
+
+    // Walk the impl items: find exactly one #[enter], collect #[method]s, reject #[exit]
+    // (a v0 non-goal), and STRIP the consumed markers from the methods we keep so the
+    // user's own `impl` stays directly callable.
+    let mut enter_ident: Option<syn::Ident> = None;
+    // Whether #[enter] returns a `Result<Self, _>` (fallible) vs a bare `Self`.
+    let mut enter_fallible = false;
+    let mut methods: Vec<ClsMethod> = Vec::new();
+    let mut errors: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    for impl_item in item_impl.items.iter_mut() {
+        let ImplItem::Fn(method) = impl_item else {
+            continue;
+        };
+        let marker = match take_cls_marker(method) {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(e.to_compile_error());
+                continue;
+            }
+        };
+        match marker {
+            Some(ClsMarker::Exit) => {
+                errors.push(
+                    syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "#[exit] is a Cls v0 NON-GOAL: deterministic teardown does NOT \
+                         run (warm containers are GC'd). Remove it; per-call cleanup \
+                         belongs inside the method. The marker is reserved for a future \
+                         release (cls-design.md §9.6 / cls-devx-design.md §6).",
+                    )
+                    .to_compile_error(),
+                );
+            }
+            Some(ClsMarker::Enter) => {
+                if enter_ident.is_some() {
+                    errors.push(
+                        syn::Error::new_spanned(
+                            &method.sig.ident,
+                            "#[cls] allows exactly ONE #[enter] method",
+                        )
+                        .to_compile_error(),
+                    );
+                } else {
+                    match validate_enter_sig(method, &class_ident) {
+                        Ok(fallible) => {
+                            enter_ident = Some(method.sig.ident.clone());
+                            enter_fallible = fallible;
+                        }
+                        Err(e) => errors.push(e.to_compile_error()),
+                    }
+                }
+            }
+            Some(ClsMarker::Method(over_tokens)) => {
+                match build_cls_method(method, &class_config, over_tokens) {
+                    Ok(m) => methods.push(m),
+                    Err(e) => errors.push(e.to_compile_error()),
+                }
+            }
+            None => {} // a plain helper method (no marker): left untouched, not registered
+        }
+    }
+
+    if enter_ident.is_none() {
+        errors.push(
+            syn::Error::new_spanned(
+                &item_impl.self_ty,
+                "#[cls] requires exactly ONE #[enter] method returning `Self` / \
+                 `anyhow::Result<Self>` (it builds the load-once singleton)",
+            )
+            .to_compile_error(),
+        );
+    }
+    if methods.is_empty() && errors.is_empty() {
+        errors.push(
+            syn::Error::new_spanned(
+                &item_impl.self_ty,
+                "#[cls] requires at least one #[method] (an `&self` fn returning \
+                 `Result<T>`)",
+            )
+            .to_compile_error(),
+        );
+    }
+
+    if !errors.is_empty() {
+        // Keep the (marker-stripped) impl so the rest of the crate still type-checks,
+        // and surface every diagnostic at once.
+        return quote! {
+            #item_impl
+            #( #errors )*
+        }
+        .into();
+    }
+
+    let enter_ident = enter_ident.expect("checked above");
+    let generated = emit_cls(
+        &class_ident,
+        &enter_ident,
+        enter_fallible,
+        &methods,
+        &facade,
+    );
+
+    quote! {
+        #item_impl
+        #generated
+    }
+    .into()
+}
+
+/// The three inert inner markers `#[cls]` consumes.
+enum ClsMarker {
+    Enter,
+    /// The `#[method(<override>)]` tokens (empty for a bare `#[method]`).
+    Method(proc_macro2::TokenStream),
+    Exit,
+}
+
+/// Find and REMOVE a `#[enter]` / `#[method(..)]` / `#[exit]` marker attribute from a
+/// method, returning which one (if any). The marker is consumed so it does not survive
+/// onto the user's own `impl` (it is not a real attribute). At most one marker per
+/// method is allowed.
+fn take_cls_marker(method: &mut syn::ImplItemFn) -> syn::Result<Option<ClsMarker>> {
+    let mut found: Option<ClsMarker> = None;
+    let mut kept = Vec::with_capacity(method.attrs.len());
+    for attr in method.attrs.drain(..) {
+        let ident = attr.path().get_ident().map(|i| i.to_string());
+        let marker = match ident.as_deref() {
+            Some("enter") => Some(ClsMarker::Enter),
+            Some("exit") => Some(ClsMarker::Exit),
+            Some("method") => {
+                // `#[method]` (no args) or `#[method(gpu = "..")]`.
+                let tokens = match &attr.meta {
+                    syn::Meta::Path(_) => proc_macro2::TokenStream::new(),
+                    syn::Meta::List(list) => list.tokens.clone(),
+                    syn::Meta::NameValue(_) => {
+                        return Err(syn::Error::new_spanned(
+                            &attr,
+                            "#[method] takes a parenthesized config list, e.g. \
+                             #[method(gpu = \"T4\")], not `#[method = ..]`",
+                        ));
+                    }
+                };
+                Some(ClsMarker::Method(tokens))
+            }
+            _ => None,
+        };
+        match marker {
+            Some(m) => {
+                if found.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        &attr,
+                        "a #[cls] method may carry at most ONE of #[enter]/#[method]/#[exit]",
+                    ));
+                }
+                found = Some(m);
+            }
+            None => kept.push(attr),
+        }
+    }
+    method.attrs = kept;
+    Ok(found)
+}
+
+/// The self-type ident of the impl block (`Embedder`), or a clear error if the self
+/// type is not a bare path.
+fn cls_self_ident(item_impl: &ItemImpl) -> syn::Result<syn::Ident> {
+    match item_impl.self_ty.as_ref() {
+        Type::Path(tp) if tp.qself.is_none() => tp
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.clone())
+            .ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &item_impl.self_ty,
+                    "#[cls] self type must be a named struct",
+                )
+            }),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[cls] applies to `impl <StructName> { .. }` where the self type is a \
+             named struct",
+        )),
+    }
+}
+
+/// Validate the `#[enter]` signature: no `&self`/`&mut self` receiver, no params, no
+/// generics, and a return of `Self` / `Result<Self, _>` (we accept both the fallible
+/// `-> anyhow::Result<Self>` and the infallible `-> Self`). Returns `true` iff the
+/// return is fallible (a `Result<Self, _>`), so the accessor body matches the form.
+fn validate_enter_sig(method: &syn::ImplItemFn, class_ident: &syn::Ident) -> syn::Result<bool> {
+    if let Some(FnArg::Receiver(recv)) = method.sig.inputs.first() {
+        return Err(syn::Error::new_spanned(
+            recv,
+            "#[enter] must be an associated fn with NO receiver: `fn load() -> \
+             anyhow::Result<Self>` (it CONSTRUCTS the value moved into the singleton)",
+        ));
+    }
+    if !method.sig.inputs.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &method.sig.inputs,
+            "#[enter] takes NO parameters in v0 (class params are deferred to Shape B). \
+             Read per-deployment config from std::env via #[cls(secrets = [..])].",
+        ));
+    }
+    if !method.sig.generics.params.is_empty() || method.sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &method.sig.generics,
+            "#[enter] cannot be generic",
+        ));
+    }
+    // Return must be `Self` / the class name, or `Result<Self, _>` (syntactic check).
+    match classify_enter_return(&method.sig.output, class_ident) {
+        Some(fallible) => Ok(fallible),
+        None => Err(syn::Error::new_spanned(
+            &method.sig.output,
+            "#[enter] must return `Self` / `anyhow::Result<Self>` (the constructed, \
+             loaded value the macro moves into the load-once singleton)",
+        )),
+    }
+}
+
+/// Classify an `#[enter]` return: `Some(false)` = bare `Self`/`<Class>` (infallible),
+/// `Some(true)` = `Result<Self, _>`/`Result<<Class>, _>` (fallible), `None` = not a
+/// valid enter return. A proc-macro cannot resolve types, so this accepts the common
+/// spellings syntactically.
+fn classify_enter_return(output: &ReturnType, class_ident: &syn::Ident) -> Option<bool> {
+    let ReturnType::Type(_, ty) = output else {
+        return None; // `-> ()` is never a valid enter
+    };
+    let Type::Path(tp) = ty.as_ref() else {
+        return None;
+    };
+    let last = tp.path.segments.last()?;
+    // Bare `Self` / `Embedder` -> infallible.
+    if matches!(last.arguments, PathArguments::None) {
+        if last.ident == "Self" || &last.ident == class_ident {
+            return Some(false);
+        }
+        return None;
+    }
+    // `Result<Self, _>` / `anyhow::Result<Embedder>` -> fallible, if the Ok type is Self.
+    if last.ident == "Result" {
+        if let PathArguments::AngleBracketed(args) = &last.arguments {
+            if let Some(GenericArgument::Type(Type::Path(itp))) = args.args.first() {
+                if let Some(iseg) = itp.path.segments.last() {
+                    if matches!(iseg.arguments, PathArguments::None)
+                        && (iseg.ident == "Self" || &iseg.ident == class_ident)
+                    {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build a [`ClsMethod`] from a `#[method(..)]`-marked fn: validate `&self`-only +
+/// `Result<T>` return + no generics, strip the receiver, classify params, and merge
+/// the method override on top of the class config.
+fn build_cls_method(
+    method: &syn::ImplItemFn,
+    class_config: &ClsConfig,
+    over_tokens: proc_macro2::TokenStream,
+) -> syn::Result<ClsMethod> {
+    let ident = method.sig.ident.clone();
+
+    if let Some(async_token) = method.sig.asyncness {
+        return Err(syn::Error::new_spanned(
+            async_token,
+            "#[method] does not support `async fn` in v0 (the runtime `typed_async!` \
+             shape is not yet implemented). Use a synchronous method.",
+        ));
+    }
+    if !method.sig.generics.params.is_empty() || method.sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &method.sig.generics,
+            "#[method] cannot be generic: the generated input type cannot be \
+             monomorphized. Use concrete owned param types.",
+        ));
+    }
+
+    // Receiver MUST be `&self` (not `self` / `&mut self`): the singleton hands out a
+    // shared `&'static` borrow (cls-devx-design.md §6.2). Mutable per-container state =
+    // interior mutability inside the struct.
+    match method.sig.inputs.first() {
+        Some(FnArg::Receiver(recv)) => {
+            if recv.reference.is_none() || recv.mutability.is_some() {
+                return Err(syn::Error::new_spanned(
+                    recv,
+                    "#[method] must take `&self` in v0 (not `self` / `&mut self`): the \
+                     load-once singleton is shared. Use interior mutability (a \
+                     Mutex/RwLock field) for mutable per-container state.",
+                ));
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &method.sig,
+                "#[method] must take `&self` (it reads the loaded singleton state)",
+            ));
+        }
+    }
+
+    // The non-receiver params become the generated `Input` fields. Each must be a plain
+    // owned `ident: Type` (same bar as `#[function]` Mode B), validated here.
+    let mut params: Vec<(syn::Ident, Type)> = Vec::new();
+    for arg in method.sig.inputs.iter().skip(1) {
+        let FnArg::Typed(pt) = arg else {
+            continue; // a second receiver is impossible after the first
+        };
+        let pat_ident = match pt.pat.as_ref() {
+            syn::Pat::Ident(pi) if pi.subpat.is_none() => pi.ident.clone(),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    pt,
+                    "name each #[method] parameter so it can become an input field \
+                     (a plain `ident: Type`, no destructuring)",
+                ));
+            }
+        };
+        if matches!(pt.ty.as_ref(), Type::Reference(_)) {
+            return Err(syn::Error::new_spanned(
+                pt,
+                "#[method] params must be owned; use String / Vec<u8> instead of a \
+                 borrowed `&str` / `&[u8]`",
+            ));
+        }
+        params.push((pat_ident, (*pt.ty).clone()));
+    }
+
+    let method_over = parse_cls_config(over_tokens)?;
+    let config = class_config.merge_over(&method_over);
+
+    Ok(ClsMethod {
+        ident,
+        config,
+        params,
+        output: method.sig.output.clone(),
+    })
+}
+
+/// Emit the per-class singleton + retry accessor, and per method the auto-IO module,
+/// the spread shim, the `inventory::submit!` registration, and the handle methods +
+/// extension trait.
+fn emit_cls(
+    class_ident: &syn::Ident,
+    enter_ident: &syn::Ident,
+    enter_fallible: bool,
+    methods: &[ClsMethod],
+    facade: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    // The process-global singleton + the get-or-try-init accessor. Caches SUCCESS only,
+    // so an #[enter] `Err` is surfaced (as a function_error) and RETRIED on the next
+    // call — a transient load failure never poisons the warm container
+    // (cls-devx-design.md §5.2 / §6.3). Sequential serve (v0) makes the benign
+    // double-build race a plain get-then-get_or_init allows impossible.
+    let singleton_static = format_ident!(
+        "__MODAL_RUST_CLS_{}",
+        class_ident.to_string().to_uppercase()
+    );
+    let accessor = format_ident!(
+        "__modal_rust_cls_{}",
+        class_ident.to_string().to_lowercase()
+    );
+
+    // The #[enter] return is normalized to a `Result<Self, anyhow::Error>` token expr.
+    // Fallible: `Embedder::load().map_err(anyhow::Error::from)`; infallible: wrap in
+    // `Ok(..)`. Detected syntactically by the macro so ONE accessor body fits both.
+    let enter_call = if enter_fallible {
+        quote! {
+            ::core::result::Result::map_err(
+                #class_ident::#enter_ident(),
+                ::core::convert::Into::<::anyhow::Error>::into,
+            )
+        }
+    } else {
+        quote! { ::core::result::Result::<#class_ident, ::anyhow::Error>::Ok(#class_ident::#enter_ident()) }
+    };
+
+    let singleton = quote! {
+        #[doc(hidden)]
+        static #singleton_static: ::std::sync::OnceLock<#class_ident> = ::std::sync::OnceLock::new();
+
+        /// get-or-try-init: return the cached singleton, else run #[enter] ONCE; cache
+        /// only on success so a transient failure retries on the next call.
+        #[doc(hidden)]
+        fn #accessor() -> ::core::result::Result<&'static #class_ident, #facade::RunnerError> {
+            if let ::core::option::Option::Some(v) = #singleton_static.get() {
+                return ::core::result::Result::Ok(v);
+            }
+            // `#[enter]` may return `Self` (infallible) or `anyhow::Result<Self>`; the
+            // macro emits the matching normalization to `Result<Self, anyhow::Error>`
+            // so this body is identical for both forms.
+            match #enter_call {
+                ::core::result::Result::Ok(v) => {
+                    ::core::result::Result::Ok(#singleton_static.get_or_init(|| v))
+                }
+                ::core::result::Result::Err(e) => {
+                    ::core::result::Result::Err(#facade::RunnerError::function_opaque(e))
+                }
+            }
+        }
+    };
+
+    // Per-method codegen.
+    let mut method_mods = Vec::new();
+    let mut handle_methods = Vec::new();
+    for m in methods {
+        let method_ident = &m.ident;
+        let entry_name = format!(
+            "{}{}{}",
+            class_ident, CLS_ENTRYPOINT_SEPARATOR, method_ident
+        );
+        // The generated mod ident uses `_` (an ident cannot contain `.`).
+        let mod_ident = format_ident!("{}_{}", class_ident, method_ident);
+        let shim_ident = format_ident!("__modal_rust_cls_shim_{}_{}", class_ident, method_ident);
+
+        let field_idents: Vec<&syn::Ident> = m.params.iter().map(|(id, _)| id).collect();
+        let field_types: Vec<&Type> = m.params.iter().map(|(_, ty)| ty).collect();
+        let output_ty = result_ok_type(&m.output);
+        let orig_output = &m.output;
+
+        let config = cls_config_to_registration(&m.config, facade);
+
+        method_mods.push(quote! {
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            pub mod #mod_ident {
+                #[allow(unused_imports)]
+                use super::*;
+
+                /// Auto-generated named input for this #[method]: one `pub` field per
+                /// non-receiver param. Serializes to the frozen named JSON object.
+                #[derive(::serde::Serialize, ::serde::Deserialize)]
+                pub struct Input {
+                    #( pub #field_idents : #field_types ),*
+                }
+
+                /// Auto-generated output alias = the method's return `Ok` type.
+                pub type Output = #output_ty;
+            }
+
+            /// Private SPREAD shim: resolves the load-once singleton (running #[enter]
+            /// once), then calls the user method with the decoded input fields.
+            /// Registered via the UNCHANGED `typed!`, so decode/call/encode + the five
+            /// error kinds are byte-identical to a free fn (only the dispatch resolves
+            /// a singleton first).
+            #[doc(hidden)]
+            #[allow(non_snake_case)] // the ident embeds the PascalCase class name
+            fn #shim_ident(__modal_rust_in: self::#mod_ident::Input) #orig_output {
+                let __modal_rust_self = #accessor()
+                    .map_err(|e| ::anyhow::anyhow!(e.to_string()))?;
+                __modal_rust_self.#method_ident( #( __modal_rust_in.#field_idents ),* )
+            }
+
+            #facade::__private::inventory::submit! {
+                #facade::Registration {
+                    name: #entry_name,
+                    handler: #facade::__private::runtime::typed!(#shim_ident),
+                    config: #config,
+                    package: ::core::env!("CARGO_PKG_NAME"),
+                }
+            }
+        });
+
+        handle_methods.push(quote! {
+            #[allow(clippy::too_many_arguments)]
+            pub fn #method_ident(
+                &self,
+                #( #field_idents : #field_types ),*
+            ) -> #facade::TypedCall<'a, self::#mod_ident::Input, self::#mod_ident::Output> {
+                #facade::TypedCall::new(
+                    self.app,
+                    #entry_name,
+                    self::#mod_ident::Input { #( #field_idents ),* },
+                )
+            }
+        });
+    }
+
+    // The handle + extension trait (the only NEW codegen vs `#[function]`).
+    let handle_ident = format_ident!("{}Handle", class_ident);
+    let trait_ident = format_ident!("{}Cls", class_ident);
+    // The accessor method on App is the snake_case class name (`embedder`).
+    let app_method = format_ident!("{}", to_snake_case(&class_ident.to_string()));
+
+    let handle = quote! {
+        /// A cheap borrowing handle to one #[cls] class on an `App` (mirrors Python's
+        /// `Embedder()`): its methods return `TypedCall`, chaining into
+        /// `.local()/.remote()/.spawn()/.map()`.
+        pub struct #handle_ident<'a> {
+            app: &'a #facade::App,
+        }
+
+        /// Brings `app.#app_method()` into scope. Implemented for the facade `App`; one
+        /// trait per class keeps coherence trivial (mirrors the free-fn `<Pascal>Call`).
+        pub trait #trait_ident {
+            fn #app_method(&self) -> #handle_ident<'_>;
+        }
+
+        impl #trait_ident for #facade::App {
+            fn #app_method(&self) -> #handle_ident<'_> {
+                #handle_ident { app: self }
+            }
+        }
+
+        impl<'a> #handle_ident<'a> {
+            #( #handle_methods )*
+        }
+    };
+
+    quote! {
+        #singleton
+        #( #method_mods )*
+        #handle
+    }
+}
+
+/// Build the `#facade::FunctionConfig { .. }` token stream for a resolved per-method
+/// [`ClsConfig`] (same shape `build_registration` emits for `#[function]`). An unset
+/// `secrets`/`volumes` (`None`) emits `&[]` — byte-identical to the bare default.
+fn cls_config_to_registration(
+    cfg: &ClsConfig,
+    facade: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let opt_u32 = |v: Option<u32>| match v {
+        Some(n) => quote! { ::core::option::Option::Some(#n) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let gpu_tok = match &cfg.gpu {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let timeout_tok = match cfg.timeout_secs {
+        Some(n) => {
+            let n = n as u32;
+            quote! { ::core::option::Option::Some(#n) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    let cache_tok = match cfg.cache {
+        Some(b) => quote! { ::core::option::Option::Some(#b) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let milli_cpu_tok = opt_u32(cfg.milli_cpu);
+    let memory_mb_tok = opt_u32(cfg.memory_mb);
+    let retries_tok = opt_u32(cfg.retries);
+    let schedule_tok = match &cfg.schedule {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let min_tok = opt_u32(cfg.min_containers);
+    let max_tok = opt_u32(cfg.max_containers);
+    let buffer_tok = opt_u32(cfg.buffer_containers);
+    let scaledown_tok = opt_u32(cfg.scaledown_window);
+    let secrets_tok = {
+        let items = cfg.secrets.clone().unwrap_or_default();
+        quote! { &[ #( #items ),* ] }
+    };
+    let volumes_tok = {
+        let items = cfg
+            .volumes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(mount, name)| quote! { (#mount, #name) })
+            .collect::<Vec<_>>();
+        quote! { &[ #( #items ),* ] }
+    };
+
+    quote! {
+        #facade::FunctionConfig {
+            gpu: #gpu_tok,
+            timeout_secs: #timeout_tok,
+            cache: #cache_tok,
+            milli_cpu: #milli_cpu_tok,
+            memory_mb: #memory_mb_tok,
+            retries: #retries_tok,
+            schedule: #schedule_tok,
+            min_containers: #min_tok,
+            max_containers: #max_tok,
+            buffer_containers: #buffer_tok,
+            scaledown_window: #scaledown_tok,
+            secrets: #secrets_tok,
+            volumes: #volumes_tok,
+        }
+    }
+}
+
+/// Convert a PascalCase class ident to snake_case for the `app.<class>()` accessor
+/// (`Embedder` -> `embedder`, `MyEmbedder` -> `my_embedder`).
+fn to_snake_case(pascal: &str) -> String {
+    let mut out = String::with_capacity(pascal.len() + 4);
+    for (i, ch) in pascal.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Generate the modal-rust runner `main()` — the whole `src/bin/modal_runner.rs`
@@ -1206,6 +2051,122 @@ mod tests {
         assert_eq!(to_pascal_case("add_gpu"), "AddGpu");
         assert_eq!(to_pascal_case("a_b_c"), "ABC");
         assert_eq!(to_pascal_case("already"), "Already");
+    }
+
+    #[test]
+    fn snake_case_lowers_pascal_class_idents() {
+        // The `app.<class>()` accessor name.
+        assert_eq!(to_snake_case("Embedder"), "embedder");
+        assert_eq!(to_snake_case("MyEmbedder"), "my_embedder");
+        assert_eq!(to_snake_case("HTTPClient"), "h_t_t_p_client");
+        assert_eq!(to_snake_case("A"), "a");
+    }
+
+    #[test]
+    fn cls_entrypoint_separator_round_trips_object_tag() {
+        // The dotted entrypoint name "<Class>.<method>" must survive the facade's
+        // `sanitize_object_tag` allowlist unchanged (alnum | '_' | '-' | '.'), or the
+        // live create RPC would get a corrupted tag. We reproduce that allowlist HERE
+        // (the facade is a sibling crate the macro cannot depend on) and assert the
+        // joined name is a fixed point.
+        let join = |class: &str, method: &str| format!("{class}{CLS_ENTRYPOINT_SEPARATOR}{method}");
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        for (class, method) in [
+            ("Embedder", "embed"),
+            ("Embedder", "dim"),
+            ("My_Cls", "do_it"),
+        ] {
+            let name = join(class, method);
+            assert_eq!(
+                sanitize(&name),
+                name,
+                "dotted entrypoint {name:?} must round-trip sanitize_object_tag"
+            );
+        }
+        // Guard the chosen default: the separator is the dot (one-edit fallback to "-").
+        assert_eq!(CLS_ENTRYPOINT_SEPARATOR, ".");
+    }
+
+    fn enter_output(src: &str) -> ReturnType {
+        let sig: syn::Signature = syn::parse_str(&format!("fn load() {src}")).unwrap();
+        sig.output
+    }
+
+    #[test]
+    fn classify_enter_return_distinguishes_fallible_and_infallible() {
+        let cls: syn::Ident = syn::parse_str("Embedder").unwrap();
+        // Infallible -> Some(false).
+        assert_eq!(
+            classify_enter_return(&enter_output("-> Self"), &cls),
+            Some(false)
+        );
+        assert_eq!(
+            classify_enter_return(&enter_output("-> Embedder"), &cls),
+            Some(false)
+        );
+        // Fallible -> Some(true).
+        assert_eq!(
+            classify_enter_return(&enter_output("-> anyhow::Result<Self>"), &cls),
+            Some(true)
+        );
+        assert_eq!(
+            classify_enter_return(&enter_output("-> Result<Embedder, MyErr>"), &cls),
+            Some(true)
+        );
+        // Not a valid enter return -> None.
+        assert_eq!(classify_enter_return(&enter_output(""), &cls), None);
+        assert_eq!(classify_enter_return(&enter_output("-> usize"), &cls), None);
+        assert_eq!(
+            classify_enter_return(&enter_output("-> Result<usize, E>"), &cls),
+            None
+        );
+    }
+
+    #[test]
+    fn cls_config_merge_overrides_field_by_field() {
+        let class = ClsConfig {
+            gpu: Some(syn::parse_str::<LitStr>(r#""T4""#).unwrap()),
+            timeout_secs: Some(600),
+            ..Default::default()
+        };
+        let method = ClsConfig {
+            gpu: Some(syn::parse_str::<LitStr>(r#""A10G""#).unwrap()),
+            ..Default::default()
+        };
+        let merged = class.merge_over(&method);
+        // Method gpu wins; class timeout is inherited.
+        assert_eq!(merged.gpu.as_ref().unwrap().value(), "A10G");
+        assert_eq!(merged.timeout_secs, Some(600));
+        // A bare #[method] (empty override) inherits the whole class config.
+        let inherited = class.merge_over(&ClsConfig::default());
+        assert_eq!(inherited.gpu.as_ref().unwrap().value(), "T4");
+        assert_eq!(inherited.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn parse_cls_config_reads_the_decorator_vocabulary() {
+        let tokens: proc_macro2::TokenStream =
+            syn::parse_str(r#"gpu = "T4", timeout = 600, secrets = ["a", "b"]"#).unwrap();
+        let cfg = parse_cls_config(tokens).expect("valid config");
+        assert_eq!(cfg.gpu.as_ref().unwrap().value(), "T4");
+        assert_eq!(cfg.timeout_secs, Some(600));
+        assert_eq!(
+            cfg.secrets.as_deref().unwrap(),
+            ["a".to_string(), "b".to_string()]
+        );
+        // `name =` is rejected on a class/method.
+        let bad: proc_macro2::TokenStream = syn::parse_str(r#"name = "x""#).unwrap();
+        assert!(parse_cls_config(bad).is_err());
     }
 
     #[test]

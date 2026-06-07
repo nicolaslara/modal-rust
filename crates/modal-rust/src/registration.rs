@@ -250,7 +250,16 @@ pub fn run_cli_with_args_from_inventory<W: std::io::Write>(argv: &[String], out:
     run_cli_with_args_and_configs(registry, &configs, argv, out)
 }
 
-/// Runtime dispatch plus the facade-owned additive `--describe` branch.
+/// Runtime dispatch plus the facade-owned additive `--describe` AND `--serve`
+/// branches.
+///
+/// The `--serve` branch is the ADDITIVE warm-reuse path (cls-design.md §2.1): it hands
+/// off to the long-lived [`modal_rust_runtime::run_serve`] loop (framed
+/// `(entrypoint, input)` requests in, one frozen envelope per response out), keeping
+/// the process — and so any generated `Cls` `OnceLock` singleton — alive across calls.
+/// The one-shot `--entrypoint/--input-*` path below is byte-identical to before; only
+/// a caller that explicitly passes `--serve` (the Python wrapper, for warm `Cls`
+/// reuse) enters the serve loop.
 pub fn run_cli_with_args_and_configs<W: std::io::Write>(
     registry: Registry,
     configs: &[(&'static str, FunctionOptions)],
@@ -259,6 +268,9 @@ pub fn run_cli_with_args_and_configs<W: std::io::Write>(
 ) -> i32 {
     if argv.first().map(String::as_str) == Some("--describe") {
         return emit_describe(&registry, configs, out);
+    }
+    if argv.first().map(String::as_str) == Some("--serve") {
+        return modal_rust_runtime::run_serve(registry);
     }
     modal_rust_runtime::run_cli_with_args(registry, argv, out)
 }

@@ -20,6 +20,15 @@ _RUNNER = "/tmp/target/release/modal_runner"
 _MARKER = "/tmp/.modal_rust_built"
 _BUILT = False
 
+# ONE persistent `modal_runner --serve` child per warm container (cls-design.md §2.1,
+# Option 2a). Built lazily on the first call and reused for every later call so a Rust
+# `OnceLock` singleton (an entered `Cls` struct) survives across calls — `#[enter]`
+# runs ONCE per warm container. Module-global, exactly like `_BUILT`/`_MARKER`. This is
+# ADDITIVE: the per-call `(entrypoint, input_json) -> envelope` contract is unchanged
+# (serve just frames the same request + the SAME one-line envelope over a pipe), and
+# the cold one-shot fallback (`_run_one_shot`) stays byte-identical to before.
+_SERVE = None
+
 # Lock files regenerate; excluding them avoids stale-lock churn in the archive.
 _PACK_EXCLUDES = [
     "--exclude=cargo/registry/cache/.package-cache",
@@ -211,9 +220,70 @@ def _build(env):
     _pack_cache()
 
 
-def handler(entrypoint, input_json):
-    env = _env()
-    _build(env)
+def _serve_enabled():
+    # Default ON: routing every call through ONE persistent `modal_runner --serve`
+    # child is what makes a `#[cls]` `#[enter]` run once per warm container, and it is
+    # envelope-identical for plain `#[function]`s (the serve loop calls the SAME
+    # handler + emits the SAME frozen envelope). An escape hatch forces the legacy
+    # cold one-shot exec per call.
+    return os.environ.get("MODAL_RUST_SERVE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _serve_child(env):
+    # Spawn (once) the long-lived `modal_runner --serve` child and reuse it. A dead
+    # child (crashed process) is transparently respawned on the next call.
+    global _SERVE
+    if _SERVE is not None and _SERVE.poll() is None:
+        return _SERVE
+    print("[run] spawning persistent modal_runner --serve child", file=sys.stderr)
+    _SERVE = subprocess.Popen(
+        [_RUNNER, "--serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        text=True,
+        env=env,
+    )
+    return _SERVE
+
+
+def _run_serve(entrypoint, input_json, env):
+    # Frame ONE request as a single JSON line and read ONE envelope line back. The
+    # request carries the SAME entrypoint + per-call input JSON the one-shot CLI takes;
+    # the response is the SAME frozen one-line envelope. On any pipe/child failure, fall
+    # back to a fresh one-shot exec (never lose a call to a broken serve child).
+    proc = _serve_child(env)
+    frame = json.dumps({"entrypoint": entrypoint, "input": input_json})
+    try:
+        proc.stdin.write(frame + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+    except Exception as e:
+        print(f"[run] serve child IO failed ({e!r}); falling back to one-shot", file=sys.stderr)
+        global _SERVE
+        _SERVE = None
+        return _run_one_shot(entrypoint, input_json, env)
+    out = line.strip()
+    if not out:
+        # The child closed its stdout (crash/EOF): drop it and fall back one-shot.
+        print(
+            f"[run] serve child produced no envelope (exit={proc.poll()}); "
+            "falling back to one-shot",
+            file=sys.stderr,
+        )
+        _SERVE = None
+        return _run_one_shot(entrypoint, input_json, env)
+    return out
+
+
+def _run_one_shot(entrypoint, input_json, env):
+    # The ORIGINAL cold path, byte-identical to before: exec a fresh `modal_runner`,
+    # one envelope, then it exits. Used when serve is disabled or as the serve fallback.
     with open("/tmp/in.json", "w") as f:
         f.write(input_json)
     proc = subprocess.run(
@@ -232,3 +302,11 @@ def handler(entrypoint, input_json):
             f"stderr tail: {proc.stderr[-500:]!r}"
         )
     return out
+
+
+def handler(entrypoint, input_json):
+    env = _env()
+    _build(env)
+    if _serve_enabled():
+        return _run_serve(entrypoint, input_json, env)
+    return _run_one_shot(entrypoint, input_json, env)

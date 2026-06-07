@@ -198,6 +198,20 @@ run "scheduled-job: cron schedule rides through inventory (cargo test)" 'test re
 run "autoscaling: doctor offline preflight (pure library, no runner bin)" 'modal-rust doctor — preflight (OFFLINE)' \
   "${CLI} doctor --project examples/autoscaling"
 
+# stateful-class — load-once stateful class with `#[modal_rust::cls]`: `#[enter]` builds
+# the expensive state (an embedding model) ONCE per warm container, every `#[method]`
+# reuses the same singleton. Proven OFFLINE via cargo test: tests/local.rs asserts
+# `#[enter]` runs exactly once across many `.local()` calls AND the embedding is real
+# (right width, deterministic, unit-norm); tests/manifest.rs asserts each method rides
+# into its own dotted FunctionCreate entrypoint (Embedder.embed gpu=A10G override,
+# Embedder.dim gpu=T4 inherited; both timeout=600). Pure library run via the CLI; the
+# offline doctor preflight proves the CLI finds the project with no creds or runner bin.
+run "stateful-class: load-once #[enter] + real embedding + dotted entrypoints (cargo test)" 'test result: ok' \
+  "cargo test -q -p stateful-class 2>&1"
+
+run "stateful-class: doctor offline preflight (pure library, no runner bin)" 'modal-rust doctor — preflight (OFFLINE)' \
+  "${CLI} doctor --project examples/stateful-class"
+
 # custom-base — pick the RUN base image + install the Rust toolchain through the
 # EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
 # MODAL_RUST_BASE_IMAGE / MODAL_RUST_INSTALL_RUST env vars — NOT decorator config).
@@ -267,6 +281,8 @@ elif ! has_creds; then
   echo "     background-jobs RUN_REMOTE=1 cargo run -p example-background-jobs --bin background_jobs"
   echo "     spawn-map-foreach RUN_REMOTE=1 cargo run -p example-spawn-map-foreach --bin spawn_map_foreach"
   echo "     own-runner-bin  ${CLI} run extract_metrics --project examples/own-runner-bin --input '{\"lines\":[\"INFO source=api a\",\"ERROR source=api b\"]}'"
+  echo "     stateful-class  (GPU; RUN_GPU=1) ${CLI} deploy Embedder.embed --project examples/stateful-class --app modal-rust-stateful-class"
+  echo "                     ${CLI} call Embedder.embed --app modal-rust-stateful-class --input '{\"text\":\"hello\"}'"
   echo "     cuda-vector-add ${CLI} run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
   echo "     cli-workflow    ${CLI} run summarize --project examples/cli-workflow --input '{\"text\":\"the quick brown fox\"}'"
@@ -326,10 +342,19 @@ else
     live "burn-add: deploy + call on a T4" \
       "MODAL_RUST_BASE_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04 MODAL_RUST_INSTALL_RUST=1 ${CLI} deploy burn_add --project examples/burn-add --app modal-rust-burn-add-example && ${CLI} call burn_add --app modal-rust-burn-add-example --input '{\"n\":256}'" \
       '"valid":true'
+
+    # GPU: stateful-class deploy + call on a T4. The methods are GPU functions
+    # (`embed`=A10G, `dim`=T4 inherited), so this rides the GPU tier. The CLI takes the
+    # registered DOTTED entrypoint name — `Embedder.embed` — which is the live proof that
+    # Modal accepts a `.`-containing object tag for a per-method Cls entrypoint.
+    live "stateful-class: deploy + call Cls method on a T4 (dotted entrypoint)" \
+      "${CLI} deploy Embedder.embed --project examples/stateful-class --app modal-rust-stateful-class && ${CLI} call Embedder.embed --app modal-rust-stateful-class --input '{\"text\":\"hello\"}'" \
+      '"ok":true'
   else
     echo "── GPU tier skipped (set RUN_GPU=1 to run the real T4 examples):"
     echo "     cuda-vector-add ${CLI} run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
     echo "     burn-add        deploy + call on a T4 (CUDA-devel image)"
+    echo "     stateful-class  deploy + call Embedder.embed on a T4 (dotted entrypoint)"
     echo
   fi
 fi

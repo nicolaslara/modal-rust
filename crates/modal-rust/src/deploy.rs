@@ -74,12 +74,36 @@ NEVER builds and NEVER mounts source. It execs ONLY the prebuilt /app/modal_runn
 baked at IMAGE-BUILD time, and RETURNS the one-line JSON envelope verbatim (the
 facade parses it).
 """
-import subprocess, sys
+import json, os, subprocess, sys
 
 _RUNNER = "/app/modal_runner"   # baked at IMAGE-BUILD time; never rebuilt
 
+# ONE persistent `/app/modal_runner --serve` child per warm container so a `#[cls]`
+# `#[enter]` runs once and is reused across calls (cls-design.md §2.1). Module-global,
+# reused for the container's lifetime. ADDITIVE: the per-call envelope contract is
+# unchanged and the cold one-shot fallback stays byte-identical.
+_SERVE = None
 
-def handler(entrypoint, input_json):
+
+def _serve_enabled():
+    return os.environ.get("MODAL_RUST_SERVE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _serve_child():
+    global _SERVE
+    if _SERVE is not None and _SERVE.poll() is None:
+        return _SERVE
+    print("[deploy] spawning persistent modal_runner --serve child", file=sys.stderr)
+    _SERVE = subprocess.Popen(
+        [_RUNNER, "--serve"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True,
+    )
+    return _SERVE
+
+
+def _run_one_shot(entrypoint, input_json):
     with open("/tmp/in.json", "w") as f:
         f.write(input_json)
     proc = subprocess.run(
@@ -95,6 +119,28 @@ def handler(entrypoint, input_json):
             f"modal_runner produced no envelope; exit={proc.returncode}; "
             f"stderr tail: {proc.stderr[-500:]!r}"
         )
+    return out
+
+
+def handler(entrypoint, input_json):
+    if not _serve_enabled():
+        return _run_one_shot(entrypoint, input_json)
+    global _SERVE
+    proc = _serve_child()
+    frame = json.dumps({"entrypoint": entrypoint, "input": input_json})
+    try:
+        proc.stdin.write(frame + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+    except Exception as e:
+        print(f"[deploy] serve child IO failed ({e!r}); one-shot fallback", file=sys.stderr)
+        _SERVE = None
+        return _run_one_shot(entrypoint, input_json)
+    out = line.strip()
+    if not out:
+        print(f"[deploy] serve child EOF (exit={proc.poll()}); one-shot fallback", file=sys.stderr)
+        _SERVE = None
+        return _run_one_shot(entrypoint, input_json)
     return out
 "#;
 

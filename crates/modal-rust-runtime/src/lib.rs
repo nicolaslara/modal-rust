@@ -574,6 +574,140 @@ pub fn run_cli_with_args<W: std::io::Write>(
     }
 }
 
+/// One framed serve REQUEST: an entrypoint name + the SAME per-call JSON input the
+/// one-shot `--input-*` flag carries (boundaries.md §3, cls-design.md §5.1). The
+/// serve loop reads one of these per line on stdin and writes exactly one frozen
+/// envelope per response, never exiting between calls — so a generated process-global
+/// `OnceLock` singleton (the entered `Cls` struct) survives across calls in a warm
+/// container. ADDITIVE: the one-shot `--entrypoint/--input-*` path is untouched.
+#[derive(serde::Deserialize)]
+struct ServeRequest {
+    /// The registry key (e.g. `"Embedder.embed"`); SAME lookup as one-shot.
+    entrypoint: String,
+    /// The per-call JSON input, verbatim (the SAME bytes `--input-json` would carry).
+    input: String,
+}
+
+/// Run the long-lived SERVE loop reading framed requests from stdin and writing one
+/// frozen envelope per response on stdout (`modal_runner --serve`).
+///
+/// This is the ADDITIVE warm-reuse path (cls-design.md §2.1, Option 2a): the process
+/// does NOT exit between calls, so a generated process-global `OnceLock` singleton —
+/// the entered `Cls` struct — is built once (its `#[enter]` runs once) and reused by
+/// every later method call in the same warm container. Free functions keep the
+/// one-shot exec; only `Cls` methods (or, later, opt-in warm work) use serve. The
+/// per-call `(entrypoint, input_json) -> envelope` contract, the five error kinds, and
+/// FILE-mode are all UNCHANGED.
+pub fn run_serve(registry: Registry) -> i32 {
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    run_serve_with_io(registry, stdin.lock(), &mut out)
+}
+
+/// The testable core of [`run_serve`]: takes an explicit `BufRead` input and an output
+/// sink so the loop can be driven in-process by unit tests (no Modal, no Python).
+///
+/// Framing: ONE request per input line, a JSON object
+/// `{"entrypoint":"Embedder.embed","input":"{\"text\":\"hi\"}"}`; ONE response per
+/// output line, the SAME frozen envelope the one-shot path emits
+/// (`{"ok":true,"value":..}` or `{"ok":false,"error":{..}}`). The loop calls the SAME
+/// [`run_handler`] (per-request `catch_unwind`) and the SAME [`Registry::get`], so the
+/// taxonomy is byte-identical to one-shot. Crucially, the loop NEVER exits on a caught
+/// panic, a decode failure, or an unknown entrypoint — it writes the failure envelope
+/// and keeps serving, so one bad call cannot poison the warm container's singleton
+/// (cls-design.md §10, the #1 correctness risk). Returns `0` on clean EOF.
+pub fn run_serve_with_io<R: std::io::BufRead, W: std::io::Write>(
+    registry: Registry,
+    input: R,
+    out: &mut W,
+) -> i32 {
+    for line in input.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("modal_runner --serve: failed to read request: {e}");
+                return 1;
+            }
+        };
+        // Skip blank lines (e.g. a trailing newline) without treating them as a
+        // malformed frame.
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A malformed FRAME (not a valid {entrypoint,input} object) is a decode_error
+        // envelope, but the loop keeps serving the next request.
+        let req: ServeRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = RunnerError::Decode(format!("malformed serve request frame: {e}"));
+                let _ = emit_line(out, &err.to_envelope());
+                continue;
+            }
+        };
+        serve_one(&registry, &req, out);
+    }
+    0
+}
+
+/// Handle ONE framed serve request: the SAME precedence as one-shot
+/// (top-level JSON parse -> entrypoint lookup -> handler under `catch_unwind`),
+/// writing exactly one envelope. NEVER exits the loop on failure.
+fn serve_one<W: std::io::Write>(registry: &Registry, req: &ServeRequest, out: &mut W) {
+    let raw_input = req.input.as_bytes();
+    // Frozen precedence: top-level JSON parse precedes entrypoint lookup.
+    if let Err(e) = serde_json::from_slice::<serde_json::Value>(raw_input) {
+        let err = RunnerError::Decode(e.to_string());
+        let _ = emit_line(out, &err.to_envelope());
+        return;
+    }
+    let handler = match registry.get(&req.entrypoint) {
+        Some(h) => h,
+        None => {
+            let err = RunnerError::UnknownEntrypoint(format!(
+                "unknown entrypoint {:?}; known entrypoints: [{}]",
+                req.entrypoint,
+                registry
+                    .names()
+                    .map(|n| format!("{n:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            let _ = emit_line(out, &err.to_envelope());
+            return;
+        }
+    };
+    // `run_handler` wraps the call in `catch_unwind`, so a panicking method yields a
+    // `panic` envelope HERE and the loop above keeps serving — the singleton survives.
+    match run_handler(handler, raw_input) {
+        Ok(bytes) => {
+            let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err =
+                        RunnerError::Encode(format!("handler output was not valid JSON: {e}"));
+                    let _ = emit_line(out, &err.to_envelope());
+                    return;
+                }
+            };
+            let envelope = serde_json::json!({ "ok": true, "value": value });
+            let _ = emit_line(out, &envelope);
+        }
+        Err(err) => {
+            let _ = emit_line(out, &err.to_envelope());
+        }
+    }
+}
+
+/// Write exactly one JSON envelope line for the serve loop. Unlike [`emit`], a write
+/// failure does not abort the whole process — it returns `Err` and the caller keeps
+/// serving (a broken pipe on one response should not poison the warm container).
+fn emit_line<W: std::io::Write>(out: &mut W, envelope: &serde_json::Value) -> std::io::Result<()> {
+    let s = serde_json::to_string(envelope)
+        .unwrap_or_else(|e| format!(r#"{{"ok":false,"error":{{"kind":"encode_error","message":"failed to serialize envelope: {e}","details":null,"backtrace":""}}}}"#));
+    writeln!(out, "{s}")?;
+    out.flush()
+}
+
 /// Write exactly one JSON envelope (one line) to `out` and return `code`. Any write
 /// failure is reported to stderr and forces exit 1.
 fn emit<W: std::io::Write>(out: &mut W, envelope: &serde_json::Value, code: i32) -> i32 {
@@ -785,5 +919,145 @@ mod tests {
         // envelope (boundaries.md §6). The success of `panic_captured_with_backtrace`
         // already proves unwind at test time; assert the cfg as an explicit signal.
         assert!(!cfg!(panic = "abort"), "build must not be panic = abort");
+    }
+
+    // ---- serve mode (the Cls load-once + crash-isolation seam, cls-design.md §6.3) ----
+
+    mod serve {
+        use super::*;
+        use serde::Deserialize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::OnceLock;
+
+        // Each test gets its OWN `(counter, OnceLock)` pair so the suite stays
+        // isolation-safe under the test harness's concurrent execution: an `OnceLock`
+        // cannot be reset, and `#[enter] ran exactly once` is asserted via the counter
+        // the `get_or_init` closure bumps exactly when it actually builds. The handlers
+        // are `fn` pointers (no captures), so each "class" is a distinct static pair.
+        // This faithfully models the generated per-class process-global singleton.
+
+        #[derive(Deserialize)]
+        struct EmbedIn {
+            text: String,
+        }
+
+        // ---- class A: the load-once + crash-isolation proof ----
+        static A_ENTER: AtomicUsize = AtomicUsize::new(0);
+        static A_SINGLETON: OnceLock<usize> = OnceLock::new();
+        fn a_singleton() -> &'static usize {
+            A_SINGLETON.get_or_init(|| {
+                A_ENTER.fetch_add(1, Ordering::SeqCst);
+                7 // the "loaded model" state
+            })
+        }
+        fn a_embed(input: EmbedIn) -> anyhow::Result<usize> {
+            Ok(*a_singleton() + input.text.len())
+        }
+        fn a_dim(_input: serde_json::Value) -> anyhow::Result<usize> {
+            Ok(*a_singleton())
+        }
+        fn a_boom(_input: serde_json::Value) -> anyhow::Result<usize> {
+            let _ = a_singleton();
+            panic!("deliberate method panic")
+        }
+
+        // ---- class B: the keep-serving-on-bad-frames proof (own singleton) ----
+        static B_SINGLETON: OnceLock<usize> = OnceLock::new();
+        fn b_dim(_input: serde_json::Value) -> anyhow::Result<usize> {
+            Ok(*B_SINGLETON.get_or_init(|| 3))
+        }
+        fn b_embed(input: EmbedIn) -> anyhow::Result<usize> {
+            Ok(*B_SINGLETON.get_or_init(|| 3) + input.text.len())
+        }
+
+        fn drive(registry: Registry, frames: &[&str]) -> Vec<serde_json::Value> {
+            let input = frames.join("\n");
+            let mut out = Vec::new();
+            let code = run_serve_with_io(registry, input.as_bytes(), &mut out);
+            assert_eq!(code, 0, "serve loop returns 0 on clean EOF");
+            String::from_utf8(out)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("one envelope per line"))
+                .collect()
+        }
+
+        #[test]
+        fn load_once_across_methods_then_crash_isolation() {
+            // Two methods of one class, a panicking method, then a recovering call —
+            // all in ONE serve process. Asserts: (a) one envelope per request, (b)
+            // #[enter] ran ONCE (singleton reuse), (c) the panic yields a `panic`
+            // envelope AND the loop keeps serving the next request (the singleton
+            // survives the panic).
+            let registry = Registry::new()
+                .function("Embedder.embed", typed!(a_embed))
+                .function("Embedder.dim", typed!(a_dim))
+                .function("Embedder.boom", typed!(a_boom));
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"{"entrypoint":"Embedder.embed","input":"{\"text\":\"hi\"}"}"#, // 7 + 2 = 9
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#,                // 7
+                    r#"{"entrypoint":"Embedder.boom","input":"null"}"#,               // panic
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#, // 7 (survives)
+                ],
+            );
+            assert_eq!(envelopes.len(), 4, "exactly one envelope per request");
+            assert_eq!(envelopes[0], serde_json::json!({"ok": true, "value": 9}));
+            assert_eq!(envelopes[1], serde_json::json!({"ok": true, "value": 7}));
+            assert_eq!(envelopes[2]["ok"], false);
+            assert_eq!(envelopes[2]["error"]["kind"], "panic");
+            assert!(envelopes[2]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("deliberate method panic"));
+            // The loop kept serving AND the singleton survived the panic.
+            assert_eq!(envelopes[3], serde_json::json!({"ok": true, "value": 7}));
+            // The whole point: #[enter] ran exactly ONCE across all four calls.
+            assert_eq!(
+                A_ENTER.load(Ordering::SeqCst),
+                1,
+                "#[enter] (the OnceLock init) ran exactly once across calls"
+            );
+        }
+
+        #[test]
+        fn malformed_frame_and_unknown_entrypoint_keep_serving() {
+            // A garbage frame, an unknown entrypoint, and a bad-shape input each yield
+            // a failure envelope WITHOUT exiting the loop; a final good call succeeds.
+            let registry = Registry::new()
+                .function("Embedder.embed", typed!(b_embed))
+                .function("Embedder.dim", typed!(b_dim));
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"not even json"#,
+                    r#"{"entrypoint":"Nope.method","input":"null"}"#,
+                    r#"{"entrypoint":"Embedder.embed","input":"not-json"}"#,
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#,
+                ],
+            );
+            assert_eq!(envelopes.len(), 4);
+            assert_eq!(envelopes[0]["error"]["kind"], "decode_error"); // bad frame
+            assert_eq!(envelopes[1]["error"]["kind"], "unknown_entrypoint");
+            assert_eq!(envelopes[2]["error"]["kind"], "decode_error"); // bad input JSON
+            assert_eq!(envelopes[3]["ok"], true); // loop still alive
+        }
+
+        #[test]
+        fn blank_lines_are_skipped() {
+            // A trailing/blank line must not be treated as a malformed frame.
+            let registry = Registry::new().function("Embedder.dim", typed!(b_dim));
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#,
+                    r#""#,
+                    r#"   "#,
+                ],
+            );
+            assert_eq!(envelopes.len(), 1, "blank lines produce no envelope");
+            assert_eq!(envelopes[0]["ok"], true);
+        }
     }
 }

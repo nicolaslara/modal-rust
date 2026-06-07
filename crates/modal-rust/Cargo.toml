@@ -71,6 +71,12 @@ tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
 # `sha256_hex` matching `sha256(render_runner_main(..))`. Already in the lockfile via
 # the SDK upload path; pulled in directly here only for the test.
 sha2 = "0.10"
+# The `#[cls]` macro-expansion test (tests/cls.rs) authors a `#[cls] impl` exactly as
+# a user would (`#[enter] fn load() -> anyhow::Result<Self>`), so the test target needs
+# `anyhow` directly — the SAME single-dep contract a real `#[cls]`/`#[function]` user
+# crate has (`modal-rust` + `serde` + `anyhow`). The generated code routes `::anyhow::`
+# paths, matching that contract.
+anyhow = "1"
 # Self dev-dependency: activates the `testkit` feature for the facade's OWN
 # test/integration/example targets ONLY (cargo merges a self dev-dep's features
 # into the crate under test for those targets). This is how the mock-backend

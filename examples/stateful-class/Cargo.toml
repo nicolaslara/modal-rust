@@ -1,0 +1,31 @@
+[package]
+name = "stateful-class"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: a load-once stateful class with `#[modal_rust::cls]`. The expensive state (an embedding model) is built ONCE per warm container by `#[enter]`, then every `#[method]` reuses the same in-memory singleton — mirroring Python's `@app.cls` + `@enter` + `@method`. Class-level config on `#[cls(gpu = \"T4\", timeout = 600)]` is inherited by each method and overridden field-by-field by a per-method `#[method(gpu = \"A10G\")]`; each method becomes its OWN entrypoint under the dotted `\"<Class>.<method>\"` name (`Embedder.embed` / `Embedder.dim`) in the FunctionCreate manifest."
+publish = false
+
+[lib]
+name = "stateful_class"
+path = "src/lib.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::cls]` macro routes its generated code through this facade, so there is
+# no `modal-rust-runtime` / `inventory` to add and no rename. LIGHT (no gRPC client) so
+# the in-container `--bin modal_runner` build is tonic-free.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+# The example LIB is a pure `#[modal_rust::cls]` library and stays LIGHT (no gRPC
+# client). The OFFLINE tests need both the `--describe`/`dry_run` projection AND the
+# `.remote()` surface (so `tests/local.rs`'s remote-on-offline-App check compiles),
+# which live behind the facade `client` feature — so we enable it on a SECOND, dev-only
+# dependency edge. Cargo unifies a crate's own deps + dev-deps only when BUILDING TESTS,
+# so the standalone lib build (and the remote runner build) stays light while the test
+# target gets `client`.
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }
+# `tests/local.rs`'s remote-on-offline-App check is an async test; tokio drives it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
