@@ -23,8 +23,9 @@ drive local, remote, and deployed calls directly.
 
 ## Quickstart
 
-A whole modal-rust crate is a single `modal-rust` dependency, a plain
-`#[function]`, and a one-line runner. Write the function:
+A whole modal-rust crate is a single `modal-rust` dependency and a plain
+`#[function]` — no runner binary to write. The `modal-rust` CLI generates the
+runner automatically. Write the function:
 
 ```rust quickstart
 use modal_rust::function;
@@ -39,15 +40,10 @@ pub fn add(a: i64, b: i64) -> anyhow::Result<i64> {
 }
 ```
 
-Add the runner — the whole `src/bin/modal_runner.rs` is one line (`quickstart` is
-your library crate's name; it has no `__private`, no hand-written `main`):
-
-```rust
-modal_rust::modal_runner!(quickstart);
-```
-
-Then run it three ways — the typed `app.add(2, 3)` method comes from a one-line
-`use` of the generated `AddCall` trait:
+That is the entire authoring surface — no `src/bin/modal_runner.rs`, no
+`__private`, no environment variable. Run it three ways via the typed
+`app.add(2, 3)` method (brought into scope with one `use` of the generated
+`AddCall` trait):
 
 ```rust
 use modal_rust::App;
@@ -70,7 +66,7 @@ async fn run() -> anyhow::Result<()> {
 ```
 
 That is the entire newcomer surface: **one `modal-rust` dependency, no rename, no
-`__private`, no environment variable, no hand-written runner.** The
+`__private`, no environment variable, no runner binary.** The
 [`examples/quickstart`](examples/quickstart) crate is exactly this code (a
 drift-guard test asserts the `rust quickstart` block above is its real source), so
 `cargo test -p quickstart` proves it compiles and runs.
@@ -112,44 +108,49 @@ From a local checkout, install the CLI you are editing with:
 cargo install --path crates/modal-rust-cli
 ```
 
-The CLI drives the first-party SDK directly — it builds your crate, reads
-`modal_runner --describe`, and creates/invokes the function over gRPC. There is no
-generated Python and no dependency on the `modal` CLI; just configure Modal
-credentials.
+The CLI drives the first-party SDK directly — it builds your crate, generates the
+`modal_runner` binary for it (or uses one you ship), reads its `--describe`
+manifest, and creates/invokes the function over gRPC. There is no generated Python
+and no dependency on the `modal` CLI; just configure Modal credentials.
+
+Your crate stays a **pure library** — a single `modal-rust` dependency and your
+`#[function]`s, no runner binary. The examples below drive
+[`examples/cli-workflow`](examples/cli-workflow), which is exactly that: a plain
+`#[function(name = "summarize")]` library with no `src/bin/`.
 
 Check your machine first:
 
 ```bash
-modal-rust doctor --rust --project examples/add
+modal-rust doctor --rust --project examples/cli-workflow
 ```
 
 Run a registered Rust function remotely on Modal:
 
 ```bash
-modal-rust run add \
-  --project examples/add \
-  --input '{"a":40,"b":2}'
+modal-rust run summarize \
+  --project examples/cli-workflow \
+  --input '{"text":"the quick brown fox"}'
 ```
 
 Deploy the project as a persistent Modal app:
 
 ```bash
-modal-rust deploy add \
-  --project examples/add \
-  --app modal-rust-add-poc
+modal-rust deploy summarize \
+  --project examples/cli-workflow \
+  --app modal-rust-cli-workflow-example
 ```
 
 Call the deployed function without rebuilding:
 
 ```bash
-modal-rust call add \
-  --app modal-rust-add-poc \
-  --input '{"a":40,"b":2}'
+modal-rust call summarize \
+  --app modal-rust-cli-workflow-example \
+  --input '{"text":"the quick brown fox"}'
 ```
 
-For your own project, point `--project` at the crate that defines the
-`modal_runner` binary and registered entrypoints. `--input` accepts inline JSON
-or `@path/to/input.json`.
+For your own project, point `--project` at your crate (the one with the
+`#[function]`s). The CLI auto-generates the runner; there is no binary to write.
+`--input` accepts inline JSON or `@path/to/input.json`.
 
 ## Library API
 
@@ -205,17 +206,25 @@ Under the hood the macro still generates a nameable `add::Input { a, b }` /
 `add::Output` pair, so you can also call dynamically by string when you need to:
 `app.function("add").remote(add::Input { a: 2, b: 3 })`.
 
-Finally, every macro-path crate needs a `modal_runner` binary — the whole
-`src/bin/modal_runner.rs` is one line (pass your library crate's name so its
-registered functions are linked in):
+The `modal-rust` CLI generates the `modal_runner` binary automatically for pure
+library crates — you do not need to write a `src/bin/modal_runner.rs` at all.
+Just run via the CLI:
+
+```bash
+cargo run -p modal-rust-cli -- run add --project path/to/my_crate --input '{"a":2,"b":3}'
+```
+
+If you want to bring your own runner (for advanced use cases, or to run the binary
+directly without the CLI), add `src/bin/modal_runner.rs` with one line:
 
 ```rust
 modal_rust::modal_runner!(my_crate);
 ```
 
 This expands to the runner `main()` and runs the frozen runner protocol; you never
-write `main()` or touch any internal `__private` path. (A single-binary crate with
-the functions in `main.rs` writes the bare `modal_rust::modal_runner!();`.)
+write `main()` or touch any internal `__private` path. See
+[`examples/own-runner-bin`](examples/own-runner-bin) for an example of the
+bring-your-own-runner pattern.
 
 If you would rather define **named, documented I/O types** yourself, pass a single
 serializable struct in and return one out. The macro detects this form and
@@ -562,7 +571,10 @@ The `examples/` directory holds runnable, live-proven crates:
 
 | Example | What it shows |
 | --- | --- |
-| `examples/add` | **(manual / no-macro)** The same `add` written by hand — the input struct, the `typed!` registration, and `modal_registry()`, i.e. everything the macro generates for you. Plus named entrypoints exercising every runner error kind. |
+| `examples/quickstart` | **(pure library)** The whole newcomer surface: a single `modal-rust` dep and a 3-line `#[function]` — **no runner bin**. Run it with the `modal-rust` CLI, which generates the runner. This is the README quickstart, drift-guarded against the README. |
+| `examples/cli-workflow` | **(pure library + CLI)** A plain `#[function(name = "summarize")]` library with no driver and no runner bin, driven entirely by the `modal-rust` CLI: `doctor`, `run`, `deploy`, `call`. |
+| `examples/own-runner-bin` | **(bring your own bin)** The escape hatch: ship your own one-line `src/bin/modal_runner.rs` (`modal_rust::modal_runner!(crate);`) when you want to wrap startup. The CLI **auto-detects** it and uses it as-is instead of generating one. |
+| `examples/add` | **(manual / no-macro)** The same `add` written by hand — the input struct, the `typed!` registration, and `modal_registry()`, i.e. everything the macro generates for you. A low-level reference; it keeps a hand-written runner named `add-runner`. Plus named entrypoints exercising every runner error kind. |
 | `examples/add-macro` | **(macro)** The same `add` in three lines: `#[modal_rust::function] fn add(a, b) -> anyhow::Result<i64>`, called `app.add(2, 3).remote().await?` — the macro generates the input struct, registration, and typed method. Plus the full decorator config (`gpu`/`timeout`/`cache`/`secrets`/`volumes`). |
 | `examples/orchestrate` | A tour of the facade driving `add` via `.local()`, `.remote()`, and `deploy`+`call` — through BOTH the manual `App::local_with_registry(modal_registry())` and the macro `App::local()` + typed `app.add(2, 3)` paths. |
 | `examples/error-handling` | **(macro)** How a failure crosses the boundary: a plain `anyhow::Result` error is opaque (`details: null`), while a `Serialize` error type rides through as machine-readable `details` the caller can deserialize and branch on. Same frozen `function_error` kind, different `details`. |
@@ -573,13 +585,25 @@ Every example runs offline (in-process, no Modal). Run them all and check their
 output with `bash scripts/check-examples.sh`, or one at a time from the repo root:
 
 ```bash
-(cd examples/quickstart && cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":2,"b":3}')
+# quickstart is a pure-library crate (no runner bin). Prove it offline in-process,
+# and that the CLI's preflight passes for the project (cargo/rustc + panic profile):
+cargo test -p quickstart -- typed_local_add_returns_5
+# -> test result: ok
+cargo run -p modal-rust-cli -- doctor --rust --project examples/quickstart
+# -> modal-rust doctor — preflight (OFFLINE) …
+
+# With Modal credentials, the same pure-library crate runs remotely via the CLI —
+# the runner is generated for you, no src/bin/modal_runner.rs to write:
+cargo run -p modal-rust-cli -- run add --project examples/quickstart --input '{"a":2,"b":3}'
 # -> {"ok":true,"value":5}
 
-(cd examples/add-macro  && cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}')
-# -> {"ok":true,"value":42}
+# add-macro is also a pure library (no runner bin); the CLI resolves it the same way:
+cargo run -p modal-rust-cli -- doctor --rust --project examples/add-macro
+# -> modal-rust doctor — preflight (OFFLINE) …
 
-(cd examples/add        && cargo run --bin modal_runner -- --entrypoint add --input-json '{"a":40,"b":2}')
+# add is the manual / no-macro reference — it KEEPS a hand-written runner, named
+# `add-runner` (not `modal_runner`, so it never collides with the generated one):
+(cd examples/add        && cargo run --bin add-runner -- --entrypoint add --input-json '{"a":40,"b":2}')
 # -> {"ok":true,"value":{"sum":42}}
 ```
 
@@ -631,14 +655,14 @@ call:   add(40, 2) -> {sum: 42}
 
 The GPU examples (`cuda-vector-add`, `burn-add`) need a real GPU and Modal
 credentials; run them via the CLI or their live tests as described in the
-[GPU](#gpu) section above. You can prove the decorator's gpu rides through inventory
-OFFLINE (no GPU, no Modal) with the runner's additive `--describe` manifest:
+[GPU](#gpu) section above. Both are pure-library crates (no runner bin) — the
+`modal-rust` CLI generates the runner. You can confirm OFFLINE (no GPU, no Modal)
+that the CLI's preflight passes for the project (cargo/rustc + the release panic
+profile the runner needs):
 
 ```bash
-# Offline proof that the decorator IS the config (no GPU, no Modal):
-cargo run -p example-cuda-vector-add --bin modal_runner -- --describe
-# -> {"schema":"modal-rust/describe@1","entrypoints":[{"name":"vector_add",
-#     "config":{"gpu":"T4","timeout_secs":null,"cache":null,"secrets":[],"volumes":[]}}]}
+cargo run -p modal-rust-cli -- doctor --rust --project examples/cuda-vector-add
+# -> modal-rust doctor — preflight (OFFLINE) …
 ```
 
 ## License

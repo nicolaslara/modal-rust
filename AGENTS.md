@@ -139,16 +139,32 @@ contract is the stable seam — guard it across every change. See
   (its own crate, written exactly as a real user would write it). The README is a
   tested artifact, never hand-written prose code.
 - The README includes the EXACT bash to run each shown example (`cd examples/<x> &&
-  cargo run …` / `cargo run -p <x> …`), and that command is covered by a test that
-  runs it and checks the expected output. A stale README must be a TEST FAILURE.
+  cargo run …` / `cargo run -p <x> …` / `modal-rust local/describe …`), and that
+  command is covered by a test that runs it and checks the expected output. A stale
+  README must be a TEST FAILURE.
 - Curate: do NOT show every example in the README — pick a few for clarity. The code
   shown is clearly the one the run command executes.
 - For README clarity you MAY elide implementation that is UNRELATED to this project
   (the actual computation — e.g. GPU/ML math) with `// …`, but ALL modal-rust code a
-  user must write (the single `modal-rust` dep, `#[modal_rust::function]`,
-  `modal_runner!()`, the `App`/config calls) MUST be shown in full and match the real
-  crate's form. The shown code keeps the same shape as the crate; only off-topic
-  internals are trimmed.
+  user must write (the single `modal-rust` dep, `#[modal_rust::function]`, and any
+  `App`/config calls) MUST be shown in full and match the real crate's form. The shown
+  code keeps the same shape as the crate; only off-topic internals are trimmed.
+- **Examples are PURE LIBRARY crates** — no `modal_runner` bin; just the `modal-rust`
+  dep + `#[function]` fns (and any driver bin for crates that demo calling the API).
+  They are run via `modal-rust run/deploy/call/local/describe`. The tooling generates
+  the runner automatically.
+- **CLI auto-detect:** if a target crate already ships a `modal_runner` bin (detected
+  via `cargo metadata` target `kind = "bin"`, `name = "modal_runner"`), the tooling
+  uses it as-is (backward-compatible). Otherwise the tooling generates a temporary
+  runner for that build/describe operation and the user's source tree is never touched.
+- **`examples/own-runner-bin`** is the ONLY workspace crate that ships its own
+  `modal_runner` bin (`src/bin/modal_runner.rs` = `modal_rust::modal_runner!(...)`). It
+  exists to exercise and document the "bring your own runner" auto-detect path.
+- **`examples/add`** is the manual/internals reference. It depends on
+  `modal-rust-runtime` DIRECTLY (no facade), builds a `Registry` by hand with
+  `typed!`, and ships its own hand-written runner binary named `add-runner` (NOT
+  `modal_runner`). It is the low-level reference for the internals path and does NOT
+  represent how a typical user writes modal-rust code.
 
 ## Modal / Secrets Rules
 

@@ -196,8 +196,8 @@
       <text class="d" x="360" y="306" text-anchor="middle">FunctionConfig · run_cli + runner protocol</text>
       <!-- user crate -->
       <rect class="b" x="200" y="356" width="320" height="50" rx="9"/>
-      <text class="t" x="360" y="378" text-anchor="middle">user / example crate  (lib.rs + modal_runner.rs)</text>
-      <text class="d" x="360" y="394" text-anchor="middle">the only place user code lives</text>
+      <text class="t" x="360" y="378" text-anchor="middle">user / example crate  (lib.rs — pure library)</text>
+      <text class="d" x="360" y="394" text-anchor="middle">the only place user code lives; tooling generates the runner</text>
       <!-- edges -->
       <path class="e" d="M340,66 L340,118"/>           <!-- facade->sdk -->
       <path class="e" d="M520,52 Q420,90 410,118"/>     <!-- cli->facade/sdk -->
@@ -233,13 +233,13 @@
       </div>
       <div class="crate">
         <h4>modal-rust-cli</h4>
-        <div class="resp">The <code>modal-rust</code> binary. Cannot link the user crate, so it builds the user's <code>modal_runner</code>, reads <code>modal_runner --describe</code> to learn the entrypoints + per-fn config, then drives a <b>headless</b> <code>App</code> through the same facade ops. <code>clap</code>/<code>tokio</code> live here only.</div>
+        <div class="resp">The <code>modal-rust</code> binary. Cannot link the user crate, so it auto-detects or generates a <code>modal_runner</code> binary (auto-detect: if the target already ships a <code>modal_runner</code> bin it is used as-is; otherwise the tooling injects one into the upload/build copy), reads <code>modal_runner --describe</code> to learn the entrypoints + per-fn config, then drives a <b>headless</b> <code>App</code> through the same facade ops. <code>clap</code>/<code>tokio</code> live here only.</div>
         <div class="files"><code class="path">crates/modal-rust-cli/src/{main,programmatic,doctor,workspace}.rs</code></div>
       </div>
       <div class="crate">
         <h4>examples/</h4>
-        <div class="resp"><code>add</code> (manual registry), <code>add-macro</code> (the <code>#[function]</code> twin), <code>cuda-vector-add</code> (cudarc, dynamic-loading), <code>burn-add</code> (a real Burn/CubeCL GPU workload — CUDA-only, excluded from default-members), and <code>orchestrate</code> (a runnable tour of the facade).</div>
-        <div class="files"><code class="path">examples/{add,add-macro,cuda-vector-add,burn-add,orchestrate}</code></div>
+        <div class="resp">All examples are pure library crates (just <code>modal-rust</code> dep + <code>#[function]</code> fns) run via the CLI. <code>add</code> is the manual/internals reference (deps <code>modal-rust-runtime</code> directly, hand-built registry, <code>add-runner</code> bin). <code>add-macro</code> is the <code>#[function]</code> twin. <code>own-runner-bin</code> is the only crate that ships its own <code>modal_runner</code> bin (demonstrating the auto-detect path). <code>cuda-vector-add</code> (cudarc), <code>burn-add</code> (Burn/CubeCL, CUDA-only), and <code>orchestrate</code> (facade tour) round out the set.</div>
+        <div class="files"><code class="path">examples/{add,add-macro,own-runner-bin,cuda-vector-add,burn-add,orchestrate,...}</code></div>
       </div>
     </div>
 
@@ -381,8 +381,8 @@
     </svg>
     </figure>
     <ol class="steps">
-      <li><b>Manual:</b> the user writes <code>pub fn modal_registry() -&gt; Registry</code> and the runner bin calls <code>run_cli(modal_registry())</code> (<code class="path">examples/add/src/bin/modal_runner.rs:9</code>). Each <code>.function(name, typed!(f))</code> rejects a duplicate name with a hard startup panic.</li>
-      <li><b>Macro:</b> <code>#[modal_rust::function]</code> expands to the unchanged fn plus one facade-owned <code>inventory::submit!{ Registration { name, handler: typed!(f), config, package } }</code> (<code class="path">crates/modal-rust-macros/src/lib.rs</code>). The runner bin calls <code>modal_rust::run_cli_from_inventory()</code>.</li>
+      <li><b>Manual:</b> the user writes <code>pub fn modal_registry() -&gt; Registry</code> and a hand-written runner bin calls <code>run_cli(modal_registry())</code> (<code class="path">examples/add/src/bin/add_runner.rs:9</code> — the low-level reference crate that deps <code>modal-rust-runtime</code> directly and ships its own runner under the unique name <code>add-runner</code>). Each <code>.function(name, typed!(f))</code> rejects a duplicate name with a hard startup panic.</li>
+      <li><b>Macro (the normal path):</b> <code>#[modal_rust::function]</code> expands to the unchanged fn plus one facade-owned <code>inventory::submit!{ Registration { name, handler: typed!(f), config, package } }</code> (<code class="path">crates/modal-rust-macros/src/lib.rs</code>). The generated (or user-supplied) runner calls <code>modal_rust::run_cli_from_inventory()</code>. No runner bin required in the user's crate — the tooling generates one.</li>
       <li><b>Convergence:</b> <code>modal_rust::registry_from_inventory()</code> inserts each facade submission through the <em>same</em> <code>Registry::function</code> path, producing a map byte-identical to the hand-built one. <code>examples/add-macro</code>'s tests assert the success envelope is byte-for-byte the manual path's.</li>
     </ol>
 
@@ -533,11 +533,11 @@
     <h3 id="f-cli">4.9 The CLI programmatic path</h3>
     <p>The <code>modal-rust</code> binary cannot link the user crate, so it learns the entrypoints + per-fn config out-of-band via <code>--describe</code> (<code class="path">crates/modal-rust-cli/src/programmatic.rs</code>):</p>
     <ol class="steps">
-      <li><b>Build for the manifest.</b> <code>cargo build --release -p &lt;pkg&gt; --bin modal_runner</code> at the workspace root (the <em>local</em> binary is for the manifest only and is never uploaded — the remote build still happens per the boundary).</li>
+      <li><b>Auto-detect &amp; build for the manifest.</b> Inspect <code>cargo metadata</code> targets: if the target package ships a bin named <code>modal_runner</code>, use it (backward-compatible, the <code>examples/own-runner-bin</code> path). Otherwise, <b>generate</b> a temporary shadow copy of the crate closure, inject <code>src/bin/modal_runner.rs</code> (= <code>&lt;facade_extern&gt;::modal_runner!(&lt;lib&gt;);</code>), and build there. In both cases the command is <code>cargo build --release -p &lt;pkg&gt; --bin modal_runner</code> (the local binary is for the manifest only and is never uploaded — the remote build still happens per the boundary).</li>
       <li><b>Describe.</b> Run <code>modal_runner --describe</code> and parse the <code>modal-rust/describe@1</code> manifest: each entrypoint's name + serialized facade <code>FunctionConfig</code> (<code class="path">crates/modal-rust/src/registration.rs</code>). <code>--describe</code> is an additive facade-runner subcommand; when absent, the frozen runtime <code>--entrypoint</code> dispatch is byte-identical (the first token differs, so they never collide).</li>
       <li><b>Drive a headless App.</b> Build <code>App::from_manifest</code> / <code>connect_from_manifest</code> (config but no handlers) and call the <em>same</em> facade ops the facade uses: <code>run</code> → <code>remote_envelope</code>, <code>deploy</code> → <code>deploy_with</code>, <code>call</code> → <code>call_envelope</code> (<code class="path">crates/modal-rust/src/app.rs:362–379</code>). The envelope string is printed verbatim and <code>ok</code> mirrors the exit code.</li>
     </ol>
-    <p>The CLI emits no generated <code>.py</code> and spawns no <code>modal</code> subprocess — the only subprocesses are <code>cargo</code> and the user's <code>modal_runner</code>. <code>doctor</code> checks credentials (and, with <code>--rust</code>, cargo/rustc + <code>panic = "abort"</code> detection).</p>
+    <p>The CLI emits no generated <code>.py</code> and spawns no <code>modal</code> subprocess — the only subprocesses are <code>cargo</code> and the (auto-detected or tooling-generated) <code>modal_runner</code>. <code>doctor</code> checks credentials (and, with <code>--rust</code>, cargo/rustc + <code>panic = "abort"</code> detection).</p>
   </section>
 
   <!-- ============================================================= -->
