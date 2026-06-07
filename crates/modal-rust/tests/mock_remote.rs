@@ -346,6 +346,82 @@ async fn run_without_secrets_is_wire_identical() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// cpu/memory ride into FunctionCreate.resources. A RUN with
+/// `cpu = 2.0` / `memory = 4096` on the decorator resolves to `milli_cpu = 2000`
+/// (`int(1000 * cpu)`, mirroring Modal) and `memory_mb = 4096`, riding into the
+/// `FunctionCreate` resources. ADDITIVE: an unset decorator leaves the server
+/// default (0/0), so the wire is byte-identical (the `..._is_wire_identical` test
+/// and the unchanged `mock_remote`/`mock_table` manifests prove that).
+#[tokio::test]
+async fn run_with_cpu_and_memory_ride_into_function_create() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-cpumem-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false; // keep the manifest minimal
+    let app = App::connect_at_with_configs(
+        "cpumem-app",
+        modal_registry(),
+        configs_for_add(FunctionConfig {
+            cache: Some(false),
+            // The wire units the macro resolves `cpu = 2.0` / `memory = 4096` to.
+            milli_cpu: Some(2000),
+            memory_mb: Some(4096),
+            ..FunctionConfig::default()
+        }),
+        mock.url(),
+        rc,
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    let resources = function.resources.expect("resources always sent");
+    assert_eq!(resources.milli_cpu, 2000, "cpu=2.0 -> milli_cpu=2000");
+    assert_eq!(resources.memory_mb, 4096, "memory=4096 MiB");
+    // CPU-only: no gpu_config rode along.
+    assert!(
+        resources.gpu_config.is_none(),
+        "cpu/memory request is GPU-free"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// cpu/memory NEGATIVE — an unset decorator leaves the server defaults (0/0), so the
+/// resources are wire-identical to before the feature. Pins the additive guarantee.
+#[tokio::test]
+async fn run_without_cpu_or_memory_is_wire_identical() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-nocpumem-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false;
+    let app = App::connect_at_with("nocpumem-app", modal_registry(), mock.url(), rc)
+        .await
+        .expect("connect");
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+    let resources = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .and_then(|f| f.resources)
+        .expect("resources always sent");
+    assert_eq!(resources.milli_cpu, 0, "unset cpu => server default 0");
+    assert_eq!(resources.memory_mb, 0, "unset memory => server default 0");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Row 5 — user volume rides into FunctionCreate. A RUN with
 /// `volumes=[("/data","my-vol")]` resolves VolumeGetOrCreate (V1, create) before
 /// FunctionCreate; the id mounts at `/data`.

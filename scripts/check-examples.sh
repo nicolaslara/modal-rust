@@ -142,6 +142,12 @@ run "volumes: --describe (mounted volume rides through inventory)" '"volumes":[[
 run "timeout-and-cache: --describe (timeout + cache ride through inventory)" '"timeout_secs":1800,"cache":true' \
   "cd examples/timeout-and-cache && cargo run -q --bin modal_runner -- --describe"
 
+# cpu-memory — decorator-is-config: right-size compute by requesting CPU cores + RAM
+# (`cpu = 2.0` -> milli_cpu = 2000, `memory = 4096` MiB). Proven OFFLINE via --describe
+# (a mock test asserts BOTH ride into the FunctionCreate manifest's resources).
+run "cpu-memory: --describe (cpu + memory ride through inventory)" '"milli_cpu":2000,"memory_mb":4096' \
+  "cd examples/cpu-memory && cargo run -q --bin modal_runner -- --describe"
+
 # custom-base — pick the RUN base image + install the Rust toolchain through the
 # EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
 # MODAL_RUST_BASE_IMAGE / MODAL_RUST_INSTALL_RUST env vars — NOT decorator config).

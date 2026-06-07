@@ -1901,6 +1901,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-cpu-memory"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "example-cuda-vector-add"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,23 @@
+[package]
+name = "example-cpu-memory"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: right-size compute by requesting CPU cores + RAM on the decorator (`#[modal_rust::function(cpu = 2.0, memory = 4096)]`). The decorator IS the config — the facade resolves `cpu` cores to milli-cores (`int(1000 * cpu)`, mirroring Modal) and rides `milli_cpu` / `memory_mb` into the FunctionCreate manifest's resources."
+publish = false
+
+[lib]
+name = "example_cpu_memory"
+path = "src/lib.rs"
+
+[[bin]]
+# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

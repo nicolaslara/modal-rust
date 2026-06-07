@@ -24,11 +24,13 @@
 //!
 //! ## Optional per-function config
 //!
-//! `#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false)]` records a
-//! facade-owned [`modal_rust::FunctionConfig`] in the same inventory record as the
-//! handler. This is control-plane metadata only: the facade reads it when creating
-//! the Modal function (`Resources.gpu_config`, `timeout_secs`), while runtime
-//! dispatch sees only `name` + `HandlerFn`.
+//! `#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false, cpu = 2.0,
+//! memory = 4096)]` records a facade-owned [`modal_rust::FunctionConfig`] in the same
+//! inventory record as the handler. This is control-plane metadata only: the facade
+//! reads it when creating the Modal function (`Resources.gpu_config`, `timeout_secs`,
+//! `Resources.milli_cpu`, `Resources.memory_mb`), while runtime dispatch sees only
+//! `name` + `HandlerFn`. `cpu` is CPU CORES (a float, e.g. `2.0`; resolved to
+//! `milli_cpu = int(1000 * cpu)`, mirroring Modal); `memory` is MEBIBYTES (an int).
 //!
 //! ## User-facing secrets + volumes
 //!
@@ -122,7 +124,7 @@ use proc_macro_crate::{crate_name, FoundCrate};
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, FnArg, GenericArgument, ItemFn, LitBool, LitInt, LitStr, PatType,
+    parse_macro_input, FnArg, GenericArgument, ItemFn, Lit, LitBool, LitInt, LitStr, PatType,
     PathArguments, ReturnType, Token, Type,
 };
 
@@ -187,6 +189,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut gpu: Option<LitStr> = None; // gpu = "T4"
     let mut timeout_secs: Option<u64> = None; // timeout = 1800   (LitInt -> u64, narrow at emit)
     let mut cache: Option<bool> = None; // cache = false
+    let mut milli_cpu: Option<u32> = None; // cpu = 2.0 (cores) -> milli_cpu = 2000
+    let mut memory_mb: Option<u32> = None; // memory = 4096 (MiB)
     let mut secrets: Vec<String> = Vec::new(); // secrets = ["a", "b"]
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     if !attr.is_empty() {
@@ -204,6 +208,20 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else if meta.path.is_ident("cache") {
                 let lit: LitBool = meta.value()?.parse()?; // true / false
                 cache = Some(lit.value);
+                Ok(())
+            } else if meta.path.is_ident("cpu") {
+                // cpu = <cores> — CPU CORES as a float (e.g. `2.0`) or an int (e.g.
+                // `2`). Mirrors Modal's `cpu` kwarg: milli_cpu = int(1000 * cpu)
+                // (truncation). Resolved to milli-cores HERE so `FunctionConfig`
+                // carries a plain `Option<u32>` const-valid in the `static`
+                // `inventory::submit!` initializer (like `timeout`).
+                milli_cpu = Some(parse_cpu_to_milli(meta.value()?)?);
+                Ok(())
+            } else if meta.path.is_ident("memory") {
+                // memory = <MiB> — requested memory in MEBIBYTES (an int), mirroring
+                // Modal's `memory` kwarg (memory_mb = memory). Narrowed to u32 at emit.
+                let lit: LitInt = meta.value()?.parse()?;
+                memory_mb = Some(lit.base10_parse()?); // bad int -> compile_error!
                 Ok(())
             } else if meta.path.is_ident("secrets") {
                 // secrets = ["my-secret", "other"] — a bracketed list of string
@@ -247,8 +265,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Err(meta.error(
                     "unsupported `#[modal_rust::function]` argument; recognized: \
                      `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
-                     `cache = <bool>`, `secrets = [\"name\", ..]`, \
-                     `volumes = [\"/mount=name\", ..]`",
+                     `cache = <bool>`, `cpu = <cores>`, `memory = <MiB>`, \
+                     `secrets = [\"name\", ..]`, `volumes = [\"/mount=name\", ..]`",
                 ))
             }
         });
@@ -327,6 +345,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             &gpu,
             timeout_secs,
             cache,
+            milli_cpu,
+            memory_mb,
             &secrets,
             &volumes,
         );
@@ -447,6 +467,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         &gpu,
         timeout_secs,
         cache,
+        milli_cpu,
+        memory_mb,
         &secrets,
         &volumes,
     );
@@ -549,6 +571,8 @@ fn emit_registration(
     gpu: &Option<LitStr>,
     timeout_secs: Option<u64>,
     cache: Option<bool>,
+    milli_cpu: Option<u32>,
+    memory_mb: Option<u32>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> TokenStream {
@@ -559,6 +583,8 @@ fn emit_registration(
         gpu,
         timeout_secs,
         cache,
+        milli_cpu,
+        memory_mb,
         secrets,
         volumes,
     );
@@ -595,6 +621,8 @@ fn build_registration(
     gpu: &Option<LitStr>,
     timeout_secs: Option<u64>,
     cache: Option<bool>,
+    milli_cpu: Option<u32>,
+    memory_mb: Option<u32>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> proc_macro2::TokenStream {
@@ -611,6 +639,17 @@ fn build_registration(
     };
     let cache_tok = match cache {
         Some(b) => quote! { ::core::option::Option::Some(#b) },
+        None => quote! { ::core::option::Option::None },
+    };
+    // `cpu`/`memory` are resolved to wire units (milli-cores / MiB) at parse time, so
+    // each is a plain `Option<u32>` const-valid in the `static` initializer (exactly
+    // like `timeout`). `None` emits `None` => byte-identical to a bare decorator.
+    let milli_cpu_tok = match milli_cpu {
+        Some(n) => quote! { ::core::option::Option::Some(#n) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let memory_mb_tok = match memory_mb {
+        Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
     // `secrets`/`volumes` are `&'static` slices on `FunctionConfig` (const-valid in
@@ -636,6 +675,8 @@ fn build_registration(
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
                     cache: #cache_tok,
+                    milli_cpu: #milli_cpu_tok,
+                    memory_mb: #memory_mb_tok,
                     secrets: #secrets_tok,
                     volumes: #volumes_tok,
                 },
@@ -773,6 +814,34 @@ fn to_pascal_case(snake: &str) -> String {
     out
 }
 
+/// Parse a `cpu = <cores>` value into milli-cores, mirroring Modal's
+/// `milli_cpu = int(1000 * cpu)` (truncation toward zero). Accepts a FLOAT literal
+/// (`2.0`, `0.5`) or an INT literal (`2` ⇒ `2.0` cores). Resolving HERE keeps
+/// [`FunctionConfig::milli_cpu`] a plain const `Option<u32>` for the `static`
+/// `inventory::submit!` initializer. A negative value is rejected (cores cannot be
+/// negative).
+fn parse_cpu_to_milli(input: syn::parse::ParseStream) -> syn::Result<u32> {
+    let lit: Lit = input.parse()?;
+    let cores: f64 = match &lit {
+        Lit::Float(f) => f.base10_parse()?,
+        Lit::Int(i) => i.base10_parse::<u64>()? as f64,
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                "`cpu` must be a number of cores, e.g. `cpu = 2.0` or `cpu = 1`",
+            ))
+        }
+    };
+    if cores < 0.0 || !cores.is_finite() {
+        return Err(syn::Error::new_spanned(
+            &lit,
+            "`cpu` (cores) must be a finite, non-negative number",
+        ));
+    }
+    // int(1000 * cpu): multiply then TRUNCATE toward zero, matching Modal's Python.
+    Ok((cores * 1000.0) as u32)
+}
+
 /// Parse a bracketed list of string literals from a `meta.value()` parse stream:
 /// `["a", "b", "c"]`. Used by both `secrets = [..]` and `volumes = [..]`. Returns
 /// the [`LitStr`]s (so callers keep the spans for good diagnostics). An empty list
@@ -835,6 +904,23 @@ mod tests {
         // No return -> unit fallback (a non-Result handler is a `typed!` compile
         // error anyway, so this fallback is never registered).
         assert_eq!(parse_out(""), "()");
+    }
+
+    #[test]
+    fn cpu_cores_resolve_to_milli_cores_like_modal() {
+        // `parse_cpu_to_milli` mirrors Modal's `milli_cpu = int(1000 * cpu)`. Drive it
+        // through `syn::parse` so we exercise the real ParseStream path.
+        let milli = |src: &str| -> u32 {
+            syn::parse::Parser::parse_str(parse_cpu_to_milli, src).expect("valid cpu")
+        };
+        assert_eq!(milli("2.0"), 2000); // float cores
+        assert_eq!(milli("0.5"), 500); // fractional core
+        assert_eq!(milli("1"), 1000); // bare int cores
+        assert_eq!(milli("0.25"), 250);
+        // Truncation toward zero (Python `int()`), not rounding.
+        assert_eq!(milli("1.9995"), 1999);
+        // Negative cores are rejected.
+        assert!(syn::parse::Parser::parse_str(parse_cpu_to_milli, "-1.0").is_err());
     }
 
     #[test]

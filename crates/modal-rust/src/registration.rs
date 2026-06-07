@@ -28,6 +28,14 @@ pub struct FunctionConfig {
     pub timeout_secs: Option<u32>,
     /// Cache hint. `None` => default. Reserved/inert for P4 (no proto target yet).
     pub cache: Option<bool>,
+    /// Requested CPU in MILLI-cores (`cpu = 2.0` ⇒ `2000`). `None` => server default
+    /// (`milli_cpu = 0`). Already resolved to wire units by the macro
+    /// (`int(1000 * cpu)`), so this stays a plain `Option<u32>` const-valid in the
+    /// `static` `inventory::submit!` initializer.
+    pub milli_cpu: Option<u32>,
+    /// Requested memory in MEBIBYTES (`memory = 4096`). `None` => server default
+    /// (`memory_mb = 0`).
+    pub memory_mb: Option<u32>,
     /// Named Modal secrets to attach.
     pub secrets: &'static [&'static str],
     /// User-volume mounts to attach as `(mount_path, volume_name)` pairs.
@@ -42,6 +50,8 @@ impl FunctionConfig {
             gpu: None,
             timeout_secs: None,
             cache: None,
+            milli_cpu: None,
+            memory_mb: None,
             secrets: &[],
             volumes: &[],
         }
@@ -65,6 +75,12 @@ pub struct FunctionOptions {
     pub timeout_secs: Option<u32>,
     /// Cache hint. `None` => path default.
     pub cache: Option<bool>,
+    /// Requested CPU in MILLI-cores. `None` => server default.
+    #[serde(default)]
+    pub milli_cpu: Option<u32>,
+    /// Requested memory in MEBIBYTES. `None` => server default.
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
     /// Named Modal secrets to attach.
     #[serde(default)]
     pub secrets: Vec<String>,
@@ -93,6 +109,8 @@ impl From<&FunctionConfig> for FunctionOptions {
             gpu: config.gpu.map(str::to_string),
             timeout_secs: config.timeout_secs,
             cache: config.cache,
+            milli_cpu: config.milli_cpu,
+            memory_mb: config.memory_mb,
             secrets: config.secrets.iter().map(|s| s.to_string()).collect(),
             volumes: config
                 .volumes
@@ -273,6 +291,8 @@ mod tests {
                 gpu: Some("T4".to_string()),
                 timeout_secs: Some(1800),
                 cache: Some(false),
+                milli_cpu: Some(2000),
+                memory_mb: Some(4096),
                 secrets: vec!["my-secret".to_string()],
                 volumes: vec![("/data".to_string(), "my-vol".to_string())],
             },
@@ -288,6 +308,8 @@ mod tests {
         assert_eq!(eps[0]["config"]["gpu"], "T4");
         assert_eq!(eps[0]["config"]["timeout_secs"], 1800);
         assert_eq!(eps[0]["config"]["cache"], false);
+        assert_eq!(eps[0]["config"]["milli_cpu"], 2000);
+        assert_eq!(eps[0]["config"]["memory_mb"], 4096);
         assert_eq!(
             eps[0]["config"]["secrets"],
             serde_json::json!(["my-secret"])
@@ -316,6 +338,8 @@ mod tests {
             gpu: Some("T4"),
             timeout_secs: Some(1800),
             cache: Some(false),
+            milli_cpu: Some(2000),
+            memory_mb: Some(4096),
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
         };
@@ -323,6 +347,8 @@ mod tests {
         assert_eq!(options.gpu.as_deref(), Some("T4"));
         assert_eq!(options.timeout_secs, Some(1800));
         assert_eq!(options.cache, Some(false));
+        assert_eq!(options.milli_cpu, Some(2000));
+        assert_eq!(options.memory_mb, Some(4096));
         assert_eq!(options.secrets, vec!["my-secret".to_string()]);
         assert_eq!(
             options.volumes,

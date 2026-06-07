@@ -246,8 +246,9 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
 ```
 
 The decorator is the config. Everything Modal needs to create the function lives
-on the attribute — `gpu`, `timeout`, `cache`, `secrets`, and `volumes` — and is
-read from the registry at call time (there are no extra CLI flags):
+on the attribute — `gpu`, `cpu`, `memory`, `timeout`, `cache`, `secrets`, and
+`volumes` — and is read from the registry at call time (there are no extra CLI
+flags):
 
 ```rust
 use modal_rust::function;
@@ -265,6 +266,8 @@ pub struct TrainOutput {
 
 #[function(
     gpu = "T4",                     // also: "A100", "A100-80GB", "H100:4", ...
+    cpu = 2.0,                      // CPU cores (float); -> milli_cpu = int(1000 * cpu)
+    memory = 4096,                  // requested RAM in MiB
     timeout = 1800,                 // wall-clock seconds
     cache = false,                  // opt out of the cargo build cache (default: on)
     secrets = ["my-api-key"],       // named Modal secrets, injected as env vars
@@ -504,6 +507,11 @@ workload:
 The GPU spec maps to Modal exactly: `"TYPE[:count]"` (e.g. `"H100:4"`); memory
 variants like `"A100-80GB"` pass through as the GPU type.
 
+Right-size plain compute with `cpu` and `memory` on the same decorator: `cpu` is a
+number of CPU cores (a float, resolved to milli-cores as `int(1000 * cpu)` exactly
+like Modal) and `memory` is requested RAM in MiB. Both default to the server default
+when unset, so a bare `#[function]` is unchanged.
+
 ## Secrets and Volumes
 
 Attach Modal secrets (injected as environment variables) and persistent volumes
@@ -522,10 +530,10 @@ pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
 }
 ```
 
-Everything on `#[function(...)]` — `gpu`, `timeout`, `cache`, `secrets`,
-`volumes` — is sourced from the registry at call time. The decorator is the
-config; there are no extra CLI flags. (Non-macro users can set the same fields on
-`RemoteConfig` / `DeployConfig`.)
+Everything on `#[function(...)]` — `gpu`, `cpu`, `memory`, `timeout`, `cache`,
+`secrets`, `volumes` — is sourced from the registry at call time. The decorator is
+the config; there are no extra CLI flags. (Non-macro users can set the same fields
+on `RemoteConfig` / `DeployConfig`.)
 
 ## Development
 

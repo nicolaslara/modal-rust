@@ -59,6 +59,7 @@ fn configs_for(case: &Case) -> BTreeMap<String, FunctionConfig> {
             cache: Some(false),
             secrets: &[],
             volumes: &[],
+            ..FunctionConfig::default()
         },
     );
     m
@@ -77,6 +78,7 @@ fn divergent_entrypoint_configs() -> BTreeMap<String, FunctionConfig> {
             cache: Some(false),
             secrets: &[],
             volumes: &[],
+            ..FunctionConfig::default()
         },
     );
     m.insert(
@@ -87,6 +89,7 @@ fn divergent_entrypoint_configs() -> BTreeMap<String, FunctionConfig> {
             cache: Some(false),
             secrets: &[],
             volumes: &[],
+            ..FunctionConfig::default()
         },
     );
     m
@@ -441,6 +444,7 @@ async fn cache_on_off_volume_manifest_table() {
                 cache: None,
                 secrets: &[],
                 volumes: &[],
+                ..FunctionConfig::default()
             },
         );
         let app = App::connect_at_with_configs(

@@ -298,7 +298,11 @@ fn build_function_spec(
         .with_mount_ids(mount_ids)
         .with_mount_client_dependencies(true)
         .with_timeout_secs(ep.timeout_secs)
-        .with_gpu(ep.options.gpu.clone())?;
+        .with_gpu(ep.options.gpu.clone())?
+        // cpu/memory ride into FunctionResources (milli_cpu/memory_mb). `None` leaves
+        // the server default (0), so an unset decorator stays wire-identical.
+        .with_milli_cpu(ep.options.milli_cpu)
+        .with_memory_mb(ep.options.memory_mb);
     // P6 cargo-cache volume at /cache (RUN only; `cache_vol_id` is None otherwise).
     if let Some(vid) = &res.cache_vol_id {
         fn_spec = fn_spec.with_volume_mount(vid.clone(), CACHE_MOUNT);

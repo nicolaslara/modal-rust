@@ -41,6 +41,11 @@ pub struct PlannedFunction {
     pub mount_ids_count: usize,
     /// The GPU type, if any (`Function.resources.gpu_config.gpu_type`); `None` = CPU.
     pub gpu: Option<String>,
+    /// Requested CPU in milli-cores (`Function.resources.milli_cpu`); `0` = server
+    /// default.
+    pub milli_cpu: u32,
+    /// Requested memory in MiB (`Function.resources.memory_mb`); `0` = server default.
+    pub memory_mb: u32,
     /// The function timeout in seconds (`Function.timeout_secs`).
     pub timeout_secs: u32,
     /// Volume mounts as `(mount_path, volume_id)` pairs (`Function.volume_mounts`).
@@ -80,6 +85,16 @@ pub fn plan_function_request(
         .as_ref()
         .and_then(|r| r.gpu_config.as_ref())
         .map(|g| g.gpu_type.clone());
+    let milli_cpu = function
+        .resources
+        .as_ref()
+        .map(|r| r.milli_cpu)
+        .unwrap_or(0);
+    let memory_mb = function
+        .resources
+        .as_ref()
+        .map(|r| r.memory_mb)
+        .unwrap_or(0);
     let volume_mounts = function
         .volume_mounts
         .iter()
@@ -90,6 +105,8 @@ pub fn plan_function_request(
         function_name: function.function_name.clone(),
         mount_ids_count: function.mount_ids.len(),
         gpu,
+        milli_cpu,
+        memory_mb,
         timeout_secs: function.timeout_secs,
         volume_mounts,
         secret_ids_count: function.secret_ids.len(),
@@ -126,13 +143,17 @@ mod tests {
             .with_mount_ids(vec!["mo-1".to_string(), "mo-2".to_string()])
             .with_timeout_secs(1800)
             .with_gpu(Some("T4"))
-            .expect("valid gpu");
+            .expect("valid gpu")
+            .with_milli_cpu(Some(2000))
+            .with_memory_mb(Some(4096));
         let planned = plan_function_request("ap-1", "fu-pre-1", &spec);
         assert_eq!(planned.module_name, "modal_rust_run_wrapper");
         // Object tag = the entrypoint ("add"), decoupled from the "handler" callable.
         assert_eq!(planned.function_name, "add");
         assert_eq!(planned.mount_ids_count, 2);
         assert_eq!(planned.gpu.as_deref(), Some("T4"));
+        assert_eq!(planned.milli_cpu, 2000);
+        assert_eq!(planned.memory_mb, 4096);
         assert_eq!(planned.timeout_secs, 1800);
         assert_eq!(planned.secret_ids_count, 0);
         assert!(

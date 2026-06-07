@@ -105,6 +105,10 @@ pub enum PlannedRequest {
         mount_ids_count: usize,
         /// The GPU type, if any (`None` = CPU).
         gpu: Option<String>,
+        /// Requested CPU in milli-cores (`0` = server default).
+        milli_cpu: u32,
+        /// Requested memory in MiB (`0` = server default).
+        memory_mb: u32,
         /// The function timeout (seconds).
         timeout_secs: u32,
         /// Volume mounts as `(mount_path, volume_id)` pairs.
@@ -193,13 +197,16 @@ impl Manifest {
                     function,
                     mount_ids_count,
                     gpu,
+                    milli_cpu,
+                    memory_mb,
                     timeout_secs,
                     volume_mounts,
                     secret_count,
                     function_data_is_none,
                 } => format!(
                     "FunctionCreate         module={module:?} function={function:?} \
-                     mount_ids={mount_ids_count} gpu={gpu:?} timeout={timeout_secs}s \
+                     mount_ids={mount_ids_count} gpu={gpu:?} cpu={milli_cpu}m \
+                     memory={memory_mb}MiB timeout={timeout_secs}s \
                      volumes={volume_mounts:?} secrets={secret_count} \
                      function_data_is_none={function_data_is_none}"
                 ),
@@ -342,6 +349,8 @@ impl ControlPlane for RecordingControlPlane {
             function: planned.function_name,
             mount_ids_count: planned.mount_ids_count,
             gpu: planned.gpu,
+            milli_cpu: planned.milli_cpu,
+            memory_mb: planned.memory_mb,
             timeout_secs: planned.timeout_secs,
             volume_mounts: planned.volume_mounts,
             secret_count: planned.secret_ids_count,
@@ -564,6 +573,8 @@ mod tests {
             gpu: Some("T4"),
             timeout_secs: Some(1800),
             cache: Some(true),
+            milli_cpu: None,
+            memory_mb: None,
             secrets: &[],
             volumes: &[],
         };
@@ -670,7 +681,7 @@ mod tests {
         // the in-container "handler" callable rides on `implementation_name` (not shown).
         assert!(render.contains(
             "FunctionCreate         module=\"modal_rust_run_wrapper\" function=\"add\" \
-             mount_ids=2 gpu=Some(\"T4\") timeout=1800s"
+             mount_ids=2 gpu=Some(\"T4\") cpu=0m memory=0MiB timeout=1800s"
         ));
         // Precreate is registered under the same per-entrypoint object tag.
         assert!(render.contains("FunctionPrecreate      function=\"add\""));

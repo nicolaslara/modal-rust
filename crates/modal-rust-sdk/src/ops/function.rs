@@ -241,6 +241,26 @@ impl FunctionSpec {
         self
     }
 
+    /// Set the requested CPU (milli-cores) on the function's resources. `None` keeps
+    /// the server default (`milli_cpu = 0`, byte-identical to today). Mirrors
+    /// [`with_gpu`](FunctionSpec::with_gpu): a `None` leaves the field at its zero
+    /// default so an unset decorator is wire-identical.
+    pub fn with_milli_cpu(mut self, milli_cpu: Option<u32>) -> Self {
+        if let Some(v) = milli_cpu {
+            self.resources.milli_cpu = v;
+        }
+        self
+    }
+
+    /// Set the requested memory (MiB) on the function's resources. `None` keeps the
+    /// server default (`memory_mb = 0`, byte-identical to today).
+    pub fn with_memory_mb(mut self, memory_mb: Option<u32>) -> Self {
+        if let Some(v) = memory_mb {
+            self.resources.memory_mb = v;
+        }
+        self
+    }
+
     /// Set the GPU spec on the function's resources (validated NOW so
     /// [`FunctionResources::to_proto`] stays infallible). `None` = CPU-only (no
     /// `gpu_config`, byte-identical to today).
@@ -705,6 +725,25 @@ mod tests {
         assert!(FunctionSpec::new("m", "handler", "im-1")
             .with_gpu(Some("T4:nope"))
             .is_err());
+    }
+
+    #[test]
+    fn with_cpu_and_memory_populate_resources_and_default_is_zero() {
+        // `with_milli_cpu(Some)` / `with_memory_mb(Some)` ride into Resources.
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_milli_cpu(Some(2000))
+            .with_memory_mb(Some(4096));
+        let r = spec.resources.to_proto();
+        assert_eq!(r.milli_cpu, 2000);
+        assert_eq!(r.memory_mb, 4096);
+
+        // `None` leaves the server default (0) — wire-identical to today.
+        let bare = FunctionSpec::new("m", "handler", "im-1")
+            .with_milli_cpu(None)
+            .with_memory_mb(None);
+        let rb = bare.resources.to_proto();
+        assert_eq!(rb.milli_cpu, 0);
+        assert_eq!(rb.memory_mb, 0);
     }
 
     #[test]

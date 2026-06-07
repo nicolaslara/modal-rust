@@ -702,6 +702,8 @@ mod tests {
                 gpu: Some("T4"),
                 timeout_secs: Some(1800),
                 cache: Some(false),
+                milli_cpu: Some(2000),
+                memory_mb: Some(4096),
                 secrets: &[],
                 volumes: &[],
             },
@@ -717,6 +719,8 @@ mod tests {
                 gpu: None,
                 timeout_secs: None,
                 cache: None,
+                milli_cpu: None,
+                memory_mb: None,
                 secrets: &["my-secret"],
                 volumes: &[("/data", "my-vol")],
             },
@@ -732,6 +736,9 @@ mod tests {
         assert_eq!(gpu_cfg.gpu.as_deref(), Some("T4"));
         assert_eq!(gpu_cfg.timeout_secs, Some(1800));
         assert_eq!(gpu_cfg.cache, Some(false));
+        // cpu/memory ride through config_for exactly like gpu/timeout.
+        assert_eq!(gpu_cfg.milli_cpu, Some(2000));
+        assert_eq!(gpu_cfg.memory_mb, Some(4096));
         // The bare decorated entrypoint has the default (all-None) config.
         let bare = app.config_for("add");
         assert_eq!(bare, FunctionOptions::default());
@@ -767,6 +774,8 @@ mod tests {
                     gpu: Some("T4"),
                     timeout_secs: Some(1800),
                     cache: None,
+                    milli_cpu: None,
+                    memory_mb: None,
                     secrets: &[],
                     volumes: &[],
                 },
@@ -790,6 +799,8 @@ mod tests {
             gpu: Some("T4"),
             timeout_secs: Some(1800),
             cache: Some(false), // deploy ignores run-cache config
+            milli_cpu: None,
+            memory_mb: None,
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
         };
@@ -854,6 +865,8 @@ mod tests {
             gpu: Some("A100"),
             timeout_secs: Some(900),
             cache: Some(true),
+            milli_cpu: Some(4000),
+            memory_mb: Some(8192),
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
         };
