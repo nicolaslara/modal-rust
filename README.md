@@ -246,8 +246,8 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
 ```
 
 The decorator is the config. Everything Modal needs to create the function lives
-on the attribute — `gpu`, `cpu`, `memory`, `timeout`, `cache`, `secrets`, and
-`volumes` — and is read from the registry at call time (there are no extra CLI
+on the attribute — `gpu`, `cpu`, `memory`, `timeout`, `retries`, `cache`, `secrets`,
+and `volumes` — and is read from the registry at call time (there are no extra CLI
 flags):
 
 ```rust
@@ -269,6 +269,7 @@ pub struct TrainOutput {
     cpu = 2.0,                      // CPU cores (float); -> milli_cpu = int(1000 * cpu)
     memory = 4096,                  // requested RAM in MiB
     timeout = 1800,                 // wall-clock seconds
+    retries = 3,                    // auto-retry a failed call N times (fixed interval)
     cache = false,                  // opt out of the cargo build cache (default: on)
     secrets = ["my-api-key"],       // named Modal secrets, injected as env vars
     volumes = ["/data=my-dataset"], // a Modal Volume `my-dataset` mounted at /data

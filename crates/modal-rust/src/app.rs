@@ -706,6 +706,7 @@ mod tests {
                 memory_mb: Some(4096),
                 secrets: &[],
                 volumes: &[],
+                retries: Some(3),
             },
             package: "modal-rust",
         }
@@ -723,6 +724,7 @@ mod tests {
                 memory_mb: None,
                 secrets: &["my-secret"],
                 volumes: &[("/data", "my-vol")],
+                retries: None,
             },
             package: "modal-rust",
         }
@@ -739,9 +741,12 @@ mod tests {
         // cpu/memory ride through config_for exactly like gpu/timeout.
         assert_eq!(gpu_cfg.milli_cpu, Some(2000));
         assert_eq!(gpu_cfg.memory_mb, Some(4096));
+        // retries ride through config_for exactly like gpu/timeout.
+        assert_eq!(gpu_cfg.retries, Some(3));
         // The bare decorated entrypoint has the default (all-None) config.
         let bare = app.config_for("add");
         assert_eq!(bare, FunctionOptions::default());
+        assert_eq!(bare.retries, None);
     }
 
     #[test]
@@ -778,6 +783,7 @@ mod tests {
                     memory_mb: None,
                     secrets: &[],
                     volumes: &[],
+                    retries: None,
                 },
             ),
         ]);
@@ -803,6 +809,7 @@ mod tests {
             memory_mb: None,
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
+            retries: None,
         };
         let app = App::from_manifest([
             ("train".to_string(), cfg.clone()),
@@ -869,6 +876,7 @@ mod tests {
             memory_mb: Some(8192),
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
+            retries: Some(5),
         };
         let app = App::from_manifest([("add".to_string(), cfg.clone())]);
         assert_eq!(app.config_for("add"), FunctionOptions::from(&cfg));

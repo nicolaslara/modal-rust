@@ -144,7 +144,7 @@ not a Modal concept.
 | `name` (801) | **Have** | `#[function(name = "...")]`. |
 | `cpu` (790) | **Partial** | SDK `FunctionResources.milli_cpu` exists (`ops/function.rs:55`) and flows to `Resources`, but the **decorator cannot set it** (always server default). Modal supports `float` or `(request, limit)` tuple. |
 | `memory` (791) | **Partial** | Same: `FunctionResources.memory_mb` exists but is not settable from the decorator. Modal supports `int` or `(request, limit)`. |
-| `retries` (798) | **Missing** | `int` or `Retries(...)` (`retries.py`). No retry policy on user functions. |
+| `retries` (798) | **Have** (int form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), riding into `Function.retry_policy`. Mirrors `_parse_retries(int)`. The `Retries(...)` struct form (custom backoff/delays) is not yet exposed. `ops/function.rs` `with_retries`. |
 | `schedule` (783) | **Missing** | `Cron`/`Period` (`schedule.py:12/61`). See §8. |
 | `min_containers` / `max_containers` / `buffer_containers` (793-795) | **Missing** | Autoscaler floor/ceiling/warm buffer (replaces old `keep_warm`/`concurrency_limit`). |
 | `scaledown_window` (796) | **Missing** | Idle-before-scaledown (old `container_idle_timeout`). |
@@ -162,8 +162,9 @@ not a Modal concept.
 | `max_inputs` / `single_use_containers` (815) | **Missing** | Single-use containers. |
 | Clustered (`i6pn`, `cluster_size`, `rdma`) | **Missing** | Multi-node clustered functions (`_clustered_functions.py`, experimental). |
 
-The high-value, cheap wins here are **`cpu` / `memory`** (the SDK already plumbs
-them — it's just a missing decorator field) and **`retries`**.
+The high-value, cheap wins here were **`cpu` / `memory`** and **`retries`** — all
+three are now **Have** (int-form `retries`); the remaining cheap win is the
+`Retries(...)` struct form for custom backoff/delays.
 
 ---
 
@@ -270,7 +271,8 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
 
 1. **`cpu` / `memory` decorator fields** — SDK already plumbs them
    (`FunctionResources`); only the macro/facade wiring is missing. Cheapest win.
-2. **`retries`** — common production need; maps to a `retry_policy` on the function.
+2. ~~**`retries`**~~ — DONE (int form): `#[function(retries = N)]` → `retry_policy`.
+   Remaining: the `Retries(...)` struct form (custom backoff/initial/max delay).
 3. **General `pip_install` / `apt_install` / `run_commands` image steps** — lets
    users add arbitrary system/runtime deps a Rust binary may dynamically link.
 4. **Inline `secrets = {dict}` / `required_keys`** — `required_keys` is a one-field

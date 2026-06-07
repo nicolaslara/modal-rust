@@ -302,7 +302,10 @@ fn build_function_spec(
         // cpu/memory ride into FunctionResources (milli_cpu/memory_mb). `None` leaves
         // the server default (0), so an unset decorator stays wire-identical.
         .with_milli_cpu(ep.options.milli_cpu)
-        .with_memory_mb(ep.options.memory_mb);
+        .with_memory_mb(ep.options.memory_mb)
+        // retries ride into Function.retry_policy. `None` leaves the field unset, so
+        // an unset decorator is byte-identical to before.
+        .with_retries(ep.options.retries);
     // P6 cargo-cache volume at /cache (RUN only; `cache_vol_id` is None otherwise).
     if let Some(vid) = &res.cache_vol_id {
         fn_spec = fn_spec.with_volume_mount(vid.clone(), CACHE_MOUNT);

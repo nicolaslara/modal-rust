@@ -40,6 +40,12 @@ pub struct FunctionConfig {
     pub secrets: &'static [&'static str],
     /// User-volume mounts to attach as `(mount_path, volume_name)` pairs.
     pub volumes: &'static [(&'static str, &'static str)],
+    /// Automatic retry COUNT (`retries = N`). `None` => no retry policy (server
+    /// default: a failed call is not retried). A bare count maps to Modal's
+    /// fixed-interval policy (`backoff = 1.0`, 1s initial / 60s max delay) when the
+    /// facade builds the `FunctionCreate`. Plain `Option<u32>`, const-valid in the
+    /// `static` `inventory::submit!` initializer (like `timeout`).
+    pub retries: Option<u32>,
 }
 
 impl FunctionConfig {
@@ -54,6 +60,7 @@ impl FunctionConfig {
             memory_mb: None,
             secrets: &[],
             volumes: &[],
+            retries: None,
         }
     }
 }
@@ -87,6 +94,9 @@ pub struct FunctionOptions {
     /// User-volume mounts to attach as `(mount_path, volume_name)` pairs.
     #[serde(default)]
     pub volumes: Vec<(String, String)>,
+    /// Automatic retry COUNT (`retries = N`). `None` => no retry policy.
+    #[serde(default)]
+    pub retries: Option<u32>,
 }
 
 impl FunctionOptions {
@@ -117,6 +127,7 @@ impl From<&FunctionConfig> for FunctionOptions {
                 .iter()
                 .map(|(mount_path, name)| (mount_path.to_string(), name.to_string()))
                 .collect(),
+            retries: config.retries,
         }
     }
 }
@@ -295,6 +306,7 @@ mod tests {
                 memory_mb: Some(4096),
                 secrets: vec!["my-secret".to_string()],
                 volumes: vec![("/data".to_string(), "my-vol".to_string())],
+                retries: Some(3),
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -318,6 +330,7 @@ mod tests {
             eps[0]["config"]["volumes"],
             serde_json::json!([["/data", "my-vol"]])
         );
+        assert_eq!(eps[0]["config"]["retries"], 3);
         assert_eq!(eps[1]["name"], "other");
         assert_eq!(eps[1]["config"]["gpu"], serde_json::Value::Null);
         assert_eq!(eps[1]["config"]["secrets"], serde_json::json!([]));
@@ -342,6 +355,7 @@ mod tests {
             memory_mb: Some(4096),
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
+            retries: Some(3),
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -354,6 +368,7 @@ mod tests {
             options.volumes,
             vec![("/data".to_string(), "my-vol".to_string())]
         );
+        assert_eq!(options.retries, Some(3));
     }
 
     #[test]

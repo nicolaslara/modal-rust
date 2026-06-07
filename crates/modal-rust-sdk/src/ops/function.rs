@@ -18,8 +18,20 @@ use crate::error::{Error, Result};
 use crate::proto::api::function::{DefinitionType, FunctionType};
 use crate::proto::api::{
     DataFormat, Function, FunctionCreateRequest, FunctionGetRequest, FunctionPrecreateRequest,
-    GpuConfig, Resources, VolumeMount,
+    FunctionRetryPolicy, GpuConfig, Resources, VolumeMount,
 };
+
+/// Default backoff coefficient for the bare integer `retries = N` form, mirroring
+/// Modal's `_parse_retries(int)` -> `Retries(max_retries=N, backoff_coefficient=1.0,
+/// initial_delay=1.0)` (`retries.py`, `_utils/function_utils.py:_parse_retries`).
+/// `1.0` = fixed-interval backoff.
+const RETRY_DEFAULT_BACKOFF_COEFFICIENT: f32 = 1.0;
+/// Default initial delay (ms) before the first retry for the bare `retries = N` form
+/// (`initial_delay=1.0` second).
+const RETRY_DEFAULT_INITIAL_DELAY_MS: u32 = 1000;
+/// Default max delay (ms) between retries — Modal's `Retries` default `max_delay=60.0`
+/// seconds (`retries.py`).
+const RETRY_DEFAULT_MAX_DELAY_MS: u32 = 60_000;
 
 /// Parse a Modal GPU spec into a [`GpuConfig`], mirroring `parse_gpu_config`
 /// (modal `_utils/function_utils.py:628`). Format: `"TYPE"` or `"TYPE:count"`.
@@ -173,6 +185,12 @@ pub struct FunctionSpec {
     /// resolves named secrets via [`ModalClient::secret_get_or_create`] and pushes
     /// the ids here; Modal injects each secret's key/values as ENV VARS.
     pub secret_ids: Vec<String>,
+    /// Retry policy → `Function.retry_policy` (proto field 18). DEFAULT `None`: an
+    /// unset policy keeps prost from emitting field 18, so the create is
+    /// byte-identical to before for every function that does not set `retries`. The
+    /// USER-facing `#[function(retries = N)]` path sets this; Modal then automatically
+    /// re-runs a failed call up to `retries` times.
+    pub retry_policy: Option<FunctionRetryPolicy>,
 }
 
 impl FunctionSpec {
@@ -194,6 +212,7 @@ impl FunctionSpec {
             mount_client_dependencies: true,
             volume_mounts: Vec::new(),
             secret_ids: Vec::new(),
+            retry_policy: None,
         }
     }
 
@@ -316,6 +335,21 @@ impl FunctionSpec {
         self.secret_ids.push(secret_id.into());
         self
     }
+
+    /// Set an automatic retry policy from a bare retry COUNT (`#[function(retries =
+    /// N)]`), mirroring Modal's `_parse_retries(int)`: a fixed-interval policy with
+    /// `backoff_coefficient = 1.0`, `initial_delay = 1s`, `max_delay = 60s`. `None`
+    /// leaves the field UNSET so the create is byte-identical to before (no
+    /// `retry_policy` on the wire).
+    pub fn with_retries(mut self, retries: Option<u32>) -> Self {
+        self.retry_policy = retries.map(|n| FunctionRetryPolicy {
+            backoff_coefficient: RETRY_DEFAULT_BACKOFF_COEFFICIENT,
+            initial_delay_ms: RETRY_DEFAULT_INITIAL_DELAY_MS,
+            max_delay_ms: RETRY_DEFAULT_MAX_DELAY_MS,
+            retries: n,
+        });
+        self
+    }
 }
 
 /// Result of [`ModalClient::function_create`].
@@ -363,8 +397,9 @@ pub(crate) fn build_function_precreate_request(
 ///   `function_serialized` in FILE mode);
 /// - `function_serialized` empty, `definition_type = FILE`, `function_type = FUNCTION`;
 /// - `resources` ALWAYS set (fix #1);
-/// - empty `volume_mounts` / `secret_ids` ⇒ prost omits those fields ⇒ wire-identical
-///   to before P6 / before secrets for existing callers.
+/// - empty `volume_mounts` / `secret_ids` and a `None` `retry_policy` ⇒ prost omits
+///   those fields ⇒ wire-identical to before P6 / before secrets / before retries for
+///   existing callers.
 pub(crate) fn build_function_create_request(
     app_id: &str,
     precreate_function_id: &str,
@@ -407,6 +442,10 @@ pub(crate) fn build_function_create_request(
         // (no-secret) callers. The user `#[function(secrets=..)]` path pushes
         // resolved secret ids here; Modal injects their key/values as ENV VARS.
         secret_ids: spec.secret_ids.clone(),
+        // `None` ⇒ prost omits field 18 ⇒ byte-identical for all existing
+        // (no-retry) callers. The user `#[function(retries = N)]` path sets a
+        // fixed-interval policy here so Modal auto-retries a failed call.
+        retry_policy: spec.retry_policy,
         ..Default::default()
     };
 
@@ -580,6 +619,35 @@ mod tests {
             spec.secret_ids.is_empty(),
             "secret_ids must default empty (wire-identical to before)"
         );
+    }
+
+    #[test]
+    fn retry_policy_defaults_none() {
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(
+            spec.retry_policy.is_none(),
+            "retry_policy must default None (wire-identical to before retries)"
+        );
+    }
+
+    #[test]
+    fn with_retries_builds_modal_fixed_interval_policy() {
+        // `with_retries(Some(N))` mirrors Modal's `_parse_retries(int)`:
+        // fixed-interval, 1s initial delay, 60s max delay, N retries.
+        let spec = FunctionSpec::new("m", "handler", "im-1").with_retries(Some(3));
+        let policy = spec.retry_policy.expect("retries set ⇒ policy present");
+        assert_eq!(policy.retries, 3);
+        assert_eq!(policy.backoff_coefficient, 1.0, "fixed-interval backoff");
+        assert_eq!(policy.initial_delay_ms, 1000, "1s initial delay");
+        assert_eq!(policy.max_delay_ms, 60_000, "60s max delay");
+
+        // `None` leaves the field unset — byte-identical to before.
+        let bare = FunctionSpec::new("m", "handler", "im-1").with_retries(None);
+        assert!(bare.retry_policy.is_none());
+
+        // `retries = 0` is a valid (zero-retry) explicit policy, distinct from unset.
+        let zero = FunctionSpec::new("m", "handler", "im-1").with_retries(Some(0));
+        assert_eq!(zero.retry_policy.expect("policy present").retries, 0);
     }
 
     #[test]
@@ -767,7 +835,8 @@ mod tests {
             .with_gpu(Some("T4"))
             .expect("valid gpu")
             .with_volume_mount("vo-cache", "/cache")
-            .with_secret_id("sc-1");
+            .with_secret_id("sc-1")
+            .with_retries(Some(3));
         let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
 
         // XOR: function is set, function_data is NOT (fix #1).
@@ -798,6 +867,14 @@ mod tests {
         assert_eq!(function.volume_mounts[0].mount_path, "/cache");
         // Secrets round-trip.
         assert_eq!(function.secret_ids, vec!["sc-1"]);
+        // The retry policy rode into Function.retry_policy (field 18).
+        let policy = function
+            .retry_policy
+            .expect("retry_policy set for retries=3");
+        assert_eq!(policy.retries, 3);
+        assert_eq!(policy.backoff_coefficient, 1.0);
+        assert_eq!(policy.initial_delay_ms, 1000);
+        assert_eq!(policy.max_delay_ms, 60_000);
     }
 
     #[test]
@@ -819,6 +896,10 @@ mod tests {
         );
         assert!(function.volume_mounts.is_empty(), "no volume mounts");
         assert!(function.secret_ids.is_empty(), "no secrets");
+        assert!(
+            function.retry_policy.is_none(),
+            "no retries ⇒ retry_policy unset (wire-identical)"
+        );
         assert!(req.function_data.is_none(), "XOR holds for CPU too");
     }
 

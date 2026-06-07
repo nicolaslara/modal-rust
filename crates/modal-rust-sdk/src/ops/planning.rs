@@ -52,6 +52,9 @@ pub struct PlannedFunction {
     pub volume_mounts: Vec<(String, String)>,
     /// Number of attached secret ids (`Function.secret_ids.len()`).
     pub secret_ids_count: usize,
+    /// The automatic retry COUNT, if a retry policy is set
+    /// (`Function.retry_policy.retries`); `None` = no policy.
+    pub retries: Option<u32>,
     /// The FILE-mode XOR invariant: `FunctionCreateRequest.function_data` is unset.
     pub function_data_is_none: bool,
 }
@@ -110,6 +113,7 @@ pub fn plan_function_request(
         timeout_secs: function.timeout_secs,
         volume_mounts,
         secret_ids_count: function.secret_ids.len(),
+        retries: function.retry_policy.map(|p| p.retries),
         function_data_is_none,
     }
 }
@@ -145,7 +149,8 @@ mod tests {
             .with_gpu(Some("T4"))
             .expect("valid gpu")
             .with_milli_cpu(Some(2000))
-            .with_memory_mb(Some(4096));
+            .with_memory_mb(Some(4096))
+            .with_retries(Some(3));
         let planned = plan_function_request("ap-1", "fu-pre-1", &spec);
         assert_eq!(planned.module_name, "modal_rust_run_wrapper");
         // Object tag = the entrypoint ("add"), decoupled from the "handler" callable.
@@ -156,6 +161,7 @@ mod tests {
         assert_eq!(planned.memory_mb, 4096);
         assert_eq!(planned.timeout_secs, 1800);
         assert_eq!(planned.secret_ids_count, 0);
+        assert_eq!(planned.retries, Some(3));
         assert!(
             planned.function_data_is_none,
             "FILE-mode XOR: function_data is None"

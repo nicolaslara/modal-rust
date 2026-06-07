@@ -1,0 +1,23 @@
+[package]
+name = "example-retries"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: make a flaky function self-heal with an automatic retry policy (`#[modal_rust::function(retries = 5)]`). The decorator IS the config — the facade builds Modal's fixed-interval retry policy (backoff 1.0, 1s initial / 60s max delay, N retries, mirroring `_parse_retries(int)`) and rides it into the FunctionCreate manifest's `retry_policy`, so Modal automatically re-runs a failed call up to N times."
+publish = false
+
+[lib]
+name = "example_retries"
+path = "src/lib.rs"
+
+[[bin]]
+# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

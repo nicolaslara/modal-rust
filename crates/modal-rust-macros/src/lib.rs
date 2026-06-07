@@ -25,12 +25,15 @@
 //! ## Optional per-function config
 //!
 //! `#[modal_rust::function(gpu = "T4", timeout = 1800, cache = false, cpu = 2.0,
-//! memory = 4096)]` records a facade-owned [`modal_rust::FunctionConfig`] in the same
-//! inventory record as the handler. This is control-plane metadata only: the facade
-//! reads it when creating the Modal function (`Resources.gpu_config`, `timeout_secs`,
-//! `Resources.milli_cpu`, `Resources.memory_mb`), while runtime dispatch sees only
-//! `name` + `HandlerFn`. `cpu` is CPU CORES (a float, e.g. `2.0`; resolved to
-//! `milli_cpu = int(1000 * cpu)`, mirroring Modal); `memory` is MEBIBYTES (an int).
+//! memory = 4096, retries = 3)]` records a facade-owned
+//! [`modal_rust::FunctionConfig`] in the same inventory record as the handler. This is
+//! control-plane metadata only: the facade reads it when creating the Modal function
+//! (`Resources.gpu_config`, `timeout_secs`, `Resources.milli_cpu`,
+//! `Resources.memory_mb`, `retry_policy`), while runtime dispatch sees only `name` +
+//! `HandlerFn`. `cpu` is CPU CORES (a float, e.g. `2.0`; resolved to `milli_cpu =
+//! int(1000 * cpu)`, mirroring Modal); `memory` is MEBIBYTES (an int); `retries` is
+//! the automatic retry COUNT (an int; mirrors Modal's bare-int `retries` kwarg → a
+//! fixed-interval retry policy).
 //!
 //! ## User-facing secrets + volumes
 //!
@@ -191,6 +194,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut cache: Option<bool> = None; // cache = false
     let mut milli_cpu: Option<u32> = None; // cpu = 2.0 (cores) -> milli_cpu = 2000
     let mut memory_mb: Option<u32> = None; // memory = 4096 (MiB)
+    let mut retries: Option<u32> = None; // retries = 3 (retry count)
     let mut secrets: Vec<String> = Vec::new(); // secrets = ["a", "b"]
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     if !attr.is_empty() {
@@ -222,6 +226,14 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Modal's `memory` kwarg (memory_mb = memory). Narrowed to u32 at emit.
                 let lit: LitInt = meta.value()?.parse()?;
                 memory_mb = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("retries") {
+                // retries = <count> — the number of automatic retries, mirroring
+                // Modal's bare-int `retries` kwarg (a fixed-interval policy). The
+                // facade builds the FunctionRetryPolicy from this count. A plain
+                // `Option<u32>` const-valid in the `static` initializer (like timeout).
+                let lit: LitInt = meta.value()?.parse()?;
+                retries = Some(lit.base10_parse()?); // bad int -> compile_error!
                 Ok(())
             } else if meta.path.is_ident("secrets") {
                 // secrets = ["my-secret", "other"] — a bracketed list of string
@@ -266,7 +278,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "unsupported `#[modal_rust::function]` argument; recognized: \
                      `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
                      `cache = <bool>`, `cpu = <cores>`, `memory = <MiB>`, \
-                     `secrets = [\"name\", ..]`, `volumes = [\"/mount=name\", ..]`",
+                     `retries = <count>`, `secrets = [\"name\", ..]`, \
+                     `volumes = [\"/mount=name\", ..]`",
                 ))
             }
         });
@@ -347,6 +360,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             cache,
             milli_cpu,
             memory_mb,
+            retries,
             &secrets,
             &volumes,
         );
@@ -469,6 +483,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         cache,
         milli_cpu,
         memory_mb,
+        retries,
         &secrets,
         &volumes,
     );
@@ -573,6 +588,7 @@ fn emit_registration(
     cache: Option<bool>,
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
+    retries: Option<u32>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> TokenStream {
@@ -585,6 +601,7 @@ fn emit_registration(
         cache,
         milli_cpu,
         memory_mb,
+        retries,
         secrets,
         volumes,
     );
@@ -623,6 +640,7 @@ fn build_registration(
     cache: Option<bool>,
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
+    retries: Option<u32>,
     secrets: &[String],
     volumes: &[(String, String)],
 ) -> proc_macro2::TokenStream {
@@ -652,6 +670,13 @@ fn build_registration(
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
+    // `retries` is a plain `Option<u32>` const-valid in the `static` initializer
+    // (exactly like `timeout`). `None` emits `None` => byte-identical to a bare
+    // decorator (no retry policy on the wire).
+    let retries_tok = match retries {
+        Some(n) => quote! { ::core::option::Option::Some(#n) },
+        None => quote! { ::core::option::Option::None },
+    };
     // `secrets`/`volumes` are `&'static` slices on `FunctionConfig` (const-valid in
     // the `static` `inventory::submit!` initializer, exactly like `gpu`/`name`). An
     // empty list emits `&[]`, byte-identical to the bare default.
@@ -677,6 +702,7 @@ fn build_registration(
                     cache: #cache_tok,
                     milli_cpu: #milli_cpu_tok,
                     memory_mb: #memory_mb_tok,
+                    retries: #retries_tok,
                     secrets: #secrets_tok,
                     volumes: #volumes_tok,
                 },

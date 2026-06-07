@@ -148,6 +148,14 @@ run "timeout-and-cache: --describe (timeout + cache ride through inventory)" '"t
 run "cpu-memory: --describe (cpu + memory ride through inventory)" '"milli_cpu":2000,"memory_mb":4096' \
   "cd examples/cpu-memory && cargo run -q --bin modal_runner -- --describe"
 
+# retries — decorator-is-config: make a flaky function self-heal with an automatic
+# retry policy (`retries = 5` -> Modal's fixed-interval policy). Proven OFFLINE via
+# --describe (a mock test asserts it rides into the FunctionCreate manifest's
+# retry_policy). The body just returns Err on a transient failure; the decorator makes
+# Modal re-run the whole call until it succeeds.
+run "retries: --describe (retry count rides through inventory)" '"retries":5' \
+  "cd examples/retries && cargo run -q --bin modal_runner -- --describe"
+
 # custom-base — pick the RUN base image + install the Rust toolchain through the
 # EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
 # MODAL_RUST_BASE_IMAGE / MODAL_RUST_INSTALL_RUST env vars — NOT decorator config).

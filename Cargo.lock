@@ -1981,6 +1981,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-retries"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "example-secrets"
 version = "0.0.0"
 dependencies = [

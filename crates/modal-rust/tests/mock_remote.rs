@@ -422,6 +422,84 @@ async fn run_without_cpu_or_memory_is_wire_identical() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// retries ride into FunctionCreate.retry_policy. A RUN with `retries = 3` on the
+/// decorator rides into `Function.retry_policy` as Modal's fixed-interval policy
+/// (`retries = 3`, `backoff_coefficient = 1.0`, `initial_delay = 1s`, `max_delay =
+/// 60s`, mirroring `_parse_retries(int)`). ADDITIVE: an unset decorator leaves
+/// `retry_policy` unset, so the wire is byte-identical (the negative test below + the
+/// unchanged `mock_remote`/`mock_table` manifests prove that).
+#[tokio::test]
+async fn run_with_retries_rides_into_function_create() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-retries-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false; // keep the manifest minimal
+    let app = App::connect_at_with_configs(
+        "retries-app",
+        modal_registry(),
+        configs_for_add(FunctionConfig {
+            cache: Some(false),
+            retries: Some(3),
+            ..FunctionConfig::default()
+        }),
+        mock.url(),
+        rc,
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    let policy = function
+        .retry_policy
+        .expect("retries=3 ⇒ retry_policy set on the manifest");
+    assert_eq!(policy.retries, 3, "retries=3 rode into the retry policy");
+    assert_eq!(
+        policy.backoff_coefficient, 1.0,
+        "bare int retries => fixed-interval backoff (Modal _parse_retries)"
+    );
+    assert_eq!(policy.initial_delay_ms, 1000, "1s initial delay");
+    assert_eq!(policy.max_delay_ms, 60_000, "60s max delay");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// retries NEGATIVE — an unset decorator leaves `retry_policy` unset, so the
+/// FunctionCreate is wire-identical to before the feature. Pins the additive guarantee.
+#[tokio::test]
+async fn run_without_retries_is_wire_identical() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp =
+        std::env::temp_dir().join(format!("modal-rust-mock-noretries-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false;
+    let app = App::connect_at_with("noretries-app", modal_registry(), mock.url(), rc)
+        .await
+        .expect("connect");
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    assert!(
+        function.retry_policy.is_none(),
+        "unset retries => no retry_policy (wire-identical)"
+    );
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Row 5 — user volume rides into FunctionCreate. A RUN with
 /// `volumes=[("/data","my-vol")]` resolves VolumeGetOrCreate (V1, create) before
 /// FunctionCreate; the id mounts at `/data`.
