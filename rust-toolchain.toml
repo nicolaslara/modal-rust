@@ -1,0 +1,6 @@
+# Pin the toolchain channel for reproducible builds + as a build-cache prerequisite
+# (a stable channel keeps fingerprints/artifacts shared across runs). The default
+# build is LIGHT (no gRPC client); see crates/modal-rust/Cargo.toml `client` feature.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

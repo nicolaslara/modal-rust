@@ -31,6 +31,10 @@ pub enum Error {
     Decode(serde_json::Error),
     /// A control-plane (remote) operation failed. Reserved for the RUN-path surface
     /// (`.remote()`/`.spawn()`/`.map()`/`FunctionCall::get`) and `connect()`.
+    ///
+    /// Gated on `client`: the SDK error type only exists when the gRPC client is
+    /// compiled in.
+    #[cfg(feature = "client")]
     Sdk(modal_rust_sdk::Error),
     /// A RUN-path call (`.remote()`/`.spawn()`/`.map()`) was made on an
     /// [`App`](crate::App) that was built offline (`App::local`/`App::local_with_registry`)
@@ -52,6 +56,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     /// Build the standard [`Error::NotConnected`] for `.remote()` on an offline App.
+    /// Used only by the client surface, so the LIGHT build allows it dead.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn not_connected() -> Error {
         Error::NotConnected(
             "`.remote()` requires a connected App: call `App::connect(name).await` \
@@ -60,9 +66,26 @@ impl Error {
         )
     }
 
-    /// Build an [`Error::Config`] from a message (invalid facade config).
+    /// Build an [`Error::Config`] from a message (invalid facade config). Used only by
+    /// the client surface (remote/deploy/dump), so the LIGHT build allows it dead.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn config(msg: impl Into<String>) -> Error {
         Error::Config(msg.into())
+    }
+
+    /// The called surface needs the `client` feature, which is OFF in this build.
+    /// Returned by the DEFAULT-build stubs of the talk-to-Modal surface
+    /// (`App::connect*`, `.remote()/.spawn()/.map()`, `deploy`/`call`, …) so a
+    /// function-only crate ALWAYS compiles light and gets a clear error if it calls
+    /// the client path. Always present (the light build needs it).
+    #[allow(dead_code)] // unused when `client` is on (the real bodies replace the stubs)
+    pub(crate) fn client_feature(what: &str) -> Error {
+        Error::NotImplemented(format!(
+            "{what} requires the `client` feature on modal-rust: set \
+             `modal-rust = {{ features = [\"client\"] }}` in your Cargo.toml \
+             (the modal-rust CLI enables it for you). The default build is light \
+             (no gRPC client) so authoring `#[function]`s + `.local()` stays fast."
+        ))
     }
 }
 
@@ -83,6 +106,7 @@ impl std::fmt::Display for Error {
             Error::Runner(e) => write!(f, "handler failed: {e}"),
             Error::Encode(e) => write!(f, "failed to encode .local() input to JSON: {e}"),
             Error::Decode(e) => write!(f, "failed to decode handler output from JSON: {e}"),
+            #[cfg(feature = "client")]
             Error::Sdk(e) => write!(f, "control-plane operation failed: {e}"),
             Error::NotConnected(msg) => write!(f, "{msg}"),
             Error::NotImplemented(msg) => write!(f, "{msg}"),
@@ -97,6 +121,7 @@ impl std::error::Error for Error {
             Error::Runner(e) => Some(e),
             Error::Encode(e) => Some(e),
             Error::Decode(e) => Some(e),
+            #[cfg(feature = "client")]
             Error::Sdk(e) => Some(e),
             Error::UnknownEntrypoint { .. }
             | Error::NotConnected(_)
@@ -112,6 +137,7 @@ impl From<RunnerError> for Error {
     }
 }
 
+#[cfg(feature = "client")]
 impl From<modal_rust_sdk::Error> for Error {
     fn from(e: modal_rust_sdk::Error) -> Self {
         Error::Sdk(e)

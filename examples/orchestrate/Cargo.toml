@@ -13,7 +13,7 @@ path = "src/main.rs"
 # The user-facing facade: App/Function + the deploy types. This is the ONE crate a
 # downstream user depends on for orchestration (it also re-exports the SDK as
 # `modal_rust::sdk`).
-modal-rust = { path = "../../crates/modal-rust" }
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }
 # The example crate that DEFINES the registered functions (`add`/`AddInput`/
 # `AddOutput`/`modal_registry()`). In a real project this is your own library crate
 # of `#[modal_rust::function]`s; here we reuse the proven `example-add`.

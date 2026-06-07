@@ -122,6 +122,10 @@ pub(crate) struct ClosureUpload {
 ///   and the remote `cargo build` would fail with a cryptic "No such file" error. The
 ///   whole-root fallback would fail the same way (the dep is outside `local_root` too),
 ///   so failing loudly here is strictly better. See [`out_of_workspace_error`].
+///
+/// Called only from the client `control_plane` (source-mount upload) + tests, so the
+/// LIGHT build allows it dead.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub(crate) fn workspace_closure(
     workspace_root: &Path,
     package: &str,
@@ -317,6 +321,9 @@ fn build_closure_upload(
 /// Build the actionable upload-time error for one or more normal path-deps that escape
 /// the workspace (so the upload can't carry their source). Names each offending crate +
 /// path and tells the user how to fix it (git/version dep, or vendor into the workspace).
+///
+/// Reached only via [`workspace_closure`] (client) + tests, so light allows it dead.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 fn out_of_workspace_error(package: &str, deps: &[OutOfWorkspaceDep]) -> String {
     use std::fmt::Write as _;
     let mut msg = format!(
@@ -505,6 +512,9 @@ struct OutOfWorkspaceDep {
 /// path-deps that escape the workspace (which the upload cannot satisfy).
 struct ClosureResult {
     dirs: Vec<PathBuf>,
+    /// Read only by the client `workspace_closure` (hard-error path) + tests; the
+    /// LIGHT `workspace_closure_lenient` ignores it, so light allows it dead.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     out_of_workspace: Vec<OutOfWorkspaceDep>,
 }
 

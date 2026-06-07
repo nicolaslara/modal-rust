@@ -10,19 +10,36 @@ publish = false
 name = "modal_rust"
 
 [features]
+# DEFAULT = LIGHT. Authoring a `#[modal_rust::function]` crate, `.local()`, and the
+# in-container `modal_runner` build need NO gRPC client — so the SDK (tonic/hyper/
+# prost/reqwest) is an OPTIONAL dep, OFF by default. This collapses the default build
+# from ~154 crates to ~9.
+default = []
+# The gRPC control-plane client (talk to Modal). NON-DEFAULT: a crate that only
+# AUTHORS `#[function]`s + uses `.local()` compiles tonic-free. Turning it on pulls
+# `modal-rust-sdk` and lights up every gRPC touchpoint: `App::connect*`,
+# `.remote()/.spawn()/.map()/.starmap()/.for_each()/.spawn_map()`, `FunctionCall::get`,
+# `deploy`/`call`, `remote_envelope`/`call_envelope`, AND the offline
+# `dry_run`/`dump_deploy_manifest` dump (offline, but it compiles against SDK
+# spec/planning TYPES). The `modal-rust` CLI enables this for you.
+client = ["dep:modal-rust-sdk", "dep:tokio"]
 # Opt-in live Modal round-trip test for `.remote()`. Gated so the no-CUDA CI box
-# NEVER runs it; enable locally with `--features live`.
-live = []
+# NEVER runs it; enable locally with `--features live`. Now REQUIRES `client` (the
+# live tests do real `.remote()`/`deploy`/`connect`).
+live = ["client"]
 # TEST-ONLY seam: exposes `App::connect_at` / `App::connect_at_with`, which point a
 # real facade `App` at an explicit `server_url` (e.g. the in-process mock from
 # `modal-rust-testkit`) with dummy creds. NOT part of the shipped public API — it is
 # additive and gated so a normal `cargo build` never surfaces it. Enabled for the
 # facade's own test/integration targets via the self dev-dependency below; no SHIPPED
-# crate enables it.
-testkit = []
+# crate enables it. Now REQUIRES `client` (it builds a real `ModalClient` pointed at
+# the mock).
+testkit = ["client"]
 
 [dependencies]
-modal-rust-sdk     = { path = "../modal-rust-sdk" }
+# OPTIONAL: pulled in only by the `client` feature (was unconditional). A crate that
+# only authors `#[function]`s + uses `.local()` never links tonic/hyper/prost/reqwest.
+modal-rust-sdk     = { path = "../modal-rust-sdk", optional = true }
 modal-rust-runtime = { path = "../modal-rust-runtime" }
 # Re-exported so users can spell `#[modal_rust::function]` (see lib.rs caveat).
 modal-rust-macros  = { path = "../modal-rust-macros" }
@@ -38,10 +55,14 @@ serde_json = "1"
 # Rewrite the uploaded workspace Cargo.toml's `members`/`default-members` to the
 # cargo-metadata closure subset (preserving `[profile]` + comments) so the scoped
 # upload is a self-consistent workspace cargo can load. Format-preserving editor.
+# Used by the LIGHT scope.rs/runner_gen.rs, so it stays unconditional.
 toml_edit  = "0.22"
-# `sync` for the RemoteHandle Mutex<ModalClient> + the function_id OnceCell;
-# `rt`/`macros` so the async `.remote()` surface is drivable.
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
+# OPTIONAL under `client`: the ONLY tokio uses in the facade are the
+# `Mutex<ModalClient>` + `OnceCell<String>` in `RemoteHandle` and the async client
+# ops — all client-side. `Function::local`/`App::local` are sync, so the light build
+# drops tokio too. `sync` for the RemoteHandle Mutex/OnceCell; `rt`/`macros` so the
+# async `.remote()` surface is drivable.
+tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
 
 [dev-dependencies]
 # Content-address the injected `modal_runner.rs` in the wire-delta mock test

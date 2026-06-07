@@ -5,26 +5,33 @@
 //! real `sdk::ModalClient` for the future remote path, but no unit/integration
 //! test calls it, so the offline gates stay green.
 
+#[cfg(feature = "client")]
 use std::collections::BTreeMap;
+#[cfg(feature = "client")]
 use std::sync::Arc;
 
+#[cfg(feature = "client")]
 use tokio::sync::{Mutex, OnceCell};
 
+#[cfg(feature = "client")]
 use crate::deploy::{self, DeployConfig, DeployedApp};
+#[cfg(feature = "client")]
 use crate::remote::{self, RemoteConfig};
 use crate::{Error, Function, FunctionOptions, Registry, Result};
 
 /// One `map` input as the SDK's `map_cbor` expects it: `(args, kwargs)` where
 /// `args = (entrypoint, input_json)` (the SAME 2-tuple `.remote()` sends) and
 /// `kwargs` is the empty map. Aliased to keep [`App::remote_map`]'s annotation
-/// readable (clippy `type_complexity`).
+/// readable (clippy `type_complexity`). Client-only.
+#[cfg(feature = "client")]
 type MapInput<'a> = ((&'a str, String), std::collections::HashMap<String, ()>);
 
 /// Memo key for created RUN-path Modal functions. Each ENTRYPOINT gets its OWN Modal
 /// function (object tag = the entrypoint) carrying its OWN effective config, so the
 /// key is the entrypoint name PLUS its effective gpu/timeout/cache/secrets/volumes.
 /// Including the config means a (hypothetical) per-call config change re-creates
-/// rather than silently reusing a stale wrapper.
+/// rather than silently reusing a stale wrapper. Client-only.
+#[cfg(feature = "client")]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RunFunctionKey {
     entrypoint: String,
@@ -42,15 +49,22 @@ pub struct App {
     registry: Registry,
     /// Per-entrypoint config from `#[modal_rust::function(...)]`. EMPTY for the
     /// manual `App::local_with_registry(registry)` / `connect_with_registry` path
-    /// (no decorator => facade defaults apply via [`App::config_for`]).
+    /// (no decorator => facade defaults apply via [`App::config_for`]). Read only by
+    /// the client surface (`.remote()`/`deploy`/dump) + tests, so the LIGHT build
+    /// allows it dead.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     configs: std::collections::BTreeMap<String, FunctionOptions>,
     /// `None` until [`App::connect`]; the live control-plane handle `.remote()`
-    /// consumes. `.local()` never touches it.
+    /// consumes. `.local()` never touches it. Client-only field: the LIGHT build has
+    /// no client, so the field is absent and the `local*`/`from_manifest` constructors
+    /// omit it.
+    #[cfg(feature = "client")]
     remote: Option<RemoteHandle>,
 }
 
 /// A live control-plane handle, built by [`App::connect`]. Private — `.remote()`
-/// drives it through [`App::remote_invoke`].
+/// drives it through [`App::remote_invoke`]. Client-only.
+#[cfg(feature = "client")]
 struct RemoteHandle {
     /// Interior mutability: `App::function` hands out `Function<'_>` borrowing
     /// `&App`, but `invoke_cbor`/the ensure sequence need `&mut ModalClient`. The
@@ -95,6 +109,7 @@ impl App {
         App {
             registry,
             configs: std::collections::BTreeMap::new(),
+            #[cfg(feature = "client")]
             remote: None,
         }
     }
@@ -107,6 +122,7 @@ impl App {
         App {
             registry,
             configs: FunctionOptions::by_name(configs),
+            #[cfg(feature = "client")]
             remote: None,
         }
     }
@@ -118,6 +134,7 @@ impl App {
     ///
     /// Enables [`Function::remote`](crate::Function::remote); `.local()` never
     /// needs this call. `.spawn()`/`.map()` remain stubbed.
+    #[cfg(feature = "client")]
     pub async fn connect(name: &str) -> Result<Self> {
         let (registry, configs) = crate::from_inventory_with_configs();
         let configs = FunctionOptions::by_name(configs);
@@ -138,6 +155,7 @@ impl App {
     /// remote handle. The manual path has NO decorator config (EMPTY `configs` =>
     /// facade defaults). The `app_id` is resolved in the configured environment
     /// (defaults to `"main"`).
+    #[cfg(feature = "client")]
     pub async fn connect_with_registry(name: &str, registry: Registry) -> Result<Self> {
         App::connect_inner(
             name,
@@ -146,6 +164,20 @@ impl App {
             RemoteConfig::default(),
         )
         .await
+    }
+
+    /// LIGHT-build stub for [`connect`](App::connect): without the `client` feature
+    /// there is no gRPC client, so connecting to Modal returns a clear error. A
+    /// function-only crate compiles either way; only an actual connect attempt fails.
+    #[cfg(not(feature = "client"))]
+    pub async fn connect(_name: &str) -> Result<Self> {
+        Err(Error::client_feature("App::connect"))
+    }
+
+    /// LIGHT-build stub for [`connect_with_registry`](App::connect_with_registry).
+    #[cfg(not(feature = "client"))]
+    pub async fn connect_with_registry(_name: &str, _registry: Registry) -> Result<Self> {
+        Err(Error::client_feature("App::connect_with_registry"))
     }
 
     /// Build a HEADLESS [`App`] from a `--describe` manifest: per-entrypoint config
@@ -164,6 +196,7 @@ impl App {
         App {
             registry: Registry::new(),
             configs: FunctionOptions::by_name(configs),
+            #[cfg(feature = "client")]
             remote: None,
         }
     }
@@ -173,6 +206,10 @@ impl App {
     /// package), instead of `connect_inner`'s hardcoded `RemoteConfig::default()`
     /// (which would (mis)discover `local_root`/`package` from the CLI's arbitrary
     /// CWD). Headless: no handlers, so only `.remote()`/`deploy`/`call` work (P9 §B).
+    ///
+    /// Client-only (it takes a [`RemoteConfig`], a client-gated type, and connects):
+    /// no light stub — the only caller is the `modal-rust` CLI, which enables `client`.
+    #[cfg(feature = "client")]
     pub async fn connect_from_manifest<I, O>(
         name: &str,
         configs: I,
@@ -196,6 +233,7 @@ impl App {
     /// only delta between `connect`/`connect_with_registry` — which pass
     /// `RemoteConfig::default()` — and the CLI's `connect_from_manifest`, which
     /// supplies a workspace-scoped config).
+    #[cfg(feature = "client")]
     async fn connect_inner(
         name: &str,
         registry: Registry,
@@ -217,6 +255,7 @@ impl App {
     /// `.remote()` never leaves a lingering persistent deployment. `ensure_function`
     /// creates the wrapper in this ephemeral app and invokes its `function_id`
     /// DIRECTLY — PERSISTENT publish is DEPLOY-only (`App::deploy`).
+    #[cfg(feature = "client")]
     async fn connect_inner_with_client(
         name: &str,
         registry: Registry,
@@ -249,7 +288,7 @@ impl App {
     /// API. The env-var path (`MODAL_SERVER_URL`) is process-global and unsuitable
     /// for parallel / table tests that each need their OWN mock port — hence this
     /// per-`App` seam.
-    #[cfg(any(test, feature = "testkit"))]
+    #[cfg(all(any(test, feature = "testkit"), feature = "client"))]
     pub async fn connect_at(name: &str, registry: Registry, server_url: String) -> Result<Self> {
         Self::connect_at_with(name, registry, server_url, RemoteConfig::default()).await
     }
@@ -258,7 +297,7 @@ impl App {
     /// (gpu/timeout/source dir/etc.) — the table-test entry point: each case builds
     /// its own mock + its own per-case `RemoteConfig` and asserts the captured
     /// `FunctionCreate` manifest.
-    #[cfg(any(test, feature = "testkit"))]
+    #[cfg(all(any(test, feature = "testkit"), feature = "client"))]
     pub async fn connect_at_with(
         name: &str,
         registry: Registry,
@@ -281,7 +320,7 @@ impl App {
     /// point that drives the manifest the SAME way a `#[function(gpu=.., timeout=..)]`
     /// decorator would (the RUN path re-derives gpu/timeout from the decorator config,
     /// not the bare `RemoteConfig`, so a faithful table must supply them here).
-    #[cfg(any(test, feature = "testkit"))]
+    #[cfg(all(any(test, feature = "testkit"), feature = "client"))]
     pub async fn connect_at_with_configs<I, O>(
         name: &str,
         registry: Registry,
@@ -315,6 +354,7 @@ impl App {
     /// Resolve the decorator [`FunctionOptions`] for `name`. Returns
     /// `FunctionOptions::default()` (all `None`) for the manual path or an unknown
     /// name, so the facade's path defaults apply.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn config_for(&self, name: &str) -> FunctionOptions {
         self.configs.get(name).cloned().unwrap_or_default()
     }
@@ -326,6 +366,7 @@ impl App {
     ///
     /// `cargo build` runs in the function body at invoke time (the RUN boundary);
     /// this method only orchestrates the control plane + the CBOR round-trip.
+    #[cfg(feature = "client")]
     pub(crate) async fn remote_invoke(
         &self,
         entrypoint: &str,
@@ -365,6 +406,7 @@ impl App {
     /// container timeout (honoring the decorator override, the same value
     /// `ensure_function` sets) plus a small queue/schedule buffer. spawn/map use
     /// the same keyed resolution path, so the deadline tracks the selected wrapper.
+    #[cfg(feature = "client")]
     async fn resolve_function(
         &self,
         handle: &RemoteHandle,
@@ -423,6 +465,7 @@ impl App {
     /// `.remote()`), enqueue ONE input, and return its `function_call_id`
     /// IMMEDIATELY (no output wait). [`Function::spawn`](crate::Function::spawn)
     /// wraps the id in a [`FunctionCall`](crate::FunctionCall).
+    #[cfg(feature = "client")]
     pub(crate) async fn remote_spawn(
         &self,
         entrypoint: &str,
@@ -444,6 +487,7 @@ impl App {
     /// `function_id`/config resolution is needed — but the deadline must still cover
     /// the cold in-body `cargo build` the first spawned input pays, so it tracks the
     /// path timeout + buffer.
+    #[cfg(feature = "client")]
     pub(crate) async fn remote_get(
         &self,
         function_call_id: &str,
@@ -465,6 +509,7 @@ impl App {
     /// enqueue N inputs under one map call, and return the runner envelopes in INPUT
     /// ORDER (the SDK reorders by input ordinal). [`Function::map`](crate::Function::map)
     /// parses each envelope via the SAME taxonomy as `.local()`/`.remote()`.
+    #[cfg(feature = "client")]
     pub(crate) async fn remote_map(
         &self,
         entrypoint: &str,
@@ -491,6 +536,7 @@ impl App {
     /// the map call's `function_call_id` IMMEDIATELY (no output wait — results are
     /// not collected). [`Function::spawn_map`](crate::Function::spawn_map) wraps the
     /// id in a [`FunctionCall`](crate::FunctionCall).
+    #[cfg(feature = "client")]
     pub(crate) async fn remote_spawn_map(
         &self,
         entrypoint: &str,
@@ -515,6 +561,7 @@ impl App {
     /// generic over entrypoints (no typed `In`/`Out`), so it needs the raw envelope
     /// to print byte-for-byte and mirror `ok` → exit code. The typed
     /// [`Function::remote`](crate::Function::remote) path is unchanged.
+    #[cfg(feature = "client")]
     pub async fn remote_envelope(&self, entrypoint: &str, input_json: String) -> Result<String> {
         self.remote_invoke(entrypoint, input_json).await
     }
@@ -523,6 +570,7 @@ impl App {
     /// envelope VERBATIM (NO build, NO upload — the deploy-call invariant). Reuses
     /// [`deploy::call_function`] exactly as [`App::call`] does, but returns the raw
     /// string for the generic-over-entrypoints CLI (P9 §B.3).
+    #[cfg(feature = "client")]
     pub async fn call_envelope(
         &self,
         app_name: &str,
@@ -547,6 +595,7 @@ impl App {
     /// app name comes from [`DeployConfig`] (default `"modal-rust-add-deploy"`,
     /// override `MODAL_RUST_DEPLOY_APP`); use [`App::deploy_with`] to pass an
     /// explicit config.
+    #[cfg(feature = "client")]
     pub async fn deploy(&self) -> Result<DeployedApp> {
         self.deploy_with(DeployConfig::default()).await
     }
@@ -559,6 +608,7 @@ impl App {
     /// image that bakes the one `modal_runner` handling all entrypoints. Divergent
     /// per-entrypoint configs COEXIST — they are no longer rejected. The manual path
     /// (no decorator config) deploys a single default function, unchanged.
+    #[cfg(feature = "client")]
     pub async fn deploy_with(&self, config: DeployConfig) -> Result<DeployedApp> {
         let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
         // Each decorated entrypoint becomes its OWN deployed function (object tag = the
@@ -579,6 +629,7 @@ impl App {
     /// handlers (the truly headless manifest path), where [`deploy::deploy_function`]
     /// falls back to a single default function under the wrapper callable. The
     /// run-only `cache` knob is irrelevant to deploy (image-build-time build).
+    #[cfg(feature = "client")]
     fn deploy_entrypoints(&self) -> Vec<deploy::DeployEntrypoint> {
         if !self.configs.is_empty() {
             return self
@@ -610,6 +661,7 @@ impl App {
     /// invoked directly; the prebuilt `/app/modal_runner` execs the handler.
     ///
     /// Requires a connected App ([`App::connect`](crate::App::connect)).
+    #[cfg(feature = "client")]
     pub async fn call<In, Out>(&self, app_name: &str, entrypoint: &str, input: In) -> Result<Out>
     where
         In: serde::Serialize,
@@ -624,6 +676,7 @@ impl App {
 
     /// CALL a [`DeployedApp`] returned by [`App::deploy`] directly (resolves by its
     /// stable name). Convenience wrapper over [`App::call`].
+    #[cfg(feature = "client")]
     pub async fn call_deployed<In, Out>(
         &self,
         deployed: &DeployedApp,
@@ -661,6 +714,7 @@ impl App {
     /// The app name the offline dump ([`App::dry_run`]) renders for the RUN path:
     /// the connected ephemeral app's name if this App is connected, else `fallback`
     /// (the config package — a bare, unconnected App has no app name). NO network.
+    #[cfg(feature = "client")]
     pub(crate) fn dump_app_name(&self, fallback: &str) -> String {
         self.remote
             .as_ref()
@@ -673,6 +727,7 @@ impl App {
     /// passes to [`deploy::deploy_function`], with the empty-fallback applied so the
     /// dump shows the concrete functions (the manual path renders ONE default
     /// function under the wrapper callable). NO network.
+    #[cfg(feature = "client")]
     pub(crate) fn deploy_entrypoints_for_dump(
         &self,
         config: &DeployConfig,
@@ -803,6 +858,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "client")]
     fn deploy_publishes_distinct_function_per_divergent_entrypoint() {
         // NEW correct behavior (was `deploy_rejects_divergent_per_entrypoint_configs`):
         // deploy now publishes ONE Modal function PER ENTRYPOINT, each with its OWN
@@ -841,6 +897,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "client")]
     fn deploy_plan_carries_identical_per_entrypoint_configs() {
         let cfg = FunctionConfig {
             gpu: Some("T4"),

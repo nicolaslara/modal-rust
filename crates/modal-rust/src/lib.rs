@@ -50,7 +50,9 @@
 //! and `clap_derive` through `clap`, so the user carries one dependency, not three.
 //! See [`__private`] for the re-exports the macro names.
 
-// (1) Control-plane SDK, namespaced as `modal_rust::sdk`.
+// (1) Control-plane SDK, namespaced as `modal_rust::sdk`. Gated on `client`: the SDK
+//     is an optional dep, so the light (default) build does not re-export it.
+#[cfg(feature = "client")]
 pub use modal_rust_sdk as sdk;
 
 // (2) Runtime essentials that appear in the facade's public API / error paths.
@@ -102,21 +104,33 @@ pub mod __private {
     pub use modal_rust_runtime::typed;
 }
 
+// `app` stays UNGATED: it owns the LIGHT `App::local*`/`from_manifest`/`function`/
+// `config_for`/`known_names` path. The client-bearing pieces inside it (RemoteHandle,
+// connect*, remote_*, deploy*, call*) are gated internally on `client`.
 mod app;
+// These modules reference SDK types (ModalClient/ImageSpec/FunctionSpec/planning), so
+// they only compile with the gRPC client. The dump (`dump.rs`) is offline but compiles
+// against SDK spec/planning TYPES, so it lives under `client` too.
+#[cfg(feature = "client")]
 mod control_plane;
+#[cfg(feature = "client")]
 mod deploy;
+#[cfg(feature = "client")]
 mod dump;
 mod error;
 mod function;
 mod registration;
+#[cfg(feature = "client")]
 mod remote;
 mod runner_gen;
 mod scope;
 
 pub use app::App;
+#[cfg(feature = "client")]
 pub use deploy::{DeployConfig, DeployedApp, DEFAULT_DEPLOY_APP};
 // The additive, network-free dry-run / dump (the deferred P8). New types/methods —
 // the facade's run/deploy/call public signatures are unchanged.
+#[cfg(feature = "client")]
 pub use dump::{Manifest, MountRole, PlannedRequest, RunMode};
 pub use error::{Error, Result};
 pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
@@ -126,7 +140,9 @@ pub use registration::{
     FunctionConfig, FunctionOptions, Registration,
 };
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
-// (P9). `App::connect_from_manifest` takes it explicitly.
+// (P9). `App::connect_from_manifest` takes it explicitly. Client-only (lives in the
+// gated `remote` module).
+#[cfg(feature = "client")]
 pub use remote::{ImageStep, RemoteConfig};
 // Tooling-generated `modal_runner` (inject-bin, design B). The `modal-rust` CLI needs
 // this for the `--describe` LOCAL build: auto-detect whether the target ships its own

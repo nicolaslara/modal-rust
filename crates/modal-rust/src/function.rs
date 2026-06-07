@@ -70,6 +70,7 @@ impl<'a> Function<'a> {
     /// - [`Error::Runner`] wrapping the frozen five-kind taxonomy (identical to
     ///   `.local()`) when the handler itself reports a structured failure.
     /// - [`Error::Decode`] if the envelope / output does not match `Out`.
+    #[cfg(feature = "client")]
     pub async fn remote<In, Out>(&self, input: In) -> Result<Out>
     where
         In: serde::Serialize,
@@ -78,6 +79,19 @@ impl<'a> Function<'a> {
         let input_json = serde_json::to_string(&input).map_err(Error::Encode)?;
         let envelope = self.app.remote_invoke(&self.name, input_json).await?;
         crate::remote::parse_envelope::<Out>(&envelope)
+    }
+
+    /// LIGHT-build stub for [`remote`](Function::remote): without the `client`
+    /// feature the gRPC client is absent, so `.remote()` returns a clear error.
+    /// The signature + generic bounds match the real method so a default-features
+    /// user crate still type-checks `app.fn(..).remote()`.
+    #[cfg(not(feature = "client"))]
+    pub async fn remote<In, Out>(&self, _input: In) -> Result<Out>
+    where
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned,
+    {
+        Err(Error::client_feature(".remote()"))
     }
 
     /// Fire-and-forget spawn (the RUN path): enqueue ONE input on Modal and return
@@ -93,6 +107,7 @@ impl<'a> Function<'a> {
     /// - [`Error::NotConnected`] if the App was not connected.
     /// - [`Error::Encode`] if `input` fails to serialize to JSON.
     /// - [`Error::Sdk`] for any control-plane / upload / enqueue failure.
+    #[cfg(feature = "client")]
     pub async fn spawn<In>(&self, input: In) -> Result<FunctionCall<'a>>
     where
         In: serde::Serialize,
@@ -103,6 +118,15 @@ impl<'a> Function<'a> {
             app: self.app,
             function_call_id,
         })
+    }
+
+    /// LIGHT-build stub for [`spawn`](Function::spawn).
+    #[cfg(not(feature = "client"))]
+    pub async fn spawn<In>(&self, _input: In) -> Result<FunctionCall<'a>>
+    where
+        In: serde::Serialize,
+    {
+        Err(Error::client_feature(".spawn()"))
     }
 
     /// Fan-out over many inputs (the RUN path): enqueue N inputs under ONE map call
@@ -120,6 +144,7 @@ impl<'a> Function<'a> {
     /// - [`Error::Encode`] if any input fails to serialize to JSON.
     /// - [`Error::Sdk`] for any control-plane / upload / enqueue / poll failure.
     /// - [`Error::Runner`] / [`Error::Decode`] per output, identical to `.remote()`.
+    #[cfg(feature = "client")]
     pub async fn map<In, Out, I>(&self, inputs: I) -> Result<Vec<Out>>
     where
         In: serde::Serialize,
@@ -137,6 +162,17 @@ impl<'a> Function<'a> {
             .collect()
     }
 
+    /// LIGHT-build stub for [`map`](Function::map).
+    #[cfg(not(feature = "client"))]
+    pub async fn map<In, Out, I>(&self, _inputs: I) -> Result<Vec<Out>>
+    where
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned,
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".map()"))
+    }
+
     /// Fan-out where each input is UNPACKED from a tuple/sequence (the RUN path):
     /// the map-family member for "spread each item into the call". Returns the N
     /// typed outputs in INPUT ORDER, exactly like [`map`](Function::map).
@@ -151,6 +187,7 @@ impl<'a> Function<'a> {
     ///
     /// # Errors
     /// Identical to [`map`](Function::map).
+    #[cfg(feature = "client")]
     pub async fn starmap<In, Out, I>(&self, inputs: I) -> Result<Vec<Out>>
     where
         In: serde::Serialize,
@@ -158,6 +195,17 @@ impl<'a> Function<'a> {
         I: IntoIterator<Item = In>,
     {
         self.map::<In, Out, I>(inputs).await
+    }
+
+    /// LIGHT-build stub for [`starmap`](Function::starmap).
+    #[cfg(not(feature = "client"))]
+    pub async fn starmap<In, Out, I>(&self, _inputs: I) -> Result<Vec<Out>>
+    where
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned,
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".starmap()"))
     }
 
     /// Fan-out for SIDE EFFECTS (the RUN path): run the function over N inputs across
@@ -175,6 +223,7 @@ impl<'a> Function<'a> {
     /// Same as [`map`](Function::map), minus [`Error::Decode`]: outputs are decoded
     /// into [`serde::de::IgnoredAny`] (the success/failure envelope status still
     /// drives fail-fast, but the body is not interpreted).
+    #[cfg(feature = "client")]
     pub async fn for_each<In, I>(&self, inputs: I) -> Result<()>
     where
         In: serde::Serialize,
@@ -185,6 +234,16 @@ impl<'a> Function<'a> {
         // envelope's ok/err status is still honored per output (fail-fast).
         let _: Vec<serde::de::IgnoredAny> = self.map(inputs).await?;
         Ok(())
+    }
+
+    /// LIGHT-build stub for [`for_each`](Function::for_each).
+    #[cfg(not(feature = "client"))]
+    pub async fn for_each<In, I>(&self, _inputs: I) -> Result<()>
+    where
+        In: serde::Serialize,
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".for_each()"))
     }
 
     /// Fire-and-forget fan-out (the RUN path): enqueue N inputs under ONE map call
@@ -204,6 +263,7 @@ impl<'a> Function<'a> {
     /// - [`Error::Encode`] if any input fails to serialize to JSON.
     /// - [`Error::Sdk`] for any control-plane / upload / enqueue failure (including
     ///   zero inputs — spawn_map requires at least one).
+    #[cfg(feature = "client")]
     pub async fn spawn_map<In, I>(&self, inputs: I) -> Result<FunctionCall<'a>>
     where
         In: serde::Serialize,
@@ -218,6 +278,16 @@ impl<'a> Function<'a> {
             app: self.app,
             function_call_id,
         })
+    }
+
+    /// LIGHT-build stub for [`spawn_map`](Function::spawn_map).
+    #[cfg(not(feature = "client"))]
+    pub async fn spawn_map<In, I>(&self, _inputs: I) -> Result<FunctionCall<'a>>
+    where
+        In: serde::Serialize,
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".spawn_map()"))
     }
 
     /// Build the [`Error::UnknownEntrypoint`] for this handle, listing the App's
@@ -237,6 +307,11 @@ impl<'a> Function<'a> {
 ///
 /// The borrow ties the handle's lifetime to the App: hold the App alive (it owns
 /// the ephemeral run) and call [`get`](FunctionCall::get) to fetch the result.
+///
+/// Always defined (so the LIGHT-build `.spawn()`/`.spawn_map()` stubs can name it as
+/// a return type), but constructed ONLY on the `client` path; `allow(dead_code)`
+/// keeps the light build warning-free since `app` is read only by the client `get`.
+#[allow(dead_code)]
 pub struct FunctionCall<'a> {
     app: &'a crate::App,
     function_call_id: String,
@@ -303,6 +378,7 @@ where
 
     /// Run REMOTELY on Modal (the RUN path), sugar over
     /// [`App::function(name).remote`](Function::remote). Returns the typed `Out`.
+    #[cfg(feature = "client")]
     pub async fn remote(self) -> Result<Out> {
         self.app
             .function(self.name)
@@ -310,10 +386,17 @@ where
             .await
     }
 
+    /// LIGHT-build stub for [`remote`](TypedCall::remote).
+    #[cfg(not(feature = "client"))]
+    pub async fn remote(self) -> Result<Out> {
+        Err(Error::client_feature(".remote()"))
+    }
+
     /// Fire-and-forget spawn (the RUN path), sugar over
     /// [`App::function(name).spawn`](Function::spawn). Returns a typed
     /// [`TypedFunctionCall`] whose `.get().await?` decodes to `Out` without the
     /// caller naming a type.
+    #[cfg(feature = "client")]
     pub async fn spawn(self) -> Result<TypedFunctionCall<'a, Out>> {
         let call = self.app.function(self.name).spawn::<In>(self.input).await?;
         Ok(TypedFunctionCall {
@@ -322,11 +405,18 @@ where
         })
     }
 
+    /// LIGHT-build stub for [`spawn`](TypedCall::spawn).
+    #[cfg(not(feature = "client"))]
+    pub async fn spawn(self) -> Result<TypedFunctionCall<'a, Out>> {
+        Err(Error::client_feature(".spawn()"))
+    }
+
     /// Fan-out over many inputs (the RUN path), sugar over
     /// [`App::function(name).map`](Function::map). The leading positional args only
     /// fixed the entrypoint + types; this handle's own `input` is DISCARDED and
     /// `map` runs the supplied iterator of `In` instead. Returns `Vec<Out>` in
     /// input order.
+    #[cfg(feature = "client")]
     pub async fn map<I>(self, inputs: I) -> Result<Vec<Out>>
     where
         I: IntoIterator<Item = In>,
@@ -334,10 +424,20 @@ where
         self.app.function(self.name).map::<In, Out, I>(inputs).await
     }
 
+    /// LIGHT-build stub for [`map`](TypedCall::map).
+    #[cfg(not(feature = "client"))]
+    pub async fn map<I>(self, _inputs: I) -> Result<Vec<Out>>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".map()"))
+    }
+
     /// Tuple-unpacking fan-out, sugar over
     /// [`App::function(name).starmap`](Function::starmap). Like
     /// [`map`](TypedCall::map), this handle's own `input` is DISCARDED and the
     /// supplied iterator is run instead. Returns `Vec<Out>` in input order.
+    #[cfg(feature = "client")]
     pub async fn starmap<I>(self, inputs: I) -> Result<Vec<Out>>
     where
         I: IntoIterator<Item = In>,
@@ -348,9 +448,19 @@ where
             .await
     }
 
+    /// LIGHT-build stub for [`starmap`](TypedCall::starmap).
+    #[cfg(not(feature = "client"))]
+    pub async fn starmap<I>(self, _inputs: I) -> Result<Vec<Out>>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".starmap()"))
+    }
+
     /// Side-effect fan-out (waits, discards outputs), sugar over
     /// [`App::function(name).for_each`](Function::for_each). This handle's own
     /// `input` is DISCARDED and the supplied iterator is run instead. Returns `()`.
+    #[cfg(feature = "client")]
     pub async fn for_each<I>(self, inputs: I) -> Result<()>
     where
         I: IntoIterator<Item = In>,
@@ -358,10 +468,20 @@ where
         self.app.function(self.name).for_each::<In, I>(inputs).await
     }
 
+    /// LIGHT-build stub for [`for_each`](TypedCall::for_each).
+    #[cfg(not(feature = "client"))]
+    pub async fn for_each<I>(self, _inputs: I) -> Result<()>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".for_each()"))
+    }
+
     /// Fire-and-forget fan-out, sugar over
     /// [`App::function(name).spawn_map`](Function::spawn_map). This handle's own
     /// `input` is DISCARDED and the supplied iterator is run instead. Returns a
     /// [`FunctionCall`] for the map call without waiting for any output.
+    #[cfg(feature = "client")]
     pub async fn spawn_map<I>(self, inputs: I) -> Result<FunctionCall<'a>>
     where
         I: IntoIterator<Item = In>,
@@ -371,12 +491,26 @@ where
             .spawn_map::<In, I>(inputs)
             .await
     }
+
+    /// LIGHT-build stub for [`spawn_map`](TypedCall::spawn_map).
+    #[cfg(not(feature = "client"))]
+    pub async fn spawn_map<I>(self, _inputs: I) -> Result<FunctionCall<'a>>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        Err(Error::client_feature(".spawn_map()"))
+    }
 }
 
 /// A typed wrapper around [`FunctionCall`] returned by [`TypedCall::spawn`]: pins
 /// the output type so `.get(timeout).await?` decodes to `Out` (= the handler's
 /// return type) without the caller naming a type. Pure sugar over
 /// [`FunctionCall::get`].
+///
+/// Always defined (so the LIGHT-build `TypedCall::spawn` stub can name it), but
+/// constructed only on the `client` path; `allow(dead_code)` keeps the light build
+/// warning-free.
+#[allow(dead_code)]
 pub struct TypedFunctionCall<'a, Out> {
     call: FunctionCall<'a>,
     _out: std::marker::PhantomData<Out>,
@@ -393,8 +527,15 @@ where
 
     /// Await the spawned call's result, sugar over [`FunctionCall::get`]. Decodes
     /// to the pinned `Out` type.
+    #[cfg(feature = "client")]
     pub async fn get(&self, timeout: Option<std::time::Duration>) -> Result<Out> {
         self.call.get::<Out>(timeout).await
+    }
+
+    /// LIGHT-build stub for [`get`](TypedFunctionCall::get).
+    #[cfg(not(feature = "client"))]
+    pub async fn get(&self, _timeout: Option<std::time::Duration>) -> Result<Out> {
+        Err(Error::client_feature(".get()"))
     }
 }
 
@@ -419,6 +560,7 @@ impl FunctionCall<'_> {
     /// - [`Error::Runner`] wrapping the frozen five-kind taxonomy (identical to
     ///   `.local()`) when the handler reports a structured failure.
     /// - [`Error::Decode`] if the envelope / output does not match `Out`.
+    #[cfg(feature = "client")]
     pub async fn get<Out>(&self, timeout: Option<std::time::Duration>) -> Result<Out>
     where
         Out: serde::de::DeserializeOwned,
@@ -428,5 +570,14 @@ impl FunctionCall<'_> {
             .remote_get(&self.function_call_id, 0, timeout)
             .await?;
         crate::remote::parse_envelope::<Out>(&envelope)
+    }
+
+    /// LIGHT-build stub for [`get`](FunctionCall::get).
+    #[cfg(not(feature = "client"))]
+    pub async fn get<Out>(&self, _timeout: Option<std::time::Duration>) -> Result<Out>
+    where
+        Out: serde::de::DeserializeOwned,
+    {
+        Err(Error::client_feature(".get()"))
     }
 }

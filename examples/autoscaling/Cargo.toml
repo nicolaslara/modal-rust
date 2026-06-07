@@ -16,3 +16,13 @@ path = "src/lib.rs"
 modal-rust = { path = "../../crates/modal-rust" }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+
+[dev-dependencies]
+# The example LIB is a pure `#[modal_rust::function]` library and stays LIGHT (no gRPC
+# client) so the in-container `--bin modal_runner` build is tonic-free. Only the
+# OFFLINE manifest test (`tests/manifest.rs`) needs the dump (`dry_run` +
+# RemoteConfig/PlannedRequest), which lives behind the facade `client` feature — so we
+# enable it on a SECOND, dev-only dependency edge. Cargo unifies a crate's own deps +
+# dev-deps only when BUILDING TESTS, so the standalone lib build (and the remote runner
+# build) stays light while the test target gets `client`.
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }

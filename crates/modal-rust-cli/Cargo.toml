@@ -15,9 +15,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 # The default (programmatic) path drives the facade's App orchestration directly
-# (P9 §C.1) — no codegen, no `modal` CLI. The facade pulls the SDK transitively, so
-# there is no direct SDK dep. The async facade ops run under a tokio runtime.
-modal-rust = { path = "../modal-rust" }
+# (P9 §C.1) — no codegen, no `modal` CLI. The CLI TALKS to Modal (connect/run/deploy/
+# call), so it enables the facade's non-default `client` feature, which pulls the SDK
+# (tonic/hyper/prost/reqwest). The async facade ops run under a tokio runtime. (The
+# LIGHT describe helpers — resolve_runner_target/materialize_shadow/
+# describe_cache_inputs — are available regardless of the feature.)
+modal-rust = { path = "../modal-rust", features = ["client"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Content-address the describe MANIFEST CACHE key (describe_cache.rs): a SHA-256 over the
 # closure source + Cargo.lock + the package/path decision keys the cached `--describe`

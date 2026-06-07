@@ -20,7 +20,7 @@ path = "src/bin/spawn_map_foreach.rs"
 # SINGLE modal dependency — exactly what a fresh external user writes. The
 # `#[modal_rust::function]` macro routes its generated code through this facade, so
 # there is no `modal-rust-runtime` / `inventory` to add and no rename.
-modal-rust = { path = "../../crates/modal-rust" }
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 # `.for_each([..])` / `.spawn_map([..])` are async; the driver drives them with a

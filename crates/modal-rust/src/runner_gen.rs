@@ -236,6 +236,9 @@ pub fn injected_runner_rel_path(t: &RunnerTarget) -> String {
 /// source upload when generation applies, or `None` (auto-detect hit, no facade dep,
 /// or unresolvable metadata) so the caller injects nothing. Runs `cargo metadata`
 /// itself — used by the FALLBACK source-mount arm (which has no parsed metadata).
+///
+/// Called only from the client `control_plane` fallback arm, so light allows it dead.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub(crate) fn injected_runner_file(
     workspace_root: &Path,
     package: &str,
