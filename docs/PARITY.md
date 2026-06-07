@@ -207,9 +207,9 @@ We do attach + mount; we do **not** offer any of Modal's volume *data* API
 | `.remote()` (1703) | **Have** | |
 | `.spawn()` (1860) + `FunctionCall.get()` | **Have** | One input; `get(timeout)`. |
 | `.map()` (1922) | **Have** | Ordered fan-out, fail-fast. |
-| `.starmap()` (1923) | **Missing** | Spread each input tuple as positional args — and we are single-named-arg (see below). |
-| `.for_each()` (1924) | **Missing** | Map for side-effects, discard outputs. |
-| `.spawn_map()` (1925) | **Missing** | Fire-and-forget fan-out (no result collection). |
+| `.starmap()` (1923) | **Have** (single-arg framing) | `Function::starmap` — each input item IS the one named-object `In` (a tuple/sequence shape); shares `.map()`'s ordered wire path. True multi-arg positional spread is still gated on multi-arg (see below). `examples/spawn-map-foreach`. |
+| `.for_each()` (1924) | **Have** | `Function::for_each` — runs N inputs across containers, WAITS, discards outputs (returns `()`). Built on the proven ordered-map collect (decodes into `IgnoredAny`), fail-fast. `examples/spawn-map-foreach`. |
+| `.spawn_map()` (1925) | **Have** | `Function::spawn_map` — fire-and-forget fan-out: opens an ASYNC MAP call, enqueues N inputs, returns a `FunctionCall` handle immediately (no result collection). SDK `spawn_map_cbor`. `examples/spawn-map-foreach`. |
 | `.map.aio` / async variants | **Missing** | Modal exposes `.aio` async forms; our methods are already `async fn`, but there is no sync/streaming-iterator distinction. |
 | Streaming/unordered map results | **Missing** | Modal can yield outputs as they complete (`order_outputs=False`); we collect all in input order before returning a `Vec`. |
 | `.remote_gen()` (1724) / generators | **Missing** | Streaming/generator returns — depends on `is_generator`; no Rust analogue yet. |
@@ -289,8 +289,11 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
    .., scaledown_window = ..)]` → `Function.autoscaler_settings`; `examples/autoscaling`.
 6. ~~**`schedule` (`Cron`/`Period`)**~~ — DONE: `#[function(schedule = Cron(..)/Period(..))]`
    → `Function.schedule`; `examples/scheduled-job` is a deployed cron job.
-7. **`starmap` / `for_each` / `spawn_map`** — natural extensions of the map family
-   (gated on multi-arg support for `starmap`).
+7. ~~**`starmap` / `for_each` / `spawn_map`**~~ — DONE: the rest of the map family on
+   the facade `Function` (`Function::starmap`/`for_each`/`spawn_map`, built on the
+   proven `.map`/`.spawn` plumbing + SDK `spawn_map_cbor`); `examples/spawn-map-foreach`.
+   `starmap` is single-arg-framed (each item IS the one named-object input); true
+   multi-arg positional spread is still gated on multi-arg.
 8. **Bigger subsystems** (`Cls`/lifecycle, web endpoints, Sandboxes, Dict, Queue) —
    each is a milestone-sized effort; `Cls` is the highest-leverage because it
    enables the load-once-serve-many model.

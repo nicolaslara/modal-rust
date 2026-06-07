@@ -486,6 +486,29 @@ impl App {
             .map_err(Into::into)
     }
 
+    /// Fire-and-forget fan-out RUN-path spawn_map: ensure the wrapper exists (same
+    /// head as `.remote()`), enqueue N inputs under ONE async MAP call, and return
+    /// the map call's `function_call_id` IMMEDIATELY (no output wait — results are
+    /// not collected). [`Function::spawn_map`](crate::Function::spawn_map) wraps the
+    /// id in a [`FunctionCall`](crate::FunctionCall).
+    pub(crate) async fn remote_spawn_map(
+        &self,
+        entrypoint: &str,
+        inputs_json: Vec<String>,
+    ) -> Result<String> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        let (function_id, _deadline) = self.resolve_function(handle, entrypoint).await?;
+        // Same per-input args shape as `.remote()`/`.map()`: (entrypoint, json) with
+        // empty kwargs, one per input.
+        let inputs: Vec<MapInput<'_>> = inputs_json
+            .into_iter()
+            .map(|j| ((entrypoint, j), std::collections::HashMap::new()))
+            .collect();
+        let mut client = handle.client.lock().await;
+        let (function_call_id, _n) = client.spawn_map_cbor(&function_id, &inputs).await?;
+        Ok(function_call_id)
+    }
+
     /// Run one entrypoint (the RUN path) and return the runner's one-line JSON
     /// envelope VERBATIM (P9 §B.3). A thin generic-free wrapper over the existing
     /// `pub(crate)` [`remote_invoke`](App::remote_invoke): the `modal-rust` CLI is

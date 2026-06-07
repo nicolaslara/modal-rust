@@ -987,3 +987,150 @@ async fn dry_run_matches_the_mock_recorded_request_order() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// `for_each` — the SIDE-EFFECT map: it fans N inputs out, WAITS for them, and
+/// discards the outputs (returns `()`). Drive it against the mock with a steered
+/// `function_get_outputs` that returns ALL N success outputs (one per input
+/// ordinal) so the collect completes, then assert: the map opened a SYNC MAP call,
+/// one `FunctionPutInputs` carried all N inputs with sequential idx, and the outputs
+/// were polled. (The default responder returns a single idx-0 output, which would
+/// never satisfy the N-output collect, so the steer is required.)
+#[tokio::test]
+async fn for_each_fans_out_n_inputs_waits_and_discards_outputs() {
+    const N: usize = 3;
+    let mock = MockModal::builder()
+        .on_function_get_outputs(|_req| {
+            // Return all N success outputs at once (idx 0..N), each a canned success
+            // envelope. for_each decodes into IgnoredAny, so the value is irrelevant —
+            // only the ok status matters.
+            let outputs = (0..N as i32)
+                .map(|idx| {
+                    let envelope = r#"{"ok":true,"value":{"sum":0}}"#.to_string();
+                    let cbor = modal_rust::sdk::codec::encode(&envelope).expect("encode envelope");
+                    FunctionGetOutputsItem {
+                        idx,
+                        data_format: DataFormat::Cbor as i32,
+                        result: Some(GenericResult {
+                            status: generic_result::GenericStatus::Success as i32,
+                            data_oneof: Some(generic_result::DataOneof::Data(cbor)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            Ok(FunctionGetOutputsResponse {
+                outputs,
+                last_entry_id: "1-0".to_string(),
+                num_unfinished_inputs: 0,
+                ..Default::default()
+            })
+        })
+        .start()
+        .await
+        .expect("mock up");
+
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-foreach-{}", std::process::id()));
+    let app = App::connect_at_with(
+        "mock-app-foreach",
+        modal_registry(),
+        mock.url(),
+        tiny_source_config(&tmp),
+    )
+    .await
+    .expect("connect at mock");
+
+    let inputs: Vec<_> = (0..N)
+        .map(|i| example_add::AddInput { a: i as i64, b: 1 })
+        .collect();
+
+    // The whole point: for_each returns `()` — the caller never names an output type.
+    let unit: () = app
+        .function("add")
+        .for_each(inputs)
+        .await
+        .expect("for_each over N inputs");
+    assert_eq!(unit, (), "for_each yields unit, discarding outputs");
+
+    // It used the proven MAP fan-out wire shape: a SYNC MAP call + ONE PutInputs
+    // carrying all N inputs with sequential idx (the ordering key).
+    let map = mock.last::<FunctionMapRequest>().expect("FunctionMap sent");
+    assert_eq!(map.function_call_type, FunctionCallType::Map as i32);
+    assert_eq!(
+        map.function_call_invocation_type,
+        FunctionCallInvocationType::Sync as i32,
+        "for_each WAITS — the MAP call is SYNC"
+    );
+    let put = mock
+        .last::<FunctionPutInputsRequest>()
+        .expect("FunctionPutInputs sent");
+    assert_eq!(put.inputs.len(), N, "all N inputs enqueued under one call");
+    assert_eq!(
+        put.inputs.iter().map(|i| i.idx).collect::<Vec<_>>(),
+        (0..N as i32).collect::<Vec<_>>(),
+        "inputs carry sequential idx 0..N (the ordering key)"
+    );
+    // for_each BLOCKS on completion, so outputs were polled.
+    assert!(
+        mock.took::<FunctionGetOutputsRequest>() >= 1,
+        "for_each waits for outputs"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// `spawn_map` — the FIRE-AND-FORGET map: it enqueues N inputs under one ASYNC MAP
+/// call and returns a `FunctionCall` handle IMMEDIATELY, WITHOUT polling any output.
+/// Assert: the map opened an ASYNC MAP call, one `FunctionPutInputs` carried all N
+/// inputs, the returned handle carries the map call id, and — the defining property
+/// — NO `FunctionGetOutputs` poll fired (fire-and-forget). The default responder
+/// works because spawn_map never reads outputs.
+#[tokio::test]
+async fn spawn_map_fans_out_n_inputs_async_without_polling_outputs() {
+    const N: usize = 4;
+    let mock = MockModal::start().await.expect("mock up");
+
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-spawnmap-{}", std::process::id()));
+    let app = App::connect_at_with(
+        "mock-app-spawnmap",
+        modal_registry(),
+        mock.url(),
+        tiny_source_config(&tmp),
+    )
+    .await
+    .expect("connect at mock");
+
+    let inputs: Vec<_> = (0..N)
+        .map(|i| example_add::AddInput { a: i as i64, b: 1 })
+        .collect();
+
+    let fc = app
+        .function("add")
+        .spawn_map(inputs)
+        .await
+        .expect("spawn_map over N inputs");
+    // The handle carries the map call's id (the mock's canned `fc-1`).
+    assert_eq!(fc.function_call_id(), "fc-1");
+
+    // Fire-and-forget over N inputs: an ASYNC MAP call + ONE PutInputs of all N.
+    let map = mock.last::<FunctionMapRequest>().expect("FunctionMap sent");
+    assert_eq!(map.function_call_type, FunctionCallType::Map as i32);
+    assert_eq!(
+        map.function_call_invocation_type,
+        FunctionCallInvocationType::Async as i32,
+        "spawn_map is FIRE-AND-FORGET — the MAP call is ASYNC"
+    );
+    let put = mock
+        .last::<FunctionPutInputsRequest>()
+        .expect("FunctionPutInputs sent");
+    assert_eq!(put.inputs.len(), N, "all N inputs enqueued under one call");
+
+    // The defining property of spawn_map: it does NOT collect results.
+    assert_eq!(
+        mock.took::<FunctionGetOutputsRequest>(),
+        0,
+        "spawn_map never polls outputs (fire-and-forget)"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

@@ -425,56 +425,11 @@ impl ModalClient {
             return Ok(Vec::new());
         }
 
-        // Step 1 — open the MAP call EMPTY (Python opens with no pipelined inputs,
-        // parallel_map.py:371-378), SYNC collect. (The MAP open does NOT take the
-        // `enqueue_pipelined` fix-#3 path — it deliberately opens with no inputs and
-        // enqueues all N below.)
-        let map_req = build_function_map_request(
-            function_id,
-            FunctionCallType::Map,
-            FunctionCallInvocationType::Sync,
-            vec![],
-        );
-        let map = self
-            .retry_rpc("function_map", map_req, |mut stub, req| async move {
-                stub.function_map(req).await
-            })
+        // Steps 1-3 — open a SYNC MAP call and enqueue all N inputs (the input
+        // ordinal IS the ordering key the server tags each output with).
+        let function_call_id = self
+            .open_map_and_enqueue(function_id, FunctionCallInvocationType::Sync, inputs)
             .await?;
-        let function_call_id = map.function_call_id;
-        if function_call_id.is_empty() {
-            return Err(Error::build(
-                "FunctionMap (MAP) returned an empty function_call_id".to_string(),
-            ));
-        }
-
-        // Step 2 — build N items with sequential idx (the input ordinal IS the
-        // ordering key). Step 3 — enqueue all N under the open call.
-        let mut items = Vec::with_capacity(n);
-        for (i, (args, kwargs)) in inputs.iter().enumerate() {
-            let encoded = codec::encode(&(args, kwargs))?;
-            items.push(FunctionPutInputsItem {
-                idx: i as i32,
-                input: Some(FunctionInput {
-                    data_format: DataFormat::Cbor as i32,
-                    final_input: false,
-                    method_name: None,
-                    args_oneof: Some(ArgsOneof::Args(encoded)),
-                }),
-                ..Default::default()
-            });
-        }
-        let put_req = build_function_put_inputs_request(function_id, &function_call_id, items);
-        let put = self
-            .retry_rpc("function_put_inputs", put_req, |mut stub, req| async move {
-                stub.function_put_inputs(req).await
-            })
-            .await?;
-        if put.inputs.len() < n {
-            return Err(Error::build(format!(
-                "FunctionPutInputs accepted {} of {n} inputs (input queue full?)",
-                put.inputs.len()
-            )));
-        }
 
         // Step 4 — collect N outputs, reorder by idx (BTreeMap keyed on the input
         // ordinal). Same long-poll loop / cursor / retry as `poll_outputs_indexed`,
@@ -536,6 +491,106 @@ impl ModalClient {
 
         // Step 5 — reassemble in input order (idx 0..N).
         reassemble_in_order(got, n)
+    }
+
+    /// Open a MAP call and enqueue all N inputs under it, returning the
+    /// `function_call_id` WITHOUT polling any output. Shared by the
+    /// result-collecting [`map_cbor`](Self::map_cbor) (`Sync`) and the
+    /// fire-and-forget [`spawn_map_cbor`](Self::spawn_map_cbor) (`Async`); the only
+    /// difference between the two map families is the invocation type and whether the
+    /// caller then polls.
+    ///
+    /// Mirrors the open+enqueue head of Python `_map_invocation`
+    /// (parallel_map.py:371-378): a `FunctionMap` (`function_call_type = MAP`) opens
+    /// the call EMPTY, then one `FunctionPutInputs` enqueues all N inputs each
+    /// carrying its sequential `idx`. (The MAP open deliberately does NOT take the
+    /// `enqueue_pipelined` fix-#3 path — it opens with no inputs.)
+    async fn open_map_and_enqueue<A, K>(
+        &mut self,
+        function_id: &str,
+        invocation_type: FunctionCallInvocationType,
+        inputs: &[(A, K)],
+    ) -> Result<String>
+    where
+        A: Serialize,
+        K: Serialize,
+    {
+        let n = inputs.len();
+        // Step 1 — open the MAP call EMPTY.
+        let map_req =
+            build_function_map_request(function_id, FunctionCallType::Map, invocation_type, vec![]);
+        let map = self
+            .retry_rpc("function_map", map_req, |mut stub, req| async move {
+                stub.function_map(req).await
+            })
+            .await?;
+        let function_call_id = map.function_call_id;
+        if function_call_id.is_empty() {
+            return Err(Error::build(
+                "FunctionMap (MAP) returned an empty function_call_id".to_string(),
+            ));
+        }
+
+        // Step 2 — build N items with sequential idx (the input ordinal IS the
+        // ordering key). Step 3 — enqueue all N under the open call.
+        let mut items = Vec::with_capacity(n);
+        for (i, (args, kwargs)) in inputs.iter().enumerate() {
+            let encoded = codec::encode(&(args, kwargs))?;
+            items.push(FunctionPutInputsItem {
+                idx: i as i32,
+                input: Some(FunctionInput {
+                    data_format: DataFormat::Cbor as i32,
+                    final_input: false,
+                    method_name: None,
+                    args_oneof: Some(ArgsOneof::Args(encoded)),
+                }),
+                ..Default::default()
+            });
+        }
+        let put_req = build_function_put_inputs_request(function_id, &function_call_id, items);
+        let put = self
+            .retry_rpc("function_put_inputs", put_req, |mut stub, req| async move {
+                stub.function_put_inputs(req).await
+            })
+            .await?;
+        if put.inputs.len() < n {
+            return Err(Error::build(format!(
+                "FunctionPutInputs accepted {} of {n} inputs (input queue full?)",
+                put.inputs.len()
+            )));
+        }
+        Ok(function_call_id)
+    }
+
+    /// Fire-and-forget fan-out: open a MAP call and enqueue all N inputs, returning
+    /// the map call's `function_call_id` IMMEDIATELY — WITHOUT polling any output.
+    /// The fan-out runs on Modal regardless; results are not collected.
+    ///
+    /// This is the map-family analogue of [`spawn_cbor`](Self::spawn_cbor) (one
+    /// input) for N inputs. Mirrors Python `Function.spawn_map` /
+    /// `_spawn_map_invocation` (parallel_map.py:290): an `Async` MAP call whose
+    /// inputs are created, then the call exits without waiting for the map to
+    /// complete. Returns `(function_call_id, n)` so the caller can record the call
+    /// and how many inputs were enqueued.
+    pub async fn spawn_map_cbor<A, K>(
+        &mut self,
+        function_id: &str,
+        inputs: &[(A, K)],
+    ) -> Result<(String, usize)>
+    where
+        A: Serialize,
+        K: Serialize,
+    {
+        let n = inputs.len();
+        if n == 0 {
+            return Err(Error::build(
+                "spawn_map called with zero inputs".to_string(),
+            ));
+        }
+        let function_call_id = self
+            .open_map_and_enqueue(function_id, FunctionCallInvocationType::Async, inputs)
+            .await?;
+        Ok((function_call_id, n))
     }
 }
 

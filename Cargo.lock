@@ -2026,6 +2026,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-spawn-map-foreach"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "example-timeout-and-cache"
 version = "0.0.0"
 dependencies = [

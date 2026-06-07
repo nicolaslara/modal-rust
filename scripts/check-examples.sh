@@ -113,6 +113,12 @@ run "fan-out-map: local fan-out (results in input order)" 'intro -> 8 words, 1 m
 run "background-jobs: local job (result a spawn converges to)" "job 'nightly-report' done -> 250000 rounds, digest 17267777379177717202" \
   "cargo run -q -p example-background-jobs --bin background_jobs"
 
+# spawn-map-foreach — the rest of the map family: side-effect maps (.for_each, waits
+# + discards) and fire-and-forget fan-out (.spawn_map). OFFLINE runs the local mirror
+# of .for_each (run every recipient's side effect in-process, discard the receipts).
+run "spawn-map-foreach: local for_each mirror (side effects, results discarded)" 'for_each (local mirror): notified 3 recipients, results discarded' \
+  "cargo run -q -p example-spawn-map-foreach --bin spawn_map_foreach"
+
 # error-handling — how a failure crosses the boundary. The driver runs BOTH failing
 # functions offline and prints the wire envelope each produces (the structured one
 # carries machine-readable `details` the caller branches on).
@@ -226,6 +232,7 @@ elif ! has_creds; then
   echo "     ways-to-call    RUN_REMOTE=1 cargo run -p example-ways-to-call --bin ways_to_call"
   echo "     fan-out-map     RUN_REMOTE=1 cargo run -p example-fan-out-map --bin fan_out_map"
   echo "     background-jobs RUN_REMOTE=1 cargo run -p example-background-jobs --bin background_jobs"
+  echo "     spawn-map-foreach RUN_REMOTE=1 cargo run -p example-spawn-map-foreach --bin spawn_map_foreach"
   echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
   echo "     cli-workflow    cargo run -p modal-rust-cli -- run summarize --project examples/cli-workflow --input '{\"text\":\"the quick brown fox\"}'"
@@ -257,6 +264,13 @@ else
     "RUN_REMOTE=1 cargo run -q -p example-background-jobs --bin background_jobs" \
     'spawn: job fired -> handle ' \
     "get:   job 'nightly-report' done -> 250000 rounds, digest 17267777379177717202"
+
+  # LIVE (CPU): spawn-map-foreach drives .for_each([..]) (waits, discards) then
+  # .spawn_map([..]) (fire-and-forget, returns a handle).
+  live "spawn-map-foreach: live .for_each([..]) + .spawn_map([..]) (CPU)" \
+    "RUN_REMOTE=1 cargo run -q -p example-spawn-map-foreach --bin spawn_map_foreach" \
+    'for_each (live): notified 3 recipients across containers, results discarded' \
+    'spawn_map (live): fired fan-out, handle '
 
   if [[ "${RUN_GPU:-}" == "1" ]]; then
     # GPU: cuda-vector-add on a T4 via the RUN path (in-body build, Tier 0).

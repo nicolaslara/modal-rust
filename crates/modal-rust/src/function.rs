@@ -137,6 +137,89 @@ impl<'a> Function<'a> {
             .collect()
     }
 
+    /// Fan-out where each input is UNPACKED from a tuple/sequence (the RUN path):
+    /// the map-family member for "spread each item into the call". Returns the N
+    /// typed outputs in INPUT ORDER, exactly like [`map`](Function::map).
+    ///
+    /// Mirrors Modal Python's `Function.starmap`, where each input item is unpacked
+    /// into the function's positional args. `modal-rust` functions take exactly ONE
+    /// named-object input (PARITY §6: multi-arg is reserved), so here each item `In`
+    /// IS that one input — you make it a tuple/sequence shape and the function
+    /// receives the unpacked whole. With that single-arg framing `starmap` and
+    /// [`map`](Function::map) share the wire path; `starmap` is the right name when
+    /// each input is naturally a tuple, and the seam for true multi-arg later.
+    ///
+    /// # Errors
+    /// Identical to [`map`](Function::map).
+    pub async fn starmap<In, Out, I>(&self, inputs: I) -> Result<Vec<Out>>
+    where
+        In: serde::Serialize,
+        Out: serde::de::DeserializeOwned,
+        I: IntoIterator<Item = In>,
+    {
+        self.map::<In, Out, I>(inputs).await
+    }
+
+    /// Fan-out for SIDE EFFECTS (the RUN path): run the function over N inputs across
+    /// containers, WAIT for them all to finish, and DISCARD the outputs — returning
+    /// `()`. Use it to drive work whose result you do not need (writing to a Volume,
+    /// notifying a webhook, etc.).
+    ///
+    /// Mirrors Modal Python's `Function.for_each` (`map` with the outputs dropped,
+    /// parallel_map.py:1067). It is fail-fast like [`map`](Function::map): the first
+    /// remote failure surfaces immediately. Unlike [`spawn_map`](Function::spawn_map)
+    /// it BLOCKS until every input completes, so a returned `Ok(())` means all N ran.
+    /// The caller never names an output type.
+    ///
+    /// # Errors
+    /// Same as [`map`](Function::map), minus [`Error::Decode`]: outputs are decoded
+    /// into [`serde::de::IgnoredAny`] (the success/failure envelope status still
+    /// drives fail-fast, but the body is not interpreted).
+    pub async fn for_each<In, I>(&self, inputs: I) -> Result<()>
+    where
+        In: serde::Serialize,
+        I: IntoIterator<Item = In>,
+    {
+        // Drive the proven ordered-map collect, decoding each output into
+        // `IgnoredAny` so no `Out` type is needed; then drop the collected vec. The
+        // envelope's ok/err status is still honored per output (fail-fast).
+        let _: Vec<serde::de::IgnoredAny> = self.map(inputs).await?;
+        Ok(())
+    }
+
+    /// Fire-and-forget fan-out (the RUN path): enqueue N inputs under ONE map call
+    /// and return a [`FunctionCall`] handle for that call IMMEDIATELY, WITHOUT
+    /// waiting for any output. The fan-out runs on Modal regardless; results are not
+    /// collected here.
+    ///
+    /// Mirrors Modal Python's `Function.spawn_map` (parallel_map.py:1220): spawn
+    /// parallel execution and exit as soon as the inputs are created. It is the
+    /// map-family analogue of [`spawn`](Function::spawn) (one input → N inputs) and
+    /// the fire-and-forget counterpart of [`for_each`](Function::for_each) (which
+    /// blocks). The FIRST spawn_map on a fresh App ensures the wrapper exists, exactly
+    /// as `.remote()`.
+    ///
+    /// # Errors
+    /// - [`Error::NotConnected`] if the App was not connected.
+    /// - [`Error::Encode`] if any input fails to serialize to JSON.
+    /// - [`Error::Sdk`] for any control-plane / upload / enqueue failure (including
+    ///   zero inputs — spawn_map requires at least one).
+    pub async fn spawn_map<In, I>(&self, inputs: I) -> Result<FunctionCall<'a>>
+    where
+        In: serde::Serialize,
+        I: IntoIterator<Item = In>,
+    {
+        let inputs_json = inputs
+            .into_iter()
+            .map(|i| serde_json::to_string(&i).map_err(Error::Encode))
+            .collect::<Result<Vec<_>>>()?;
+        let function_call_id = self.app.remote_spawn_map(&self.name, inputs_json).await?;
+        Ok(FunctionCall {
+            app: self.app,
+            function_call_id,
+        })
+    }
+
     /// Build the [`Error::UnknownEntrypoint`] for this handle, listing the App's
     /// known names.
     fn unknown(&self) -> Error {
@@ -249,6 +332,44 @@ where
         I: IntoIterator<Item = In>,
     {
         self.app.function(self.name).map::<In, Out, I>(inputs).await
+    }
+
+    /// Tuple-unpacking fan-out, sugar over
+    /// [`App::function(name).starmap`](Function::starmap). Like
+    /// [`map`](TypedCall::map), this handle's own `input` is DISCARDED and the
+    /// supplied iterator is run instead. Returns `Vec<Out>` in input order.
+    pub async fn starmap<I>(self, inputs: I) -> Result<Vec<Out>>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        self.app
+            .function(self.name)
+            .starmap::<In, Out, I>(inputs)
+            .await
+    }
+
+    /// Side-effect fan-out (waits, discards outputs), sugar over
+    /// [`App::function(name).for_each`](Function::for_each). This handle's own
+    /// `input` is DISCARDED and the supplied iterator is run instead. Returns `()`.
+    pub async fn for_each<I>(self, inputs: I) -> Result<()>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        self.app.function(self.name).for_each::<In, I>(inputs).await
+    }
+
+    /// Fire-and-forget fan-out, sugar over
+    /// [`App::function(name).spawn_map`](Function::spawn_map). This handle's own
+    /// `input` is DISCARDED and the supplied iterator is run instead. Returns a
+    /// [`FunctionCall`] for the map call without waiting for any output.
+    pub async fn spawn_map<I>(self, inputs: I) -> Result<FunctionCall<'a>>
+    where
+        I: IntoIterator<Item = In>,
+    {
+        self.app
+            .function(self.name)
+            .spawn_map::<In, I>(inputs)
+            .await
     }
 }
 
