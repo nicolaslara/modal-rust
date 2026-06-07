@@ -9,10 +9,6 @@ publish = false
 name = "example_burn_add"
 path = "src/lib.rs"
 
-[[bin]]
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
 [dependencies]
 # SINGLE modal dependency: the `modal-rust` facade (renamed `modal_rust_facade` via
 # Cargo's `package = "..."`). The `#[modal_rust::function]` macro routes every emitted

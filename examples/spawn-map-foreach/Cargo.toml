@@ -10,11 +10,6 @@ name = "example_spawn_map_foreach"
 path = "src/lib.rs"
 
 [[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
-[[bin]]
 # The driver tour: the offline local fan-out runs in `cargo run`; the live
 # `.for_each([..])` (waits, discards) and `.spawn_map([..])` (fire-and-forget)
 # shapes compile always, run only with credentials.

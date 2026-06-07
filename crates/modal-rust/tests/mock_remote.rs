@@ -1134,3 +1134,182 @@ async fn spawn_map_fans_out_n_inputs_async_without_polling_outputs() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// Inject-bin wire delta (design B §5.2.2): a crate that DOES declare a `modal-rust`
+/// facade dep and ships NO `modal_runner` bin must get the tooling-generated runner
+/// injected into the SOURCE upload — exactly ONE extra `MountFile` at
+/// `<remote_src>/<crate_rel>/src/bin/modal_runner.rs`, whose bytes equal
+/// `render_runner_main(..)` (proven via the content-addressed `sha256_hex`, since the
+/// mock confirms files by probe). Mount/RPC COUNTS are unchanged (the file rides INSIDE
+/// the one source mount). Uses cargo SCOPING (the production path) over the REAL repo
+/// workspace + the real `quickstart` example: `modal-rust` is a workspace MEMBER, so the
+/// closure resolves it (no out-of-workspace error — see `run_errors_on_out_of_workspace_
+/// path_dep`), and quickstart's lack of a `modal_runner` bin triggers generation.
+#[tokio::test]
+async fn run_injects_generated_runner_bin_when_absent() {
+    use sha2::{Digest, Sha256};
+
+    let mock = MockModal::builder()
+        .function_result_value(serde_json::json!({ "sum": 42 }))
+        .start()
+        .await
+        .expect("mock up");
+
+    // The REAL repo workspace root (this test crate is crates/modal-rust). The target is
+    // the real `quickstart` example: a pure library (no `modal_runner` bin) whose
+    // `modal-rust` path-dep is a workspace member, so the upload closure resolves it.
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("repo root is two levels above crates/modal-rust")
+        .to_path_buf();
+
+    let run_config = RemoteConfig {
+        local_root: repo_root.clone(),
+        package: "quickstart".to_string(),
+        use_cargo_scoping: true, // production scoped path
+        cache: false,            // keep the manifest minimal
+        ..RemoteConfig::default()
+    };
+    let app = App::connect_at_with("inject-app", modal_registry(), mock.url(), run_config)
+        .await
+        .expect("connect at mock");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 40, "b": 2 }))
+        .await
+        .expect("remote add");
+
+    // The SOURCE mount's recorded files: find the injected runner by path.
+    let mounts = mock.requests::<MountGetOrCreateRequest>();
+    let runner_files: Vec<&MountFile> = mounts
+        .iter()
+        .flat_map(|m| m.files.iter())
+        .filter(|f| f.filename.ends_with("/src/bin/modal_runner.rs"))
+        .collect();
+    assert_eq!(
+        runner_files.len(),
+        1,
+        "exactly ONE injected modal_runner.rs (the +1-file wire delta), got: {:?}",
+        runner_files.iter().map(|f| &f.filename).collect::<Vec<_>>()
+    );
+    let runner = runner_files[0];
+    // Path: <remote_src>/examples/quickstart/src/bin/modal_runner.rs (REMOTE_SRC = /src).
+    assert_eq!(
+        runner.filename,
+        "/src/examples/quickstart/src/bin/modal_runner.rs"
+    );
+
+    // Bytes: content-address the EXACT generated body via `render_runner_main`.
+    let target = modal_rust::resolve_runner_target(&repo_root, "quickstart")
+        .expect("runner target resolves");
+    assert!(
+        target.is_generatable(),
+        "no own bin + facade dep => generate"
+    );
+    assert_eq!(
+        modal_rust::injected_runner_rel_path(&target),
+        "examples/quickstart/src/bin/modal_runner.rs"
+    );
+    let expected_body = modal_rust::render_runner_main(&target);
+    assert!(
+        expected_body.contains("modal_rust::modal_runner!(quickstart);"),
+        "generated body spells the facade extern + lib ident: {expected_body}"
+    );
+    let expected_sha = {
+        let digest = Sha256::digest(expected_body.as_bytes());
+        let mut s = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(&mut s, "{b:02x}");
+        }
+        s
+    };
+    assert_eq!(
+        runner.sha256_hex, expected_sha,
+        "the injected file's bytes equal render_runner_main(..)"
+    );
+
+    // Mount/RPC COUNTS unchanged: client + source on RUN (the extra file rides INSIDE
+    // the source mount, it is not a new mount).
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+    assert_eq!(
+        function.mount_ids.len(),
+        2,
+        "RUN still attaches exactly client + source mounts (no new mount)"
+    );
+}
+
+/// Fix (user-generality): a remote run for an external standalone crate that deps
+/// `modal-rust` by a PATH OUTSIDE its own workspace must FAIL LOUDLY at upload time —
+/// the closure can't carry that source, so the in-container `cargo build` would
+/// otherwise fail with a cryptic "No such file" error. Mirrors the natural local-dev
+/// layout (modal-rust is not on crates.io): `injectee` is its own ws root + sole member,
+/// so the facade path-dep escapes the workspace. The error must name the offending crate
+/// and point at the git/version fix. No control-plane RPCs should fire.
+#[tokio::test]
+async fn run_errors_on_out_of_workspace_path_dep() {
+    let mock = MockModal::builder()
+        .function_result_value(serde_json::json!({ "sum": 42 }))
+        .start()
+        .await
+        .expect("mock up");
+
+    let facade_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-oow-{}", std::process::id()));
+    let crate_dir = tmp.join("injectee");
+    fs::create_dir_all(crate_dir.join("src")).unwrap();
+    fs::write(
+        tmp.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"injectee\"]\n",
+    )
+    .unwrap();
+    // The facade is depended on by an ABSOLUTE path OUTSIDE this synthetic workspace.
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"injectee\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [lib]\nname = \"injectee\"\npath = \"src/lib.rs\"\n\n\
+             [dependencies]\nmodal-rust = {{ path = {facade:?} }}\n",
+            facade = facade_dir
+        ),
+    )
+    .unwrap();
+    fs::write(
+        crate_dir.join("src/lib.rs"),
+        "// pure library, no runner bin\n",
+    )
+    .unwrap();
+
+    let run_config = RemoteConfig {
+        local_root: tmp.clone(),
+        package: "injectee".to_string(),
+        use_cargo_scoping: true,
+        cache: false,
+        ..RemoteConfig::default()
+    };
+    let app = App::connect_at_with("oow-app", modal_registry(), mock.url(), run_config)
+        .await
+        .expect("connect at mock");
+
+    let result: Result<serde_json::Value, _> = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 40, "b": 2 }))
+        .await;
+    let err = result.expect_err("out-of-workspace path-dep must fail loudly");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("modal-rust") && msg.contains("OUTSIDE the uploaded workspace"),
+        "error names the offending crate + the cause: {msg}"
+    );
+    assert!(
+        msg.contains("git or version"),
+        "error points at the git/version fix: {msg}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

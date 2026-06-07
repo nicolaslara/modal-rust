@@ -6,8 +6,8 @@
 //! wire IS your input struct, the success value IS your output struct. No I/O type
 //! is named at the call site beyond your own structs.
 //!
-//! The companion `src/bin/modal_runner.rs` is the one-line runner; `tests/local.rs`
-//! proves the offline `.local()` round-trip through your structs.
+//! `tests/local.rs` proves the offline `.local()` round-trip through your structs.
+//! The runner is generated automatically by the modal-rust tooling — no bin needed.
 
 use modal_rust::function;
 use serde::{Deserialize, Serialize};

@@ -110,6 +110,7 @@ mod error;
 mod function;
 mod registration;
 mod remote;
+mod runner_gen;
 mod scope;
 
 pub use app::App;
@@ -127,6 +128,16 @@ pub use registration::{
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly.
 pub use remote::{ImageStep, RemoteConfig};
+// Tooling-generated `modal_runner` (inject-bin, design B). The `modal-rust` CLI needs
+// this for the `--describe` LOCAL build: auto-detect whether the target ships its own
+// `modal_runner` bin, and if not, materialize a temp SHADOW copy with the generated
+// runner and build there (never mutating the user's tree). Run/deploy inject inside
+// the source upload (no CLI involvement). Single source of truth — no second
+// `cargo metadata` call, no logic drift.
+pub use runner_gen::{
+    injected_runner_rel_path, materialize_shadow, render_runner_main, resolve_runner_target,
+    RunnerTarget,
+};
 
 /// Shared lock serializing the unit tests that mutate the SHARED process env
 /// (`MODAL_RUST_*`). `cargo test` runs a binary's tests in parallel threads, so two

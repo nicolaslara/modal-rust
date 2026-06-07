@@ -9,10 +9,6 @@ publish = false
 name = "example_custom_types"
 path = "src/lib.rs"
 
-[[bin]]
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
 [dependencies]
 # SINGLE modal dependency — exactly what a fresh external user writes. The
 # `#[modal_rust::function]` macro routes its generated code through this facade, so

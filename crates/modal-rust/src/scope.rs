@@ -35,36 +35,62 @@ use std::process::Command;
 use serde::Deserialize;
 
 /// Top-level `cargo metadata --format-version 1` shape (only the fields we read).
+///
+/// `pub(crate)` so [`crate::runner_gen`] can reuse the SAME parsed metadata (one
+/// `cargo metadata` call) for auto-detect + lib-name + crate-rel resolution.
 #[derive(Debug, Deserialize)]
-struct Metadata {
+pub(crate) struct Metadata {
     /// Package-id strings of the workspace members.
-    workspace_members: Vec<String>,
+    pub workspace_members: Vec<String>,
     /// Absolute workspace root (holds the workspace `Cargo.toml`/`Cargo.lock`).
-    workspace_root: PathBuf,
+    pub workspace_root: PathBuf,
     /// All packages in the graph (with `--no-deps`, just the workspace members).
-    packages: Vec<Package>,
+    pub packages: Vec<Package>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Package {
+pub(crate) struct Package {
     /// Opaque package-id (matches entries in `workspace_members`).
-    id: String,
+    pub id: String,
     /// Cargo package name (matched against the scoping target).
-    name: String,
+    pub name: String,
     /// Absolute path to this package's `Cargo.toml`.
-    manifest_path: PathBuf,
+    pub manifest_path: PathBuf,
     /// This package's declared dependencies.
-    dependencies: Vec<Dependency>,
+    pub dependencies: Vec<Dependency>,
+    /// Build targets of this package (kind + name). Used by [`crate::runner_gen`] to
+    /// detect an existing `modal_runner` bin and to read the `[lib]` name. Defaults to
+    /// empty if `cargo metadata` omits it (older cargo) — the closure algorithm here
+    /// never reads it.
+    #[serde(default)]
+    pub targets: Vec<Target>,
+}
+
+/// A single `cargo metadata` build target (`targets[]` per package): the `kind`s
+/// (`["lib"]`, `["bin"]`, `["cdylib"]`, …) and the target `name`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Target {
+    /// Target kinds (e.g. `["bin"]`, `["lib"]`). Auto-detect matches a kind that
+    /// CONTAINS `"bin"`.
+    #[serde(default)]
+    pub kind: Vec<String>,
+    /// Target name (e.g. `"modal_runner"`, the crate's lib name).
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct Dependency {
+pub(crate) struct Dependency {
+    /// The dependency package name (e.g. `"modal-rust"`). Used only for diagnostics —
+    /// to name the offending crate when a normal path-dep points outside the upload.
+    #[serde(default)]
+    name: String,
     /// Dependency-kind: absent/`null` = normal, `"dev"`, or `"build"`. Only normal
     /// deps are followed (dev/build deps are not needed to build the runner binary
     /// and dev deps can form cycles — e.g. `modal-rust` dev-deps on `example-add`).
     #[serde(default)]
     kind: Option<String>,
-    /// Filesystem path for a path dependency (`None` for a registry/git dep).
+    /// Filesystem path for a path dependency, ALWAYS absolute + canonicalized by cargo
+    /// (`None` for a registry/git dep).
     #[serde(default)]
     path: Option<PathBuf>,
 }
@@ -87,8 +113,19 @@ pub(crate) struct ClosureUpload {
 /// the dependency-closure crate dirs, the workspace `Cargo.lock` (verbatim), and the
 /// REWRITTEN workspace `Cargo.toml` (members scoped to the closure — see module docs).
 ///
-/// Returns `None` to signal the caller's whole-root fallback (see module docs).
-pub(crate) fn workspace_closure(workspace_root: &Path, package: &str) -> Option<ClosureUpload> {
+/// Returns:
+/// - `Ok(Some(_))` — the scoped upload set;
+/// - `Ok(None)` — soft fallback to the caller's whole-root upload (metadata
+///   unavailable/unparseable, no workspace `Cargo.toml`, or the target package absent);
+/// - `Err(msg)` — a HARD, actionable failure that the caller must surface (NOT fall
+///   back on): a normal path-dep escapes the workspace, so its source can't be uploaded
+///   and the remote `cargo build` would fail with a cryptic "No such file" error. The
+///   whole-root fallback would fail the same way (the dep is outside `local_root` too),
+///   so failing loudly here is strictly better. See [`out_of_workspace_error`].
+pub(crate) fn workspace_closure(
+    workspace_root: &Path,
+    package: &str,
+) -> Result<Option<ClosureUpload>, String> {
     let manifest = workspace_root.join("Cargo.toml");
     if !manifest.is_file() {
         eprintln!(
@@ -96,20 +133,65 @@ pub(crate) fn workspace_closure(workspace_root: &Path, package: &str) -> Option<
              uploading whole source root minus ignore files",
             workspace_root.display()
         );
-        return None;
+        return Ok(None);
     }
 
-    // `?` returns None on any failure; run_cargo_metadata already logged the reason.
-    let metadata = run_cargo_metadata(&manifest)?;
+    // run_cargo_metadata already logged the reason on failure; soft-fall-back.
+    let Some(metadata) = run_cargo_metadata(&manifest) else {
+        return Ok(None);
+    };
 
-    let Some(dirs) = closure_from_metadata(&metadata, package) else {
+    let Some(ClosureResult {
+        dirs,
+        out_of_workspace,
+    }) = closure_from_metadata(&metadata, package)
+    else {
         eprintln!(
             "[modal-rust] cargo metadata unavailable (package '{package}' not found in \
              workspace members); uploading whole source root minus ignore files"
         );
-        return None;
+        return Ok(None);
     };
 
+    // A normal path-dep escaping the workspace can't be uploaded — fail loudly with an
+    // actionable message instead of letting the remote build fail cryptically.
+    if !out_of_workspace.is_empty() {
+        return Err(out_of_workspace_error(package, &out_of_workspace));
+    }
+
+    Ok(build_closure_upload(&metadata, package, dirs))
+}
+
+/// Like [`workspace_closure`] but LENIENT toward out-of-workspace path-deps: it returns
+/// the closure even when a normal path-dep escapes the workspace, because the LOCAL
+/// `--describe` SHADOW build (the sole caller) CAN resolve such deps against the user's
+/// on-disk tree (the shadow rewrites them to absolute paths — see
+/// [`crate::runner_gen::materialize_shadow`]). The remote upload, by contrast, cannot
+/// carry that source, so [`workspace_closure`] hard-errors there. Returns `None` only on
+/// the same soft-fallback conditions (metadata unavailable / target not a member).
+pub(crate) fn workspace_closure_lenient(
+    workspace_root: &Path,
+    package: &str,
+) -> Option<ClosureUpload> {
+    let manifest = workspace_root.join("Cargo.toml");
+    if !manifest.is_file() {
+        return None;
+    }
+    let metadata = run_cargo_metadata(&manifest)?;
+    let ClosureResult { dirs, .. } = closure_from_metadata(&metadata, package)?;
+    build_closure_upload(&metadata, package, dirs)
+}
+
+/// Assemble the [`ClosureUpload`] (rewritten workspace manifest + verbatim `Cargo.lock` +
+/// dev-dep-stripped member manifests + injected runner) from already-resolved closure
+/// `dirs`. Shared by [`workspace_closure`] and [`workspace_closure_lenient`]. Returns
+/// `None` on the soft-fallback conditions (unreadable / un-rewritable workspace
+/// manifest), having logged the reason.
+fn build_closure_upload(
+    metadata: &Metadata,
+    package: &str,
+    dirs: Vec<PathBuf>,
+) -> Option<ClosureUpload> {
     let ws_root = &metadata.workspace_root;
     let ws_manifest = ws_root.join("Cargo.toml");
 
@@ -191,11 +273,46 @@ pub(crate) fn workspace_closure(workspace_root: &Path, package: &str) -> Option<
         }
     }
 
+    // Inject the tooling-generated `modal_runner` bin into the upload copy (design B)
+    // unless the target already ships its own (auto-detect) or declares no `modal-rust`
+    // facade dep (not generatable). Reuses the metadata already parsed above (no extra
+    // `cargo metadata` call). Pushed onto `inline_files` so it rides the source mount at
+    // `<remote_src>/<crate_rel>/src/bin/modal_runner.rs`, EXEMPT from ignore, overwrite-
+    // precedent (it wins over an on-disk file at the same path — e.g. a crate that DOES
+    // ship a bin still has `has_own_runner_bin == true` so we skip and keep its own).
+    if let Some(runner) = crate::runner_gen::injected_runner_file_from_metadata(metadata, package) {
+        inline_files.push(runner);
+    }
+
     Some(ClosureUpload {
         dirs,
         extra_files,
         inline_files,
     })
+}
+
+/// Build the actionable upload-time error for one or more normal path-deps that escape
+/// the workspace (so the upload can't carry their source). Names each offending crate +
+/// path and tells the user how to fix it (git/version dep, or vendor into the workspace).
+fn out_of_workspace_error(package: &str, deps: &[OutOfWorkspaceDep]) -> String {
+    use std::fmt::Write as _;
+    let mut msg = format!(
+        "package '{package}' depends on {} crate(s) by a path OUTSIDE the uploaded \
+         workspace, whose source cannot be uploaded to Modal:\n",
+        deps.len()
+    );
+    for dep in deps {
+        let _ = writeln!(msg, "  - {} (path = {})", dep.name, dep.path.display());
+    }
+    msg.push_str(
+        "Remote run/deploy uploads only the workspace dependency closure, so an \
+         out-of-workspace path-dep would make the in-container `cargo build` fail to \
+         read its Cargo.toml. Fix by depending on these crates via a git or version \
+         (crates.io) spec, or by vendoring them into this workspace. (Local `--describe` \
+         resolves out-of-workspace path-deps against your on-disk tree, so it is \
+         unaffected.)",
+    );
+    msg
 }
 
 /// Remove `[dev-dependencies]` (and any `[target.<cfg>.dev-dependencies]`) tables from
@@ -240,6 +357,14 @@ fn strip_dev_dependencies(original: &str) -> Result<Option<String>, String> {
 /// via `toml_edit`. A `[workspace] exclude` array, if present, is cleared (the
 /// excluded dirs aren't uploaded, so excluding them is moot and could reference a
 /// missing path).
+///
+/// A STANDALONE crate (an external user's pure-library package with NO `[workspace]`
+/// table — its own metadata makes it its own workspace root + sole member) needs no
+/// member rewriting: there are no members to scope, and the single-package manifest is
+/// already self-consistent. Return it unchanged so the closure path (and the local
+/// `--describe` shadow build that depends on it) works for external users, not just the
+/// in-workspace examples. In-workspace manifests always carry `[workspace]`, so this
+/// branch is never taken for them — zero wire delta.
 fn rewrite_workspace_members(
     original: &str,
     workspace_root: &Path,
@@ -250,6 +375,11 @@ fn rewrite_workspace_members(
     let mut doc: DocumentMut = original
         .parse()
         .map_err(|e| format!("parse Cargo.toml: {e}"))?;
+
+    // Standalone (single-package) manifest: no `[workspace]` to rewrite. Leave it as-is.
+    if doc.get("workspace").and_then(Item::as_table_like).is_none() {
+        return Ok(original.to_string());
+    }
 
     // Closure dirs as workspace-relative POSIX strings, sorted + deduped.
     let mut rel: Vec<String> = dirs
@@ -294,7 +424,10 @@ fn rewrite_workspace_members(
 
 /// Run `cargo metadata --format-version 1 --no-deps --manifest-path <manifest>` and
 /// parse stdout. Returns `None` (with a stderr note) on any failure.
-fn run_cargo_metadata(manifest: &Path) -> Option<Metadata> {
+///
+/// `pub(crate)` so [`crate::runner_gen`] reuses the SAME invocation (auto-detect +
+/// lib-name + crate-rel all read from one parsed `Metadata`).
+pub(crate) fn run_cargo_metadata(manifest: &Path) -> Option<Metadata> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--no-deps"])
@@ -332,11 +465,32 @@ fn run_cargo_metadata(manifest: &Path) -> Option<Metadata> {
     }
 }
 
+/// A normal (non-dev, non-build) path-dependency whose target dir is NOT a workspace
+/// member — so [`closure_from_metadata`] cannot upload its source. The remote
+/// `cargo build` would then fail to read the dep's `Cargo.toml`. Captured so the I/O
+/// layer can fail loudly with the offending crate's name + path (see
+/// [`OutOfWorkspaceDep`] handling in [`workspace_closure`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutOfWorkspaceDep {
+    /// The dependency package name (e.g. `"modal-rust"`).
+    name: String,
+    /// The absolute, canonicalized dir the path-dep points at (cargo-reported).
+    path: PathBuf,
+}
+
+/// The result of the pure closure walk: the closure crate dirs PLUS any normal
+/// path-deps that escape the workspace (which the upload cannot satisfy).
+struct ClosureResult {
+    dirs: Vec<PathBuf>,
+    out_of_workspace: Vec<OutOfWorkspaceDep>,
+}
+
 /// Pure closure algorithm over parsed metadata. Returns the workspace-member normal
-/// path-dep closure crate dirs of `package`, or `None` if `package` is not a member.
+/// path-dep closure crate dirs of `package` (plus any out-of-workspace normal path-deps
+/// encountered along the way), or `None` if `package` is not a member.
 ///
 /// Split out from I/O so it is unit-testable on fixtures (no cargo invocation).
-fn closure_from_metadata(metadata: &Metadata, package: &str) -> Option<Vec<PathBuf>> {
+fn closure_from_metadata(metadata: &Metadata, package: &str) -> Option<ClosureResult> {
     let member_ids: HashSet<&str> = metadata
         .workspace_members
         .iter()
@@ -374,6 +528,8 @@ fn closure_from_metadata(metadata: &Metadata, package: &str) -> Option<Vec<PathB
         .find(|p| p.name == package && member_ids.contains(p.id.as_str()))?;
 
     let mut closure: HashSet<PathBuf> = HashSet::new();
+    // De-duplicate out-of-workspace deps by (name, path) so each is reported once.
+    let mut escaped: Vec<OutOfWorkspaceDep> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![dir_of(target)];
     while let Some(cur) = stack.pop() {
         if !closure.insert(cur.clone()) {
@@ -390,8 +546,21 @@ fn closure_from_metadata(metadata: &Metadata, package: &str) -> Option<Vec<PathB
             let Some(dep_path) = &dep.path else {
                 continue; // registry / git dep — fetched by cargo on Modal.
             };
-            if member_dirs.contains(dep_path) && !closure.contains(dep_path) {
-                stack.push(dep_path.clone());
+            if member_dirs.contains(dep_path) {
+                if !closure.contains(dep_path) {
+                    stack.push(dep_path.clone());
+                }
+            } else {
+                // A normal path-dep that escapes the workspace: the upload can't carry
+                // its source, so the remote build would fail. Record it (deduped) for a
+                // loud, actionable error at upload time.
+                let entry = OutOfWorkspaceDep {
+                    name: dep.name.clone(),
+                    path: dep_path.clone(),
+                };
+                if !escaped.contains(&entry) {
+                    escaped.push(entry);
+                }
             }
         }
     }
@@ -400,7 +569,11 @@ fn closure_from_metadata(metadata: &Metadata, package: &str) -> Option<Vec<PathB
     // keeps logs/tests predictable).
     let mut dirs: Vec<PathBuf> = closure.into_iter().collect();
     dirs.sort();
-    Some(dirs)
+    escaped.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+    Some(ClosureResult {
+        dirs,
+        out_of_workspace: escaped,
+    })
 }
 
 #[cfg(test)]
@@ -426,18 +599,21 @@ mod tests {
                     name: "modal-rust-runtime".into(),
                     manifest_path: "/ws/crates/runtime/Cargo.toml".into(),
                     dependencies: vec![],
+                    targets: vec![],
                 },
                 Package {
                     id: "macros-id".into(),
                     name: "modal-rust-macros".into(),
                     manifest_path: "/ws/crates/macros/Cargo.toml".into(),
                     dependencies: vec![],
+                    targets: vec![],
                 },
                 Package {
                     id: "sdk-id".into(),
                     name: "modal-rust-sdk".into(),
                     manifest_path: "/ws/crates/sdk/Cargo.toml".into(),
                     dependencies: vec![],
+                    targets: vec![],
                 },
                 Package {
                     id: "addex-id".into(),
@@ -446,15 +622,18 @@ mod tests {
                     dependencies: vec![
                         // normal path-dep on runtime
                         Dependency {
+                            name: "modal-rust-runtime".into(),
                             kind: None,
                             path: Some("/ws/crates/runtime".into()),
                         },
                         // a registry dep (no path) — ignored
                         Dependency {
+                            name: "serde".into(),
                             kind: None,
                             path: None,
                         },
                     ],
+                    targets: vec![],
                 },
                 Package {
                     id: "facade-id".into(),
@@ -462,23 +641,28 @@ mod tests {
                     manifest_path: "/ws/crates/facade/Cargo.toml".into(),
                     dependencies: vec![
                         Dependency {
+                            name: "modal-rust-runtime".into(),
                             kind: None,
                             path: Some("/ws/crates/runtime".into()),
                         },
                         Dependency {
+                            name: "modal-rust-macros".into(),
                             kind: None,
                             path: Some("/ws/crates/macros".into()),
                         },
                         Dependency {
+                            name: "modal-rust-sdk".into(),
                             kind: None,
                             path: Some("/ws/crates/sdk".into()),
                         },
                         // DEV path-dep on example-add — MUST be excluded.
                         Dependency {
+                            name: "example-add".into(),
                             kind: Some("dev".into()),
                             path: Some("/ws/examples/add".into()),
                         },
                     ],
+                    targets: vec![],
                 },
             ],
         }
@@ -487,24 +671,28 @@ mod tests {
     #[test]
     fn closure_for_example_add_is_self_plus_runtime() {
         let m = fixture();
-        let dirs = closure_from_metadata(&m, "example-add").unwrap();
+        let result = closure_from_metadata(&m, "example-add").unwrap();
         assert_eq!(
-            dirs,
+            result.dirs,
             vec![
                 PathBuf::from("/ws/crates/runtime"),
                 PathBuf::from("/ws/examples/add"),
             ],
             "example-add closure = {{examples/add, crates/runtime}} only"
         );
+        assert!(
+            result.out_of_workspace.is_empty(),
+            "all path-deps are workspace members"
+        );
     }
 
     #[test]
     fn closure_for_facade_excludes_dev_dep_on_example() {
         let m = fixture();
-        let dirs = closure_from_metadata(&m, "modal-rust").unwrap();
+        let result = closure_from_metadata(&m, "modal-rust").unwrap();
         // The dev-dep on example-add must NOT appear; normal deps must.
         assert_eq!(
-            dirs,
+            result.dirs,
             vec![
                 PathBuf::from("/ws/crates/facade"),
                 PathBuf::from("/ws/crates/macros"),
@@ -513,9 +701,48 @@ mod tests {
             ],
         );
         assert!(
-            !dirs.contains(&PathBuf::from("/ws/examples/add")),
+            !result.dirs.contains(&PathBuf::from("/ws/examples/add")),
             "the dev path-dep on example-add must be excluded"
         );
+        assert!(result.out_of_workspace.is_empty());
+    }
+
+    #[test]
+    fn closure_flags_out_of_workspace_normal_path_dep() {
+        // An external standalone crate `myapp` (its own ws root + sole member) that deps
+        // the facade `modal-rust` by an out-of-workspace path. The closure is {myapp}
+        // only, and the escaping `modal-rust` dep is recorded so the upload fails loudly.
+        let m = Metadata {
+            workspace_root: PathBuf::from("/tmp/myapp"),
+            workspace_members: vec!["myapp-id".into()],
+            packages: vec![Package {
+                id: "myapp-id".into(),
+                name: "myapp".into(),
+                manifest_path: "/tmp/myapp/Cargo.toml".into(),
+                dependencies: vec![Dependency {
+                    name: "modal-rust".into(),
+                    kind: None,
+                    // cargo canonicalizes the relative `../checkout/...` to absolute.
+                    path: Some("/elsewhere/checkout/crates/modal-rust".into()),
+                }],
+                targets: vec![],
+            }],
+        };
+        let result = closure_from_metadata(&m, "myapp").unwrap();
+        assert_eq!(result.dirs, vec![PathBuf::from("/tmp/myapp")]);
+        assert_eq!(
+            result.out_of_workspace,
+            vec![OutOfWorkspaceDep {
+                name: "modal-rust".into(),
+                path: PathBuf::from("/elsewhere/checkout/crates/modal-rust"),
+            }],
+            "the escaping facade path-dep is captured for a loud upload error"
+        );
+        // The actionable error names the crate, its path, and the git/version fix.
+        let err = out_of_workspace_error("myapp", &result.out_of_workspace);
+        assert!(err.contains("modal-rust"));
+        assert!(err.contains("/elsewhere/checkout/crates/modal-rust"));
+        assert!(err.contains("git or version"));
     }
 
     #[test]
@@ -582,6 +809,23 @@ panic = "unwind"
             doc["profile"]["release"]["panic"].as_str(),
             Some("unwind"),
             "[profile.release] panic = unwind must be preserved"
+        );
+    }
+
+    #[test]
+    fn rewrite_standalone_manifest_is_noop() {
+        // An external user's pure-library crate: no `[workspace]` table. The rewrite is
+        // a verbatim no-op (nothing to scope) so the closure path works for external
+        // crates, not just the in-workspace examples.
+        let original = "[package]\nname = \"modal-user-demo\"\nedition = \"2021\"\n\
+                        [dependencies]\nmodal-rust = { path = \"/x/modal-rust\" }\n";
+        let dirs = vec![PathBuf::from("/tmp/modal-user-demo")];
+        let out =
+            rewrite_workspace_members(original, &PathBuf::from("/tmp/modal-user-demo"), &dirs)
+                .unwrap();
+        assert_eq!(
+            out, original,
+            "standalone manifest is returned byte-identical"
         );
     }
 

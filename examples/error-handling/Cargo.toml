@@ -10,11 +10,6 @@ name = "example_error_handling"
 path = "src/lib.rs"
 
 [[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
-[[bin]]
 # The driver tour: runs both failing functions OFFLINE through `.local()`, prints the
 # wire envelope each produces, and branches on the structured `details`. No Modal.
 name = "error_handling"

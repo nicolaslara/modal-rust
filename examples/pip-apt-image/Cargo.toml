@@ -10,11 +10,6 @@ name = "example_pip_apt_image"
 path = "src/lib.rs"
 
 [[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
-[[bin]]
 # The offline driver: builds a RemoteConfig with apt/pip/run image-builder steps,
 # dry_runs, and prints the rendered image dockerfile lines. Pure projection — no
 # Modal, no credentials, no network.

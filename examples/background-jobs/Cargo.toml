@@ -10,11 +10,6 @@ name = "example_background_jobs"
 path = "src/lib.rs"
 
 [[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
-[[bin]]
 # The driver tour: the offline `.local()` run executes in `cargo run`; the live
 # `.spawn()` + `.get(timeout)` fire-and-forget shape compiles always, runs only with
 # Modal credentials.

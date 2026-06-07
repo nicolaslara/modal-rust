@@ -1,8 +1,9 @@
 //! Offline proof of the quickstart's `.local()` path (zero Modal, zero network) —
-//! the exact ergonomic behavior the README promises. The runner protocol itself
-//! (`--describe` / `--entrypoint`) is proven by running the `modal_runner` binary
-//! (see the verification commands / `examples/add-macro`), so this stays on the
-//! clean public surface: no `__private`.
+//! the exact ergonomic behavior the README promises. This crate is a PURE LIBRARY —
+//! the `modal-rust` CLI generates the runner automatically; the runner protocol itself
+//! (`--describe` / `--entrypoint`) is exercised via the CLI (see the verification
+//! commands and `examples/add-macro`). This test stays on the clean public surface:
+//! no `__private`.
 
 use modal_rust::App;
 use quickstart::AddCall;

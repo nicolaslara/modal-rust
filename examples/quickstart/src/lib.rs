@@ -7,8 +7,10 @@
 //! this crate compiles and its `.local()` test passes, "README == crate source"
 //! implies "the README authoring code compiles and runs".
 //!
-//! The companion `src/bin/modal_runner.rs` is the one-line runner; `tests/local.rs`
-//! proves `App::local()` + `app.add(2, 3).local()? == 5`.
+//! This is a PURE LIBRARY crate — no `src/bin/modal_runner.rs`. The `modal-rust`
+//! CLI generates the runner automatically (`cargo run -p modal-rust-cli -- run add
+//! --project examples/quickstart`). See `tests/local.rs` for the in-process proof
+//! that `App::local()` + `app.add(2, 3).local()? == 5`.
 
 // quickstart:begin
 use modal_rust::function;

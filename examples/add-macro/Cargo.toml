@@ -9,10 +9,6 @@ publish = false
 name = "example_add_macro"
 path = "src/lib.rs"
 
-[[bin]]
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
 [dependencies]
 # SINGLE modal dependency: the `modal-rust` facade, under its OWN name (NO rename).
 # A fresh external user writes exactly this. The `#[modal_rust::function]` macro

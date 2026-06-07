@@ -14,9 +14,13 @@ members = [
     # targets only.
     "crates/modal-rust-testkit",
     # The README quickstart, as a real compiled+tested crate (the cleanest newcomer
-    # surface: single `modal-rust` dep, 3-line #[function], one-line modal_runner!()).
-    # A drift-guard test asserts the README's quickstart block IS this crate's source.
+    # surface: single `modal-rust` dep, 3-line #[function], NO runner bin — the CLI
+    # generates it). A drift-guard test asserts the README's quickstart block IS this crate's source.
     "examples/quickstart",
+    # Bring-your-own-runner demonstrator: the SINGLE workspace member that keeps a bin
+    # named `modal_runner`. It exercises the CLI's auto-detect path (use the crate's own
+    # `modal_runner` bin when present, otherwise generate one).
+    "examples/own-runner-bin",
     "examples/add",
     "examples/add-macro",
     "examples/custom-types",
@@ -55,6 +59,7 @@ default-members = [
     "crates/modal-rust-cli",
     "crates/modal-rust-macros",
     "examples/quickstart",
+    "examples/own-runner-bin",
     "examples/add",
     "examples/add-macro",
     "examples/custom-types",

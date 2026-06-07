@@ -1,8 +1,10 @@
 //! The `add` walking-skeleton example (boundaries.md §3, tasks.md M0).
 //!
 //! The user authors only this `lib.rs` and `modal_registry()` — they do not own
-//! `main()`. The CLI owns the ~15-line `src/bin/modal_runner.rs` whose fixed body
-//! is `modal_rust_runtime::run_cli(example_add::modal_registry())`.
+//! `main()`. This MANUAL reference keeps a hand-written runner in
+//! `src/bin/add_runner.rs` (bin name `add-runner`, NOT `modal_runner`, so it never
+//! collides with the generated/own `modal_runner` bins), whose fixed body is
+//! `modal_rust_runtime::run_cli(example_add::modal_registry())`.
 //!
 //! Besides the real `add` handler, this registers named test entrypoints that
 //! exercise every one of the five runner error kinds so the M0 acceptance commands

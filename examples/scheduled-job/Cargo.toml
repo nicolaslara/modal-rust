@@ -9,11 +9,6 @@ publish = false
 name = "example_scheduled_job"
 path = "src/lib.rs"
 
-[[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
 [dependencies]
 # SINGLE modal dependency — exactly what a fresh external user writes. The
 # `#[modal_rust::function]` macro routes its generated code through this facade, so

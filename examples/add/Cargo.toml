@@ -9,9 +9,13 @@ publish = false
 name = "example_add"
 path = "src/lib.rs"
 
+# MANUAL reference: hand-built Registry (no inventory, no `modal-rust` facade), so the
+# tooling cannot generate a `modal_runner` for it. The bin is named `add-runner` (NOT
+# `modal_runner`) so it never collides with the generated/own `modal_runner` bins the
+# rest of the workspace uses (cargo#6313 output-filename collision).
 [[bin]]
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
+name = "add-runner"
+path = "src/bin/add_runner.rs"
 
 [dependencies]
 modal-rust-runtime = { path = "../../crates/modal-rust-runtime" }

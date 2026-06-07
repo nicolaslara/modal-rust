@@ -3164,6 +3164,7 @@ dependencies = [
  "modal-rust-testkit",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml_edit 0.22.27",
 ]
@@ -3591,6 +3592,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "own-runner-bin"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

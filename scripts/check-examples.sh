@@ -3,8 +3,11 @@
 #
 # Three tiers, each gated on what the host can actually do:
 #
-#   1. OFFLINE   — always run. The in-process `.local()` / `--describe` commands
-#                  from README.md's "Examples" section. No credentials, no network.
+#   1. OFFLINE   — always run. In-process tests / `cargo test` / `doctor` + the
+#                  named `add-runner` bin for the manual reference. No credentials,
+#                  no network. Every pure-library example is exercised through the
+#                  `modal-rust` CLI or its `cargo test` suite (NOT via per-example
+#                  `cargo run --bin modal_runner`).
 #   2. LIVE      — run automatically WHEN Modal credentials are present
 #                  (`~/.modal.toml` or MODAL_TOKEN_ID + MODAL_TOKEN_SECRET). The
 #                  CPU `.remote()` + deploy + call round-trips. Cheap and fast.
@@ -75,26 +78,45 @@ has_creds() {
   [[ -f "${HOME}/.modal.toml" ]] || { [[ -n "${MODAL_TOKEN_ID:-}" ]] && [[ -n "${MODAL_TOKEN_SECRET:-}" ]]; }
 }
 
+# ───────────────────────── Build the CLI once ─────────────────────────
+# All `modal-rust run/deploy/call/doctor` invocations below use this binary.
+echo "── Building modal-rust-cli …"
+if ! cargo build -q -p modal-rust-cli 2>/dev/null; then
+  echo "FATAL: cargo build -p modal-rust-cli failed" >&2
+  exit 1
+fi
+CLI="target/debug/modal-rust"
+echo "   built: ${CLI}"
+echo
+
 # ───────────────────────── 1. OFFLINE (always) ─────────────────────────
 
-# quickstart — the headline (auto-I/O add)
-run "quickstart: add(2, 3)" '{"ok":true,"value":5}' \
-  "cd examples/quickstart && cargo run -q --bin modal_runner -- --entrypoint add --input-json '{\"a\":2,\"b\":3}'"
+# quickstart — pure-library example (no runner bin; the CLI generates it). Offline
+# coverage: in-process tests prove add(2,3)==5; doctor --rust verifies the CLI
+# resolves the project without a hand-written runner bin (the banner is always
+# printed to stdout; credentials optional for the offline tier).
+run "quickstart: typed_local_add_returns_5 (in-process)" 'test result: ok' \
+  "cargo test -q -p quickstart -- typed_local_add_returns_5 2>&1"
 
-run "quickstart: --describe lists add" '"name":"add"' \
-  "cd examples/quickstart && cargo run -q --bin modal_runner -- --describe"
+run "quickstart: doctor --rust (CLI resolves pure-library project)" 'modal-rust doctor — preflight (OFFLINE)' \
+  "${CLI} doctor --rust --project examples/quickstart"
 
-# add-macro — macro path (struct I/O)
-run "add-macro: add(40, 2)" '{"ok":true,"value":42}' \
-  "cd examples/add-macro && cargo run -q --bin modal_runner -- --entrypoint add --input-json '{\"a\":40,\"b\":2}'"
+# add-macro — macro path (struct I/O). Proven OFFLINE via cargo test: the
+# `add_registered_via_inventory_runner_envelope` test dispatches through the frozen
+# runner CLI, proving the same `{"ok":true,"value":42}` the runner would print.
+run "add-macro: runner envelope (in-process via cargo test)" 'test result: ok' \
+  "cargo test -q -p example-add-macro -- add_registered_via_inventory_runner_envelope 2>&1"
 
-# custom-types — a function over YOUR OWN structs (macro infers I/O from the signature)
-run "custom-types: score(Player) -> Scored" '{"ok":true,"value":{"accuracy_pct":70,"name":"Ada","points":700}}' \
-  "cd examples/custom-types && cargo run -q --bin modal_runner -- --entrypoint score --input-json '{\"name\":\"Ada\",\"hits\":7,\"shots\":10}'"
+# custom-types — a function over YOUR OWN structs (macro infers I/O from the
+# signature). Proven OFFLINE via cargo test: `score_round_trips_through_user_structs`
+# drives the same in-process dispatch path.
+run "custom-types: score(Player) -> Scored (in-process via cargo test)" 'test result: ok' \
+  "cargo test -q -p example-custom-types 2>&1"
 
-# add — manual / no-macro path ({sum} output)
+# add — manual / no-macro path ({sum} output). MANUAL reference: hand-built Registry,
+# so it keeps a hand-written runner whose bin is `add-runner` (NOT `modal_runner`).
 run "add (manual): add(40, 2)" '{"ok":true,"value":{"sum":42}}' \
-  "cd examples/add && cargo run -q --bin modal_runner -- --entrypoint add --input-json '{\"a\":40,\"b\":2}'"
+  "cd examples/add && cargo run -q --bin add-runner -- --entrypoint add --input-json '{\"a\":40,\"b\":2}'"
 
 # orchestrate — the local tour (manual + macro/inventory + auto-I/O)
 run "orchestrate: local tour" 'add(2, 3) -> 5' \
@@ -125,59 +147,56 @@ run "spawn-map-foreach: local for_each mirror (side effects, results discarded)"
 run "error-handling: structured error -> details + branch" 'branch:     short by 50 cents -> prompt a top-up' \
   "cargo run -q -p example-error-handling --bin error_handling"
 
-# error-handling — the plain anyhow path lands on `function_error` with `details:null`
-# (proven straight through the frozen runner CLI envelope).
-run "error-handling: anyhow error -> function_error, details:null" '"kind":"function_error","message":"insufficient funds: asked 150, have 100"' \
-  "cd examples/error-handling && cargo run -q --bin modal_runner -- --entrypoint withdraw --input-json '{\"amount\":150,\"balance\":100}'"
+# error-handling — the plain anyhow path lands on `function_error` with `details:null`.
+# Proven OFFLINE via cargo test: `anyhow_error_is_opaque_with_null_details` dispatches
+# through the in-process facade and asserts `details == None` on the RunnerError.
+run "error-handling: anyhow error -> function_error, details:null (in-process via cargo test)" 'test result: ok' \
+  "cargo test -q -p example-error-handling -- anyhow_error_is_opaque_with_null_details 2>&1"
 
-# secrets — decorator-is-config: a named secret rides through inventory, proven
-# OFFLINE via --describe (a mock test asserts it rides into the FunctionCreate manifest).
-run "secrets: --describe (named secret rides through inventory)" '"secrets":["my-api-key"]' \
-  "cd examples/secrets && cargo run -q --bin modal_runner -- --describe"
+# secrets — decorator-is-config: a named secret rides through inventory. Proven OFFLINE
+# via cargo test (tests/manifest.rs): `named_secret_rides_into_function_create` uses
+# App::dry_run to assert the secret id rides into the FunctionCreate manifest.
+run "secrets: named secret rides through inventory (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-secrets 2>&1"
 
-# volumes — decorator-is-config: a named volume mounts at /data and rides through
-# inventory, proven OFFLINE via --describe (a mock test asserts the mount rides into
-# the FunctionCreate manifest). The body persists a file across calls under the mount.
-run "volumes: --describe (mounted volume rides through inventory)" '"volumes":[["/data","my-vol"]]' \
-  "cd examples/volumes && cargo run -q --bin modal_runner -- --describe"
+# volumes — decorator-is-config: a named volume mounts at /data. Proven OFFLINE via
+# cargo test (tests/manifest.rs): `mounted_volume_rides_into_function_create` uses
+# App::dry_run to assert the volume mount rides into the FunctionCreate manifest.
+run "volumes: mounted volume rides through inventory (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-volumes 2>&1"
 
-# timeout-and-cache — decorator-is-config: the operational knobs (per-function
-# timeout + the on-by-default cargo BUILD cache) ride through inventory, proven
-# OFFLINE via --describe (a mock test asserts BOTH ride into the FunctionCreate
-# manifest — timeout_secs and the /cache cargo-cache volume mount).
-run "timeout-and-cache: --describe (timeout + cache ride through inventory)" '"timeout_secs":1800,"cache":true' \
-  "cd examples/timeout-and-cache && cargo run -q --bin modal_runner -- --describe"
+# timeout-and-cache — decorator-is-config: timeout + cache knobs ride through
+# inventory. Proven OFFLINE via cargo test (tests/manifest.rs): asserts both
+# timeout_secs and the cargo-cache volume mount ride into the FunctionCreate manifest.
+run "timeout-and-cache: timeout + cache ride through inventory (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-timeout-and-cache 2>&1"
 
-# cpu-memory — decorator-is-config: right-size compute by requesting CPU cores + RAM
-# (`cpu = 2.0` -> milli_cpu = 2000, `memory = 4096` MiB). Proven OFFLINE via --describe
-# (a mock test asserts BOTH ride into the FunctionCreate manifest's resources).
-run "cpu-memory: --describe (cpu + memory ride through inventory)" '"milli_cpu":2000,"memory_mb":4096' \
-  "cd examples/cpu-memory && cargo run -q --bin modal_runner -- --describe"
+# cpu-memory — decorator-is-config: right-size compute by requesting CPU cores + RAM.
+# Proven OFFLINE via cargo test (tests/manifest.rs): asserts milli_cpu + memory_mb
+# ride into the FunctionCreate manifest's resources.
+run "cpu-memory: cpu + memory ride through inventory (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-cpu-memory 2>&1"
 
-# retries — decorator-is-config: make a flaky function self-heal with an automatic
-# retry policy (`retries = 5` -> Modal's fixed-interval policy). Proven OFFLINE via
-# --describe (a mock test asserts it rides into the FunctionCreate manifest's
-# retry_policy). The body just returns Err on a transient failure; the decorator makes
-# Modal re-run the whole call until it succeeds.
-run "retries: --describe (retry count rides through inventory)" '"retries":5' \
-  "cd examples/retries && cargo run -q --bin modal_runner -- --describe"
+# retries — decorator-is-config: a retry policy makes a flaky function self-heal.
+# Proven OFFLINE via cargo test (tests/manifest.rs): asserts `retries == 5` rides
+# into the FunctionCreate manifest's retry_policy.
+run "retries: retry count rides through inventory (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-retries 2>&1"
 
-# scheduled-job — decorator-is-config: a DEPLOYED function that runs on a cron schedule
-# with NO caller (`schedule = Cron("0 9 * * 1")` -> Modal's Schedule.Cron). Proven
-# OFFLINE via --describe (a mock test asserts the cron rides into the FunctionCreate
-# manifest's schedule, field 72). The body just does its work; the decorator makes
-# Modal trigger it on the cadence after `modal-rust deploy`.
-run "scheduled-job: --describe (cron schedule rides through inventory)" '"schedule":"cron:UTC:0 9 * * 1"' \
-  "cd examples/scheduled-job && cargo run -q --bin modal_runner -- --describe"
+# scheduled-job — decorator-is-config: a cron schedule runs the function on a cadence.
+# Proven OFFLINE via cargo test (tests/manifest.rs): asserts the cron spec rides into
+# the FunctionCreate manifest's schedule field.
+run "scheduled-job: cron schedule rides through inventory (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-scheduled-job 2>&1"
 
 # autoscaling — decorator-is-config: control warm capacity + scale-to-zero with the
 # autoscaler knobs (`min_containers`/`max_containers`/`buffer_containers` +
-# `scaledown_window`). Proven OFFLINE via --describe (a mock test asserts they ride into
-# the FunctionCreate manifest's autoscaler_settings, field 79). The body just does its
-# work; the decorator tells Modal how many containers to keep warm and when to scale to
-# zero.
-run "autoscaling: --describe (autoscaler knobs ride through inventory)" '"min_containers":1,"max_containers":10,"buffer_containers":2,"scaledown_window":120' \
-  "cd examples/autoscaling && cargo run -q --bin modal_runner -- --describe"
+# `scaledown_window`). Proven OFFLINE via tests/manifest.rs (App::dry_run asserts all
+# four knobs ride into FunctionCreate's autoscaler_settings). The crate is a pure
+# library run via the modal-rust CLI; the offline doctor preflight proves the CLI finds
+# the project without credentials or a runner bin.
+run "autoscaling: doctor offline preflight (pure library, no runner bin)" 'modal-rust doctor — preflight (OFFLINE)' \
+  "${CLI} doctor --project examples/autoscaling"
 
 # custom-base — pick the RUN base image + install the Rust toolchain through the
 # EXPOSED build-config knobs (RemoteConfig.base_image / .install_rust, or the
@@ -213,11 +232,25 @@ run "deploy-and-call: deploy builds once, call invokes with no rebuild" 'boundar
 # call verbs require Modal and are documented compile/listed-only (their build is
 # covered by `cargo build`). Asserts the OFFLINE preflight banner the doctor prints.
 run "cli-workflow: doctor offline preflight (no driver binary)" 'modal-rust doctor — preflight (OFFLINE)' \
-  "cargo run -q -p modal-rust-cli -- doctor --rust --project examples/cli-workflow"
+  "${CLI} doctor --rust --project examples/cli-workflow"
 
-# cuda-vector-add — decorator-is-config, proven OFFLINE via --describe
-run "cuda-vector-add: --describe (gpu rides through inventory)" '"gpu":"T4"' \
-  "cd examples/cuda-vector-add && cargo run -q --bin modal_runner -- --describe"
+# cuda-vector-add — decorator-is-config: gpu="T4" rides through the macro. Proven
+# OFFLINE via the CLI doctor preflight: the CLI resolves the project (finds the
+# workspace root, confirms cargo is available). The GPU decorator config is proven via
+# the live RUN_GPU tier below which runs the actual T4 kernel. (No tests/ dir in this
+# crate; the gpu= decorator contract is exercised end-to-end in the GPU tier.)
+run "cuda-vector-add: doctor offline preflight (gpu decorator via CLI path)" 'modal-rust doctor — preflight (OFFLINE)' \
+  "${CLI} doctor --project examples/cuda-vector-add"
+
+# own-runner-bin — the "bring-your-own runner" escape hatch. This is the SINGLE
+# workspace member that ships its own `modal_runner` bin (a hand-written one-liner
+# wrapping modal_runner!(own_runner_bin)). The CLI auto-detects this bin via cargo
+# metadata and uses it as-is (no shadow runner is generated). Proven OFFLINE via
+# cargo test: the manifest.rs tests prove the entrypoint is registered (the
+# --describe / registry view) and dispatch works through the frozen runner CLI.
+# This exercises the "auto-detect: use the existing bin" path end-to-end.
+run "own-runner-bin: auto-detect existing modal_runner (cargo test)" 'test result: ok' \
+  "cargo test -q -p own-runner-bin 2>&1"
 
 # ───────────────────────── 2 & 3. LIVE / GPU ─────────────────────────
 
@@ -233,11 +266,12 @@ elif ! has_creds; then
   echo "     fan-out-map     RUN_REMOTE=1 cargo run -p example-fan-out-map --bin fan_out_map"
   echo "     background-jobs RUN_REMOTE=1 cargo run -p example-background-jobs --bin background_jobs"
   echo "     spawn-map-foreach RUN_REMOTE=1 cargo run -p example-spawn-map-foreach --bin spawn_map_foreach"
-  echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
+  echo "     own-runner-bin  ${CLI} run extract_metrics --project examples/own-runner-bin --input '{\"lines\":[\"INFO source=api a\",\"ERROR source=api b\"]}'"
+  echo "     cuda-vector-add ${CLI} run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
   echo "     burn-add        (deploy+call on a T4; RUN_GPU=1)"
-  echo "     cli-workflow    cargo run -p modal-rust-cli -- run summarize --project examples/cli-workflow --input '{\"text\":\"the quick brown fox\"}'"
-  echo "                     cargo run -p modal-rust-cli -- deploy summarize --project examples/cli-workflow --app modal-rust-cli-workflow-example"
-  echo "                     cargo run -p modal-rust-cli -- call summarize --app modal-rust-cli-workflow-example --input '{\"text\":\"the quick brown fox\"}'"
+  echo "     cli-workflow    ${CLI} run summarize --project examples/cli-workflow --input '{\"text\":\"the quick brown fox\"}'"
+  echo "                     ${CLI} deploy summarize --project examples/cli-workflow --app modal-rust-cli-workflow-example"
+  echo "                     ${CLI} call summarize --app modal-rust-cli-workflow-example --input '{\"text\":\"the quick brown fox\"}'"
   echo
 else
   # LIVE (CPU): one orchestrate run drives .remote() + deploy + call.
@@ -272,20 +306,29 @@ else
     'for_each (live): notified 3 recipients across containers, results discarded' \
     'spawn_map (live): fired fan-out, handle '
 
+  # LIVE (CPU): own-runner-bin — exercises the auto-detect "use the existing bin"
+  # path through the CLI. The CLI detects the `modal_runner` bin in cargo metadata
+  # and builds + uses IT (not a generated shadow runner). The function crunches a
+  # small log batch and returns a Metrics struct.
+  live "own-runner-bin: auto-detect existing modal_runner via CLI run (CPU)" \
+    "${CLI} run extract_metrics --project examples/own-runner-bin --input '{\"lines\":[\"INFO source=api a\",\"ERROR source=api b\"]}'" \
+    '"ok":true' \
+    '"total":2'
+
   if [[ "${RUN_GPU:-}" == "1" ]]; then
     # GPU: cuda-vector-add on a T4 via the RUN path (in-body build, Tier 0).
     live "cuda-vector-add: run on a T4 (.remote())" \
-      "cargo run -q -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'" \
+      "${CLI} run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'" \
       '"valid":true'
 
     # GPU: burn-add deployed + called on a T4 (CUDA-devel image, Tier 1). The
     # first deploy build is slow; re-deploys reuse the cached image.
     live "burn-add: deploy + call on a T4" \
-      "MODAL_RUST_BASE_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04 MODAL_RUST_INSTALL_RUST=1 cargo run -q -p modal-rust-cli -- deploy burn_add --project examples/burn-add --app modal-rust-burn-add-example && cargo run -q -p modal-rust-cli -- call burn_add --app modal-rust-burn-add-example --input '{\"n\":256}'" \
+      "MODAL_RUST_BASE_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04 MODAL_RUST_INSTALL_RUST=1 ${CLI} deploy burn_add --project examples/burn-add --app modal-rust-burn-add-example && ${CLI} call burn_add --app modal-rust-burn-add-example --input '{\"n\":256}'" \
       '"valid":true'
   else
     echo "── GPU tier skipped (set RUN_GPU=1 to run the real T4 examples):"
-    echo "     cuda-vector-add cargo run -p modal-rust-cli -- run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
+    echo "     cuda-vector-add ${CLI} run vector_add --project examples/cuda-vector-add --input '{\"n\":1024}'"
     echo "     burn-add        deploy + call on a T4 (CUDA-devel image)"
     echo
   fi

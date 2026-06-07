@@ -10,12 +10,6 @@ name = "example_deploy_and_call"
 path = "src/lib.rs"
 
 [[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-# This is the SAME binary the DEPLOY image bakes once and every `call` execs.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
-[[bin]]
 # The offline driver: projects BOTH the RUN and DEPLOY manifests (no Modal, no
 # network) and prints where each one builds the binary. Pure projection.
 name = "deploy_and_call"

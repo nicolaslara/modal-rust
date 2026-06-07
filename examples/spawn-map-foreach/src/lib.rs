@@ -26,7 +26,7 @@
 //! default runs the real handler in-process for every recipient (the local mirror of
 //! `.for_each(..)` — every side effect happens, results discarded); the live
 //! `.for_each([..])` / `.spawn_map([..])` shapes compile always and run only with
-//! Modal credentials. `src/bin/modal_runner.rs` is the one-line runner.
+//! Modal credentials. Run/deploy is driven by the modal-rust CLI (no runner bin needed).
 
 use modal_rust::function;
 use serde::{Deserialize, Serialize};

@@ -100,16 +100,57 @@ fn check_schema(schema: &str) -> Result<()> {
 /// Build the user crate's `modal_runner` and read its `--describe` manifest (P9 §C.3).
 ///
 /// Returns the parsed [`Manifest`] plus the resolved `(workspace_root, package)` the
-/// caller threads into `RemoteConfig`/`DeployConfig`.
+/// caller threads into `RemoteConfig`/`DeployConfig`. The returned `workspace_root` is
+/// ALWAYS the real on-disk root (the upload root run/deploy will scope) — never the
+/// temp shadow, which is local-build-only and removed before return.
+///
+/// Auto-detect (inject-bin, design B):
+/// - If the target crate ALREADY ships a `modal_runner` bin → build it at the real
+///   workspace root and run `target/release/modal_runner --describe` (today's path,
+///   backward-compatible, byte-identical).
+/// - Otherwise GENERATE: materialize a temp SHADOW copy of the crate's cargo
+///   dependency closure with the generated `src/bin/modal_runner.rs` injected, build
+///   `-p <pkg> --bin modal_runner` THERE (cwd = shadow root), and run the shadow's
+///   `target/release/modal_runner --describe`. The user's on-disk `src/` is never
+///   touched; the shadow resolves `modal-rust` identically to the real upload.
 fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, String)> {
     let root = workspace::workspace_root(project)?;
     // `-p <pkg>` disambiguates the shared `modal_runner` bin across workspace members
-    // (boundaries.md §8) — the SAME package the shims built.
+    // (boundaries.md §8) — the SAME package run/deploy build.
     let package = workspace::package_name(project)?;
 
-    // 1. LOCAL build (manifest-only; NOT uploaded). cwd = workspace root, inheriting
+    // Auto-detect: does the target ship its own `modal_runner` bin (or is it not
+    // generatable)? `resolve_runner_target` reads the SAME `cargo metadata` +
+    // target manifest the upload path uses, so the decision cannot drift.
+    let target = modal_rust::resolve_runner_target(&root, &package);
+    let generate = target.as_ref().map(|t| t.is_generatable()).unwrap_or(false);
+
+    // Pick the BUILD root: a temp shadow when generating, else the real root. Held in
+    // an Option so the shadow temp dir is cleaned up on EVERY exit path.
+    let shadow = if generate {
+        let t = target.as_ref().expect("generate => target resolved");
+        let dest = shadow_dir_for(&package);
+        // Best-effort clean of a stale shadow from a previous run, then materialize.
+        let _ = std::fs::remove_dir_all(&dest);
+        modal_rust::materialize_shadow(&root, t, &dest).with_context(|| {
+            format!(
+                "failed to materialize shadow build tree at {}",
+                dest.display()
+            )
+        })?;
+        Some(ShadowDir(dest))
+    } else {
+        None
+    };
+    let build_root: &Path = shadow.as_ref().map(|s| s.0.as_path()).unwrap_or(&root);
+
+    // 1. LOCAL build (manifest-only; NOT uploaded). cwd = the build root, inheriting
     //    stderr so the compile log streams. `Command::new("cargo")` — NOT `modal`.
-    eprintln!("modal-rust: building {package} modal_runner (cargo) for --describe …");
+    if generate {
+        eprintln!("modal-rust: generating {package} modal_runner (shadow build) for --describe …");
+    } else {
+        eprintln!("modal-rust: building {package} modal_runner (cargo) for --describe …");
+    }
     let status = Command::new("cargo")
         .args([
             "build",
@@ -119,7 +160,7 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
             "--bin",
             "modal_runner",
         ])
-        .current_dir(&root)
+        .current_dir(build_root)
         .status()
         .context("failed to spawn `cargo` (is it on $PATH? run `modal-rust doctor --rust`)")?;
     if !status.success() {
@@ -130,7 +171,10 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
     }
 
     // 2. Run `modal_runner --describe`, capture stdout, parse the manifest.
-    let runner_bin = root.join("target").join("release").join("modal_runner");
+    let runner_bin = build_root
+        .join("target")
+        .join("release")
+        .join("modal_runner");
     let out = Command::new(&runner_bin)
         .arg("--describe")
         .output()
@@ -147,7 +191,32 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
         .context("failed to parse `modal_runner --describe` manifest JSON")?;
     check_schema(&manifest.schema)?;
 
+    // The shadow (if any) is dropped here, removing the temp tree. The returned
+    // `root` is the REAL workspace root (the upload root), not the shadow.
+    drop(shadow);
     Ok((manifest, root, package))
+}
+
+/// A temp shadow build dir removed on drop (so `build_and_describe` cleans up on every
+/// exit path, including the `?`/`bail!` error paths).
+struct ShadowDir(std::path::PathBuf);
+
+impl Drop for ShadowDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A unique, gitignored temp dir for the `--describe` shadow build (PID + monotonic
+/// counter so concurrent `modal-rust describe` invocations never collide).
+fn shadow_dir_for(package: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "modal-rust-shadow-{package}-{}-{n}",
+        std::process::id()
+    ))
 }
 
 /// Print the runner's one-line JSON envelope VERBATIM to stdout and mirror its `ok`

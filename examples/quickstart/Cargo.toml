@@ -2,18 +2,12 @@
 name = "quickstart"
 version = "0.0.0"
 edition = "2021"
-description = "The README quickstart, as a real compiled+tested crate: the cleanest newcomer surface — a single `modal-rust` dep, a 3-line #[function], and a one-line modal_runner!(). No rename, no __private, no env var, no hand-written runner main()."
+description = "The README quickstart, as a real compiled+tested crate: the cleanest newcomer surface — a single `modal-rust` dep and a 3-line #[function]. No runner bin, no __private, no env var. The modal-rust CLI generates the runner automatically."
 publish = false
 
 [lib]
 name = "quickstart"
 path = "src/lib.rs"
-
-[[bin]]
-# The RUN/DEPLOY wrapper builds `--bin modal_runner`; this target's whole body is
-# one line: `modal_rust::modal_runner!(quickstart);`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
 
 [dependencies]
 # The ONE modal dependency. The `#[modal_rust::function]` macro routes its generated

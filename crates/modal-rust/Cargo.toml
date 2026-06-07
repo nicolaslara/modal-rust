@@ -44,6 +44,12 @@ toml_edit  = "0.22"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
+# Content-address the injected `modal_runner.rs` in the wire-delta mock test
+# (`run_injects_generated_runner_bin_when_absent`): the mock's `mount_put_file`
+# returns `exists=true` after a PROBE, so the bytes are proven via the MountFile's
+# `sha256_hex` matching `sha256(render_runner_main(..))`. Already in the lockfile via
+# the SDK upload path; pulled in directly here only for the test.
+sha2 = "0.10"
 # Self dev-dependency: activates the `testkit` feature for the facade's OWN
 # test/integration/example targets ONLY (cargo merges a self dev-dep's features
 # into the crate under test for those targets). This is how the mock-backend

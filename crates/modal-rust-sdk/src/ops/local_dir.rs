@@ -191,6 +191,23 @@ impl ModalClient {
         modalignore_name: &str,
         environment: Option<&str>,
     ) -> Result<String> {
+        self.mount_local_dir_with_inline(local_dir, remote_path, modalignore_name, environment, &[])
+            .await
+    }
+
+    /// [`mount_local_dir`](Self::mount_local_dir) plus `extra_inline_files`: in-memory
+    /// `(workspace-relative POSIX path, bytes)` appended verbatim, EXEMPT from ignore
+    /// matching and OVERWRITING any same-path walked file. The facade uses this on the
+    /// FALLBACK source-mount arm to inject the tooling-generated `modal_runner.rs` even
+    /// when cargo-metadata scoping is unavailable.
+    pub async fn mount_local_dir_with_inline(
+        &mut self,
+        local_dir: impl AsRef<Path>,
+        remote_path: &str,
+        modalignore_name: &str,
+        environment: Option<&str>,
+        extra_inline_files: &[(String, Vec<u8>)],
+    ) -> Result<String> {
         let local_dir = local_dir.as_ref();
         if !local_dir.is_dir() {
             return Err(Error::invalid(format!(
@@ -199,7 +216,7 @@ impl ModalClient {
             )));
         }
         let matcher = build_matcher(local_dir, modalignore_name)?;
-        let files = collect_files(local_dir, remote_path, &matcher)?;
+        let files = collect_files(local_dir, remote_path, &matcher, extra_inline_files)?;
         self.finalize_mount(files, local_dir, environment).await
     }
 
@@ -502,16 +519,28 @@ fn collect_files_for_dirs(
         files.push(read_local_file(path, mount_filename)?);
     }
 
-    // Inline extra files (the rewritten workspace Cargo.toml): bytes provided
-    // directly, mounted at `<remote_prefix>/<rel-posix>`, no ignore check. These take
-    // PRECEDENCE over a same-path walked/extra file (e.g. a Cargo.toml inside a
-    // closure crate dir at the workspace root) because they are inserted last with an
-    // explicit overwrite of any prior same-path entry.
+    append_inline_files(&mut files, &mut seen, remote_prefix, extra_inline_files);
+    Ok(files)
+}
+
+/// Append `extra_inline_files` (in-memory `(workspace-relative POSIX path, bytes)`)
+/// to `files`, mounted at `<remote_prefix>/<rel-posix>`, EXEMPT from ignore matching.
+/// Each takes PRECEDENCE over a same-path walked/extra file (e.g. the rewritten
+/// workspace `Cargo.toml` over the verbatim one, or the injected `modal_runner.rs`):
+/// inserted last with an explicit overwrite of any prior same-path entry. Shared by
+/// BOTH the closure collector and the fallback whole-dir collector so their inline
+/// semantics cannot drift.
+fn append_inline_files(
+    files: &mut Vec<LocalFile>,
+    seen: &mut HashSet<String>,
+    remote_prefix: &str,
+    extra_inline_files: &[(String, Vec<u8>)],
+) {
     for (rel_posix, data) in extra_inline_files {
         let rel_posix = rel_posix.trim_start_matches('/');
         let mount_filename = mount_path(remote_prefix, rel_posix);
-        // Overwrite any prior entry at this mount path (the rewritten manifest wins
-        // over the verbatim one a crate-dir walk might have emitted).
+        // Overwrite any prior entry at this mount path (the inline bytes win over a
+        // verbatim file a walk might have emitted).
         files.retain(|f| f.mount_filename != mount_filename);
         seen.insert(mount_filename.clone());
         files.push(LocalFile {
@@ -520,21 +549,23 @@ fn collect_files_for_dirs(
             mode: Some(0o644),
         });
     }
-
-    Ok(files)
 }
 
 /// FALLBACK collector: walk the whole `local_dir`, prune ignored directories early
 /// (directory pruning stops descent — critical for `target/`), and collect the
-/// surviving files as [`LocalFile`] with `<remote_prefix>/<rel-as-posix>` paths.
+/// surviving files as [`LocalFile`] with `<remote_prefix>/<rel-as-posix>` paths. Then
+/// append `extra_inline_files` (the injected `modal_runner.rs`) with the SAME
+/// overwrite-precedence + ignore-exemption as the closure collector.
 fn collect_files(
     local_dir: &Path,
     remote_prefix: &str,
     matcher: &Gitignore,
+    extra_inline_files: &[(String, Vec<u8>)],
 ) -> Result<Vec<LocalFile>> {
     let remote_prefix = normalize_remote_prefix(remote_prefix);
     let remote_prefix = remote_prefix.as_str();
     let mut files = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let walker = WalkDir::new(local_dir).into_iter().filter_entry(|entry| {
         // Always keep the root itself; prune any descendant dir/file whose RELATIVE
         // path is ignored (directory pruning stops descent into huge trees).
@@ -556,9 +587,11 @@ fn collect_files(
             .map_err(|e| Error::build(format!("path prefix error during walk: {e}")))?;
         let rel_posix = to_posix(rel);
         let mount_filename = mount_path(remote_prefix, &rel_posix);
+        seen.insert(mount_filename.clone());
         files.push(read_local_file(entry.path(), mount_filename)?);
     }
 
+    append_inline_files(&mut files, &mut seen, remote_prefix, extra_inline_files);
     Ok(files)
 }
 
@@ -826,7 +859,7 @@ mod tests {
     fn collect_files_fallback_prunes_and_maps_posix() {
         let dir = tempdir_with_files();
         let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
-        let mut files = collect_files(dir.path(), "/src", &m).unwrap();
+        let mut files = collect_files(dir.path(), "/src", &m, &[]).unwrap();
         files.sort_by(|a, b| a.mount_filename.cmp(&b.mount_filename));
         let names: Vec<&str> = files.iter().map(|f| f.mount_filename.as_str()).collect();
         assert_eq!(
@@ -840,9 +873,27 @@ mod tests {
     fn collect_files_fallback_handles_root_mount_prefix() {
         let dir = tempdir_with_files();
         let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
-        let files = collect_files(dir.path(), "/", &m).unwrap();
+        let files = collect_files(dir.path(), "/", &m, &[]).unwrap();
         assert!(files.iter().any(|f| f.mount_filename == "/Cargo.toml"));
         assert!(files.iter().all(|f| !f.mount_filename.starts_with("//")));
+    }
+
+    #[test]
+    fn collect_files_fallback_appends_inline_runner() {
+        // The fallback whole-dir walk also carries injected inline files (the generated
+        // `modal_runner.rs`), EXEMPT from ignore and at the right mount path.
+        let dir = tempdir_with_files();
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let inline = vec![(
+            "app/src/bin/modal_runner.rs".to_string(),
+            b"modal_rust::modal_runner!(app);\n".to_vec(),
+        )];
+        let files = collect_files(dir.path(), "/src", &m, &inline).unwrap();
+        let runner = files
+            .iter()
+            .find(|f| f.mount_filename == "/src/app/src/bin/modal_runner.rs")
+            .expect("injected runner present on the fallback path");
+        assert_eq!(runner.data, b"modal_rust::modal_runner!(app);\n");
     }
 
     /// Build a small temp tree: Cargo.toml, sub/main.rs, target/junk (ignored),

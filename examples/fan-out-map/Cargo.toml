@@ -10,11 +10,6 @@ name = "example_fan_out_map"
 path = "src/lib.rs"
 
 [[bin]]
-# The RUN/DEPLOY runner — its whole body is one line: `modal_rust::modal_runner!(..)`.
-name = "modal_runner"
-path = "src/bin/modal_runner.rs"
-
-[[bin]]
 # The driver tour: the offline local fan-out runs in `cargo run`; the live
 # `.map([..])` fan-out across containers compiles always, runs only with credentials.
 name = "fan_out_map"

@@ -712,10 +712,17 @@ impl ControlPlane for LiveControlPlane<'_> {
         // local_root minus ignored files. Both prune via `.modalignore` > `.gitignore`
         // > built-in defaults (resolved in the SDK). The per-file PUT/probe + blob
         // upload are encapsulated inside these SDK calls.
-        match (
-            source.use_cargo_scoping,
-            crate::scope::workspace_closure(source.local_root, source.package),
-        ) {
+        //
+        // A HARD scoping error (e.g. a normal path-dep escaping the workspace, whose
+        // source the upload cannot carry) is surfaced as `Error::Config` — NOT swallowed
+        // into the whole-root fallback, which would fail the same cryptic way remotely.
+        let scoped = if source.use_cargo_scoping {
+            crate::scope::workspace_closure(source.local_root, source.package)
+                .map_err(Error::config)?
+        } else {
+            None
+        };
+        match (source.use_cargo_scoping, scoped) {
             (true, Some(closure)) => {
                 let spec = modal_rust_sdk::WorkspaceClosureSpec {
                     workspace_root: source.local_root,
@@ -729,15 +736,28 @@ impl ControlPlane for LiveControlPlane<'_> {
                     .mount_workspace_closure(&spec, remote_path, None)
                     .await?)
             }
-            _ => Ok(self
-                .client
-                .mount_local_dir(
-                    source.local_root,
-                    remote_path,
-                    source.modalignore_name,
-                    None,
-                )
-                .await?),
+            _ => {
+                // FALLBACK whole-dir upload (no cargo scoping or metadata unavailable).
+                // Still inject the tooling-generated `modal_runner` bin when the target
+                // is generatable (this path runs its own `cargo metadata` via
+                // `injected_runner_file`; on the mock's synthetic no-facade crate it
+                // returns `None`, so the wire stays frozen). Auto-detect crates and
+                // facade-less crates inject nothing.
+                let inline =
+                    crate::runner_gen::injected_runner_file(source.local_root, source.package)
+                        .map(|f| vec![f])
+                        .unwrap_or_default();
+                Ok(self
+                    .client
+                    .mount_local_dir_with_inline(
+                        source.local_root,
+                        remote_path,
+                        source.modalignore_name,
+                        None,
+                        &inline,
+                    )
+                    .await?)
+            }
         }
     }
 

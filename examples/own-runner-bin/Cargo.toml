@@ -1,0 +1,33 @@
+[package]
+name = "own-runner-bin"
+version = "0.0.0"
+edition = "2021"
+description = "Bring-your-own runner bin: a macro example that ships its OWN `modal_runner` target (for extra startup logic) instead of relying on the CLI's auto-generated one. The CLI auto-detects this `modal_runner` bin and uses it as-is. The SINGLE workspace member that keeps a bin named `modal_runner`."
+publish = false
+
+[lib]
+name = "own_runner_bin"
+path = "src/lib.rs"
+
+[[bin]]
+# The POINT of this example: a HAND-WRITTEN `modal_runner` target. The CLI's
+# run/deploy/--describe paths auto-detect a `modal_runner` bin via cargo metadata
+# and use it as-is (no shadow runner is generated). Its whole body is still the
+# one-line macro — `modal_rust::modal_runner!(own_runner_bin)` — but because it
+# lives in the user's tree you OWN it and can add startup logic around it.
+name = "modal_runner"
+path = "src/bin/modal_runner.rs"
+
+[dependencies]
+# The ONE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::function]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+# Test-only: the offline `tests/manifest.rs` parses the runner's JSON envelope to
+# assert the frozen `--describe`/dispatch shape. The shipped library/runner needs no
+# direct serde_json — it goes through the facade — so this stays out of [dependencies].
+serde_json = "1"
