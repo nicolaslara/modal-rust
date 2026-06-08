@@ -39,10 +39,9 @@ fn named_secret_rides_into_function_create() {
         .expect("dry_run projects the RUN manifest");
 
     // 1. The named secret is resolved before FunctionCreate.
-    let resolved = manifest
-        .requests
-        .iter()
-        .any(|r| matches!(r, PlannedRequest::SecretGetOrCreate { name } if name == "my-api-key"));
+    let resolved = manifest.requests.iter().any(
+        |r| matches!(r, PlannedRequest::SecretGetOrCreate { name, .. } if name == "my-api-key"),
+    );
     assert!(
         resolved,
         "the decorator's `my-api-key` secret is resolved (SecretGetOrCreate)"

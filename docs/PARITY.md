@@ -89,8 +89,8 @@ Everything past this point is a gap.
 | Feature | Status | Note (Modal ref) |
 |---|---|---|
 | Named secret in decorator (`from_name`) | **Have** | `#[function(secrets=["x"])]` → `secret_get_or_create` → `Function.secret_ids`. `ops/secret.rs:40`. |
-| `required_keys` assertion on `from_name` | **Partial** | SDK plumbs `required_keys` into `SecretGetOrCreateRequest` (`ops/secret.rs:40`), but the **macro has no syntax to set it** — always passed empty. Modal `secret.py:406`. Small effort: add a decorator field. |
-| Inline `Secret.from_dict({...})` in decorator | **Missing** | The SDK has `secret_from_dict` (`ops/secret.rs:72`, `CREATE_IF_MISSING`), but it is used only by tests to provision ephemeral secrets — not exposed in `#[function(...)]`. Modal also supports the bare `env={...}` kwarg on `app.function` (`app.py:889` → `Secret.from_dict(env)`). Medium effort: macro syntax + facade resolve. |
+| `required_keys` assertion on `from_name` | **Have** | `#[function(secrets=["x"], required_keys=["API_KEY", ..])]` threads the asserted keys into `secret_get_or_create` → `SecretGetOrCreateRequest.required_keys`, so Modal errors if a key is missing. One flat list applied to all named secrets (v0). Modal `secret.py:406`. `ops/secret.rs:40`. |
+| Inline `Secret.from_dict({...})` in decorator | **Have** | `#[function(env={"K"="V", ..})]` mirrors Modal's `app.function(env=..)` (`app.py:889` → `Secret.from_dict(env)`): the facade derives a deterministic per-entrypoint secret name and resolves it via `secret_from_dict` (`ops/secret.rs:72`, `CREATE_IF_MISSING`, idempotent), pushing the id into the SAME `Function.secret_ids` list named secrets use — so `env` and `secrets` compose. |
 | `Secret.from_dotenv()` / `.env` file | **Missing** | `secret.py:341`. No file parsing. |
 | `Secret.from_local_environ([...])` | **Missing** | `secret.py:315` (forward selected host env vars). |
 
@@ -151,7 +151,7 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `name` (801) | **Have** | `#[function(name = "...")]`. |
 | `cpu` (790) | **Partial** | SDK `FunctionResources.milli_cpu` exists (`ops/function.rs:55`) and flows to `Resources`, but the **decorator cannot set it** (always server default). Modal supports `float` or `(request, limit)` tuple. |
 | `memory` (791) | **Partial** | Same: `FunctionResources.memory_mb` exists but is not settable from the decorator. Modal supports `int` or `(request, limit)`. |
-| `retries` (798) | **Have** (int form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), riding into `Function.retry_policy`. Mirrors `_parse_retries(int)`. The `Retries(...)` struct form (custom backoff/delays) is not yet exposed. `ops/function.rs` `with_retries`. |
+| `retries` (798) | **Have** (int + struct form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), mirroring `_parse_retries(int)`. The STRUCT form `#[function(retries = Retries(max_retries = N[, backoff_coefficient = f][, initial_delay = s][, max_delay = s]))]` sets custom backoff/delays (seconds → `initial_delay_ms`/`max_delay_ms`), mirroring `Retries(..)` (`retries.py`). Both ride into `Function.retry_policy`. `ops/function.rs` `with_retries` / `with_retry_policy`. |
 | `schedule` (783) | **Have** | `#[function(schedule = Cron("..")/Period(..))]` → `Function.schedule` (field 72) as a `Schedule.Cron`/`Schedule.Period`, mirroring `schedule.py:12/61`. The macro canonicalizes the call form to a spec the SDK's `parse_schedule` parses; `with_schedule` rides it into the deploy FunctionCreate. See §8. |
 | `min_containers` / `max_containers` / `buffer_containers` (793-795) | **Have** | `#[function(min_containers = .., max_containers = .., buffer_containers = ..)]` → `Function.autoscaler_settings` (field 79) + the deprecated mirror fields Modal still sets (`warm_pool_size`/`concurrency_limit`/`_experimental_buffer_containers`), mirroring `_functions.py:764-768,1019-1021`. Validated like Modal (`max >= min`). `ops/function.rs` `with_autoscaler`; `examples/autoscaling`. |
 | `scaledown_window` (796) | **Have** | `#[function(scaledown_window = <secs>)]` → `Function.autoscaler_settings.scaledown_window` + the legacy `task_idle_timeout_secs`, mirroring `_functions.py:768,1022`. Validated `> 0` (Modal `_functions.py:761`). `with_autoscaler`. |
@@ -169,10 +169,11 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `max_inputs` / `single_use_containers` (815) | **Missing** | Single-use containers. |
 | Clustered (`i6pn`, `cluster_size`, `rdma`) | **Missing** | Multi-node clustered functions (`_clustered_functions.py`, experimental). |
 
-The high-value, cheap wins here were **`cpu` / `memory`**, **`retries`**, and
-**autoscaling** (`min`/`max`/`buffer_containers` + `scaledown_window`) — all now
-**Have** (int-form `retries`); the remaining cheap win is the `Retries(...)` struct
-form for custom backoff/delays.
+The high-value, cheap wins here — **`cpu` / `memory`**, **`retries`** (both the
+int form AND the `Retries(...)` struct form for custom backoff/delays), and
+**autoscaling** (`min`/`max`/`buffer_containers` + `scaledown_window`) — are all now
+**Have**. The remaining decorator gaps (`@concurrent`, `@batched`, region/cloud, …)
+are M-sized or runtime-coupled.
 
 ---
 
@@ -297,13 +298,17 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
 
 1. **`cpu` / `memory` decorator fields** — SDK already plumbs them
    (`FunctionResources`); only the macro/facade wiring is missing. Cheapest win.
-2. ~~**`retries`**~~ — DONE (int form): `#[function(retries = N)]` → `retry_policy`.
-   Remaining: the `Retries(...)` struct form (custom backoff/initial/max delay).
+2. ~~**`retries`**~~ — DONE (int + struct form): `#[function(retries = N)]` and
+   `#[function(retries = Retries(max_retries = N, backoff_coefficient = f,
+   initial_delay = s, max_delay = s))]` → `retry_policy` (`with_retries` /
+   `with_retry_policy`).
 3. ~~**General `pip_install` / `apt_install` / `run_commands` image steps**~~ — DONE:
    `RemoteConfig::image_steps` / `DeployConfig::image_steps` carry ordered `ImageStep`s
    (`apt`/`pip`/`run`) rendered into the image dockerfile; `examples/pip-apt-image`.
-4. **Inline `secrets = {dict}` / `required_keys`** — `required_keys` is a one-field
-   macro addition (SDK-side done); inline dict needs facade resolve.
+4. ~~**Inline `secrets = {dict}` / `required_keys`**~~ — DONE:
+   `#[function(secrets=[..], required_keys=[..])]` threads asserted keys into
+   `from_name`; `#[function(env={"K"="V", ..})]` resolves an inline `Secret.from_dict`
+   into the same `Function.secret_ids` (so `env` + `secrets` compose).
 5. ~~**`min/max/buffer_containers` + `scaledown_window`**~~ — DONE: static autoscaling
    control via `#[function(min_containers = .., max_containers = .., buffer_containers =
    .., scaledown_window = ..)]` → `Function.autoscaler_settings`; `examples/autoscaling`.

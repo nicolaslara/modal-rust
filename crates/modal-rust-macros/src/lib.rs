@@ -209,12 +209,15 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut milli_cpu: Option<u32> = None; // cpu = 2.0 (cores) -> milli_cpu = 2000
     let mut memory_mb: Option<u32> = None; // memory = 4096 (MiB)
     let mut retries: Option<u32> = None; // retries = 3 (retry count)
+    let mut retries_spec: Option<String> = None; // retries = Retries(..) -> spec string
     let mut schedule: Option<String> = None; // schedule = Cron("..") / Period(..) -> spec string
     let mut min_containers: Option<u32> = None; // min_containers = 1 (autoscaler floor)
     let mut max_containers: Option<u32> = None; // max_containers = 5 (autoscaler ceiling)
     let mut buffer_containers: Option<u32> = None; // buffer_containers = 2 (warm buffer)
     let mut scaledown_window: Option<u32> = None; // scaledown_window = 120 (idle secs)
     let mut secrets: Vec<String> = Vec::new(); // secrets = ["a", "b"]
+    let mut required_keys: Vec<String> = Vec::new(); // required_keys = ["API_KEY", ..]
+    let mut env: Vec<(String, String)> = Vec::new(); // env = {"K" = "V", ..} -> inline secret
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     if !attr.is_empty() {
         let parser = syn::meta::parser(|meta| {
@@ -247,12 +250,21 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 memory_mb = Some(lit.base10_parse()?); // bad int -> compile_error!
                 Ok(())
             } else if meta.path.is_ident("retries") {
-                // retries = <count> — the number of automatic retries, mirroring
-                // Modal's bare-int `retries` kwarg (a fixed-interval policy). The
-                // facade builds the FunctionRetryPolicy from this count. A plain
-                // `Option<u32>` const-valid in the `static` initializer (like timeout).
-                let lit: LitInt = meta.value()?.parse()?;
-                retries = Some(lit.base10_parse()?); // bad int -> compile_error!
+                // retries = <count>  OR  retries = Retries(max_retries = N, ..)
+                //
+                // Two forms (peek the value): a bare INT literal keeps the current
+                // fixed-interval shortcut (`retries: Some(u32)`, mirroring Modal's
+                // bare-int `retries`); a `Retries(..)` CALL is the STRUCT form (custom
+                // backoff/delays), canonicalized to a const SPEC string the facade hands
+                // to the SDK's `parse_retries_spec` (same trick as `schedule`, keeping it
+                // const-valid in the `static`). The two are mutually exclusive.
+                let value = meta.value()?;
+                if value.peek(LitInt) {
+                    let lit: LitInt = value.parse()?;
+                    retries = Some(lit.base10_parse()?); // bad int -> compile_error!
+                } else {
+                    retries_spec = Some(parse_retries_to_spec(value)?);
+                }
                 Ok(())
             } else if meta.path.is_ident("schedule") {
                 // schedule = Cron("expr"[, "tz"])  OR  Period(days = 1, hours = 4, ..)
@@ -296,6 +308,26 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                     secrets.push(s.value());
                 }
                 Ok(())
+            } else if meta.path.is_ident("required_keys") {
+                // required_keys = ["API_KEY", "DB_URL"] — a bracketed list of string
+                // literals the facade asserts exist on the named `secrets = [..]` (one
+                // flat list applied to all named secrets in v0). Mirrors Modal's
+                // `Secret.from_name(.., required_keys=[..])`.
+                for s in parse_str_list(meta.value()?)? {
+                    required_keys.push(s.value());
+                }
+                Ok(())
+            } else if meta.path.is_ident("env") {
+                // env = {"API_TOKEN" = "dev", "REGION" = "us"} — an INLINE secret as a
+                // brace-delimited map of `LitStr = LitStr` pairs, mirroring Modal's
+                // `app.function(env={..})` → `Secret.from_dict(env)`. The facade derives
+                // a deterministic per-entrypoint secret deployment name and resolves it
+                // via `secret_from_dict` (CREATE_IF_MISSING), pushing the id into the
+                // SAME secret_ids list named secrets use (so `env` + `secrets` compose).
+                for (k, v) in parse_str_map(meta.value()?)? {
+                    env.push((k.value(), v.value()));
+                }
+                Ok(())
             } else if meta.path.is_ident("volumes") {
                 // volumes = ["/data=my-vol", ..] — a bracketed list of "MOUNT=NAME"
                 // string literals. Split on the FIRST '=' into (mount_path, name).
@@ -331,10 +363,12 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "unsupported `#[modal_rust::function]` argument; recognized: \
                      `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
                      `cache = <bool>`, `cpu = <cores>`, `memory = <MiB>`, \
-                     `retries = <count>`, `schedule = Cron(\"..\")/Period(..)`, \
+                     `retries = <count>` or `retries = Retries(max_retries = N, ..)`, \
+                     `schedule = Cron(\"..\")/Period(..)`, \
                      `min_containers = <N>`, `max_containers = <N>`, \
                      `buffer_containers = <N>`, `scaledown_window = <secs>`, \
-                     `secrets = [\"name\", ..]`, `volumes = [\"/mount=name\", ..]`",
+                     `secrets = [\"name\", ..]`, `required_keys = [\"KEY\", ..]`, \
+                     `env = {\"K\" = \"V\", ..}`, `volumes = [\"/mount=name\", ..]`",
                 ))
             }
         });
@@ -417,12 +451,15 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             milli_cpu,
             memory_mb,
             retries,
+            retries_spec.as_deref(),
             schedule.as_deref(),
             min_containers,
             max_containers,
             buffer_containers,
             scaledown_window,
             &secrets,
+            &required_keys,
+            &env,
             &volumes,
         );
     }
@@ -546,12 +583,15 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         milli_cpu,
         memory_mb,
         retries,
+        retries_spec.as_deref(),
         schedule.as_deref(),
         min_containers,
         max_containers,
         buffer_containers,
         scaledown_window,
         &secrets,
+        &required_keys,
+        &env,
         &volumes,
     );
 
@@ -580,6 +620,7 @@ struct ClsConfig {
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
     retries: Option<u32>,
+    retries_spec: Option<String>,
     schedule: Option<String>,
     min_containers: Option<u32>,
     max_containers: Option<u32>,
@@ -587,6 +628,8 @@ struct ClsConfig {
     scaledown_window: Option<u32>,
     // `None` = unset (inherit). `Some(vec)` = explicitly set (override, even if empty).
     secrets: Option<Vec<String>>,
+    required_keys: Option<Vec<String>>,
+    env: Option<Vec<(String, String)>>,
     volumes: Option<Vec<(String, String)>>,
 }
 
@@ -603,12 +646,21 @@ impl ClsConfig {
             milli_cpu: over.milli_cpu.or(self.milli_cpu),
             memory_mb: over.memory_mb.or(self.memory_mb),
             retries: over.retries.or(self.retries),
+            retries_spec: over
+                .retries_spec
+                .clone()
+                .or_else(|| self.retries_spec.clone()),
             schedule: over.schedule.clone().or_else(|| self.schedule.clone()),
             min_containers: over.min_containers.or(self.min_containers),
             max_containers: over.max_containers.or(self.max_containers),
             buffer_containers: over.buffer_containers.or(self.buffer_containers),
             scaledown_window: over.scaledown_window.or(self.scaledown_window),
             secrets: over.secrets.clone().or_else(|| self.secrets.clone()),
+            required_keys: over
+                .required_keys
+                .clone()
+                .or_else(|| self.required_keys.clone()),
+            env: over.env.clone().or_else(|| self.env.clone()),
             volumes: over.volumes.clone().or_else(|| self.volumes.clone()),
         }
     }
@@ -644,8 +696,15 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
             cfg.memory_mb = Some(lit.base10_parse()?);
             Ok(())
         } else if meta.path.is_ident("retries") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.retries = Some(lit.base10_parse()?);
+            // Bare int (fixed-interval shortcut) OR the `Retries(..)` struct form, same
+            // peek as `#[function]`.
+            let value = meta.value()?;
+            if value.peek(LitInt) {
+                let lit: LitInt = value.parse()?;
+                cfg.retries = Some(lit.base10_parse()?);
+            } else {
+                cfg.retries_spec = Some(parse_retries_to_spec(value)?);
+            }
             Ok(())
         } else if meta.path.is_ident("schedule") {
             cfg.schedule = Some(parse_schedule_to_spec(meta.value()?)?);
@@ -671,6 +730,22 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
                 parse_str_list(meta.value()?)?
                     .iter()
                     .map(|s| s.value())
+                    .collect(),
+            );
+            Ok(())
+        } else if meta.path.is_ident("required_keys") {
+            cfg.required_keys = Some(
+                parse_str_list(meta.value()?)?
+                    .iter()
+                    .map(|s| s.value())
+                    .collect(),
+            );
+            Ok(())
+        } else if meta.path.is_ident("env") {
+            cfg.env = Some(
+                parse_str_map(meta.value()?)?
+                    .into_iter()
+                    .map(|(k, v)| (k.value(), v.value()))
                     .collect(),
             );
             Ok(())
@@ -710,7 +785,7 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
                 "unsupported `#[cls]`/`#[method]` argument; recognized: `gpu`, \
                  `timeout`, `cache`, `cpu`, `memory`, `retries`, `schedule`, \
                  `min_containers`, `max_containers`, `buffer_containers`, \
-                 `scaledown_window`, `secrets`, `volumes`",
+                 `scaledown_window`, `secrets`, `required_keys`, `env`, `volumes`",
             ))
         }
     });
@@ -1346,6 +1421,10 @@ fn cls_config_to_registration(
     let milli_cpu_tok = opt_u32(cfg.milli_cpu);
     let memory_mb_tok = opt_u32(cfg.memory_mb);
     let retries_tok = opt_u32(cfg.retries);
+    let retries_spec_tok = match &cfg.retries_spec {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
     let schedule_tok = match &cfg.schedule {
         Some(s) => quote! { ::core::option::Option::Some(#s) },
         None => quote! { ::core::option::Option::None },
@@ -1356,6 +1435,20 @@ fn cls_config_to_registration(
     let scaledown_tok = opt_u32(cfg.scaledown_window);
     let secrets_tok = {
         let items = cfg.secrets.clone().unwrap_or_default();
+        quote! { &[ #( #items ),* ] }
+    };
+    let required_keys_tok = {
+        let items = cfg.required_keys.clone().unwrap_or_default();
+        quote! { &[ #( #items ),* ] }
+    };
+    let env_tok = {
+        let items = cfg
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| quote! { (#k, #v) })
+            .collect::<Vec<_>>();
         quote! { &[ #( #items ),* ] }
     };
     let volumes_tok = {
@@ -1377,12 +1470,15 @@ fn cls_config_to_registration(
             milli_cpu: #milli_cpu_tok,
             memory_mb: #memory_mb_tok,
             retries: #retries_tok,
+            retries_spec: #retries_spec_tok,
             schedule: #schedule_tok,
             min_containers: #min_tok,
             max_containers: #max_tok,
             buffer_containers: #buffer_tok,
             scaledown_window: #scaledown_tok,
             secrets: #secrets_tok,
+            required_keys: #required_keys_tok,
+            env: #env_tok,
             volumes: #volumes_tok,
         }
     }
@@ -1499,12 +1595,15 @@ fn emit_registration(
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
     retries: Option<u32>,
+    retries_spec: Option<&str>,
     schedule: Option<&str>,
     min_containers: Option<u32>,
     max_containers: Option<u32>,
     buffer_containers: Option<u32>,
     scaledown_window: Option<u32>,
     secrets: &[String],
+    required_keys: &[String],
+    env: &[(String, String)],
     volumes: &[(String, String)],
 ) -> TokenStream {
     let registration = build_registration(
@@ -1518,12 +1617,15 @@ fn emit_registration(
         milli_cpu,
         memory_mb,
         retries,
+        retries_spec,
         schedule,
         min_containers,
         max_containers,
         buffer_containers,
         scaledown_window,
         secrets,
+        required_keys,
+        env,
         volumes,
     );
     quote! {
@@ -1563,12 +1665,15 @@ fn build_registration(
     milli_cpu: Option<u32>,
     memory_mb: Option<u32>,
     retries: Option<u32>,
+    retries_spec: Option<&str>,
     schedule: Option<&str>,
     min_containers: Option<u32>,
     max_containers: Option<u32>,
     buffer_containers: Option<u32>,
     scaledown_window: Option<u32>,
     secrets: &[String],
+    required_keys: &[String],
+    env: &[(String, String)],
     volumes: &[(String, String)],
 ) -> proc_macro2::TokenStream {
     let gpu_tok = match gpu {
@@ -1604,6 +1709,14 @@ fn build_registration(
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
+    // `retries_spec` is the canonicalized `Retries(..)` STRUCT form as a `&'static str`
+    // SPEC (the facade hands it to the SDK's `parse_retries_spec`), const-valid in the
+    // `static` initializer exactly like `gpu`/`schedule`. `None` emits `None` =>
+    // byte-identical to a bare decorator (the int form / no retries stays unchanged).
+    let retries_spec_tok = match retries_spec {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
     // Each autoscaler knob is a plain `Option<u32>` const-valid in the `static`
     // initializer (exactly like `timeout`/`retries`). `None` emits `None` =>
     // byte-identical to a bare decorator (no autoscaler_settings on the wire).
@@ -1628,6 +1741,18 @@ fn build_registration(
     // empty list emits `&[]`, byte-identical to the bare default.
     let secrets_tok = {
         let items = secrets.iter();
+        quote! { &[ #( #items ),* ] }
+    };
+    // `required_keys` (asserted on the named secrets) + `env` (inline-secret key/values)
+    // are `&'static` slices on `FunctionConfig`, const-valid in the `static` initializer
+    // exactly like `secrets`/`volumes`. Empty lists emit `&[]`, byte-identical to the
+    // bare default.
+    let required_keys_tok = {
+        let items = required_keys.iter();
+        quote! { &[ #( #items ),* ] }
+    };
+    let env_tok = {
+        let items = env.iter().map(|(k, v)| quote! { (#k, #v) });
         quote! { &[ #( #items ),* ] }
     };
     let volumes_tok = {
@@ -1655,12 +1780,15 @@ fn build_registration(
                     milli_cpu: #milli_cpu_tok,
                     memory_mb: #memory_mb_tok,
                     retries: #retries_tok,
+                    retries_spec: #retries_spec_tok,
                     schedule: #schedule_tok,
                     min_containers: #min_containers_tok,
                     max_containers: #max_containers_tok,
                     buffer_containers: #buffer_containers_tok,
                     scaledown_window: #scaledown_window_tok,
                     secrets: #secrets_tok,
+                    required_keys: #required_keys_tok,
+                    env: #env_tok,
                     volumes: #volumes_tok,
                 },
                 // Capture the USER crate's cargo package name HERE — this macro
@@ -1834,6 +1962,194 @@ fn parse_str_list(input: syn::parse::ParseStream) -> syn::Result<Vec<LitStr>> {
     syn::bracketed!(content in input);
     let items: Punctuated<LitStr, Token![,]> = Punctuated::parse_terminated(&content)?;
     Ok(items.into_iter().collect())
+}
+
+/// Parse a brace-delimited map of `LitStr = LitStr` pairs from a `meta.value()` parse
+/// stream: `{"K" = "V", "K2" = "V2"}`. Used by `env = {..}` (the inline secret). Map
+/// syntax IS parseable in the meta parser as a braced group of comma-separated
+/// `name = value` string-literal assignments. Returns the `(key, value)` [`LitStr`]
+/// pairs (keeping spans for diagnostics). An empty map `{}` is allowed (yields no
+/// pairs). A duplicate key is rejected (it would silently clobber an env var).
+fn parse_str_map(input: syn::parse::ParseStream) -> syn::Result<Vec<(LitStr, LitStr)>> {
+    let content;
+    syn::braced!(content in input);
+    let mut pairs: Vec<(LitStr, LitStr)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while !content.is_empty() {
+        let key: LitStr = content.parse()?;
+        content.parse::<Token![=]>()?;
+        let value: LitStr = content.parse()?;
+        if !seen.insert(key.value()) {
+            return Err(syn::Error::new_spanned(
+                &key,
+                format!("duplicate `env` key {:?}", key.value()),
+            ));
+        }
+        pairs.push((key, value));
+        // Allow a trailing comma; stop at the end of the braced group otherwise.
+        if content.is_empty() {
+            break;
+        }
+        content.parse::<Token![,]>()?;
+    }
+    Ok(pairs)
+}
+
+/// Parse a `retries = Retries(..)` STRUCT-form value into a canonical SPEC string the
+/// SDK's `parse_retries_spec` understands. Call-shaped, exactly like `Cron(..)` /
+/// `Period(..)`, mirroring Modal's `Retries(max_retries, backoff_coefficient,
+/// initial_delay, max_delay)` (`retries.py`):
+///
+/// - `max_retries` (REQUIRED, int) → `max=<N>` (the retry count).
+/// - `backoff_coefficient` (optional, float; default `1.0`) → `backoff=<f>`.
+/// - `initial_delay` (optional, SECONDS, int or float; default `1.0`) → `initial_ms=<ms>`.
+/// - `max_delay` (optional, SECONDS, int or float; default `60.0`) → `max_ms=<ms>`.
+///
+/// Seconds are converted to integer milliseconds HERE (Modal stores
+/// `initial_delay_ms`/`max_delay_ms`), so the spec stays a flat `&'static str`. Only
+/// the components present are emitted (the SDK fills the rest with Modal's defaults).
+/// A malformed form becomes a `compile_error!` so the user learns at compile time.
+fn parse_retries_to_spec(input: syn::parse::ParseStream) -> syn::Result<String> {
+    let call: syn::ExprCall = input.parse().map_err(|_| {
+        syn::Error::new(
+            input.span(),
+            "`retries` must be a bare integer (`retries = 5`) or the struct form \
+             `retries = Retries(max_retries = N[, backoff_coefficient = f] \
+             [, initial_delay = s][, max_delay = s])`",
+        )
+    })?;
+    let kind = match call.func.as_ref() {
+        Expr::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default(),
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                "`retries` struct form must call `Retries(..)`",
+            ))
+        }
+    };
+    if kind != "Retries" {
+        return Err(syn::Error::new_spanned(
+            &call.func,
+            format!("unknown retries kind {kind:?}; expected the `Retries(..)` struct form"),
+        ));
+    }
+    let mut max_retries: Option<String> = None;
+    let mut parts: Vec<String> = Vec::new();
+    for arg in &call.args {
+        let Expr::Assign(assign) = arg else {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "Retries components must be `name = value`, e.g. `max_retries = 5`",
+            ));
+        };
+        let Expr::Path(name_path) = assign.left.as_ref() else {
+            return Err(syn::Error::new_spanned(
+                &assign.left,
+                "Retries component name must be a bare identifier (e.g. `max_retries`)",
+            ));
+        };
+        let name = name_path
+            .path
+            .get_ident()
+            .map(|i| i.to_string())
+            .ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &assign.left,
+                    "Retries component name must be an identifier",
+                )
+            })?;
+        match name.as_str() {
+            "max_retries" => max_retries = Some(format!("max={}", expect_u32_lit(&assign.right)?)),
+            "backoff_coefficient" => {
+                parts.push(format!("backoff={}", expect_f64_lit(&assign.right)?))
+            }
+            "initial_delay" => parts.push(format!("initial_ms={}", secs_lit_to_ms(&assign.right)?)),
+            "max_delay" => parts.push(format!("max_ms={}", secs_lit_to_ms(&assign.right)?)),
+            other => {
+                return Err(syn::Error::new_spanned(
+                    &assign.left,
+                    format!(
+                        "unknown Retries component {other:?}; expected one of \
+                         `max_retries`, `backoff_coefficient`, `initial_delay`, `max_delay`"
+                    ),
+                ))
+            }
+        }
+    }
+    let max_retries = max_retries.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &call,
+            "Retries requires `max_retries = N` (the retry count), e.g. \
+             `Retries(max_retries = 5)`",
+        )
+    })?;
+    // `max` first, then the optional components in the order written.
+    let mut all = vec![max_retries];
+    all.extend(parts);
+    Ok(format!("retries:{}", all.join(",")))
+}
+
+/// Extract a non-negative integer (`u32`) from a numeric-literal call argument, or a
+/// clear `compile_error!`. Used for `max_retries`.
+fn expect_u32_lit(expr: &Expr) -> syn::Result<u32> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(i), ..
+        }) => i.base10_parse(),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "expected a non-negative integer literal",
+        )),
+    }
+}
+
+/// Extract an `f64` from a numeric-literal call argument (accepts a float OR an int),
+/// rendered verbatim for the spec. Used for `backoff_coefficient`.
+fn expect_f64_lit(expr: &Expr) -> syn::Result<f64> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Float(f), ..
+        }) => f.base10_parse(),
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(i), ..
+        }) => Ok(i.base10_parse::<u64>()? as f64),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "expected a number (float or int)",
+        )),
+    }
+}
+
+/// Convert a delay given in SECONDS (a float or int literal) to integer MILLISECONDS,
+/// mirroring Modal storing `initial_delay_ms`/`max_delay_ms`. Truncates toward zero
+/// (like Modal's `int(1000 * secs)`). Rejects negative / non-finite values.
+fn secs_lit_to_ms(expr: &Expr) -> syn::Result<u32> {
+    let secs: f64 = match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Float(f), ..
+        }) => f.base10_parse()?,
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(i), ..
+        }) => i.base10_parse::<u64>()? as f64,
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                "delay must be a number of SECONDS (float or int), e.g. `0.5` or `30`",
+            ))
+        }
+    };
+    if secs < 0.0 || !secs.is_finite() {
+        return Err(syn::Error::new_spanned(
+            expr,
+            "delay (seconds) must be a finite, non-negative number",
+        ));
+    }
+    Ok((secs * 1000.0) as u32)
 }
 
 /// The seven `Period(..)` component names, in Modal's large→small order
@@ -2229,5 +2545,75 @@ mod tests {
         assert!(bad("Period(days = 1.5)"));
         // A literal colon in the cron string would corrupt the colon-delimited spec.
         assert!(bad(r#"Cron("0 9:30 * * 1")"#));
+    }
+
+    #[test]
+    fn retries_struct_form_canonicalizes_to_spec() {
+        // Drive `parse_retries_to_spec` through the real ParseStream path. The output is
+        // the canonical SPEC string the SDK's `parse_retries_spec` consumes (seconds →
+        // ms at parse time).
+        let spec = |src: &str| -> String {
+            syn::parse::Parser::parse_str(parse_retries_to_spec, src).expect("valid retries")
+        };
+        // Full struct form: max first, then the components in the order written.
+        assert_eq!(
+            spec("Retries(max_retries = 5, backoff_coefficient = 2.0, initial_delay = 0.5, max_delay = 30.0)"),
+            "retries:max=5,backoff=2,initial_ms=500,max_ms=30000"
+        );
+        // Only the required `max_retries` — the SDK fills the rest with Modal defaults.
+        assert_eq!(spec("Retries(max_retries = 3)"), "retries:max=3");
+        // Integer delays (seconds) convert to ms too.
+        assert_eq!(
+            spec("Retries(max_retries = 2, initial_delay = 1, max_delay = 60)"),
+            "retries:max=2,initial_ms=1000,max_ms=60000"
+        );
+        // A fully-qualified path still resolves by its last segment.
+        assert_eq!(
+            spec("modal_rust::Retries(max_retries = 4)"),
+            "retries:max=4"
+        );
+    }
+
+    #[test]
+    fn retries_struct_form_rejects_malformed() {
+        let bad = |src: &str| syn::parse::Parser::parse_str(parse_retries_to_spec, src).is_err();
+        // Not a call expression.
+        assert!(bad("5"));
+        // Unknown kind.
+        assert!(bad("Backoff(max_retries = 5)"));
+        // Missing the required max_retries.
+        assert!(bad("Retries(backoff_coefficient = 2.0)"));
+        // Unknown component.
+        assert!(bad("Retries(max_retries = 5, jitter = 0.1)"));
+        // Positional (non `name = value`) component.
+        assert!(bad("Retries(5)"));
+        // Negative delay.
+        assert!(bad("Retries(max_retries = 5, initial_delay = -1.0)"));
+    }
+
+    #[test]
+    fn env_map_parses_pairs_and_rejects_dupes() {
+        let pairs = |src: &str| -> Vec<(String, String)> {
+            syn::parse::Parser::parse_str(parse_str_map, src)
+                .expect("valid env map")
+                .into_iter()
+                .map(|(k, v)| (k.value(), v.value()))
+                .collect()
+        };
+        assert_eq!(
+            pairs(r#"{"API_TOKEN" = "dev", "REGION" = "us"}"#),
+            vec![
+                ("API_TOKEN".to_string(), "dev".to_string()),
+                ("REGION".to_string(), "us".to_string()),
+            ]
+        );
+        // Trailing comma allowed; empty map allowed.
+        assert_eq!(
+            pairs(r#"{"K" = "V",}"#),
+            vec![("K".to_string(), "V".to_string())]
+        );
+        assert!(pairs("{}").is_empty());
+        // A duplicate key is rejected (it would silently clobber an env var).
+        assert!(syn::parse::Parser::parse_str(parse_str_map, r#"{"K" = "a", "K" = "b"}"#).is_err());
     }
 }

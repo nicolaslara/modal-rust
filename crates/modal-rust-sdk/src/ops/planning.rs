@@ -30,7 +30,10 @@ pub struct PlannedImage {
 /// SDK-owned projection of a FILE-mode `FunctionCreate` request, carrying just the
 /// fields the dump renders/asserts. Built from [`plan_function_request`]; no proto
 /// leaks out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` only (not `Eq`): the retry backoff coefficient is an `f32`, which is not
+/// `Eq` (NaN). Equality is still meaningful for the dump's assertions.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlannedFunction {
     /// The importable wrapper module name (`Function.module_name`).
     pub module_name: String,
@@ -55,6 +58,16 @@ pub struct PlannedFunction {
     /// The automatic retry COUNT, if a retry policy is set
     /// (`Function.retry_policy.retries`); `None` = no policy.
     pub retries: Option<u32>,
+    /// The retry policy's backoff coefficient, if a policy is set
+    /// (`Function.retry_policy.backoff_coefficient`); `None` = no policy. `1.0` for the
+    /// bare-int fixed-interval form; a custom value for the `Retries(..)` struct form.
+    pub retry_backoff_coefficient: Option<f32>,
+    /// The retry policy's initial delay in ms, if a policy is set
+    /// (`Function.retry_policy.initial_delay_ms`); `None` = no policy.
+    pub retry_initial_delay_ms: Option<u32>,
+    /// The retry policy's max delay in ms, if a policy is set
+    /// (`Function.retry_policy.max_delay_ms`); `None` = no policy.
+    pub retry_max_delay_ms: Option<u32>,
     /// A human-readable summary of the run schedule, if set (`Function.schedule`);
     /// `None` = no schedule. `"cron(<expr> @ <tz>)"` for a [`Cron`], or
     /// `"period(<components>)"` for a [`Period`]. Mirrors what the wire carries
@@ -142,6 +155,9 @@ pub fn plan_function_request(
         volume_mounts,
         secret_ids_count: function.secret_ids.len(),
         retries: function.retry_policy.map(|p| p.retries),
+        retry_backoff_coefficient: function.retry_policy.map(|p| p.backoff_coefficient),
+        retry_initial_delay_ms: function.retry_policy.map(|p| p.initial_delay_ms),
+        retry_max_delay_ms: function.retry_policy.map(|p| p.max_delay_ms),
         schedule,
         min_containers,
         max_containers,
@@ -232,6 +248,10 @@ mod tests {
         assert_eq!(planned.timeout_secs, 1800);
         assert_eq!(planned.secret_ids_count, 0);
         assert_eq!(planned.retries, Some(3));
+        // Bare-int form ⇒ Modal's fixed-interval defaults.
+        assert_eq!(planned.retry_backoff_coefficient, Some(1.0));
+        assert_eq!(planned.retry_initial_delay_ms, Some(1000));
+        assert_eq!(planned.retry_max_delay_ms, Some(60_000));
         assert_eq!(planned.schedule.as_deref(), Some("cron(0 9 * * 1 @ UTC)"));
         assert_eq!(planned.min_containers, Some(1));
         assert_eq!(planned.max_containers, Some(5));
@@ -241,5 +261,21 @@ mod tests {
             planned.function_data_is_none,
             "FILE-mode XOR: function_data is None"
         );
+    }
+
+    #[test]
+    fn plan_function_projects_struct_form_retry_policy() {
+        // The `Retries(..)` STRUCT form: custom backoff + delays ride into the projected
+        // retry policy (the count, backoff, and both delays).
+        let spec = FunctionSpec::new("modal_rust_run_wrapper", "handler", "im-1")
+            .with_retry_policy(Some(
+                "retries:max=5,backoff=2.0,initial_ms=500,max_ms=30000",
+            ))
+            .expect("valid retries spec");
+        let planned = plan_function_request("ap-1", "fu-pre-1", &spec);
+        assert_eq!(planned.retries, Some(5));
+        assert_eq!(planned.retry_backoff_coefficient, Some(2.0));
+        assert_eq!(planned.retry_initial_delay_ms, Some(500));
+        assert_eq!(planned.retry_max_delay_ms, Some(30_000));
     }
 }

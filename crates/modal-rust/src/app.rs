@@ -785,8 +785,11 @@ mod tests {
                 milli_cpu: Some(2000),
                 memory_mb: Some(4096),
                 secrets: &[],
+                required_keys: &[],
+                env: &[],
                 volumes: &[],
                 retries: Some(3),
+                retries_spec: None,
                 schedule: Some("cron:UTC:0 9 * * 1"),
                 min_containers: None,
                 max_containers: None,
@@ -809,8 +812,11 @@ mod tests {
                 milli_cpu: None,
                 memory_mb: None,
                 secrets: &["my-secret"],
+                required_keys: &[],
+                env: &[],
                 volumes: &[("/data", "my-vol")],
                 retries: None,
+                retries_spec: None,
                 schedule: None,
                 min_containers: None,
                 max_containers: None,
@@ -873,17 +879,7 @@ mod tests {
                 FunctionConfig {
                     gpu: Some("T4"),
                     timeout_secs: Some(1800),
-                    cache: None,
-                    milli_cpu: None,
-                    memory_mb: None,
-                    secrets: &[],
-                    volumes: &[],
-                    retries: None,
-                    schedule: None,
-                    min_containers: None,
-                    max_containers: None,
-                    buffer_containers: None,
-                    scaledown_window: None,
+                    ..FunctionConfig::default()
                 },
             ),
         ]);
@@ -906,16 +902,9 @@ mod tests {
             gpu: Some("T4"),
             timeout_secs: Some(1800),
             cache: Some(false), // deploy ignores run-cache config
-            milli_cpu: None,
-            memory_mb: None,
             secrets: &["my-secret"],
             volumes: &[("/data", "my-vol")],
-            retries: None,
-            schedule: None,
-            min_containers: None,
-            max_containers: None,
-            buffer_containers: None,
-            scaledown_window: None,
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([
             ("train".to_string(), cfg.clone()),
@@ -981,13 +970,11 @@ mod tests {
             milli_cpu: Some(4000),
             memory_mb: Some(8192),
             secrets: &["my-secret"],
+            required_keys: &["API_KEY"],
+            env: &[("REGION", "us")],
             volumes: &[("/data", "my-vol")],
             retries: Some(5),
-            schedule: Some("period:days=1"),
-            min_containers: None,
-            max_containers: None,
-            buffer_containers: None,
-            scaledown_window: None,
+            ..FunctionConfig::default()
         };
         let app = App::from_manifest([("add".to_string(), cfg.clone())]);
         assert_eq!(app.config_for("add"), FunctionOptions::from(&cfg));

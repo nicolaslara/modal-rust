@@ -305,10 +305,14 @@ pub struct TrainOutput {
     cpu = 2.0,                      // CPU cores (float); -> milli_cpu = int(1000 * cpu)
     memory = 4096,                  // requested RAM in MiB
     timeout = 1800,                 // wall-clock seconds
-    retries = 3,                    // auto-retry a failed call N times (fixed interval)
+    retries = 3,                    // auto-retry N times (fixed interval); or the struct
+                                    // form Retries(max_retries = 5, backoff_coefficient = 2.0,
+                                    // initial_delay = 0.5, max_delay = 30.0) for custom backoff
     schedule = Cron("0 9 * * 1"),   // run on a cron cadence after deploy (or Period(days = 1))
     cache = false,                  // opt out of the cargo build cache (default: on)
     secrets = ["my-api-key"],       // named Modal secrets, injected as env vars
+    required_keys = ["API_KEY"],    // assert these keys exist on the named secrets
+    env = { "REGION" = "us-east" }, // an INLINE secret (Secret.from_dict), injected as env vars
     volumes = ["/data=my-dataset"], // a Modal Volume `my-dataset` mounted at /data
 )]
 pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
@@ -451,18 +455,23 @@ cost on *every* call. `#[modal_rust::cls]` pays it **once per warm container** a
 reuses the result — mirroring Python's `@app.cls` + `@enter` + `@method`. You write a
 plain struct for the state and a `#[cls(..)]` `impl` block for the behavior:
 
-```rust
-use modal_rust::cls;
+With `use modal_rust::cls;` in scope, the authored surface is exactly the
+[`examples/stateful-class`](examples/stateful-class) crate (this block is drift-guarded
+against it by `examples/stateful-class/tests/readme_drift.rs` — a stale README is a test
+failure):
 
+```rust cls
 pub struct Embedder {
     model: Model,
 }
 
 #[cls(gpu = "T4", timeout = 600)] // CLASS-LEVEL default config -> inherited by every #[method].
 impl Embedder {
-    /// Runs ONCE per warm container (mirrors `@modal.enter()`). The macro moves the
-    /// built value into a process-lifetime singleton, so this expensive step happens a
-    /// single time no matter how many method calls the warm container serves.
+    /// Runs ONCE per warm container (mirrors `@modal.enter()`). Loads the embedding
+    /// model and returns the built value; the macro moves it into a process-lifetime
+    /// singleton, so this expensive step happens a single time no matter how many method
+    /// calls a warm container serves. (`Model::load` is offline + CPU-only here, but it
+    /// stands in for the real "read weights from disk / warm a GPU" cost.)
     #[enter]
     fn load() -> anyhow::Result<Self> {
         Ok(Embedder {
@@ -470,13 +479,15 @@ impl Embedder {
         })
     }
 
-    /// Reuse the already-loaded model by `&self`. `#[method(gpu = "A10G")]` OVERRIDES the
-    /// class default gpu (`T4`) for this method only; `timeout = 600` is still inherited.
+    /// Embed `text` into a fixed-width unit-length vector, reusing the already-loaded
+    /// model by `&self`. `#[method(gpu = "A10G")]` OVERRIDES the class default gpu
+    /// (`T4`) for this method only; `timeout = 600` is still inherited from `#[cls]`.
     #[method(gpu = "A10G")]
     fn embed(&self, text: String) -> anyhow::Result<Vec<f32>> {
         Ok(self.model.embed(&text))
     }
 
+    /// Report the model's output dimensionality, reusing the loaded model by `&self`.
     /// Bare `#[method]` — inherits BOTH `gpu = "T4"` and `timeout = 600` from `#[cls]`.
     #[method]
     fn dim(&self) -> anyhow::Result<usize> {

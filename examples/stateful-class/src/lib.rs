@@ -52,6 +52,10 @@ pub use embedding::load_count;
 /// The expensive state, loaded ONCE per warm container. A PLAIN struct — no macro on the
 /// type. It just holds the loaded embedding [`Model`]; all class-level config rides on
 /// the `#[cls(..)]` attribute on the impl block below.
+//
+// README drift-guard: the region between the begin/end markers below is kept
+// byte-identical to the ```rust cls block in README.md (see tests/readme_drift.rs).
+// cls:begin
 pub struct Embedder {
     model: Model,
 }
@@ -85,3 +89,4 @@ impl Embedder {
         Ok(self.model.dim())
     }
 }
+// cls:end

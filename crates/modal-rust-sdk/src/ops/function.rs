@@ -34,6 +34,69 @@ const RETRY_DEFAULT_INITIAL_DELAY_MS: u32 = 1000;
 /// seconds (`retries.py`).
 const RETRY_DEFAULT_MAX_DELAY_MS: u32 = 60_000;
 
+/// Parse a modal-rust retry SPEC string (the `Retries(..)` STRUCT form) into a
+/// [`FunctionRetryPolicy`], mirroring Modal's `Retries(max_retries, backoff_coefficient,
+/// initial_delay, max_delay)` (`retries.py`). The spec is the canonical, const-string
+/// form the `#[function(retries = Retries(..))]` macro emits (a `&'static str` is
+/// const-valid in the `inventory::submit!` static initializer, exactly like `gpu` /
+/// `schedule`).
+///
+/// Format: `"retries:max=<N>[,backoff=<f>][,initial_ms=<u32>][,max_ms=<u32>]"`. The
+/// `max=` component (the retry COUNT) is REQUIRED; the rest default to Modal's
+/// `Retries` defaults (`backoff_coefficient=1.0`, `initial_delay=1s ⇒ 1000ms`,
+/// `max_delay=60s ⇒ 60000ms`). The macro converts seconds→ms at parse time so the
+/// spec carries integer millisecond delays. A malformed spec maps to [`Error::build`]
+/// (mirroring Python's `InvalidError`).
+fn parse_retries_spec(spec: &str) -> Result<FunctionRetryPolicy> {
+    let rest = spec.strip_prefix("retries:").ok_or_else(|| {
+        Error::build(format!(
+            "Invalid retries spec {spec:?}: expected a \"retries:..\" prefix"
+        ))
+    })?;
+    let mut retries: Option<u32> = None;
+    let mut backoff_coefficient = RETRY_DEFAULT_BACKOFF_COEFFICIENT;
+    let mut initial_delay_ms = RETRY_DEFAULT_INITIAL_DELAY_MS;
+    let mut max_delay_ms = RETRY_DEFAULT_MAX_DELAY_MS;
+    for part in rest.split(',').filter(|p| !p.is_empty()) {
+        let (key, value) = part.split_once('=').ok_or_else(|| {
+            Error::build(format!(
+                "Invalid retries component {part:?} in spec {spec:?}: expected key=value"
+            ))
+        })?;
+        let parse_u32 = |v: &str| -> Result<u32> {
+            v.trim()
+                .parse()
+                .map_err(|_| Error::build(format!("Invalid integer {v:?} for retries {key:?}")))
+        };
+        match key.trim() {
+            "max" => retries = Some(parse_u32(value)?),
+            "backoff" => {
+                backoff_coefficient = value.trim().parse().map_err(|_| {
+                    Error::build(format!("Invalid float {value:?} for retries \"backoff\""))
+                })?
+            }
+            "initial_ms" => initial_delay_ms = parse_u32(value)?,
+            "max_ms" => max_delay_ms = parse_u32(value)?,
+            other => {
+                return Err(Error::build(format!(
+                    "Unknown retries component {other:?} in spec {spec:?}"
+                )))
+            }
+        }
+    }
+    let retries = retries.ok_or_else(|| {
+        Error::build(format!(
+            "Invalid retries spec {spec:?}: missing required \"max\" (the retry count)"
+        ))
+    })?;
+    Ok(FunctionRetryPolicy {
+        backoff_coefficient,
+        initial_delay_ms,
+        max_delay_ms,
+        retries,
+    })
+}
+
 /// Parse a Modal GPU spec into a [`GpuConfig`], mirroring `parse_gpu_config`
 /// (modal `_utils/function_utils.py:628`). Format: `"TYPE"` or `"TYPE:count"`.
 ///
@@ -493,6 +556,19 @@ impl FunctionSpec {
         self
     }
 
+    /// Set a CUSTOM retry policy from a modal-rust retry SPEC string (the `Retries(..)`
+    /// STRUCT form, `#[function(retries = Retries(max_retries = N, backoff = f,
+    /// initial_delay = s, max_delay = s))]`), parsed by [`parse_retries_spec`] into the
+    /// four [`FunctionRetryPolicy`] fields. `None` leaves the field UNSET so the create
+    /// is byte-identical to before (no `retry_policy` on the wire). A malformed spec
+    /// returns [`Error::build`]. This is the custom-backoff sibling of [`with_retries`]
+    /// (the bare-int fixed-interval shortcut); the two are mutually exclusive (the macro
+    /// emits at most one).
+    pub fn with_retry_policy(mut self, spec: Option<&str>) -> Result<Self> {
+        self.retry_policy = spec.map(parse_retries_spec).transpose()?;
+        Ok(self)
+    }
+
     /// Set a run schedule from a modal-rust schedule SPEC string
     /// (`#[function(schedule = Cron("..")/Period(..))]`), parsed by [`parse_schedule`]
     /// into Modal's `Schedule` (a `Cron`/`Period` oneof). `None` leaves the field UNSET
@@ -854,6 +930,70 @@ mod tests {
         // `retries = 0` is a valid (zero-retry) explicit policy, distinct from unset.
         let zero = FunctionSpec::new("m", "handler", "im-1").with_retries(Some(0));
         assert_eq!(zero.retry_policy.expect("policy present").retries, 0);
+    }
+
+    #[test]
+    fn parse_retries_spec_custom_backoff_and_delays() {
+        // The STRUCT form: all four FunctionRetryPolicy fields ride through. seconds were
+        // converted to ms by the macro, so the spec carries integer ms delays.
+        let p = parse_retries_spec("retries:max=5,backoff=2.0,initial_ms=500,max_ms=30000")
+            .expect("valid retries spec");
+        assert_eq!(p.retries, 5);
+        assert_eq!(p.backoff_coefficient, 2.0);
+        assert_eq!(p.initial_delay_ms, 500);
+        assert_eq!(p.max_delay_ms, 30_000);
+    }
+
+    #[test]
+    fn parse_retries_spec_defaults_optional_components() {
+        // Only `max` (the count) is required; the rest fall back to Modal's Retries
+        // defaults (backoff 1.0, 1s initial, 60s max).
+        let p = parse_retries_spec("retries:max=3").expect("valid retries spec");
+        assert_eq!(p.retries, 3);
+        assert_eq!(p.backoff_coefficient, RETRY_DEFAULT_BACKOFF_COEFFICIENT);
+        assert_eq!(p.initial_delay_ms, RETRY_DEFAULT_INITIAL_DELAY_MS);
+        assert_eq!(p.max_delay_ms, RETRY_DEFAULT_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn parse_retries_spec_rejects_malformed() {
+        // Missing the "retries:" tag.
+        assert!(parse_retries_spec("max=5").is_err());
+        // Missing the required `max` count.
+        assert!(parse_retries_spec("retries:backoff=2.0").is_err());
+        // Unknown component.
+        assert!(parse_retries_spec("retries:max=5,jitter=0.1").is_err());
+        // Non-integer count.
+        assert!(parse_retries_spec("retries:max=lots").is_err());
+        // Non-float backoff.
+        assert!(parse_retries_spec("retries:max=5,backoff=fast").is_err());
+    }
+
+    #[test]
+    fn with_retry_policy_sets_and_clears() {
+        // `Some(spec)` parses the struct form into the proto policy; `None` leaves it
+        // unset (byte-identical to before retries).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_retry_policy(Some(
+                "retries:max=5,backoff=2.0,initial_ms=500,max_ms=30000",
+            ))
+            .expect("valid retries spec");
+        let policy = spec.retry_policy.expect("struct retries ⇒ policy present");
+        assert_eq!(policy.retries, 5);
+        assert_eq!(policy.backoff_coefficient, 2.0);
+        assert_eq!(policy.initial_delay_ms, 500);
+        assert_eq!(policy.max_delay_ms, 30_000);
+
+        // `None` leaves the field unset.
+        let bare = FunctionSpec::new("m", "handler", "im-1")
+            .with_retry_policy(None)
+            .expect("none is valid");
+        assert!(bare.retry_policy.is_none());
+
+        // A malformed spec surfaces as an error (mirrors `with_schedule`).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_retry_policy(Some("nonsense"))
+            .is_err());
     }
 
     #[test]

@@ -39,6 +39,19 @@ pub struct FunctionConfig {
     pub memory_mb: Option<u32>,
     /// Named Modal secrets to attach.
     pub secrets: &'static [&'static str],
+    /// Asserted-present keys on the named `secrets` (`required_keys = ["K", ..]`). One
+    /// flat list applied to ALL named secrets (v0); the facade passes it to
+    /// `Secret.from_name`, and Modal errors if a key is missing. Empty (the default) =>
+    /// no assertion, byte-identical to before.
+    pub required_keys: &'static [&'static str],
+    /// Inline secret key/values (`env = {"K" = "V", ..}`, mirroring Modal's
+    /// `app.function(env=..)` → `Secret.from_dict`). Empty (the default) => no inline
+    /// secret, byte-identical to before. When non-empty the facade resolves these via a
+    /// deterministic per-entrypoint `Secret.from_dict` (CREATE_IF_MISSING) and attaches
+    /// the resulting id to the SAME `secret_ids` list named `secrets` use (so `env` and
+    /// `secrets` compose). `&'static` slice (const-valid in the `static` initializer,
+    /// like `volumes`).
+    pub env: &'static [(&'static str, &'static str)],
     /// User-volume mounts to attach as `(mount_path, volume_name)` pairs.
     pub volumes: &'static [(&'static str, &'static str)],
     /// Automatic retry COUNT (`retries = N`). `None` => no retry policy (server
@@ -47,6 +60,13 @@ pub struct FunctionConfig {
     /// facade builds the `FunctionCreate`. Plain `Option<u32>`, const-valid in the
     /// `static` `inventory::submit!` initializer (like `timeout`).
     pub retries: Option<u32>,
+    /// Custom retry-policy SPEC string (`retries = Retries(max_retries = N, ..)`, the
+    /// STRUCT form). `None` => use the bare-int `retries` shortcut (or no policy). The
+    /// macro canonicalizes the `Retries(..)` form to a `&'static str` SPEC the SDK's
+    /// `parse_retries_spec` reads (custom backoff/initial/max delay) when the facade
+    /// builds the `FunctionCreate`; const-valid in the `static` initializer (like
+    /// `schedule`). Mutually exclusive with `retries` (the macro emits at most one).
+    pub retries_spec: Option<&'static str>,
     /// Run-SCHEDULE spec string (`schedule = Cron(..)/Period(..)`). `None` => no
     /// schedule (the function is invoked only by callers). The macro canonicalizes the
     /// `Cron`/`Period` form to a `&'static str` SPEC the SDK's `parse_schedule` reads
@@ -79,8 +99,11 @@ impl FunctionConfig {
             milli_cpu: None,
             memory_mb: None,
             secrets: &[],
+            required_keys: &[],
+            env: &[],
             volumes: &[],
             retries: None,
+            retries_spec: None,
             schedule: None,
             min_containers: None,
             max_containers: None,
@@ -116,12 +139,26 @@ pub struct FunctionOptions {
     /// Named Modal secrets to attach.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Asserted-present keys on the named `secrets` (`required_keys = [..]`). Empty =>
+    /// no assertion.
+    #[serde(default)]
+    pub required_keys: Vec<String>,
+    /// Inline secret key/values (`env = {"K" = "V", ..}`). Empty => no inline secret.
+    /// Owned form of the `&'static` pairs; the facade resolves them via a deterministic
+    /// per-entrypoint `Secret.from_dict`.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
     /// User-volume mounts to attach as `(mount_path, volume_name)` pairs.
     #[serde(default)]
     pub volumes: Vec<(String, String)>,
     /// Automatic retry COUNT (`retries = N`). `None` => no retry policy.
     #[serde(default)]
     pub retries: Option<u32>,
+    /// Custom retry-policy SPEC string (`retries = Retries(..)`, struct form). `None` =>
+    /// use the bare-int `retries` shortcut (or no policy). Owned form of the `&'static
+    /// str` spec; the facade hands it to the SDK's `parse_retries_spec`.
+    #[serde(default)]
+    pub retries_spec: Option<String>,
     /// Run-SCHEDULE spec string (`schedule = Cron(..)/Period(..)`). `None` => no
     /// schedule. Owned form of the `&'static str` spec; the facade hands it to the SDK
     /// when building the `FunctionCreate`.
@@ -165,12 +202,19 @@ impl From<&FunctionConfig> for FunctionOptions {
             milli_cpu: config.milli_cpu,
             memory_mb: config.memory_mb,
             secrets: config.secrets.iter().map(|s| s.to_string()).collect(),
+            required_keys: config.required_keys.iter().map(|s| s.to_string()).collect(),
+            env: config
+                .env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             volumes: config
                 .volumes
                 .iter()
                 .map(|(mount_path, name)| (mount_path.to_string(), name.to_string()))
                 .collect(),
             retries: config.retries,
+            retries_spec: config.retries_spec.map(str::to_string),
             schedule: config.schedule.map(str::to_string),
             min_containers: config.min_containers,
             max_containers: config.max_containers,
@@ -382,8 +426,11 @@ mod tests {
                 milli_cpu: Some(2000),
                 memory_mb: Some(4096),
                 secrets: vec!["my-secret".to_string()],
+                required_keys: vec!["API_KEY".to_string()],
+                env: vec![("REGION".to_string(), "us".to_string())],
                 volumes: vec![("/data".to_string(), "my-vol".to_string())],
                 retries: Some(3),
+                retries_spec: None,
                 schedule: Some("cron:UTC:0 9 * * 1".to_string()),
                 min_containers: Some(1),
                 max_containers: Some(5),
@@ -407,6 +454,14 @@ mod tests {
         assert_eq!(
             eps[0]["config"]["secrets"],
             serde_json::json!(["my-secret"])
+        );
+        assert_eq!(
+            eps[0]["config"]["required_keys"],
+            serde_json::json!(["API_KEY"])
+        );
+        assert_eq!(
+            eps[0]["config"]["env"],
+            serde_json::json!([["REGION", "us"]])
         );
         assert_eq!(
             eps[0]["config"]["volumes"],
@@ -433,7 +488,10 @@ mod tests {
     fn function_config_default_has_empty_secrets_and_volumes() {
         let d = FunctionConfig::default();
         assert!(d.secrets.is_empty());
+        assert!(d.required_keys.is_empty());
+        assert!(d.env.is_empty());
         assert!(d.volumes.is_empty());
+        assert!(d.retries_spec.is_none());
         let c = FunctionConfig::new();
         assert_eq!(d, c);
     }
@@ -447,8 +505,11 @@ mod tests {
             milli_cpu: Some(2000),
             memory_mb: Some(4096),
             secrets: &["my-secret"],
+            required_keys: &["API_KEY"],
+            env: &[("REGION", "us")],
             volumes: &[("/data", "my-vol")],
             retries: Some(3),
+            retries_spec: None,
             schedule: Some("cron:UTC:0 9 * * 1"),
             min_containers: Some(1),
             max_containers: Some(5),
@@ -462,11 +523,14 @@ mod tests {
         assert_eq!(options.milli_cpu, Some(2000));
         assert_eq!(options.memory_mb, Some(4096));
         assert_eq!(options.secrets, vec!["my-secret".to_string()]);
+        assert_eq!(options.required_keys, vec!["API_KEY".to_string()]);
+        assert_eq!(options.env, vec![("REGION".to_string(), "us".to_string())]);
         assert_eq!(
             options.volumes,
             vec![("/data".to_string(), "my-vol".to_string())]
         );
         assert_eq!(options.retries, Some(3));
+        assert_eq!(options.retries_spec, None);
         assert_eq!(options.schedule.as_deref(), Some("cron:UTC:0 9 * * 1"));
         assert_eq!(options.min_containers, Some(1));
         assert_eq!(options.max_containers, Some(5));

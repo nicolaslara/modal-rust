@@ -315,9 +315,6 @@ fn build_function_spec(
         // the server default (0), so an unset decorator stays wire-identical.
         .with_milli_cpu(ep.options.milli_cpu)
         .with_memory_mb(ep.options.memory_mb)
-        // retries ride into Function.retry_policy. `None` leaves the field unset, so
-        // an unset decorator is byte-identical to before.
-        .with_retries(ep.options.retries)
         // schedule rides into Function.schedule (Cron/Period). `None` leaves the field
         // unset, so an unset decorator is byte-identical; a malformed spec is rejected
         // up front (mirrors `with_gpu`).
@@ -332,6 +329,15 @@ fn build_function_spec(
             buffer_containers: ep.options.buffer_containers,
             scaledown_window: ep.options.scaledown_window,
         })?;
+    // retries ride into Function.retry_policy. The `Retries(..)` STRUCT form (custom
+    // backoff/delays, `retries_spec`) wins when present; otherwise the bare-int
+    // `retries` fixed-interval shortcut applies. Both `None` ⇒ no policy ⇒ byte-identical
+    // to before. The two are mutually exclusive (the macro emits at most one), but
+    // `retries_spec` is checked FIRST so a struct form is never shadowed.
+    fn_spec = match ep.options.retries_spec.as_deref() {
+        Some(spec) => fn_spec.with_retry_policy(Some(spec))?,
+        None => fn_spec.with_retries(ep.options.retries),
+    };
     // P6 cargo-cache volume at /cache (RUN only; `cache_vol_id` is None otherwise).
     if let Some(vid) = &res.cache_vol_id {
         fn_spec = fn_spec.with_volume_mount(vid.clone(), CACHE_MOUNT);
@@ -375,8 +381,20 @@ pub(crate) trait ControlPlane {
     /// V2 filesystem (the cargo cache); `false` ⇒ V1 (a user volume).
     async fn ensure_volume(&mut self, name: &str, v2: bool) -> Result<String>;
 
-    /// Resolve a named Secret by `from_name` lookup → `secret_id`.
-    async fn ensure_secret(&mut self, name: &str) -> Result<String>;
+    /// Resolve a named Secret by `from_name` lookup → `secret_id`. `required_keys` are
+    /// asserted-present keys on the secret (empty = no assertion); the server errors if
+    /// a key is missing. Mirrors `Secret.from_name(.., required_keys=[..])`.
+    async fn ensure_secret(&mut self, name: &str, required_keys: &[String]) -> Result<String>;
+
+    /// Resolve an INLINE Secret from a `{key: value}` env map (`#[function(env = {..})]`)
+    /// by `from_dict` (CREATE_IF_MISSING, idempotent) → `secret_id`. `name` is the
+    /// deterministic per-entrypoint deployment name the facade derives. Mirrors
+    /// `Secret.from_dict(env)`; the resulting id rides into the SAME `secret_ids` list.
+    async fn ensure_inline_secret(
+        &mut self,
+        name: &str,
+        env: &[(String, String)],
+    ) -> Result<String>;
 
     /// Resolve the hosted modal-client mount → `mount_id`.
     async fn ensure_client_mount(&mut self) -> Result<String>;
@@ -508,11 +526,12 @@ pub(crate) async fn provision<C: ControlPlane>(
         if inputs.cache {
             cache_vol_id = Some(cp.ensure_volume(CACHE_VOLUME_NAME, true).await?);
         }
-        // Run-level secrets + user volumes (the single RUN entrypoint's config).
+        // Run-level secrets + user volumes (the single RUN entrypoint's config). Named
+        // secrets carry `required_keys`; a non-empty inline `env` adds one more id.
         let ep = single_entrypoint(inputs)?;
-        for name in &ep.options.secrets {
-            run_secret_ids.push(cp.ensure_secret(name).await?);
-        }
+        let object_tag = crate::remote::sanitize_object_tag(&ep.name);
+        run_secret_ids =
+            resolve_entrypoint_secrets(cp, inputs.app_name, &object_tag, &ep.options).await?;
         for (mount_path, name) in &ep.options.volumes {
             reject_cache_collision(inputs.cache, mount_path)?;
             let vid = cp.ensure_volume(name, false).await?;
@@ -574,10 +593,10 @@ pub(crate) async fn provision<C: ControlPlane>(
                 run_user_volume_mounts.clone(),
             )
         } else {
-            let mut secret_ids: Vec<String> = Vec::with_capacity(ep.options.secrets.len());
-            for name in &ep.options.secrets {
-                secret_ids.push(cp.ensure_secret(name).await?);
-            }
+            // Named secrets (with `required_keys`) + the inline `env` secret, resolved
+            // PER ENTRYPOINT here in the loop (the inline name keys on this object tag).
+            let secret_ids =
+                resolve_entrypoint_secrets(cp, inputs.app_name, &object_tag, &ep.options).await?;
             let mut user_volume_mounts: Vec<(String, String)> =
                 Vec::with_capacity(ep.options.volumes.len());
             for (mount_path, name) in &ep.options.volumes {
@@ -632,6 +651,37 @@ pub(crate) async fn provision<C: ControlPlane>(
         image_id,
         publish_url,
     })
+}
+
+/// Derive the DETERMINISTIC deployment name for an entrypoint's INLINE secret
+/// (`#[function(env = {..})]`). Keyed on the app name + the (sanitized) entrypoint so
+/// re-runs of the SAME app+entrypoint resolve the SAME `Secret.from_dict`
+/// (CREATE_IF_MISSING is idempotent on a stable name). Distinct entrypoints get
+/// distinct inline secrets, so two functions' `env` maps never collide.
+fn inline_secret_name(app_name: &str, object_tag: &str) -> String {
+    format!("modal-rust-inline-env-{app_name}-{object_tag}")
+}
+
+/// Resolve an entrypoint's NAMED secrets (with `required_keys`) AND its inline `env`
+/// secret into the combined `secret_ids` list (named first, then the inline id). Shared
+/// by the RUN and DEPLOY arms so the resolution + ordering cannot drift. The inline
+/// secret is resolved only when `env` is non-empty (so a bare entrypoint is
+/// byte-identical: no extra `SecretGetOrCreate`).
+async fn resolve_entrypoint_secrets<C: ControlPlane>(
+    cp: &mut C,
+    app_name: &str,
+    object_tag: &str,
+    options: &FunctionOptions,
+) -> Result<Vec<String>> {
+    let mut secret_ids: Vec<String> = Vec::with_capacity(options.secrets.len() + 1);
+    for name in &options.secrets {
+        secret_ids.push(cp.ensure_secret(name, &options.required_keys).await?);
+    }
+    if !options.env.is_empty() {
+        let name = inline_secret_name(app_name, object_tag);
+        secret_ids.push(cp.ensure_inline_secret(&name, &options.env).await?);
+    }
+    Ok(secret_ids)
 }
 
 /// Reject a user volume mounted at the reserved cargo-cache path (RUN path).
@@ -694,8 +744,23 @@ impl ControlPlane for LiveControlPlane<'_> {
             .await?)
     }
 
-    async fn ensure_secret(&mut self, name: &str) -> Result<String> {
-        Ok(self.client.secret_get_or_create(name, &[], None).await?)
+    async fn ensure_secret(&mut self, name: &str, required_keys: &[String]) -> Result<String> {
+        Ok(self
+            .client
+            .secret_get_or_create(name, required_keys, None)
+            .await?)
+    }
+
+    async fn ensure_inline_secret(
+        &mut self,
+        name: &str,
+        env: &[(String, String)],
+    ) -> Result<String> {
+        // CREATE_IF_MISSING is idempotent + retry-safe (re-running returns the same id),
+        // so the deterministic per-entrypoint name makes inline env re-runs stable. The
+        // VALUES are never logged (Modal/secrets rules).
+        let env_map: std::collections::HashMap<String, String> = env.iter().cloned().collect();
+        Ok(self.client.secret_from_dict(name, &env_map, None).await?)
     }
 
     async fn ensure_client_mount(&mut self) -> Result<String> {

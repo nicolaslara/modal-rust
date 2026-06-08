@@ -72,10 +72,17 @@ pub enum PlannedRequest {
         /// `true` ⇒ V2 (the cargo cache); `false` ⇒ V1 (a user volume).
         v2: bool,
     },
-    /// `SecretGetOrCreate` (a named user secret resolved by from_name).
+    /// `SecretGetOrCreate` (a named user secret resolved by from_name, OR an inline
+    /// `env = {..}` secret resolved by from_dict).
     SecretGetOrCreate {
-        /// The secret deployment name.
+        /// The secret deployment name (named secret, or the derived inline-env name).
         name: String,
+        /// Asserted-present keys on a NAMED secret (`required_keys = [..]`); empty for an
+        /// inline secret or when no keys are asserted.
+        required_keys: Vec<String>,
+        /// `true` ⇒ an INLINE `env = {..}` secret (from_dict, CREATE_IF_MISSING); `false`
+        /// ⇒ a NAMED secret (from_name lookup).
+        inline: bool,
     },
     /// `MountGetOrCreate` (one of the three mount roles).
     MountGetOrCreate {
@@ -117,6 +124,13 @@ pub enum PlannedRequest {
         secret_count: usize,
         /// The automatic retry COUNT, if a retry policy is set; `None` = no policy.
         retries: Option<u32>,
+        /// The retry backoff coefficient, if a policy is set; `None` = no policy. `1.0`
+        /// for the bare-int form, custom for the `Retries(..)` struct form.
+        retry_backoff_coefficient: Option<f32>,
+        /// The retry initial delay (ms), if a policy is set; `None` = no policy.
+        retry_initial_delay_ms: Option<u32>,
+        /// The retry max delay (ms), if a policy is set; `None` = no policy.
+        retry_max_delay_ms: Option<u32>,
         /// A human-readable summary of the run schedule, if set; `None` = no schedule.
         schedule: Option<String>,
         /// Autoscaler floor (`min_containers`); `None` = unset (scale to zero).
@@ -174,8 +188,16 @@ impl Manifest {
                 PlannedRequest::VolumeGetOrCreate { name, v2 } => {
                     format!("VolumeGetOrCreate      name={name:?} v2={v2}")
                 }
-                PlannedRequest::SecretGetOrCreate { name } => {
-                    format!("SecretGetOrCreate      name={name:?}")
+                PlannedRequest::SecretGetOrCreate {
+                    name,
+                    required_keys,
+                    inline,
+                } => {
+                    let kind = if *inline { "inline" } else { "from_name" };
+                    format!(
+                        "SecretGetOrCreate      name={name:?} kind={kind} \
+                         required_keys={required_keys:?}"
+                    )
                 }
                 PlannedRequest::MountGetOrCreate { role } => {
                     format!("MountGetOrCreate       role={role:?}")
@@ -215,6 +237,9 @@ impl Manifest {
                     volume_mounts,
                     secret_count,
                     retries,
+                    retry_backoff_coefficient,
+                    retry_initial_delay_ms,
+                    retry_max_delay_ms,
                     schedule,
                     min_containers,
                     max_containers,
@@ -226,7 +251,9 @@ impl Manifest {
                      mount_ids={mount_ids_count} gpu={gpu:?} cpu={milli_cpu}m \
                      memory={memory_mb}MiB timeout={timeout_secs}s \
                      volumes={volume_mounts:?} secrets={secret_count} \
-                     retries={retries:?} schedule={schedule:?} \
+                     retries={retries:?} backoff={retry_backoff_coefficient:?} \
+                     initial_ms={retry_initial_delay_ms:?} max_ms={retry_max_delay_ms:?} \
+                     schedule={schedule:?} \
                      min_containers={min_containers:?} max_containers={max_containers:?} \
                      buffer_containers={buffer_containers:?} \
                      scaledown_window={scaledown_window:?} \
@@ -305,11 +332,28 @@ impl ControlPlane for RecordingControlPlane {
         Ok(format!("vo-{}", self.next_id()))
     }
 
-    async fn ensure_secret(&mut self, name: &str) -> Result<String> {
+    async fn ensure_secret(&mut self, name: &str, required_keys: &[String]) -> Result<String> {
         self.requests.push(PlannedRequest::SecretGetOrCreate {
             name: name.to_string(),
+            required_keys: required_keys.to_vec(),
+            inline: false,
         });
-        Ok("sc-1".to_string())
+        Ok(format!("se-{}", self.next_id()))
+    }
+
+    async fn ensure_inline_secret(
+        &mut self,
+        name: &str,
+        _env: &[(String, String)],
+    ) -> Result<String> {
+        // Record the deployment name + the inline flag, but NEVER the env VALUES (secrets
+        // rules) — the dump must be safe to print. The id rides into FunctionCreate.
+        self.requests.push(PlannedRequest::SecretGetOrCreate {
+            name: name.to_string(),
+            required_keys: Vec::new(),
+            inline: true,
+        });
+        Ok(format!("se-{}", self.next_id()))
     }
 
     async fn ensure_client_mount(&mut self) -> Result<String> {
@@ -377,6 +421,9 @@ impl ControlPlane for RecordingControlPlane {
             volume_mounts: planned.volume_mounts,
             secret_count: planned.secret_ids_count,
             retries: planned.retries,
+            retry_backoff_coefficient: planned.retry_backoff_coefficient,
+            retry_initial_delay_ms: planned.retry_initial_delay_ms,
+            retry_max_delay_ms: planned.retry_max_delay_ms,
             schedule: planned.schedule,
             min_containers: planned.min_containers,
             max_containers: planned.max_containers,
@@ -782,6 +829,140 @@ mod tests {
             fc.0.iter().any(|(path, _)| path == "/data"),
             "the user volume rode into FunctionCreate at /data"
         );
+    }
+
+    #[test]
+    fn dry_run_required_keys_ride_into_named_secret_request() {
+        // C2a: `required_keys = [..]` rides into the named `SecretGetOrCreate` (from_name)
+        // so Modal asserts those keys exist; the resolved id still lands in FunctionCreate.
+        let cfg = FunctionConfig {
+            cache: Some(false),
+            secrets: &["api-creds"],
+            required_keys: &["API_KEY", "DB_URL"],
+            ..FunctionConfig::default()
+        };
+        let app = App::from_manifest([("add".to_string(), cfg)]);
+        let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");
+
+        // The named secret request carries the asserted keys and is NOT inline.
+        let secret = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::SecretGetOrCreate {
+                    name,
+                    required_keys,
+                    inline,
+                } => Some((name.clone(), required_keys.clone(), *inline)),
+                _ => None,
+            })
+            .expect("SecretGetOrCreate recorded");
+        assert_eq!(secret.0, "api-creds");
+        assert_eq!(secret.1, vec!["API_KEY".to_string(), "DB_URL".to_string()]);
+        assert!(!secret.2, "named secret is a from_name lookup, not inline");
+
+        // The resolved id rode into FunctionCreate.
+        let secret_count = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::FunctionCreate { secret_count, .. } => Some(*secret_count),
+                _ => None,
+            })
+            .expect("FunctionCreate");
+        assert_eq!(
+            secret_count, 1,
+            "the named secret id rode into FunctionCreate"
+        );
+    }
+
+    #[test]
+    fn dry_run_inline_env_rides_into_function_create_secret_ids() {
+        // C2b: `env = {"K" = "V"}` becomes an INLINE Secret.from_dict (CREATE_IF_MISSING)
+        // whose resolved id rides into FunctionCreate.secret_ids — composing with named
+        // secrets. Here both an `env` AND a named secret are set: two secret ids.
+        let cfg = FunctionConfig {
+            cache: Some(false),
+            secrets: &["api-creds"],
+            env: &[("API_TOKEN", "dev"), ("REGION", "us")],
+            ..FunctionConfig::default()
+        };
+        let app = App::from_manifest([("add".to_string(), cfg)]);
+        let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");
+
+        // Exactly one INLINE SecretGetOrCreate (from_dict) + one NAMED one (from_name).
+        let inline: Vec<(String, bool)> = manifest
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                PlannedRequest::SecretGetOrCreate { name, inline, .. } => {
+                    Some((name.clone(), *inline))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inline.len(), 2, "named + inline secret each resolved");
+        let inline_one = inline
+            .iter()
+            .find(|(_, is_inline)| *is_inline)
+            .expect("an inline env secret was resolved");
+        // Deterministic per-entrypoint inline-secret name (keyed on app + object tag).
+        assert!(
+            inline_one.0.contains("inline-env") && inline_one.0.contains("add"),
+            "inline secret name is deterministic per entrypoint, got {:?}",
+            inline_one.0
+        );
+
+        // Both the named id AND the inline id rode into FunctionCreate.secret_ids.
+        let secret_count = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::FunctionCreate { secret_count, .. } => Some(*secret_count),
+                _ => None,
+            })
+            .expect("FunctionCreate");
+        assert_eq!(
+            secret_count, 2,
+            "named secret id + inline env secret id BOTH ride into FunctionCreate"
+        );
+    }
+
+    #[test]
+    fn dry_run_struct_retries_ride_into_function_create() {
+        // C4: the `Retries(..)` STRUCT form (custom backoff/delays) rides into the planned
+        // FunctionCreate's retry policy — count, backoff, and both delays.
+        let cfg = FunctionConfig {
+            cache: Some(false),
+            retries_spec: Some("retries:max=5,backoff=2.0,initial_ms=500,max_ms=30000"),
+            ..FunctionConfig::default()
+        };
+        let app = App::from_manifest([("add".to_string(), cfg)]);
+        let manifest = app.dry_run("add", &run_cfg()).expect("dry_run");
+
+        let policy = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::FunctionCreate {
+                    retries,
+                    retry_backoff_coefficient,
+                    retry_initial_delay_ms,
+                    retry_max_delay_ms,
+                    ..
+                } => Some((
+                    *retries,
+                    *retry_backoff_coefficient,
+                    *retry_initial_delay_ms,
+                    *retry_max_delay_ms,
+                )),
+                _ => None,
+            })
+            .expect("FunctionCreate");
+        assert_eq!(policy.0, Some(5), "retry count rode in");
+        assert_eq!(policy.1, Some(2.0), "custom backoff rode in");
+        assert_eq!(policy.2, Some(500), "custom initial delay (ms) rode in");
+        assert_eq!(policy.3, Some(30_000), "custom max delay (ms) rode in");
     }
 
     #[test]
