@@ -15,7 +15,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.94"
+  # Match the repo-pinned toolchain (rust-toolchain.toml = 1.96.0). A stale 1.94 here
+  # made `cargo fmt --check` disagree with local rustfmt (1.96.0) on import ordering,
+  # reddening CI on every push. Keep this in lockstep with rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.96.0"
   TMPDIR: /tmp
 
 # NOTE: The Rust job is gated on a Cargo workspace existing. Until prototype M0
