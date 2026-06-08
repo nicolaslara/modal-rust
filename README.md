@@ -175,8 +175,15 @@ modal-rust call summarize \
 ```
 
 For your own project, point `--project` at your crate (the one with the
-`#[function]`s). The CLI auto-generates the runner; there is no binary to write.
-`--input` accepts inline JSON or `@path/to/input.json`.
+`#[function]`s) — it defaults to the current directory, so from inside your crate
+you can omit `--project` entirely. The CLI auto-generates the runner; there is no
+binary to write. `--input` accepts inline JSON or `@path/to/input.json`.
+
+The CLI validates `--input` **locally before any Modal round-trip**: it decodes
+your JSON against the function's expected input shape and, on a mismatch, fails
+fast with the expected shape (a `decode_error`) instead of building and running on
+Modal only to fail there. A typo in the entrypoint name or a missing runner
+degrades gracefully to the normal remote check rather than a false rejection.
 
 ## Library API
 
@@ -283,8 +290,8 @@ pub fn add(input: AddInput) -> anyhow::Result<AddOutput> {
 The decorator is the config. Everything Modal needs to create the function lives
 on the attribute — `gpu`, `cpu`, `memory`, `timeout`, `retries`, `schedule`,
 autoscaling (`min_containers`/`max_containers`/`buffer_containers`/`scaledown_window`),
-`cache`, `secrets`, and `volumes` — and is read from the registry at call time (there
-are no extra CLI flags):
+`cache`, `secrets`, `required_keys`, `env`, `volumes`, and a per-function `image` — and
+is read from the registry at call time (there are no extra CLI flags):
 
 ```rust
 use modal_rust::function;
@@ -314,6 +321,13 @@ pub struct TrainOutput {
     required_keys = ["API_KEY"],    // assert these keys exist on the named secrets
     env = { "REGION" = "us-east" }, // an INLINE secret (Secret.from_dict), injected as env vars
     volumes = ["/data=my-dataset"], // a Modal Volume `my-dataset` mounted at /data
+    image = Image(                  // a PER-FUNCTION image just for THIS entrypoint
+        base = "nvidia/cuda:12.4.1-devel-ubuntu22.04", // override the base image
+        install_rust = true,        // install the Rust toolchain on that base
+        apt = ["libssl-dev"],       // apt packages (prepended to path-level steps)
+        pip = ["numpy"],            // pip packages
+        run = ["echo built"],       // arbitrary RUN commands
+    ),
 )]
 pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
     let _key = std::env::var("API_KEY")?;        // from the secret
@@ -321,6 +335,15 @@ pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
     Ok(TrainOutput { ok: true })
 }
 ```
+
+`image = Image(..)` is the per-function analogue of Python's
+`app.function(image=..)`: it makes *this* entrypoint build on the declared base.
+`base`/`install_rust` **override** the path-level default base (the same base you
+can otherwise set globally via `RemoteConfig.base_image`/`.install_rust` or
+`MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`), while `apt`/`pip`/`run`
+**prepend** to any path-level image steps. A bare `Image()` is a no-op. This is how
+a single GPU function declares its CUDA-devel base inline — see
+[Run vs Deploy](#run-vs-deploy) for the GPU `run` mechanics.
 
 Resolve a `Function` handle by name from the inventory registry and call it three
 ways:
@@ -589,6 +612,56 @@ That split is the core product invariant. The development path optimizes for
 fast iteration from local Rust source; the deployed path optimizes for stable
 invocation without rebuilding.
 
+### Rust-specific tradeoffs (things you do not think about in Python)
+
+In Python, Modal pre-builds the image, so by the time your function runs there is
+**no compile step** — the code is already importable. Rust is compiled, and that
+moves where the build happens:
+
+- **The `run` path compiles in the function container.** `.remote()` (and
+  `modal-rust run`) upload your source and run `cargo build` *inside* the Modal
+  function body, then execute the runner. So a cold call pays a compile, and a
+  heavy crate (`burn`/`cubecl`, large transitive trees) can exhaust RAM during
+  `rustc`/`nvcc` and get killed — Modal reports this as
+  `GENERIC_STATUS_TERMINATED`. The fix is to give the build room with a higher
+  `memory =` on the decorator (e.g. `memory = 8192` for the Burn example); the
+  [Build cache](#build-cache) then makes warm runs skip the recompile entirely.
+- **`deploy` moves the build to image-build time.** `deploy` + `call` runs
+  `cargo build` **once**, at image creation, with full build resources, and bakes
+  a prebuilt `/app/modal_runner` into a persistent image. There is no per-cold-
+  container rebuild and no source upload at call time — the right choice for a
+  heavy crate or a hot production endpoint.
+- **The `client` feature shrinks the build massively.** Keeping the gRPC client
+  behind the non-default `client` feature (see [Install](#the-client-feature-talking-to-modal-vs-authoring))
+  collapses a ~150-crate tree to ~9, so the in-container `run` build stays small
+  and fast. A normal `#[function]` library that you `modal-rust run`/`deploy` never
+  compiles tonic at all.
+- **`--serve` keeps one runner warm.** With `modal_runner --serve` (used by the
+  `#[cls]` path) the process stays warm across inputs, so a `#[cls]` `#[enter]`
+  runs **once per warm container** rather than once per call — load-once,
+  serve-many. *(Future: memory snapshotting would make `#[enter]` pay its cost
+  **once ever** and restore the snapshot on every container start, including cold
+  starts — see [docs/ROADMAP.md](docs/ROADMAP.md).)*
+- **GPU does NOT imply deploy.** A GPU function runs fine on the `run` path **given
+  a CUDA-devel base** for the toolkit (NVRTC/cudart) plus a high enough `memory =`
+  for the in-body build. Set the base either per function with
+  `#[function(image = Image(base = "nvidia/cuda:..-devel", install_rust = true))]`,
+  or path-wide via `RemoteConfig.base_image`/`.install_rust` (or
+  `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`). Because the heavy CUDA crate
+  still compiles in the body on `run`, `deploy` is **recommended** so that build
+  happens once at image-build time — but it is a performance/efficiency choice, not
+  a requirement. *(The GPU `run` path is supported via these knobs; this specific
+  end-to-end GPU `run` has not been re-verified live in this pass — the heavy GPU
+  examples below are exercised via `deploy`.)*
+
+**When to run vs deploy.** Reach for **`run`** while iterating from local source:
+it is the tightest edit→call loop, the build cache keeps warm runs near-instant,
+and for light crates the in-body compile is a couple of seconds. Switch to
+**`deploy`** when the build is expensive (heavy/GPU crates, where an in-body
+compile risks `GENERIC_STATUS_TERMINATED` without enough `memory =`), when you want
+a stable persistent endpoint that never rebuilds at call time, or when a
+schedule/autoscaling config should stay live independent of your laptop.
+
 ### Build cache
 
 To keep the `.remote()` development loop fast, the in-container Cargo build is
@@ -652,10 +725,13 @@ workload:
   (driver-only image), run on a T4 via `.remote()`.
 - `examples/burn-add` — a Burn/CubeCL tensor op on CUDA, deployed and called on a
   T4. Because it needs the CUDA toolkit (NVRTC/cudart) at build and run time, the
-  image uses a `nvidia/cuda:*-devel` base with the Rust toolchain installed; set
-  this with `MODAL_RUST_BASE_IMAGE` + `MODAL_RUST_INSTALL_RUST=1` (or
-  `RemoteConfig`/`DeployConfig`). For the heavy CUDA build, prefer `deploy` +
-  `call` so the build happens once at image-build time.
+  image uses a `nvidia/cuda:*-devel` base with the Rust toolchain installed. Set
+  that base **either** per function on the decorator —
+  `#[function(image = Image(base = "nvidia/cuda:..-devel", install_rust = true))]`
+  — **or** path-wide with `MODAL_RUST_BASE_IMAGE` + `MODAL_RUST_INSTALL_RUST=1`
+  (or `RemoteConfig`/`DeployConfig`). The example also sets `memory = 8192` so the
+  heavy in-body build does not get killed (`GENERIC_STATUS_TERMINATED`). For that
+  heavy CUDA build, prefer `deploy` + `call` so it happens once at image-build time.
 
 The GPU spec maps to Modal exactly: `"TYPE[:count]"` (e.g. `"H100:4"`); memory
 variants like `"A100-80GB"` pass through as the GPU type.
@@ -685,9 +761,10 @@ pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
 
 Everything on `#[function(...)]` — `gpu`, `cpu`, `memory`, `timeout`, `retries`,
 `schedule`, autoscaling (`min_containers`/`max_containers`/`buffer_containers`/
-`scaledown_window`), `cache`, `secrets`, `volumes` — is sourced from the registry at
-call time. The decorator is the config; there are no extra CLI flags. (Non-macro users
-can set the same fields on `RemoteConfig` / `DeployConfig`.)
+`scaledown_window`), `cache`, `secrets`, `required_keys`, `env`, `volumes`, and a
+per-function `image` — is sourced from the registry at call time. The decorator is the
+config; there are no extra CLI flags. (Non-macro users can set the same fields on
+`RemoteConfig` / `DeployConfig`.)
 
 ## Development
 
@@ -722,6 +799,21 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 | `examples/stateful-class` | **(macro / `Cls`)** Load-once-serve-many: a `#[modal_rust::cls]` impl with `#[enter]` (load an embedding model ONCE per warm container) + `#[method]`s reusing it by `&self`, called `app.embedder().embed("hi".into()).remote().await?`. Each method is its own dotted `Embedder.embed` / `Embedder.dim` entrypoint; live-confirmed on a T4. |
+| `examples/custom-types` | **(macro / I/O)** Real functions take and return your own `struct`s: derive `Serialize`/`Deserialize`, take a struct, return a struct, and the macro infers the typed I/O from the signature. `score(Player) -> Scored` turns a match record into a score. |
+| `examples/ways-to-call` | **(macro / call shapes)** One function (`square(n: i64)`), four invocation patterns side by side — `.local()`, `.remote().await`, `.spawn()` + `.get()`, and `.map([..])` — all through the same typed `app.square(n)` method. The "how do I actually call this" tour. |
+| `examples/deploy-and-call` | **(run vs deploy)** The build boundary made concrete: `.remote()` rebuilds in the function body on each cold start, while `deploy` runs `cargo build --release` ONCE at image-build time and bakes the binary in so each `call` skips the rebuild. |
+| `examples/fan-out-map` | **(call shapes)** Embarrassingly-parallel scale-out with `.map()`: one `#[function]` mapped over N inputs returns `Vec<Out>` in input order. `analyze` returns a document's word count + estimated reading time. |
+| `examples/background-jobs` | **(call shapes)** Fire-and-forget with `.spawn()`: enqueue a job, get a handle back immediately, do other work, then collect the result with `.get(timeout)` — the async-job pattern vs blocking `.remote()`. |
+| `examples/spawn-map-foreach` | **(call shapes)** The rest of the map family: `.spawn_map()` (fire-and-forget fan-out) and `.for_each()` (side-effect map that waits and discards results). `notify` sends a per-recipient notification. |
+| `examples/cpu-memory` | **(decorator config)** Right-size plain compute with `#[function(cpu = 2.0, memory = 4096)]` (2.0 cores -> 2000 milli-cores, 4096 MiB -> 4 GiB). `crunch` folds a batch of records into a deterministic checksum. |
+| `examples/timeout-and-cache` | **(decorator config)** Operational knobs: a function `timeout` plus the on-by-default cargo build cache (`#[function(timeout = 1800, cache = true)]`). `spin` runs N checksum-fold iterations. |
+| `examples/retries` | **(decorator config)** Self-healing with an automatic retry policy (`#[function(retries = 5)]`): `fetch` fails the first two attempts and succeeds on the third, with no retry loop in your code. |
+| `examples/secrets` | **(decorator config)** Attach a named Modal secret (`#[function(secrets = ["my-api-key"])]`) and read it as an env var inside the function. `check_secret` reports whether `MY_API_KEY` was injected and its length — never the value. |
+| `examples/volumes` | **(decorator config)** Mount a Volume (`#[function(volumes = ["/data=my-vol"])]`), write a file, and read it back on the next call — persistent storage across invocations. `record_visit` appends to a log and returns the running count. |
+| `examples/autoscaling` | **(decorator config)** Control warm capacity and scale-to-zero (`min`/`max`/`buffer_containers`, `scaledown_window`) for the latency-vs-cost tradeoff. `embed` turns a document into an L2-normalized feature vector — a believable unit of work to scale out. |
+| `examples/scheduled-job` | **(decorator config)** A deployed function that runs on a cron cadence with no caller (`#[function(schedule = Cron("0 9 * * 1"))]`): once deployed, Modal triggers `weekly_report` automatically. |
+| `examples/custom-base` | **(image config)** Pick the RUN base image and install the Rust toolchain via the path-level knobs (`RemoteConfig.base_image`/`.install_rust`, or `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`) without editing the body. `probe` checksums an input so you can confirm the body ran on your chosen image. |
+| `examples/pip-apt-image` | **(image config)** The image-builder steps API: add system packages, Python packages, and shell commands via `RemoteConfig::image_steps` (`ImageStep::apt`/`pip`/`run`), mirroring Python's `Image.apt_install(..)`/`pip_install(..)`/`run_commands(..)`. |
 
 Every example runs offline (in-process, no Modal). Run them all and check their
 output with `bash scripts/check-examples.sh`, or one at a time from the repo root:

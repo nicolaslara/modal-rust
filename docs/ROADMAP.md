@@ -43,9 +43,13 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
 ## Next steps (features)
 
 ### Cheap parity (the mock makes these testable offline now)
-- `cpu`/`memory` (≈free — `FunctionResources` already plumbed), `retries`, image builders
-  (`pip_install`/`apt_install`), `schedule` (Cron/Period), inline secrets-from-dict + dotenv,
-  autoscaling, `starmap`. Each is small and ships with mock tests.
+- DONE: `cpu`/`memory` (`FunctionResources`), `retries` (int + `Retries(..)` struct),
+  image builders (`pip_install`/`apt_install`/`run_commands`) + a per-function custom
+  `image = Image(base/install_rust/apt/pip/run)` decorator field, `schedule` (Cron/Period),
+  inline `env={..}` secrets-from-dict + `required_keys`, autoscaling, `starmap`. Each
+  shipped with mock tests.
+- Still cheap & open: `Secret.from_dotenv()` / `.env` file parsing; `cpu`/`memory` as a
+  `(request, limit)` tuple.
 
 ### Big parity (need real design)
 - ~~`Cls` (stateful classes: load-once `@enter` + `@method`)~~ — DONE (v0, Shape A):
@@ -56,6 +60,11 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   `modal.parameter` class params (use `#[cls(secrets=[..])]` + `std::env` for now).
 - Web endpoints (`@fastapi_endpoint`/`@asgi_app`) — now the largest remaining gap —
   then `Dict`/`Queue`/`Sandbox`/NFS.
+- **`enable_memory_snapshot` / Cls memory-checkpointing** (high value, `snapshot.py`) —
+  let the expensive `#[enter]` load run **once ever**, snapshot the loaded process, and
+  restore it on every (even cold) container start. This extends `Cls` load-once-serve-many
+  across the run/cold-start path (not just within a single warm container), which is the
+  big remaining unlock for the heavy-load `Cls` story.
 
 ### Infra / quality
 - **Benchmarks runnable** — wire the plan-only A/B-vs-Python harness (cold/warm build, deploy,

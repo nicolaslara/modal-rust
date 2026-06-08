@@ -70,8 +70,11 @@ A short summary of the surface that is genuinely done:
 - **Volumes (user + cache)**: `#[function(volumes = ["/m=name"])]` →
   `VolumeGetOrCreate` → `Function.volume_mounts`, plus the on-by-default cargo
   build cache as a V2 volume. `ops/volume.rs`, `ops/function.rs`.
-- **Config**: `gpu`, `cpu`, `memory`, `timeout`, `retries`, `schedule`, `cache`,
-  `secrets`, `volumes` on the decorator.
+- **Config**: `gpu`, `cpu`, `memory`, `timeout`, `retries` (int + `Retries(..)`
+  struct), `schedule` (`Cron`/`Period`), `cache`, `secrets`, `required_keys`,
+  inline `env={..}` (a `Secret.from_dict` that composes with `secrets`), `volumes`,
+  autoscaling (`min`/`max`/`buffer_containers` + `scaledown_window`), and a
+  per-function custom `image = Image(..)` on the decorator.
 - **Source upload**: cargo-metadata-scoped, `.modalignore` > `.gitignore` >
   defaults, matching `mount.py`/`file_pattern_matcher.py` precedence intent.
 - **Transport**: first-party gRPC over our own vendored `api.proto` (auth, retries,
@@ -147,10 +150,10 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `timeout` (799) | **Have** | `timeout = <secs>`. |
 | `secrets` (785) | **Have** (named only) | See §2. |
 | `volumes` (789) | **Have** (Volume only) | `CloudBucketMount` value variant Missing — see §5. |
-| `image` (782) | **Partial** | The image is assembled by the facade from a base tag + add_python + toolchain flags (`MODAL_RUST_BASE_IMAGE`, `with_rust_toolchain`); there is **no** way to pass a fully custom `Image` object per function. |
+| `image` (782) | **Have** (per-function custom image) | `#[function(image = Image(base = "..", install_rust = <bool>, apt = [..], pip = [..], run = [..]))]` mirrors Modal's `app.function(image=..)` — that entrypoint builds on the declared base. `base`/`install_rust` **override** the path-level default; `apt`/`pip`/`run` **prepend** to the path-level `image_steps`. Path-level defaults still exist too (`RemoteConfig::base_image`/`install_rust` or `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`; `examples/custom-base`). Remaining gap: the richer Modal `Image` builder chain (`from_registry` layering, `dockerfile_commands`, etc. — see §3), not a fully chainable per-function `Image` algebra. |
 | `name` (801) | **Have** | `#[function(name = "...")]`. |
-| `cpu` (790) | **Partial** | SDK `FunctionResources.milli_cpu` exists (`ops/function.rs:55`) and flows to `Resources`, but the **decorator cannot set it** (always server default). Modal supports `float` or `(request, limit)` tuple. |
-| `memory` (791) | **Partial** | Same: `FunctionResources.memory_mb` exists but is not settable from the decorator. Modal supports `int` or `(request, limit)`. |
+| `cpu` (790) | **Have** | `#[function(cpu = 2.0)]` → `FunctionResources.milli_cpu` (`ops/function.rs:55`) → `Resources` (the macro parses `is_ident("cpu")` and converts the `float` cores to milli-CPU). Remaining gap: Modal's `(request, limit)` tuple form — we take only the scalar request. |
+| `memory` (791) | **Have** | `#[function(memory = 4096)]` → `FunctionResources.memory_mb` (the macro parses `is_ident("memory")`; e.g. `examples/burn-add` uses `memory = 8192`). Remaining gap: Modal's `(request, limit)` tuple form — we take only the scalar request. |
 | `retries` (798) | **Have** (int + struct form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), mirroring `_parse_retries(int)`. The STRUCT form `#[function(retries = Retries(max_retries = N[, backoff_coefficient = f][, initial_delay = s][, max_delay = s]))]` sets custom backoff/delays (seconds → `initial_delay_ms`/`max_delay_ms`), mirroring `Retries(..)` (`retries.py`). Both ride into `Function.retry_policy`. `ops/function.rs` `with_retries` / `with_retry_policy`. |
 | `schedule` (783) | **Have** | `#[function(schedule = Cron("..")/Period(..))]` → `Function.schedule` (field 72) as a `Schedule.Cron`/`Schedule.Period`, mirroring `schedule.py:12/61`. The macro canonicalizes the call form to a spec the SDK's `parse_schedule` parses; `with_schedule` rides it into the deploy FunctionCreate. See §8. |
 | `min_containers` / `max_containers` / `buffer_containers` (793-795) | **Have** | `#[function(min_containers = .., max_containers = .., buffer_containers = ..)]` → `Function.autoscaler_settings` (field 79) + the deprecated mirror fields Modal still sets (`warm_pool_size`/`concurrency_limit`/`_experimental_buffer_containers`), mirroring `_functions.py:764-768,1019-1021`. Validated like Modal (`max >= min`). `ops/function.rs` `with_autoscaler`; `examples/autoscaling`. |
@@ -160,7 +163,7 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `region` (804) / `cloud` (803) | **Missing** | Region/cloud placement (`scheduler_placement.py`). |
 | `proxy` (797) | **Missing** | `_Proxy` egress (`proxy.py`). See §8. |
 | `ephemeral_disk` (792) | **Missing** | Scratch disk sizing. |
-| `enable_memory_snapshot` (807) | **Missing** | Memory checkpoint for faster cold starts (`snapshot.py`). |
+| `enable_memory_snapshot` (807) | **Missing** | Memory checkpoint for faster cold starts (`snapshot.py`). High value specifically for `Cls`: it would let the expensive `#[enter]` load run **once ever** and be restored from a snapshot on every (even cold) container start — so the load-once value persists across the run/cold-start path, not just within one warm container. |
 | `block_network` (808) | **Missing** | Network isolation. |
 | `restrict_modal_access` (809) | **Missing** | |
 | `network_file_systems` (788) | **Missing** | See §5. |
@@ -170,10 +173,11 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | Clustered (`i6pn`, `cluster_size`, `rdma`) | **Missing** | Multi-node clustered functions (`_clustered_functions.py`, experimental). |
 
 The high-value, cheap wins here — **`cpu` / `memory`**, **`retries`** (both the
-int form AND the `Retries(...)` struct form for custom backoff/delays), and
-**autoscaling** (`min`/`max`/`buffer_containers` + `scaledown_window`) — are all now
-**Have**. The remaining decorator gaps (`@concurrent`, `@batched`, region/cloud, …)
-are M-sized or runtime-coupled.
+int form AND the `Retries(...)` struct form for custom backoff/delays),
+**autoscaling** (`min`/`max`/`buffer_containers` + `scaledown_window`), and a
+**per-function custom `image = Image(..)`** — are all now **Have**. The remaining
+decorator gaps (`@concurrent`, `@batched`, region/cloud, …) are M-sized or
+runtime-coupled.
 
 ---
 
@@ -273,7 +277,7 @@ and class parameters (`modal.parameter`). Until then, inject config via
 | **`Proxy`** (static-egress proxy) | **Missing** | `proxy.py`. |
 | **Scaling / autoscaler control** | **Partial** | Static config `min/max/buffer_containers` + `scaledown_window` are **Have** (§4) → `Function.autoscaler_settings`. Live `update_autoscaler` (§6) is still Missing. |
 | **Tunnels** (`forward`) | **Missing** | `_tunnel.py`. |
-| **Cls-based memory snapshot / checkpointing** | **Missing** | `snapshot.py`. |
+| **Cls-based memory snapshot / checkpointing** | **Missing** | `snapshot.py`. The high-value `Cls` win: pay the expensive `#[enter]` load **once ever**, snapshot the loaded process, and restore it on every (even cold) container start — extending load-once-serve-many across cold starts, not just within a warm container. |
 | **Logs streaming / `modal logs`** | **Partial** | We stream image-build logs (`ImageJoinStreaming`) and function-output logs inline; no general `app logs` / live function log tail API. |
 | **Environments / Workspaces management** | **Partial** | We resolve/use the configured environment (`env_or_default`); no create/list environment RPCs (`environments.py`, `workspace.py`). |
 | **Billing / call graph / clustered functions** | **Missing** | `billing.py`, `call_graph.py`, `_clustered_functions.py`. |
@@ -296,8 +300,10 @@ has no equivalent.
 
 Ordered by value-to-effort for a Rust-on-Modal runtime:
 
-1. **`cpu` / `memory` decorator fields** — SDK already plumbs them
-   (`FunctionResources`); only the macro/facade wiring is missing. Cheapest win.
+1. ~~**`cpu` / `memory` decorator fields**~~ — DONE: `#[function(cpu = 2.0, memory =
+   4096)]` → `FunctionResources` (`milli_cpu`/`memory_mb`); the macro parses both
+   (`examples/burn-add` uses `memory = 8192`). Remaining gap: Modal's `(request, limit)`
+   tuple form.
 2. ~~**`retries`**~~ — DONE (int + struct form): `#[function(retries = N)]` and
    `#[function(retries = Retries(max_retries = N, backoff_coefficient = f,
    initial_delay = s, max_delay = s))]` → `retry_policy` (`with_retries` /
@@ -305,6 +311,9 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
 3. ~~**General `pip_install` / `apt_install` / `run_commands` image steps**~~ — DONE:
    `RemoteConfig::image_steps` / `DeployConfig::image_steps` carry ordered `ImageStep`s
    (`apt`/`pip`/`run`) rendered into the image dockerfile; `examples/pip-apt-image`.
+   Also DONE: a **per-function custom `image = Image(base/install_rust/apt/pip/run)`**
+   decorator field (the `app.function(image=..)` analogue) — `base`/`install_rust`
+   override the path default, `apt`/`pip`/`run` prepend to the path steps.
 4. ~~**Inline `secrets = {dict}` / `required_keys`**~~ — DONE:
    `#[function(secrets=[..], required_keys=[..])]` threads asserted keys into
    `from_name`; `#[function(env={"K"="V", ..})]` resolves an inline `Secret.from_dict`
