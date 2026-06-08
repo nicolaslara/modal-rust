@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{HandlerFn, Registry};
-use modal_rust_runtime::CheckFn;
+use modal_rust_runtime::{CheckFn, PrimeFn};
 
 /// Per-function deploy/run CONFIG sourced from
 /// `#[modal_rust::function(gpu=..., timeout=..., cache=...)]`.
@@ -96,6 +96,12 @@ pub struct FunctionConfig {
     /// env-only `MODAL_RUST_BASE_IMAGE`. Const-valid in the `static` initializer like
     /// `gpu`/`schedule`.
     pub image: Option<&'static str>,
+    /// Memory-snapshot opt-in (`enable_memory_snapshot = true`), `#[cls]`-only in v0.
+    /// `false` (the default) ⇒ inert ⇒ byte-identical to before. The facade only lets it
+    /// take effect on the DEPLOY boundary (Modal snapshots deployed apps), so a RUN stays
+    /// wire-identical even when the decorator opts in. A bare `bool`, const-valid in the
+    /// `static` `inventory::submit!` initializer (like `cache`).
+    pub enable_memory_snapshot: bool,
 }
 
 impl FunctionConfig {
@@ -120,6 +126,7 @@ impl FunctionConfig {
             buffer_containers: None,
             scaledown_window: None,
             image: None,
+            enable_memory_snapshot: false,
         }
     }
 }
@@ -195,6 +202,13 @@ pub struct FunctionOptions {
     /// deploy). Rides the `--describe` manifest so the CLI path resolves it too.
     #[serde(default)]
     pub image: Option<String>,
+    /// Memory-snapshot opt-in (`enable_memory_snapshot = true`), `#[cls]`-only in v0.
+    /// `false` (the default) ⇒ inert ⇒ byte-identical to before. The facade only lets it
+    /// take effect on the DEPLOY boundary (Modal snapshots deployed apps); RUN stays
+    /// wire-identical. Owned form of the `bool`; rides the `--describe` manifest so the
+    /// CLI path resolves it too.
+    #[serde(default)]
+    pub enable_memory_snapshot: bool,
 }
 
 impl FunctionOptions {
@@ -239,6 +253,7 @@ impl From<&FunctionConfig> for FunctionOptions {
             buffer_containers: config.buffer_containers,
             scaledown_window: config.scaledown_window,
             image: config.image.map(str::to_string),
+            enable_memory_snapshot: config.enable_memory_snapshot,
         }
     }
 }
@@ -267,6 +282,13 @@ pub struct Registration {
     /// local validation and degrade to the remote decode check rather than
     /// false-reject. The `#[modal_rust::function]`/`#[cls]` macros always populate it.
     pub check: Option<CheckFn>,
+    /// The SNAPSHOT-PRIME hook: forces this entrypoint's `#[cls]` singleton (running
+    /// its `#[enter]` inside Modal's memory-snapshot freeze window) on a `prime` serve
+    /// frame. Populated ONLY for snapshot-enabled `#[cls]` methods (the `#[cls]` macro
+    /// sets it when `enable_memory_snapshot = true`); `None` for plain `#[function]`s
+    /// and non-snapshot classes ⇒ inert, byte-identical to before. The facade threads
+    /// it into the runtime [`Registry`] so the serve loop can fire it best-effort.
+    pub snapshot_prime: Option<PrimeFn>,
     /// Per-function deploy/run config sourced from the decorator.
     pub config: FunctionConfig,
     /// Cargo package captured at the user crate's macro expansion site.
@@ -289,9 +311,16 @@ pub fn registry_from_inventory() -> Registry {
 /// to the handler-only `function` otherwise. Shared by both inventory collectors so
 /// the checker wiring cannot drift between them.
 fn register_one(registry: Registry, registration: &Registration) -> Registry {
-    match registration.check {
+    let registry = match registration.check {
         Some(check) => registry.function_checked(registration.name, registration.handler, check),
         None => registry.function(registration.name, registration.handler),
+    };
+    // Carry the SNAPSHOT-PRIME hook (if any) into the runtime registry so the serve
+    // loop fires it on a `prime` frame. `None` (plain functions / non-snapshot classes)
+    // adds nothing ⇒ a registry with no snapshot `#[cls]` has no primes, byte-identical.
+    match registration.snapshot_prime {
+        Some(prime) => registry.snapshot_prime(prime),
+        None => registry,
     }
 }
 
@@ -458,6 +487,7 @@ mod tests {
                 image: Some(
                     r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#.to_string(),
                 ),
+                enable_memory_snapshot: false,
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -519,6 +549,7 @@ mod tests {
         assert!(d.volumes.is_empty());
         assert!(d.retries_spec.is_none());
         assert!(d.image.is_none());
+        assert!(!d.enable_memory_snapshot);
         let c = FunctionConfig::new();
         assert_eq!(d, c);
     }
@@ -543,6 +574,7 @@ mod tests {
             buffer_containers: Some(2),
             scaledown_window: Some(120),
             image: Some(r#"{"base":"rust:1-slim"}"#),
+            enable_memory_snapshot: true,
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -565,6 +597,7 @@ mod tests {
         assert_eq!(options.buffer_containers, Some(2));
         assert_eq!(options.scaledown_window, Some(120));
         assert_eq!(options.image.as_deref(), Some(r#"{"base":"rust:1-slim"}"#));
+        assert!(options.enable_memory_snapshot);
     }
 
     #[test]

@@ -44,6 +44,20 @@ pub type HandlerFn = fn(&[u8]) -> Result<Vec<u8>, RunnerError>;
 /// handler decodes.
 pub type CheckFn = fn(&[u8]) -> Result<(), RunnerError>;
 
+/// A SNAPSHOT-PRIME hook reduced to a bare `fn` pointer: it FORCES a `#[cls]`
+/// singleton's `get_or_init` (running its `#[enter]` exactly once) and DISCARDS the
+/// value, returning `Ok(())` on success. Populated ONLY for snapshot-enabled
+/// `#[cls]` methods; `None` for plain functions and non-snapshot classes.
+///
+/// The serve loop calls every registered prime on a `{"kind":"prime"}` frame
+/// (BEST-EFFORT — a per-fn error is logged and skipped, never crashing the loop) so
+/// the class's `#[enter]` runs INSIDE Modal's memory-snapshot freeze window. Because
+/// it routes through the same `OnceLock` `get_or_init` the first real request would,
+/// a class shared by several method-registrations is primed at most once even if its
+/// prime fn is invoked N times, and a missed prime degrades to the existing lazy
+/// `#[enter]` (correctness floor) rather than re-running.
+pub type PrimeFn = fn() -> Result<(), RunnerError>;
+
 /// The frozen failure taxonomy (boundaries.md §2). The runner models failure as a
 /// Rust enum that **wraps** the user's error rather than stringifying it early, so
 /// the monomorphized [`typed!`] wrapper can preserve structure.
@@ -317,6 +331,11 @@ pub struct Registration {
     /// checker; such entrypoints skip local validation (degrade to the remote
     /// decode check) rather than false-reject.
     pub check: Option<CheckFn>,
+    /// The SNAPSHOT-PRIME hook (forces this entrypoint's `#[cls]` singleton so its
+    /// `#[enter]` runs inside the snapshot freeze window). `None` for plain functions
+    /// and non-snapshot classes ⇒ inert; populated ONLY for snapshot-enabled `#[cls]`
+    /// methods. The serve loop runs it on a `prime` frame (best-effort).
+    pub snapshot_prime: Option<PrimeFn>,
 }
 
 inventory::collect!(Registration);
@@ -335,6 +354,14 @@ pub struct Registry {
     /// builders), so `--check-input` reports them as "no local validation available"
     /// and degrades to the remote decode check — never a false rejection.
     checks: BTreeMap<&'static str, CheckFn>,
+    /// SNAPSHOT-PRIME hooks to run on a `{"kind":"prime"}` serve frame. A flat list
+    /// (not keyed by name) because the serve loop fires ALL of them: each forces a
+    /// `#[cls]` singleton's `#[enter]` inside the snapshot freeze window. Idempotence
+    /// is owned by the underlying `OnceLock` `get_or_init`, so a class shared by N
+    /// method-registrations is primed once even though N entries land here. Empty for
+    /// any registry built without snapshot-enabled `#[cls]` methods, so a `prime` frame
+    /// simply acks `{"primed":0}`.
+    primes: Vec<PrimeFn>,
 }
 
 impl Registry {
@@ -343,6 +370,7 @@ impl Registry {
         Registry {
             handlers: BTreeMap::new(),
             checks: BTreeMap::new(),
+            primes: Vec::new(),
         }
     }
 
@@ -369,6 +397,9 @@ impl Registry {
                 }
                 None => registry.function(registration.name, registration.handler),
             };
+            if let Some(prime) = registration.snapshot_prime {
+                registry = registry.snapshot_prime(prime);
+            }
         }
         registry
     }
@@ -403,6 +434,16 @@ impl Registry {
             panic!("duplicate entrypoint registered: {name:?}");
         }
         self.checks.insert(name, check);
+        self
+    }
+
+    /// Record a SNAPSHOT-PRIME hook to be fired (best-effort) on a `prime` serve
+    /// frame. Builder-style (consumes + returns `self`) like [`Registry::function`].
+    /// Unlike handlers, primes are NOT keyed by name and NEVER rejected for
+    /// duplication: the serve loop calls every one, and the underlying `OnceLock`
+    /// `get_or_init` makes repeated calls for the same class idempotent.
+    pub fn snapshot_prime(mut self, prime: PrimeFn) -> Self {
+        self.primes.push(prime);
         self
     }
 
@@ -757,6 +798,22 @@ struct ServeRequest {
     input: String,
 }
 
+/// The OPTIONAL typed-frame discriminant (architecture §0): a forward-safe seam over
+/// the SAME one-line serve framing. ONLY the `kind` field is read here; everything
+/// else on the line is left for the per-kind parser, so a `request` frame is decoded
+/// by the UNCHANGED [`ServeRequest`] exactly as before.
+///
+/// - absent / `"request"` ⇒ the EXISTING `{entrypoint,input}` request path (old
+///   `kind`-less frames keep working byte-identically).
+/// - `"prime"` ⇒ run the snapshot primes, ack `{"primed":<n>}`, serve no user request.
+/// - a FUTURE `"restore"` lands as a new arm here (post-restore hooks) WITHOUT
+///   touching the request path — the additive forward-safety mechanism.
+#[derive(serde::Deserialize)]
+struct FrameKind {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
 /// Run the long-lived SERVE loop reading framed requests from stdin and writing one
 /// frozen envelope per response on stdout (`modal_runner --serve`).
 ///
@@ -803,6 +860,29 @@ pub fn run_serve_with_io<R: std::io::BufRead, W: std::io::Write>(
         if line.trim().is_empty() {
             continue;
         }
+        // Forward-safe seam (architecture §0): peek ONLY at an optional `kind`. A
+        // `kind`-less (or `kind == "request"`) frame falls through to the UNCHANGED
+        // request path below, so old serve frames decode byte-identically. A frame
+        // that does not even parse as a JSON object here also falls through (the
+        // request path emits the SAME `malformed serve request frame` decode_error as
+        // before — no new error surface for old bad frames).
+        if let Ok(FrameKind { kind: Some(kind) }) = serde_json::from_str::<FrameKind>(&line) {
+            match kind.as_str() {
+                "request" => {} // explicit request kind: fall through to the request path
+                "prime" => {
+                    serve_prime(&registry, out);
+                    continue;
+                }
+                other => {
+                    // An unknown kind is a degradeable signal, not a crash: report a
+                    // decode_error frame and keep serving (a future `restore` kind is
+                    // additive — it lands as a new arm above, never here).
+                    let err = RunnerError::Decode(format!("unknown serve frame kind: {other:?}"));
+                    let _ = emit_line(out, &err.to_envelope());
+                    continue;
+                }
+            }
+        }
         // A malformed FRAME (not a valid {entrypoint,input} object) is a decode_error
         // envelope, but the loop keeps serving the next request.
         let req: ServeRequest = match serde_json::from_str(&line) {
@@ -816,6 +896,40 @@ pub fn run_serve_with_io<R: std::io::BufRead, W: std::io::Write>(
         serve_one(&registry, &req, out);
     }
     0
+}
+
+/// Handle ONE `{"kind":"prime"}` frame: run every registered snapshot prime
+/// BEST-EFFORT (a per-fn `Err` or panic is logged to stderr and skipped, NEVER
+/// crashing the serve loop), then write exactly ONE ack line `{"primed":<n_ok>}`
+/// where `n_ok` counts the primes that returned `Ok`. Serves no user request.
+///
+/// Each prime forces a `#[cls]` singleton's `get_or_init`, so its `#[enter]` runs
+/// INSIDE Modal's memory-snapshot freeze window. Idempotence is owned by `OnceLock`:
+/// a class shared by several method-registrations is primed once even though its
+/// prime fn appears multiple times. If a prime never runs (frame never sent, child
+/// died, or it errored), the FIRST real request still lazily runs `#[enter]` via the
+/// existing `OnceLock` path — correctness holds; only the snapshot perf win is lost.
+fn serve_prime<W: std::io::Write>(registry: &Registry, out: &mut W) {
+    // Install the quiet panic hook so a panicking prime does not dump the default
+    // message to stderr (we log our own one-line diagnostic and continue).
+    install_panic_hook();
+    let mut primed_ok: usize = 0;
+    for prime in &registry.primes {
+        // Catch a panicking prime too: a bad `#[enter]` must degrade to lazy init, not
+        // poison the warm container's serve loop (architecture §4 correctness floor).
+        let outcome = panic::catch_unwind(AssertUnwindSafe(prime));
+        match outcome {
+            Ok(Ok(())) => primed_ok += 1,
+            Ok(Err(e)) => {
+                eprintln!("modal_runner --serve: snapshot prime failed: {e}");
+            }
+            Err(_) => {
+                eprintln!("modal_runner --serve: snapshot prime panicked");
+            }
+        }
+    }
+    let ack = serde_json::json!({ "primed": primed_ok });
+    let _ = emit_line(out, &ack);
 }
 
 /// Handle ONE framed serve request: the SAME precedence as one-shot
@@ -1139,6 +1253,26 @@ mod tests {
             Ok(*B_SINGLETON.get_or_init(|| 3) + input.text.len())
         }
 
+        // ---- class C: the snapshot-PRIME proof (own singleton + prime fn) ----
+        // Models a snapshot-enabled `#[cls]`: `c_prime` forces the singleton (running
+        // `#[enter]` once) the way the macro-generated `__modal_snapshot_prime_<Class>`
+        // does, and `c_dim` reuses it. The counter proves `#[enter]` ran EXACTLY once.
+        static C_ENTER: AtomicUsize = AtomicUsize::new(0);
+        static C_SINGLETON: OnceLock<usize> = OnceLock::new();
+        fn c_singleton() -> &'static usize {
+            C_SINGLETON.get_or_init(|| {
+                C_ENTER.fetch_add(1, Ordering::SeqCst);
+                42 // the "loaded model" state
+            })
+        }
+        fn c_prime() -> Result<(), RunnerError> {
+            let _ = c_singleton();
+            Ok(())
+        }
+        fn c_dim(_input: serde_json::Value) -> anyhow::Result<usize> {
+            Ok(*c_singleton())
+        }
+
         fn drive(registry: Registry, frames: &[&str]) -> Vec<serde_json::Value> {
             let input = frames.join("\n");
             let mut out = Vec::new();
@@ -1227,6 +1361,89 @@ mod tests {
             );
             assert_eq!(envelopes.len(), 1, "blank lines produce no envelope");
             assert_eq!(envelopes[0]["ok"], true);
+        }
+
+        #[test]
+        fn prime_frame_runs_enter_once_then_request_reuses_it() {
+            // Architecture §0/§4: a `{"kind":"prime"}` frame forces the snapshot
+            // `#[cls]` singleton (runs `#[enter]` once) and acks `{"primed":1}` WITHOUT
+            // serving a user request; a following request reuses the primed singleton
+            // (no second `#[enter]`). Two method-registrations share the ONE prime fn —
+            // duplicate primes are idempotent via the `OnceLock`.
+            C_ENTER.store(0, Ordering::SeqCst);
+            let registry = Registry::new()
+                .function("Counter.dim", typed!(c_dim))
+                .function("Counter.also", typed!(c_dim))
+                .snapshot_prime(c_prime)
+                .snapshot_prime(c_prime); // same class registered twice -> primed once
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"{"kind":"prime"}"#,                            // ack, no user request
+                    r#"{"entrypoint":"Counter.dim","input":"null"}"#, // reuse, value 42
+                ],
+            );
+            assert_eq!(envelopes.len(), 2, "one ack + one request envelope");
+            // The prime acked with the count of primes that returned Ok (both did).
+            assert_eq!(envelopes[0], serde_json::json!({"primed": 2}));
+            // The request reused the primed singleton.
+            assert_eq!(envelopes[1], serde_json::json!({"ok": true, "value": 42}));
+            // The whole point: `#[enter]` (the `OnceLock` init) ran EXACTLY once across
+            // the prime and the subsequent request — the prime warmed it, the request
+            // reused it, and the duplicate prime did not re-enter.
+            assert_eq!(
+                C_ENTER.load(Ordering::SeqCst),
+                1,
+                "#[enter] ran exactly once: primed once, reused by the request"
+            );
+        }
+
+        #[test]
+        fn prime_frame_with_no_primes_acks_zero() {
+            // A `prime` frame on a registry with NO snapshot primes is harmless: it acks
+            // `{"primed":0}` and keeps serving (correctness floor — lazy `#[enter]`
+            // still happens on the first real request).
+            let registry = Registry::new().function("Embedder.dim", typed!(b_dim));
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"{"kind":"prime"}"#,
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#,
+                ],
+            );
+            assert_eq!(envelopes.len(), 2);
+            assert_eq!(envelopes[0], serde_json::json!({"primed": 0}));
+            assert_eq!(envelopes[1]["ok"], true);
+        }
+
+        #[test]
+        fn explicit_request_kind_is_served_like_a_plain_frame() {
+            // An explicit `kind == "request"` frame is served EXACTLY like a `kind`-less
+            // one (forward-safety: old frames and new explicit-request frames converge).
+            let registry = Registry::new().function("Embedder.dim", typed!(b_dim));
+            let envelopes = drive(
+                registry,
+                &[r#"{"kind":"request","entrypoint":"Embedder.dim","input":"null"}"#],
+            );
+            assert_eq!(envelopes.len(), 1);
+            assert_eq!(envelopes[0]["ok"], true);
+        }
+
+        #[test]
+        fn unknown_kind_is_a_decode_error_and_keeps_serving() {
+            // An unknown frame kind degrades to a decode_error envelope (not a crash);
+            // the loop keeps serving the next request.
+            let registry = Registry::new().function("Embedder.dim", typed!(b_dim));
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"{"kind":"restore"}"#, // FUTURE kind, not built in v0
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#,
+                ],
+            );
+            assert_eq!(envelopes.len(), 2);
+            assert_eq!(envelopes[0]["error"]["kind"], "decode_error");
+            assert_eq!(envelopes[1]["ok"], true); // loop still alive
         }
     }
 

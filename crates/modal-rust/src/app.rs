@@ -774,6 +774,7 @@ mod tests {
             name: "add",
             handler: test_handler as HandlerFn,
             check: None,
+            snapshot_prime: None,
             config: FunctionConfig::new(),
             package: "modal-rust",
         }
@@ -784,6 +785,7 @@ mod tests {
             name: "add_gpu",
             handler: test_handler as HandlerFn,
             check: None,
+            snapshot_prime: None,
             config: FunctionConfig {
                 gpu: Some("T4"),
                 timeout_secs: Some(1800),
@@ -802,6 +804,7 @@ mod tests {
                 buffer_containers: None,
                 scaledown_window: None,
                 image: None,
+                enable_memory_snapshot: false,
             },
             package: "modal-rust",
         }
@@ -812,6 +815,7 @@ mod tests {
             name: "add_extras",
             handler: test_handler as HandlerFn,
             check: None,
+            snapshot_prime: None,
             config: FunctionConfig {
                 gpu: None,
                 timeout_secs: None,
@@ -830,6 +834,7 @@ mod tests {
                 buffer_containers: None,
                 scaledown_window: None,
                 image: None,
+                enable_memory_snapshot: false,
             },
             package: "modal-rust",
         }

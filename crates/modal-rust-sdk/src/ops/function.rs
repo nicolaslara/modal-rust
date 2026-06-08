@@ -394,6 +394,14 @@ pub struct FunctionSpec {
     /// scaledown_window = ..)]` path sets these; Modal then controls warm capacity and
     /// scale-to-zero accordingly.
     pub autoscaler: FunctionAutoscaler,
+    /// Memory-snapshot (checkpoint/restore) opt-in → `Function.checkpointing_enabled`
+    /// (proto field 41) + `Function.is_checkpointing_function` (proto field 40). DEFAULT
+    /// `false`: both bools stay `false` ⇒ prost omits fields 40 + 41 ⇒ the create is
+    /// byte-identical to before for every function that does not opt in. The facade only
+    /// sets this on the DEPLOY boundary (Modal snapshots deployed apps), via
+    /// [`with_memory_snapshot`](FunctionSpec::with_memory_snapshot); RUN stays
+    /// wire-identical even when the decorator opts in.
+    pub checkpointing_enabled: bool,
 }
 
 impl FunctionSpec {
@@ -418,6 +426,7 @@ impl FunctionSpec {
             retry_policy: None,
             schedule: None,
             autoscaler: FunctionAutoscaler::default(),
+            checkpointing_enabled: false,
         }
     }
 
@@ -603,6 +612,16 @@ impl FunctionSpec {
         self.autoscaler = autoscaler;
         Ok(self)
     }
+
+    /// Opt into Modal memory snapshot (checkpoint/restore) for this function. When `on`,
+    /// the built [`Function`] sets BOTH `checkpointing_enabled` (proto field 41) and
+    /// `is_checkpointing_function` (proto field 40); when `false` (the default) both stay
+    /// unset ⇒ prost omits them ⇒ byte-identical to before. The facade gates this to the
+    /// DEPLOY boundary only (Modal snapshots deployed apps), so RUN stays wire-identical.
+    pub fn with_memory_snapshot(mut self, on: bool) -> Self {
+        self.checkpointing_enabled = on;
+        self
+    }
 }
 
 /// Result of [`ModalClient::function_create`].
@@ -728,6 +747,11 @@ pub(crate) fn build_function_create_request(
         concurrency_limit,
         experimental_buffer_containers,
         task_idle_timeout_secs,
+        // Memory snapshot (proto fields 40 + 41). `false` (the default) ⇒ prost omits
+        // both ⇒ byte-identical for every non-snapshot function. The facade only sets
+        // `spec.checkpointing_enabled` on the DEPLOY boundary, so RUN stays wire-identical.
+        checkpointing_enabled: spec.checkpointing_enabled,
+        is_checkpointing_function: spec.checkpointing_enabled,
         ..Default::default()
     };
 
@@ -1532,5 +1556,54 @@ mod tests {
         assert_eq!(req.environment_name, "main");
         // Latest version.
         assert_eq!(req.app_version, 0);
+    }
+
+    #[test]
+    fn checkpointing_defaults_false_and_is_wire_identical() {
+        // DEFAULT false: a bare spec leaves BOTH checkpoint bools unset on the wire
+        // (prost omits fields 40 + 41) — byte-identical to before memory snapshot.
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(
+            !spec.checkpointing_enabled,
+            "checkpointing must default false"
+        );
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        assert!(
+            !function.checkpointing_enabled,
+            "no memory snapshot ⇒ checkpointing_enabled unset (wire-identical)"
+        );
+        assert!(
+            !function.is_checkpointing_function,
+            "no memory snapshot ⇒ is_checkpointing_function unset (wire-identical)"
+        );
+    }
+
+    #[test]
+    fn with_memory_snapshot_sets_both_proto_fields() {
+        // `with_memory_snapshot(true)` flips BOTH `checkpointing_enabled` (field 41) and
+        // `is_checkpointing_function` (field 40) on the built Function.
+        let spec = FunctionSpec::new("m", "handler", "im-1").with_memory_snapshot(true);
+        assert!(spec.checkpointing_enabled, "setter flips the spec flag");
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        assert!(
+            function.checkpointing_enabled,
+            "with_memory_snapshot(true) ⇒ checkpointing_enabled (field 41)"
+        );
+        assert!(
+            function.is_checkpointing_function,
+            "with_memory_snapshot(true) ⇒ is_checkpointing_function (field 40)"
+        );
+
+        // `with_memory_snapshot(false)` leaves both unset (back to wire-identical).
+        let off = FunctionSpec::new("m", "handler", "im-1").with_memory_snapshot(false);
+        let off_fn = build_function_create_request("ap-1", "fu-pre-1", &off)
+            .function
+            .expect("function set");
+        assert!(!off_fn.checkpointing_enabled);
+        assert!(!off_fn.is_checkpointing_function);
     }
 }

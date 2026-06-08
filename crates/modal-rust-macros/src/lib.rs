@@ -371,6 +371,16 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // the `static` `inventory::submit!` initializer (like `schedule`/`gpu`).
                 image = Some(parse_image_to_spec(meta.value()?)?);
                 Ok(())
+            } else if meta.path.is_ident("enable_memory_snapshot") {
+                // Memory snapshot is `#[cls]`-only in v0: it captures the `#[enter]`
+                // load into the deploy-time snapshot, and a free `#[function]` has no
+                // `#[enter]` to capture. Reject with a pointed diagnostic rather than the
+                // generic "unsupported argument" so the user knows to use `#[cls]`.
+                Err(meta.error(
+                    "memory snapshot is `#[cls]`-only in v0; it captures the `#[enter]` \
+                     load. Move this handler into a `#[cls]` and set \
+                     `#[cls(enable_memory_snapshot = true)]`.",
+                ))
             } else {
                 Err(meta.error(
                     "unsupported `#[modal_rust::function]` argument; recognized: \
@@ -649,6 +659,9 @@ struct ClsConfig {
     volumes: Option<Vec<(String, String)>>,
     // `None` = unset (inherit). `Some(spec)` = an explicit `image = Image(..)` override.
     image: Option<String>,
+    // `None` = unset (inherit). `Some(bool)` = an explicit `enable_memory_snapshot = ..`
+    // opt-in (memory snapshot is `#[cls]`-only in v0; it captures the `#[enter]` load).
+    enable_memory_snapshot: Option<bool>,
 }
 
 impl ClsConfig {
@@ -681,6 +694,7 @@ impl ClsConfig {
             env: over.env.clone().or_else(|| self.env.clone()),
             volumes: over.volumes.clone().or_else(|| self.volumes.clone()),
             image: over.image.clone().or_else(|| self.image.clone()),
+            enable_memory_snapshot: over.enable_memory_snapshot.or(self.enable_memory_snapshot),
         }
     }
 }
@@ -797,6 +811,14 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
         } else if meta.path.is_ident("image") {
             cfg.image = Some(parse_image_to_spec(meta.value()?)?);
             Ok(())
+        } else if meta.path.is_ident("enable_memory_snapshot") {
+            // enable_memory_snapshot = <bool> — a bare bool opting this `#[cls]` into
+            // Modal memory snapshot (same shape/precedent as `cache`). When true, the
+            // class's `#[enter]` load is captured into the deploy-time snapshot via the
+            // serve loop's `prime` frame (deploy-only effect). Default unset ⇒ inert.
+            let lit: LitBool = meta.value()?.parse()?;
+            cfg.enable_memory_snapshot = Some(lit.value);
+            Ok(())
         } else if meta.path.is_ident("name") {
             Err(meta.error(
                 "`name` is not valid on `#[cls]`/`#[method]`: the entrypoint name is \
@@ -808,7 +830,7 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
                  `timeout`, `cache`, `cpu`, `memory`, `retries`, `schedule`, \
                  `min_containers`, `max_containers`, `buffer_containers`, \
                  `scaledown_window`, `secrets`, `required_keys`, `env`, `volumes`, \
-                 `image`",
+                 `image`, `enable_memory_snapshot`",
             ))
         }
     });
@@ -1296,6 +1318,35 @@ fn emit_cls(
         }
     };
 
+    // The SNAPSHOT-PRIME hook. The class is snapshot-enabled iff ANY method resolved
+    // `enable_memory_snapshot = true` (the class-level `#[cls(enable_memory_snapshot =
+    // true)]` flag is inherited by every method; a per-method override can also set it).
+    // When enabled, emit ONE free fn matching `fn() -> Result<(), RunnerError>` that
+    // FORCES the EXISTING singleton accessor (running `#[enter]` once inside Modal's
+    // snapshot freeze window) and set `snapshot_prime: Some(..)` on EACH method's
+    // `Registration`. When disabled, no prime fn is emitted and every `snapshot_prime`
+    // is `None` ⇒ inert, byte-identical to before.
+    let snapshot_enabled = methods
+        .iter()
+        .any(|m| m.config.enable_memory_snapshot.unwrap_or(false));
+    let prime_ident = format_ident!("__modal_snapshot_prime_{}", class_ident);
+    let prime_fn = if snapshot_enabled {
+        quote! {
+            /// Snapshot-prime hook for this `#[cls]`: forces the EXISTING load-once
+            /// singleton (running `#[enter]` once), discarding the borrow. Fired by the
+            /// serve loop on a `prime` frame so `#[enter]` lands inside Modal's
+            /// memory-snapshot freeze window. Reuses the SAME accessor as request
+            /// dispatch (no second singleton).
+            #[doc(hidden)]
+            #[allow(non_snake_case)] // the ident embeds the PascalCase class name
+            fn #prime_ident() -> ::core::result::Result<(), #facade::RunnerError> {
+                #accessor().map(|_| ())
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // Per-method codegen.
     let mut method_mods = Vec::new();
     let mut handle_methods = Vec::new();
@@ -1315,6 +1366,15 @@ fn emit_cls(
         let orig_output = &m.output;
 
         let config = cls_config_to_registration(&m.config, facade);
+
+        // This method's snapshot-prime: `Some(<class prime fn>)` iff this method opted
+        // into memory snapshot (the prime fn is emitted once above when ANY method does),
+        // else `None` ⇒ the serve loop's `prime` frame is a no-op for it.
+        let snapshot_prime_tok = if m.config.enable_memory_snapshot.unwrap_or(false) {
+            quote! { ::core::option::Option::Some(#prime_ident) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
 
         method_mods.push(quote! {
             #[doc(hidden)]
@@ -1356,6 +1416,11 @@ fn emit_cls(
                     check: ::core::option::Option::Some(
                         #facade::__private::runtime::typed_check!(#shim_ident)
                     ),
+                    // `Some(<class prime fn>)` for a snapshot-enabled `#[cls]` method,
+                    // else `None` (byte-identical default ⇒ the serve loop's `prime`
+                    // frame is a no-op). The prime forces the shared singleton, so a
+                    // class with several methods is primed once even if called N times.
+                    snapshot_prime: #snapshot_prime_tok,
                     config: #config,
                     package: ::core::env!("CARGO_PKG_NAME"),
                 }
@@ -1410,6 +1475,7 @@ fn emit_cls(
 
     quote! {
         #singleton
+        #prime_fn
         #( #method_mods )*
         #handle
     }
@@ -1488,6 +1554,10 @@ fn cls_config_to_registration(
         Some(s) => quote! { ::core::option::Option::Some(#s) },
         None => quote! { ::core::option::Option::None },
     };
+    // Unset ⇒ `false` (inert default, byte-identical wire). A plain `bool` literal,
+    // const-valid in the `static` `inventory::submit!` initializer.
+    let snapshot_on = cfg.enable_memory_snapshot.unwrap_or(false);
+    let snapshot_tok = quote! { #snapshot_on };
 
     quote! {
         #facade::FunctionConfig {
@@ -1508,6 +1578,10 @@ fn cls_config_to_registration(
             env: #env_tok,
             volumes: #volumes_tok,
             image: #image_tok,
+            // The resolved `enable_memory_snapshot` opt-in (unset ⇒ `false`). `false` is
+            // const-valid in the `static` `inventory::submit!` initializer and keeps the
+            // wire byte-identical; `true` rides into the deploy-time `FunctionCreate`.
+            enable_memory_snapshot: #snapshot_tok,
         }
     }
 }
@@ -1812,6 +1886,9 @@ fn build_registration(
                 // handler decodes; const-valid in the `static` initializer (a `fn`
                 // pointer coercion, exactly like `handler`).
                 check: ::core::option::Option::Some(#check_expr),
+                // `#[function]` is never snapshot-enabled (memory snapshot is
+                // `#[cls]`-only in v0), so the prime hook is always `None` here ⇒ inert.
+                snapshot_prime: ::core::option::Option::None,
                 config: #facade::FunctionConfig {
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
@@ -1830,6 +1907,10 @@ fn build_registration(
                     env: #env_tok,
                     volumes: #volumes_tok,
                     image: #image_tok,
+                    // Phase 2 adds the field with its inert default; the `#[cls]` parser
+                    // threads the real opt-in in a later phase. `false` is const-valid in
+                    // the `static` initializer and keeps the wire byte-identical.
+                    enable_memory_snapshot: false,
                 },
                 // Capture the USER crate's cargo package name HERE — this macro
                 // expands in the user's crate, so `env!("CARGO_PKG_NAME")` is the
@@ -2842,5 +2923,143 @@ mod tests {
         assert!(pairs("{}").is_empty());
         // A duplicate key is rejected (it would silently clobber an env var).
         assert!(syn::parse::Parser::parse_str(parse_str_map, r#"{"K" = "a", "K" = "b"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_cls_config_reads_enable_memory_snapshot_bool() {
+        // The bare-bool opt-in parses on `#[cls]` (precedent: `cache`). Unset ⇒ `None`
+        // (inherit / inert); `true`/`false` are recorded explicitly.
+        let on: proc_macro2::TokenStream = syn::parse_str("enable_memory_snapshot = true").unwrap();
+        assert_eq!(
+            parse_cls_config(on).unwrap().enable_memory_snapshot,
+            Some(true)
+        );
+        let off: proc_macro2::TokenStream =
+            syn::parse_str("enable_memory_snapshot = false").unwrap();
+        assert_eq!(
+            parse_cls_config(off).unwrap().enable_memory_snapshot,
+            Some(false)
+        );
+        // Unset on a bare `#[cls]` ⇒ `None` (inert default).
+        assert_eq!(
+            parse_cls_config(proc_macro2::TokenStream::new())
+                .unwrap()
+                .enable_memory_snapshot,
+            None
+        );
+        // A non-bool value is rejected (mirrors `cache`).
+        let bad: proc_macro2::TokenStream = syn::parse_str("enable_memory_snapshot = 1").unwrap();
+        assert!(parse_cls_config(bad).is_err());
+    }
+
+    #[test]
+    fn cls_config_merge_threads_enable_memory_snapshot() {
+        // A class-level opt-in is inherited by a bare `#[method]`; a method override
+        // wins (field-by-field merge, same as the other config fields).
+        let class = ClsConfig {
+            enable_memory_snapshot: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            class
+                .merge_over(&ClsConfig::default())
+                .enable_memory_snapshot,
+            Some(true)
+        );
+        let method_off = ClsConfig {
+            enable_memory_snapshot: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            class.merge_over(&method_off).enable_memory_snapshot,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cls_config_registration_emits_resolved_snapshot_flag() {
+        let facade = quote! { ::modal_rust };
+        // Unset ⇒ inert `false` in the emitted `FunctionConfig`.
+        let off = cls_config_to_registration(&ClsConfig::default(), &facade).to_string();
+        assert!(
+            off.contains("enable_memory_snapshot : false"),
+            "unset opt-in must emit the inert `false`, got: {off}"
+        );
+        // Set ⇒ `true` rides into the emitted `FunctionConfig`.
+        let cfg = ClsConfig {
+            enable_memory_snapshot: Some(true),
+            ..Default::default()
+        };
+        let on = cls_config_to_registration(&cfg, &facade).to_string();
+        assert!(
+            on.contains("enable_memory_snapshot : true"),
+            "opt-in must emit `true`, got: {on}"
+        );
+    }
+
+    /// Build a minimal `&self`-only `#[method]`-style [`ClsMethod`] for `emit_cls` tests.
+    fn cls_method(name: &str, snapshot: Option<bool>) -> ClsMethod {
+        let sig: syn::Signature =
+            syn::parse_str(&format!("fn {name}(&self) -> anyhow::Result<usize>")).unwrap();
+        ClsMethod {
+            ident: syn::parse_str(name).unwrap(),
+            config: ClsConfig {
+                enable_memory_snapshot: snapshot,
+                ..Default::default()
+            },
+            params: Vec::new(),
+            output: sig.output,
+        }
+    }
+
+    #[test]
+    fn emit_cls_generates_snapshot_prime_when_enabled() {
+        let class: syn::Ident = syn::parse_str("Embedder").unwrap();
+        let enter: syn::Ident = syn::parse_str("load").unwrap();
+        let facade = quote! { ::modal_rust };
+
+        // Snapshot-enabled `#[cls]`: emits the `__modal_snapshot_prime_<Class>` free fn
+        // (forcing the EXISTING accessor) and sets `snapshot_prime: Some(..)` on the
+        // method registration.
+        let on = emit_cls(
+            &class,
+            &enter,
+            true,
+            &[cls_method("dim", Some(true))],
+            &facade,
+        )
+        .to_string();
+        assert!(
+            on.contains("fn __modal_snapshot_prime_Embedder"),
+            "snapshot `#[cls]` must emit the prime free fn, got: {on}"
+        );
+        // The prime forces the EXISTING singleton accessor (no second singleton).
+        assert!(
+            on.contains("__modal_rust_cls_embedder () . map"),
+            "the prime must force the existing accessor, got: {on}"
+        );
+        assert!(
+            on.contains("snapshot_prime : :: core :: option :: Option :: Some (__modal_snapshot_prime_Embedder)"),
+            "the method registration must wire `snapshot_prime: Some(prime)`, got: {on}"
+        );
+    }
+
+    #[test]
+    fn emit_cls_omits_snapshot_prime_when_disabled() {
+        let class: syn::Ident = syn::parse_str("Embedder").unwrap();
+        let enter: syn::Ident = syn::parse_str("load").unwrap();
+        let facade = quote! { ::modal_rust };
+
+        // Plain `#[cls]` (no opt-in): NO prime fn, every `snapshot_prime` is `None` ⇒
+        // byte-identical to before.
+        let off = emit_cls(&class, &enter, true, &[cls_method("dim", None)], &facade).to_string();
+        assert!(
+            !off.contains("__modal_snapshot_prime"),
+            "non-snapshot `#[cls]` must NOT emit a prime fn, got: {off}"
+        );
+        assert!(
+            off.contains("snapshot_prime : :: core :: option :: Option :: None"),
+            "non-snapshot method must keep `snapshot_prime: None`, got: {off}"
+        );
     }
 }

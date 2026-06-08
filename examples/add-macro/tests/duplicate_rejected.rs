@@ -21,11 +21,11 @@ fn dup_handler(_input: &[u8]) -> Result<Vec<u8>, RunnerError> {
 }
 
 inventory::submit! {
-    Registration { name: "dup", handler: dup_handler as HandlerFn, check: None, config: FunctionConfig::new(), package: "" }
+    Registration { name: "dup", handler: dup_handler as HandlerFn, check: None, snapshot_prime: None, config: FunctionConfig::new(), package: "" }
 }
 
 inventory::submit! {
-    Registration { name: "dup", handler: dup_handler as HandlerFn, check: None, config: FunctionConfig::new(), package: "" }
+    Registration { name: "dup", handler: dup_handler as HandlerFn, check: None, snapshot_prime: None, config: FunctionConfig::new(), package: "" }
 }
 
 #[test]

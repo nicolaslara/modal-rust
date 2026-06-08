@@ -1,0 +1,28 @@
+[package]
+name = "snapshot-class"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: `#[modal_rust::cls(enable_memory_snapshot = true)]` — a memory-snapshot Cls. The expensive `#[enter]` build (here a sorted word-concordance index over an embedded corpus) runs ONCE per warm container exactly like a plain `#[cls]`, but when the app is DEPLOYED Modal also snapshots the loaded process so cold containers restore the already-built index instead of re-running `#[enter]`. The flag rides into the DEPLOY `FunctionCreate.checkpointing_enabled` (proven offline by `tests/manifest.rs`); RUN stays wire-identical. The heavy build lives in its own `src/concordance.rs` module so `src/lib.rs` stays the clean Modal surface."
+publish = false
+
+[lib]
+name = "snapshot_class"
+path = "src/lib.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::cls]` macro routes its generated code through this facade, so there is
+# no `modal-rust-runtime` / `inventory` to add and no rename. LIGHT (no gRPC client) so
+# the in-container `modal_runner` build the CLI generates is tonic-free.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+# The example LIB is a pure `#[modal_rust::cls]` library and stays LIGHT (no gRPC
+# client). The OFFLINE tests need the `--describe`/`dump_deploy_manifest` projection,
+# which lives behind the facade `client` feature — so we enable it on a SECOND, dev-only
+# dependency edge. Cargo unifies a crate's own deps + dev-deps only when BUILDING TESTS,
+# so the standalone lib build (and the CLI-generated runner build) stays light while the
+# test target gets `client`.
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }

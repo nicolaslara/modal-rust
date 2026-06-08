@@ -142,6 +142,39 @@ def handler(entrypoint, input_json):
         _SERVE = None
         return _run_one_shot(entrypoint, input_json)
     return out
+
+
+def _snapshot_prime_enabled():
+    return os.environ.get("MODAL_RUST_SNAPSHOT_PRIME", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _snapshot_prime():
+    # MODULE-GLOBAL eager prime (memory-snapshot v0 §6): runs at IMPORT, BEFORE Modal's
+    # snapshot point, so the snapshot-enabled `#[cls]` `#[enter]` lands INSIDE the freeze
+    # window and is restored (load-once-EVER) rather than re-run on every cold start.
+    # Baked on ONLY when a deployed entrypoint opted into `enable_memory_snapshot`
+    # (the MODAL_RUST_SNAPSHOT_PRIME ENV); off ⇒ this is a no-op and the import is
+    # byte-identical to a non-snapshot deploy.
+    #
+    # BEST-EFFORT: the whole block is wrapped so it NEVER fails the import. If the prime
+    # frame is never sent, the child fails, or a prime errors, the FIRST real request
+    # still lazily runs `#[enter]` via the runner's OnceLock path — correctness is
+    # preserved; only the snapshot perf win is lost (the §9 correctness floor).
+    if not (_serve_enabled() and _snapshot_prime_enabled()):
+        return
+    try:
+        proc = _serve_child()
+        proc.stdin.write(json.dumps({"kind": "prime"}) + "\n")
+        proc.stdin.flush()
+        ack = proc.stdout.readline().strip()
+        print(f"[deploy] snapshot prime ack: {ack!r}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — prime must never fail the import.
+        print(f"[deploy] snapshot prime failed ({e!r}); lazy #[enter] fallback", file=sys.stderr)
+
+
+_snapshot_prime()
 "#;
 
 /// All knobs for the DEPLOY path. Mirrors [`RemoteConfig`] but adds the STABLE
@@ -461,6 +494,46 @@ mod tests {
         );
         // No {{PACKAGE}} placeholder — the package was chosen at image-build time.
         assert!(!src.contains("{{PACKAGE}}"));
+    }
+
+    #[test]
+    fn deploy_wrapper_src_has_module_global_snapshot_prime() {
+        let src = DEPLOY_WRAPPER_SRC;
+        // The eager prime is a MODULE-GLOBAL call (runs at import, before the snapshot),
+        // gated on _serve_enabled() AND the MODAL_RUST_SNAPSHOT_PRIME env.
+        assert!(
+            src.contains("def _snapshot_prime():"),
+            "the import-time prime helper must be defined"
+        );
+        assert!(
+            src.contains("MODAL_RUST_SNAPSHOT_PRIME"),
+            "the prime must gate on the MODAL_RUST_SNAPSHOT_PRIME env"
+        );
+        assert!(
+            src.contains(r#"json.dumps({"kind": "prime"})"#),
+            "the prime must write a `{{\"kind\":\"prime\"}}` frame"
+        );
+        assert!(
+            src.contains("_serve_enabled() and _snapshot_prime_enabled()"),
+            "the prime must be gated on both serve-enabled and the prime env"
+        );
+        // It is INVOKED at module-global scope (after the helpers + handler are defined),
+        // so it fires at import — before Modal takes the memory snapshot.
+        let call_at = src
+            .rfind("\n_snapshot_prime()")
+            .expect("module-global _snapshot_prime() call must be present");
+        let def_at = src
+            .find("def _snapshot_prime():")
+            .expect("def present (checked above)");
+        assert!(
+            call_at > def_at,
+            "the module-global prime call must come AFTER its definition"
+        );
+        // BEST-EFFORT: a try/except guards it so it never fails the import.
+        assert!(
+            src.contains("snapshot prime failed"),
+            "the prime must be wrapped so it never fails the import"
+        );
     }
 
     #[test]

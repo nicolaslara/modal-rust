@@ -236,12 +236,19 @@ pub(crate) fn build_image_spec(
 /// base`, bakes the deploy wrapper, COPYs the SOURCE (this layer's build context),
 /// then runs `cargo build --release` + `cp`/bake of `/app/modal_runner`. cargo runs
 /// AT image-build time; the deployed runtime never repeats it. Pure (no I/O).
+///
+/// `bake_snapshot_prime` bakes `ENV MODAL_RUST_SNAPSHOT_PRIME=1` (next to the existing
+/// `RUST_BACKTRACE` ENV) so the deploy wrapper's import-time prime block (deploy.rs §6)
+/// fires before Modal's snapshot point. It is `true` only when ANY deployed entrypoint
+/// opted into `enable_memory_snapshot`; when `false` the layer renders byte-identically
+/// to a non-snapshot deploy (the off-path forward-safety guarantee).
 pub(crate) fn build_deploy_top_layer_spec(
     base_image_id: &str,
     source_mount_id: &str,
     package: &str,
+    bake_snapshot_prime: bool,
 ) -> ImageSpec {
-    ImageSpec::from_registry(String::new()) // FROM replaced by `FROM base` (layered).
+    let mut spec = ImageSpec::from_registry(String::new()) // FROM replaced by `FROM base`.
         .with_base_image(base_image_id)
         .with_wrapper_module(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC)
         .with_context_mount(source_mount_id)
@@ -256,8 +263,13 @@ pub(crate) fn build_deploy_top_layer_spec(
             "RUN cp {DEPLOY_SRC}/target/release/modal_runner {DEPLOY_RUNNER} \
              && chmod +x {DEPLOY_RUNNER}"
         ))
-        .with_command("ENV RUST_BACKTRACE=1")
-        .with_command("ENTRYPOINT []")
+        .with_command("ENV RUST_BACKTRACE=1");
+    // Snapshot prime is opt-in: only baked when a deployed entrypoint enabled memory
+    // snapshot, so the default deploy image is byte-identical (no extra ENV layer).
+    if bake_snapshot_prime {
+        spec = spec.with_command("ENV MODAL_RUST_SNAPSHOT_PRIME=1");
+    }
+    spec.with_command("ENTRYPOINT []")
 }
 
 /// Build the FILE-mode [`FunctionSpec`] for one entrypoint — the ONLY function-create
@@ -328,7 +340,13 @@ fn build_function_spec(
             max_containers: ep.options.max_containers,
             buffer_containers: ep.options.buffer_containers,
             scaledown_window: ep.options.scaledown_window,
-        })?;
+        })?
+        // Memory snapshot is DEPLOY-only (Modal snapshots deployed apps), so set
+        // `checkpointing_enabled` ONLY when this is the DEPLOY boundary AND the
+        // entrypoint opted in. RUN stays wire-identical even if the decorator opts in.
+        .with_memory_snapshot(
+            ep.options.enable_memory_snapshot && boundary.app_state == AppState::Deployed,
+        );
     // retries ride into Function.retry_policy. The `Retries(..)` STRUCT form (custom
     // backoff/delays, `retries_spec`) wins when present; otherwise the bare-int
     // `retries` fixed-interval shortcut applies. Both `None` ⇒ no policy ⇒ byte-identical
@@ -568,10 +586,18 @@ pub(crate) async fn provision<C: ControlPlane>(
         SourceDelivery::RunMount => cp.ensure_image(&app_id, &base_spec, 0).await?,
         SourceDelivery::DeployContext => {
             let base_image_id = cp.ensure_image(&app_id, &base_spec, 0).await?;
+            // Bake the snapshot-prime ENV when ANY deployed entrypoint opted into memory
+            // snapshot. Reached only on the DEPLOY boundary, so the deploy app_state is
+            // implied; off ⇒ byte-identical image (the §9 off-path guarantee).
+            let bake_snapshot_prime = inputs
+                .entrypoints
+                .iter()
+                .any(|ep| ep.options.enable_memory_snapshot);
             let top_spec = build_deploy_top_layer_spec(
                 &base_image_id,
                 &source_mount_id,
                 inputs.source.package,
+                bake_snapshot_prime,
             );
             cp.ensure_image(&app_id, &top_spec, 1).await?
         }
@@ -957,7 +983,7 @@ mod tests {
         // DEPLOY top layer: bases on layer 1 (FROM base), the source rides this
         // layer's build CONTEXT so cargo compiles it AT image-build time, then the
         // binary is baked to /app/modal_runner.
-        let spec = build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add");
+        let spec = build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", false);
         assert_eq!(spec.base_image_id.as_deref(), Some("im-layer1"));
         assert_eq!(spec.context_mount_id.as_deref(), Some("mo-deploy-src"));
         assert!(spec
@@ -972,6 +998,34 @@ mod tests {
         // No apt/pip on the top layer (Python is inherited from the base layer).
         assert!(spec.pre_bake_commands.is_empty());
         assert!(!spec.pip_install_modal);
+        // Off-path (no snapshot entrypoint): the prime ENV is NOT baked ⇒ byte-identical.
+        assert!(
+            !spec
+                .extra_commands
+                .iter()
+                .any(|c| c.contains("MODAL_RUST_SNAPSHOT_PRIME")),
+            "default deploy image must not carry the snapshot-prime ENV"
+        );
+    }
+
+    #[test]
+    fn deploy_top_layer_bakes_snapshot_prime_env_when_enabled() {
+        // A deployed entrypoint opted into memory snapshot ⇒ the top layer bakes
+        // `ENV MODAL_RUST_SNAPSHOT_PRIME=1` next to `RUST_BACKTRACE`, so the wrapper's
+        // import-time prime fires before Modal's snapshot point.
+        let spec = build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", true);
+        assert!(
+            spec.extra_commands
+                .iter()
+                .any(|c| c == "ENV MODAL_RUST_SNAPSHOT_PRIME=1"),
+            "snapshot deploy image must bake the prime ENV, got: {:?}",
+            spec.extra_commands
+        );
+        // It rides alongside the existing RUST_BACKTRACE ENV (both present).
+        assert!(spec
+            .extra_commands
+            .iter()
+            .any(|c| c == "ENV RUST_BACKTRACE=1"));
     }
 
     #[test]

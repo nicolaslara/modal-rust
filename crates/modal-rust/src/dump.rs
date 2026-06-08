@@ -141,6 +141,10 @@ pub enum PlannedRequest {
         buffer_containers: Option<u32>,
         /// Idle-before-scaledown seconds (`scaledown_window`); `None` = unset.
         scaledown_window: Option<u32>,
+        /// Memory-snapshot opt-in on the WIRE (`Function.checkpointing_enabled` /
+        /// `is_checkpointing_function`). DEPLOY-only: `true` only when the entrypoint
+        /// opted in AND this is the DEPLOY boundary; always `false` on RUN.
+        checkpointing_enabled: bool,
         /// The FILE-mode XOR invariant: `function_data` is unset.
         function_data_is_none: bool,
     },
@@ -245,6 +249,7 @@ impl Manifest {
                     max_containers,
                     buffer_containers,
                     scaledown_window,
+                    checkpointing_enabled,
                     function_data_is_none,
                 } => format!(
                     "FunctionCreate         module={module:?} function={function:?} \
@@ -257,6 +262,7 @@ impl Manifest {
                      min_containers={min_containers:?} max_containers={max_containers:?} \
                      buffer_containers={buffer_containers:?} \
                      scaledown_window={scaledown_window:?} \
+                     checkpointing_enabled={checkpointing_enabled} \
                      function_data_is_none={function_data_is_none}"
                 ),
                 PlannedRequest::AppPublish { app_state } => {
@@ -429,6 +435,11 @@ impl ControlPlane for RecordingControlPlane {
             max_containers: planned.max_containers,
             buffer_containers: planned.buffer_containers,
             scaledown_window: planned.scaledown_window,
+            // Surfaced directly from the FunctionSpec the live path builds (the planning
+            // projection does not carry it). DEPLOY-only: the facade's
+            // `build_function_spec` only sets it on the DEPLOY boundary, so a RUN dump
+            // records `false` even when the decorator opts in.
+            checkpointing_enabled: spec.checkpointing_enabled,
             function_data_is_none: planned.function_data_is_none,
         });
         // A deterministic function id keeps the cumulative publish union non-empty;
@@ -1269,5 +1280,86 @@ mod tests {
         let manifest = app.dry_run("add", &run_cfg()).expect("offline dry_run");
         assert_eq!(manifest.app_name, "app", "falls back to the package name");
         assert!(!manifest.requests.is_empty());
+    }
+
+    /// Pull the (single) FunctionCreate's `checkpointing_enabled` out of a manifest.
+    fn checkpointing_enabled(manifest: &Manifest) -> bool {
+        manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::FunctionCreate {
+                    checkpointing_enabled,
+                    ..
+                } => Some(*checkpointing_enabled),
+                _ => None,
+            })
+            .expect("FunctionCreate")
+    }
+
+    #[test]
+    fn enable_memory_snapshot_rides_into_deploy_function_create_only() {
+        // `enable_memory_snapshot = true` takes effect DEPLOY-only (Modal snapshots
+        // deployed apps): it rides into the DEPLOY FunctionCreate.checkpointing_enabled
+        // but is suppressed on the RUN dump (RUN stays wire-identical).
+        let cfg = FunctionConfig {
+            enable_memory_snapshot: true,
+            cache: Some(false), // keep the RUN manifest minimal
+            ..FunctionConfig::default()
+        };
+
+        // RUN: the flag does NOT take effect (wire-identical to a non-snapshot run).
+        let run_app = App::from_manifest([("add".to_string(), cfg.clone())]);
+        let run_manifest = run_app.dry_run("add", &run_cfg()).expect("dry_run");
+        assert!(
+            !checkpointing_enabled(&run_manifest),
+            "RUN never snapshots — checkpointing_enabled stays false"
+        );
+        assert!(
+            run_manifest
+                .render()
+                .contains("checkpointing_enabled=false"),
+            "RUN render shows the flag off"
+        );
+
+        // DEPLOY: the flag rides into FunctionCreate.checkpointing_enabled.
+        let deploy_app = App::from_manifest([("add".to_string(), cfg)]);
+        let dcfg = DeployConfig {
+            app_name: "snap-deploy".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: false,
+            ..DeployConfig::for_app("snap-deploy")
+        };
+        let deploy_manifest = deploy_app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+        assert!(
+            checkpointing_enabled(&deploy_manifest),
+            "DEPLOY: enable_memory_snapshot rides into checkpointing_enabled"
+        );
+        assert!(
+            deploy_manifest
+                .render()
+                .contains("checkpointing_enabled=true"),
+            "DEPLOY render shows the flag on"
+        );
+    }
+
+    #[test]
+    fn no_memory_snapshot_keeps_deploy_function_create_wire_identical() {
+        // Flag OFF (the default): even the DEPLOY FunctionCreate leaves
+        // checkpointing_enabled false ⇒ byte-identical to a non-snapshot deploy.
+        let app = App::from_manifest([("add".to_string(), FunctionConfig::default())]);
+        let dcfg = DeployConfig {
+            app_name: "plain-deploy".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: false,
+            ..DeployConfig::for_app("plain-deploy")
+        };
+        let manifest = app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+        assert!(
+            !checkpointing_enabled(&manifest),
+            "flag off ⇒ checkpointing_enabled false on DEPLOY too"
+        );
     }
 }

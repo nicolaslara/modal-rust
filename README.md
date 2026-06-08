@@ -562,6 +562,41 @@ a `Cls`-authoring crate that only uses `.local()` (and is run via the CLI) stays
 `compile_error`) and `modal.parameter` class params — for now inject config with
 `#[cls(secrets = [..])]` + `std::env` reads in `#[enter]`.
 
+#### Pay `#[enter]` once *ever* — `enable_memory_snapshot`
+
+A plain `#[cls]` loads once per *warm* container, but a **cold** container (after
+scale-to-zero) re-runs `#[enter]` from scratch — so for a genuinely expensive build
+that cold-start cost recurs forever. Add one flag,
+`#[cls(enable_memory_snapshot = true)]`, and a **deployed** app runs `#[enter]` once,
+Modal snapshots the loaded process, and every later container — cold ones included —
+**restores** the already-built state instead of re-running the build. This extends
+load-once-serve-many across cold starts, not just within one warm container. Mirrors
+Modal's `enable_memory_snapshot` (`Cls`, CPU). See
+[`examples/snapshot-class`](examples/snapshot-class).
+
+Three things to know:
+
+- **Deploy-only.** Modal only snapshots *deployed* apps, so the flag takes effect on
+  `deploy`, not `run`. On `deploy` it rides into the wire field Modal reads to
+  snapshot the class; on `run` it is suppressed and the wire stays byte-identical to a
+  non-snapshot `#[cls]` (which falls back to ordinary load-once, once per warm
+  container). So you `run` to iterate and `deploy` to get the cold-start win.
+- **The prime.** A deploy makes `#[enter]` run *inside* Modal's snapshot window
+  (otherwise it would run after restore — too late). If the prime ever fails to run,
+  the first real request still lazily runs `#[enter]`: correctness is preserved, only
+  the snapshot speedup is lost.
+- **Frozen-`#[enter]`-state caveat.** A snapshot freezes the *entire* process state at
+  the moment `#[enter]` finishes and restores it on every cold container. Anything
+  `#[enter]` captures — **environment variables, the wall clock / timestamps, RNG
+  seeds, open connections / file handles** — is frozen identically across all
+  restores. Do **not** capture per-container or time-sensitive values in `#[enter]`
+  and expect them to differ across restores; per-container work that must be fresh
+  belongs in the method body (which runs on every call).
+
+v0 is CPU-only and `#[cls]`-only — `#[function(enable_memory_snapshot = true)]` is a
+compile error. The GPU snap/restore split and a `#[restore]` hook are tracked in
+[`docs/ROADMAP.md`](docs/ROADMAP.md); see [`docs/PARITY.md`](docs/PARITY.md) for status.
+
 ## How It Works
 
 Every user function is erased into a static handler table:
@@ -639,9 +674,10 @@ moves where the build happens:
 - **`--serve` keeps one runner warm.** With `modal_runner --serve` (used by the
   `#[cls]` path) the process stays warm across inputs, so a `#[cls]` `#[enter]`
   runs **once per warm container** rather than once per call — load-once,
-  serve-many. *(Future: memory snapshotting would make `#[enter]` pay its cost
-  **once ever** and restore the snapshot on every container start, including cold
-  starts — see [docs/ROADMAP.md](docs/ROADMAP.md).)*
+  serve-many. Add `#[cls(enable_memory_snapshot = true)]` and a *deployed* class
+  pays `#[enter]` **once ever**: Modal snapshots the loaded process and restores it
+  on every container start, cold ones included (see
+  [Pay `#[enter]` once *ever*](#pay-enter-once-ever--enable_memory_snapshot)).
 - **GPU does NOT imply deploy.** A GPU function runs fine on the `run` path **given
   a CUDA-devel base** for the toolkit (NVRTC/cudart) plus a high enough `memory =`
   for the in-body build. Set the base either per function with
@@ -800,6 +836,7 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/cuda-vector-add` | **(macro)** A real GPU kernel — `cudarc` Driver API + precompiled PTX — authored with `#[modal_rust::function(gpu = "T4", name = "vector_add")]`; the decorator IS the config, run on a T4 via `.remote()`. |
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 | `examples/stateful-class` | **(macro / `Cls`)** Load-once-serve-many: a `#[modal_rust::cls]` impl with `#[enter]` (load an embedding model ONCE per warm container) + `#[method]`s reusing it by `&self`, called `app.embedder().embed("hi".into()).remote().await?`. Each method is its own dotted `Embedder.embed` / `Embedder.dim` entrypoint; live-confirmed on a T4. |
+| `examples/snapshot-class` | **(macro / `Cls` / memory snapshot)** Pay `#[enter]` ONCE EVER: a `#[modal_rust::cls(enable_memory_snapshot = true)]` whose `#[enter]` builds a sorted word-concordance index. On a *deployed* app Modal snapshots the loaded process and restores it on every container — cold ones included — so the build is not re-run per cold start. Deploy-only (`run` stays wire-identical); offline tests prove load-once + that the flag rides into the DEPLOY `FunctionCreate` and not the RUN one. |
 | `examples/custom-types` | **(macro / I/O)** Real functions take and return your own `struct`s: derive `Serialize`/`Deserialize`, take a struct, return a struct, and the macro infers the typed I/O from the signature. `score(Player) -> Scored` turns a match record into a score. |
 | `examples/ways-to-call` | **(macro / call shapes)** One function (`square(n: i64)`), four invocation patterns side by side — `.local()`, `.remote().await`, `.spawn()` + `.get()`, and `.map([..])` — all through the same typed `app.square(n)` method. The "how do I actually call this" tour. |
 | `examples/deploy-and-call` | **(run vs deploy)** The build boundary made concrete: `.remote()` rebuilds in the function body on each cold start, while `deploy` runs `cargo build --release` ONCE at image-build time and bakes the binary in so each `call` skips the rebuild. |

@@ -60,11 +60,22 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   `modal.parameter` class params (use `#[cls(secrets=[..])]` + `std::env` for now).
 - Web endpoints (`@fastapi_endpoint`/`@asgi_app`) — now the largest remaining gap —
   then `Dict`/`Queue`/`Sandbox`/NFS.
-- **`enable_memory_snapshot` / Cls memory-checkpointing** (high value, `snapshot.py`) —
-  let the expensive `#[enter]` load run **once ever**, snapshot the loaded process, and
-  restore it on every (even cold) container start. This extends `Cls` load-once-serve-many
-  across the run/cold-start path (not just within a single warm container), which is the
-  big remaining unlock for the heavy-load `Cls` story.
+- ~~**`enable_memory_snapshot` / Cls memory-checkpointing** (high value, `snapshot.py`)~~
+  — DONE (v0, CPU-only, `#[cls]`-only): `#[cls(enable_memory_snapshot = true)]` makes the
+  expensive `#[enter]` load run **once ever** on a *deployed* app — Modal snapshots the
+  loaded process and restores it on every (even cold) container start, extending
+  load-once-serve-many across the cold-start path. DEPLOY-ONLY (the flag rides into
+  `Function.checkpointing_enabled`/`is_checkpointing_function` only at the deploy boundary;
+  RUN stays wire-identical), built on a typed `prime` lifecycle frame on the `--serve` loop
+  (degrades to lazy `#[enter]` if the prime fails). `examples/snapshot-class`. Named
+  follow-ups:
+  - **GPU snap/restore split** — a CPU snapshot blocks GPU access in the snap window, so a
+    GPU `#[cls]` must load on CPU inside the snapshot window and move to the GPU *after*
+    restore. This lands as the documented-but-not-built `restore` lifecycle frame + a
+    `#[restore]` (post-restore) macro hook — additive on top of v0's typed frames.
+  - **`enable_gpu_snapshot`** — Modal's GPU-memory snapshot variant, gated on the split above.
+  - **`#[function(enable_memory_snapshot)]`** — `#[function]`-level snapshot support (v0 is
+    `#[cls]`-only; the macro currently `compile_error`s the function form).
 
 ### Infra / quality
 - **Benchmarks runnable** — wire the plan-only A/B-vs-Python harness (cold/warm build, deploy,
