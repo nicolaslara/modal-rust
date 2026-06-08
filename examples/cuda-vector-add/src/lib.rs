@@ -146,7 +146,7 @@ fn capture_ptx_jit_error_log(
 /// facade reads that config when CREATING the Modal function, so the function lands on
 /// a T4 with no caller-side `with_gpu`. Run `modal_runner --describe` to see the gpu
 /// ride through inventory; the runner dispatch itself ignores the config.
-#[modal_rust::function(gpu = "T4", name = "vector_add")]
+#[modal_rust::function(gpu = "T4", name = "vector_add", memory = 8192)]
 pub fn vector_add(input: VectorAddInput) -> anyhow::Result<VectorAddOutput> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;

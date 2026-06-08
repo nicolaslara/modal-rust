@@ -126,7 +126,7 @@ fn tier1_self_check() -> anyhow::Result<(String, String)> {
 /// facade reads that config when CREATING the Modal function, so the function lands on
 /// a T4 with no caller-side `with_gpu`. Run `modal_runner --describe` to see the gpu
 /// ride through inventory; the runner dispatch itself ignores the config.
-#[modal_rust::function(gpu = "T4", name = "burn_add")]
+#[modal_rust::function(gpu = "T4", name = "burn_add", memory = 8192)]
 pub fn burn_add(input: BurnAddInput) -> anyhow::Result<BurnAddOutput> {
     use burn::tensor::{Tensor, TensorData};
 
