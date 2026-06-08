@@ -721,8 +721,10 @@ mod tests {
         // OVERRIDES base/install_rust and PREPENDS its steps before the path-level
         // `image_steps`. Doubles as a regression guard: `base` is moved out of the parsed
         // image AND `steps()` is still read afterwards (the partial-move this fold once had).
-        let mut config = RemoteConfig::default();
-        config.image_steps = vec![ImageStep::run(["echo path-level"])];
+        let config = RemoteConfig {
+            image_steps: vec![ImageStep::run(["echo path-level"])],
+            ..Default::default()
+        };
         let spec = r#"{"base":"nvidia/cuda:12.6.3-devel-ubuntu22.04","install_rust":true,"apt":["libpng-dev"]}"#;
         let folded = apply_function_image(config, Some(spec)).expect("fold the image spec");
 
