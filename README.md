@@ -650,9 +650,10 @@ moves where the build happens:
   `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`). Because the heavy CUDA crate
   still compiles in the body on `run`, `deploy` is **recommended** so that build
   happens once at image-build time — but it is a performance/efficiency choice, not
-  a requirement. *(The GPU `run` path is supported via these knobs; this specific
-  end-to-end GPU `run` has not been re-verified live in this pass — the heavy GPU
-  examples below are exercised via `deploy`.)*
+  a requirement. *(Verified 2026-06-08: `modal-rust run burn_add` ran end-to-end on a
+  T4 via the `image = Image(..)` decorator + `memory = 16384` — `8 GB` OOMs the
+  CubeCL build, `16 GB` clears it. `deploy` stays recommended for heavy GPU crates to
+  avoid the per-cold-container rebuild and the high runtime memory.)*
 
 **When to run vs deploy.** Reach for **`run`** while iterating from local source:
 it is the tightest edit→call loop, the build cache keeps warm runs near-instant,

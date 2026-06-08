@@ -2,9 +2,10 @@
 
 A real ML workload: a Burn/CubeCL tensor add on the CUDA backend (kernels
 JIT-compiled via NVRTC at runtime) on a T4, verified against a CPU reference.
-Authored with
-`#[modal_rust::function(gpu = "T4", name = "burn_add", memory = 8192)]` — the
-decorator IS the config.
+Authored with `#[modal_rust::function(gpu = "T4", name = "burn_add", memory = 16384,
+image = Image(base = "nvidia/cuda:12.6.3-devel-ubuntu22.04", install_rust = true))]`
+— the decorator IS the config; the `image` declares the CUDA-devel base so a GPU
+`run` builds + runs end-to-end (verified on a T4, below), not just `deploy`.
 
 ## Why deploy is recommended here (not "GPU forces deploy")
 
@@ -47,7 +48,7 @@ JIT-compile the kernels:
   #[modal_rust::function(
       gpu = "T4",
       name = "burn_add",
-      memory = 8192,
+      memory = 16384,
       image = Image(base = "nvidia/cuda:12.6.3-devel-ubuntu22.04", install_rust = true),
   )]
   ```
@@ -66,11 +67,17 @@ JIT-compile the kernels:
     modal-rust run burn_add --input '{"n":256}'
   ```
 
-Either way, keep `memory = 8192` (or higher) so the in-body `cargo` build does not
-OOM. `deploy` is still recommended here because it moves that heavy build to
-image-build time (once, with full resources) instead of paying it on every cold
-container — a performance/efficiency choice, not a requirement. (GPU `run`
-end-to-end is not asserted as verified here; the mechanism above is what enables it.)
+Either way, give the in-body build room: `memory = 16384` is needed — `8192` OOMs
+the heavy CubeCL release build (`GENERIC_STATUS_TERMINATED`), `16384` clears it.
+`deploy` is still recommended here because it moves that heavy build to image-build
+time (once, with full resources) instead of paying it on every cold container, and
+the deployed runtime then does not need the 16 GB — a performance/efficiency choice,
+not a requirement.
+
+**Verified (2026-06-08).** `modal-rust run burn_add --input '{"n":256}'` with the
+`image` decorator above ran end-to-end on a T4:
+`{"ok":true,"value":{"backend":"burn-cuda (CubeCL CUDA / cudarc)","valid":true,"n":256,"samples":[[0,0.0,0.0],[128,384.0,384.0],[255,765.0,765.0]],...}}`
+— the GPU tensor add matching the CPU reference.
 
 If a `run` is killed, the build log lives in `modal app logs` (it is lost
 client-side when the container is killed). See
