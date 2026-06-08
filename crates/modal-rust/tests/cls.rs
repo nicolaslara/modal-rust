@@ -115,6 +115,46 @@ fn cls_registers_dotted_entrypoints_with_merged_config() {
     assert_eq!(dim["config"]["timeout_secs"], 600);
 }
 
+#[test]
+fn cls_check_input_validates_locally_through_the_macro() {
+    // End-to-end proof of fix A through the REAL macro/inventory path: the `#[method]`
+    // macro emits a `typed_check!` companion, so the runner's `--check-input` mode can
+    // DECODE-ONLY validate `Embedder.embed`'s `{ text: String }` input WITHOUT running
+    // the method body — exactly what the CLI invokes to fail fast before any Modal call.
+    let run = |entrypoint: &str, input: &str| -> (serde_json::Value, i32) {
+        let argv = vec![
+            "--check-input".to_string(),
+            "--entrypoint".to_string(),
+            entrypoint.to_string(),
+            "--input-json".to_string(),
+            input.to_string(),
+        ];
+        let mut buf = Vec::new();
+        let code = modal_rust::run_cli_with_args_from_inventory(&argv, &mut buf);
+        let v: serde_json::Value = serde_json::from_slice(&buf).expect("check envelope");
+        (v, code)
+    };
+
+    // Good input (the right shape) decodes → exit 0, ok:true.
+    let (ok, code) = run("Embedder.embed", r#"{"text":"the quick brown fox"}"#);
+    assert_eq!(code, 0);
+    assert_eq!(ok["ok"], true);
+
+    // Bad input (missing `text`) fails locally → exit 1, decode_error naming the field.
+    let (bad, code) = run("Embedder.embed", r#"{"nope":1}"#);
+    assert_eq!(code, 1);
+    assert_eq!(bad["error"]["kind"], "decode_error");
+    assert!(
+        bad["error"]["message"].as_str().unwrap().contains("text"),
+        "decode error names the missing field: {bad}"
+    );
+
+    // An unknown entrypoint fails fast locally too (a typo never reaches Modal).
+    let (unknown, code) = run("Embedder.nope", r#"{"text":"x"}"#);
+    assert_eq!(code, 1);
+    assert_eq!(unknown["error"]["kind"], "unknown_entrypoint");
+}
+
 #[tokio::test]
 async fn cls_remote_on_offline_app_is_not_connected() {
     // `.remote()` on a method needs a connected App, exactly like a free fn: an offline

@@ -767,6 +767,7 @@ mod tests {
         Registration {
             name: "add",
             handler: test_handler as HandlerFn,
+            check: None,
             config: FunctionConfig::new(),
             package: "modal-rust",
         }
@@ -776,6 +777,7 @@ mod tests {
         Registration {
             name: "add_gpu",
             handler: test_handler as HandlerFn,
+            check: None,
             config: FunctionConfig {
                 gpu: Some("T4"),
                 timeout_secs: Some(1800),
@@ -799,6 +801,7 @@ mod tests {
         Registration {
             name: "add_extras",
             handler: test_handler as HandlerFn,
+            check: None,
             config: FunctionConfig {
                 gpu: None,
                 timeout_secs: None,

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{HandlerFn, Registry};
+use modal_rust_runtime::CheckFn;
 
 /// Per-function deploy/run CONFIG sourced from
 /// `#[modal_rust::function(gpu=..., timeout=..., cache=...)]`.
@@ -197,6 +198,12 @@ pub struct Registration {
     pub name: &'static str,
     /// The monomorphized `typed!` wrapper `fn` pointer.
     pub handler: HandlerFn,
+    /// The monomorphized `typed_check!` DECODE-ONLY companion, powering the runner's
+    /// `--check-input` LOCAL input validation (fail fast before any Modal call).
+    /// `None` for hand-built records that predate the checker; such entrypoints skip
+    /// local validation and degrade to the remote decode check rather than
+    /// false-reject. The `#[modal_rust::function]`/`#[cls]` macros always populate it.
+    pub check: Option<CheckFn>,
     /// Per-function deploy/run config sourced from the decorator.
     pub config: FunctionConfig,
     /// Cargo package captured at the user crate's macro expansion site.
@@ -209,9 +216,20 @@ inventory::collect!(Registration);
 pub fn registry_from_inventory() -> Registry {
     let mut registry = Registry::new();
     for registration in inventory::iter::<Registration> {
-        registry = registry.function(registration.name, registration.handler);
+        registry = register_one(registry, registration);
     }
     registry
+}
+
+/// Insert one inventory [`Registration`] into `registry`, recording its
+/// `--check-input` [`CheckFn`] when present (via `function_checked`) and falling back
+/// to the handler-only `function` otherwise. Shared by both inventory collectors so
+/// the checker wiring cannot drift between them.
+fn register_one(registry: Registry, registration: &Registration) -> Registry {
+    match registration.check {
+        Some(check) => registry.function_checked(registration.name, registration.handler, check),
+        None => registry.function(registration.name, registration.handler),
+    }
 }
 
 /// Build the runtime registry and the per-name control-plane configs from one
@@ -220,7 +238,7 @@ pub fn from_inventory_with_configs() -> (Registry, Vec<(&'static str, FunctionOp
     let mut registry = Registry::new();
     let mut configs = Vec::new();
     for registration in inventory::iter::<Registration> {
-        registry = registry.function(registration.name, registration.handler);
+        registry = register_one(registry, registration);
         configs.push((
             registration.name,
             FunctionOptions::from(&registration.config),

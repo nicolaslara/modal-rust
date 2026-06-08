@@ -63,9 +63,20 @@ use crate::proto::api::{
 const MOUNT_PUT_FILE_CLIENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Built-in default ignore patterns — the FLOOR for a project with no
-/// `.gitignore`/`.modalignore`. Gitignore syntax. Build artifacts and VCS only;
-/// everything else is decided by the project's own ignore files.
-pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &["target/", ".git/", "**/*.rlib"];
+/// `.gitignore`/`.modalignore`. Gitignore syntax. Build artifacts, VCS, and cargo
+/// integration-test dirs only; everything else is decided by the project's own ignore
+/// files.
+///
+/// `tests/` (a cargo INTEGRATION-test directory) is excluded because the source upload
+/// exists ONLY to feed the in-container `cargo build -p <pkg> --bin modal_runner` — and
+/// `--bin` never compiles `tests/*.rs`. Uploading them is pure waste (~13 needless
+/// `live_*.rs`/`mock_*.rs` files across this workspace). Rust UNIT tests are inline
+/// `mod tests {}` in `.rs` files (never a directory), so they ride along untouched; a
+/// crate's `src/**/tests/` MODULE directory (rare) would also match, but such a layout
+/// is not a build input for the runner bin either. A project can re-include a needed
+/// path via a `!tests/...` negation in `.modalignore` (higher precedence than this
+/// floor).
+pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &["target/", ".git/", "**/*.rlib", "tests/"];
 
 /// Default filename for the highest-precedence ignore file (gitignore syntax).
 pub const DEFAULT_MODALIGNORE_NAME: &str = ".modalignore";
@@ -708,6 +719,69 @@ mod tests {
             &p("examples/add/src/bin/modal_runner.rs"),
             false
         ));
+    }
+
+    #[test]
+    fn defaults_prune_integration_tests_dir() {
+        // `tests/` (cargo integration tests) is excluded by the built-in floor: the
+        // source upload feeds `cargo build --bin modal_runner`, which never compiles
+        // `tests/*.rs`. Unit tests are inline `mod tests {}` in `.rs` files (kept).
+        let dir = TempTree::new();
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        // A crate-root tests dir and its files are ignored…
+        assert!(is_ignored(&m, &p("tests"), true));
+        assert!(is_ignored(&m, &p("tests/live_run.rs"), false));
+        // …at any depth (a workspace member's tests dir).
+        assert!(is_ignored(&m, &p("crates/x/tests/mock_wire.rs"), false));
+        assert!(is_ignored(&m, &p("examples/quickstart/tests/it.rs"), false));
+        // Real source under src/ is kept (including a FILE literally named tests.rs).
+        assert!(!is_ignored(&m, &p("src/lib.rs"), false));
+        assert!(!is_ignored(&m, &p("src/tests.rs"), false));
+    }
+
+    #[test]
+    fn collect_files_for_dirs_excludes_tests_dir() {
+        // The PRIMARY (closure) collector drops a crate's `tests/` dir but keeps src/.
+        let dir = TempTree::new();
+        dir.write("Cargo.toml", "[workspace]\n");
+        dir.write("Cargo.lock", "# lock\n");
+        dir.write("a/Cargo.toml", "[package]\n");
+        dir.write("a/src/lib.rs", "fn a() {}\n");
+        dir.write(
+            "a/tests/live_a.rs",
+            "// integration test, not a build input\n",
+        );
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let crate_dirs = vec![dir.path().join("a")];
+        let extras = vec![dir.path().join("Cargo.toml"), dir.path().join("Cargo.lock")];
+        let files =
+            collect_files_for_dirs(dir.path(), &crate_dirs, &extras, &[], "/src", &m).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.mount_filename.as_str()).collect();
+        assert!(
+            names.contains(&"/src/a/src/lib.rs"),
+            "crate source is uploaded: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("/tests/")),
+            "no tests/ files uploaded: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collect_files_fallback_excludes_tests_dir() {
+        // The FALLBACK whole-dir walk also prunes `tests/`.
+        let dir = TempTree::new();
+        dir.write("Cargo.toml", "[package]\n");
+        dir.write("src/lib.rs", "fn a() {}\n");
+        dir.write("tests/mock_x.rs", "// not a build input\n");
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let files = collect_files(dir.path(), "/src", &m, &[]).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.mount_filename.as_str()).collect();
+        assert!(names.contains(&"/src/src/lib.rs"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("/tests/")),
+            "tests/ pruned on the fallback walk: {names:?}"
+        );
     }
 
     #[test]

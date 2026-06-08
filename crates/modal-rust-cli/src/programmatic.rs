@@ -167,7 +167,20 @@ fn no_entrypoints_error(package: &str) -> String {
     )
 }
 
-fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, String)> {
+/// The outcome of [`build_and_describe`]: the parsed manifest, the real workspace
+/// root, the resolved package, and the path to the LOCAL `modal_runner` binary the
+/// describe build produced — `None` only when describe was served from the manifest
+/// CACHE and the binary is not on disk (so `--check-input` validation is skipped, not
+/// forced to rebuild). The runner path is REUSED for `--check-input` local input
+/// validation before any remote call.
+struct DescribeOutcome {
+    manifest: Manifest,
+    root: std::path::PathBuf,
+    package: String,
+    runner_bin: Option<std::path::PathBuf>,
+}
+
+fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
     let root = workspace::workspace_root(project)?;
     // `-p <pkg>` disambiguates the shared `modal_runner` bin across workspace members
     // (boundaries.md §8) — the SAME package run/deploy build.
@@ -217,7 +230,18 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
                     bail!("{}", no_entrypoints_error(&package));
                 }
                 eprintln!("modal-rust: describe cache hit ({package}); skipping build");
-                return Ok((manifest, root, package));
+                // The cache skips the build, so the runner binary MAY be absent (e.g.
+                // after `cargo clean`). Surface it for `--check-input` only when it is
+                // actually on disk; otherwise validation degrades to the remote decode
+                // check (no forced rebuild — keeps the cache-hit happy path fast).
+                let runner_bin = shared_target.join("debug").join("modal_runner");
+                let runner_bin = runner_bin.is_file().then_some(runner_bin);
+                return Ok(DescribeOutcome {
+                    manifest,
+                    root,
+                    package,
+                    runner_bin,
+                });
             }
         }
     }
@@ -308,7 +332,84 @@ fn build_and_describe(project: &Path) -> Result<(Manifest, std::path::PathBuf, S
     // The shadow (if any) is dropped here, removing the temp tree. The returned
     // `root` is the REAL workspace root (the upload root), not the shadow.
     drop(shadow);
-    Ok((manifest, root, package))
+    Ok(DescribeOutcome {
+        manifest,
+        root,
+        package,
+        // Freshly built this invocation → present on disk; reused for `--check-input`.
+        runner_bin: Some(runner_bin),
+    })
+}
+
+/// Validate `input_json` LOCALLY against `entrypoint`'s declared input shape by running
+/// the already-built `runner_bin` in DECODE-ONLY `--check-input` mode — NO Modal call,
+/// NO handler body. Returns `Err` (fail fast) when the input cannot be decoded, with a
+/// clear message naming the entrypoint + the runner's decode diagnostic; returns `Ok`
+/// when the input decodes, the entrypoint has no checker (handler-only registration),
+/// or the check could not run (so the happy path is never blocked by a tooling hiccup).
+///
+/// The runner emits ONE JSON line: `{"ok":true}` (decodes) / `{"ok":true,"checked":
+/// false}` (no local checker) / the frozen failure envelope (`decode_error` /
+/// `unknown_entrypoint`). We key off the exit code + the envelope's `error.kind`:
+/// `decode_error` is a real input-shape mismatch (fail fast); `unknown_entrypoint`
+/// means the on-disk runner does NOT register this entrypoint, which — since the
+/// caller already confirmed it exists in the held describe manifest — can only mean the
+/// runner binary at the shared `<target>/debug/modal_runner` path is a DIFFERENT
+/// generatable crate's last build (all generated runners collide on that one path). In
+/// that case the local check is not authoritative for THIS crate, so we degrade to the
+/// remote decode check rather than false-rejecting a valid run.
+fn validate_input_locally(runner_bin: &Path, entrypoint: &str, input_json: &str) -> Result<()> {
+    let out = match Command::new(runner_bin)
+        .args(["--check-input", "--entrypoint", entrypoint, "--input-json"])
+        .arg(input_json)
+        .output()
+    {
+        Ok(o) => o,
+        // Could not spawn the checker (binary vanished, exec error): do NOT block the
+        // run — degrade to the remote decode check, exactly the prior behavior.
+        Err(_) => return Ok(()),
+    };
+
+    // Exit 0 ⇒ input decoded (or no local checker) ⇒ proceed.
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // A non-zero exit is a local check failure. Parse the runner's one-line envelope to
+    // read its `error.kind` + `error.message`.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+    let kind = envelope
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("kind"))
+        .and_then(|k| k.as_str());
+
+    // `unknown_entrypoint` here is NOT a user error: the manifest (consulted before this
+    // call) DOES contain `entrypoint`, so an on-disk runner that does not know it is a
+    // stale/wrong binary at the shared `modal_runner` path (the cache-hit collision
+    // across generatable crates). Degrade to the remote decode check — do not block.
+    if kind == Some("unknown_entrypoint") {
+        return Ok(());
+    }
+
+    let detail = envelope
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| stdout.trim().to_string());
+
+    bail!(
+        "input does not match entrypoint '{entrypoint}': {detail}. \
+         The input did not decode locally, so the call was NOT sent to Modal. \
+         Pass a matching --input '{{...}}' (see the example's README, e.g. \
+         examples/autoscaling/README.md)."
+    );
 }
 
 /// Parse `--describe` stdout into a [`Manifest`] and validate its schema. The SAME
@@ -364,8 +465,24 @@ pub async fn cmd_run_programmatic(
     input_json: String,
     timeout: Option<u64>,
 ) -> Result<i32> {
-    let (manifest, root, package) = build_and_describe(project)?;
+    let DescribeOutcome {
+        manifest,
+        root,
+        package,
+        runner_bin,
+    } = build_and_describe(project)?;
     let _ = manifest.entry(entrypoint)?;
+
+    // LOCAL input validation (fail fast, NO Modal call): decode `--input` against the
+    // entrypoint's input shape via the already-built runner's `--check-input` mode. A
+    // bad-shape input (e.g. `run embed` with no `--input`) errors HERE with a clear
+    // expected-shape message instead of building+running on Modal only to fail with a
+    // remote `decode_error`. Skipped (degrades to the remote check) only when the local
+    // runner binary is unavailable (a cache hit after `cargo clean`).
+    if let Some(runner_bin) = &runner_bin {
+        validate_input_locally(runner_bin, entrypoint, &input_json)?;
+    }
+
     if let Some(t) = timeout {
         eprintln!(
             "modal-rust: note: --timeout {t}s is informational; the entrypoint's decorator \
@@ -400,7 +517,12 @@ pub async fn cmd_deploy_programmatic(
     project: &Path,
     app_name: &str,
 ) -> Result<i32> {
-    let (manifest, root, package) = build_and_describe(project)?;
+    let DescribeOutcome {
+        manifest,
+        root,
+        package,
+        runner_bin: _,
+    } = build_and_describe(project)?;
     // Deploy publishes every manifest entrypoint as its own Modal function over one
     // shared image. The selected `entrypoint` is still not the only deployed
     // function, but validate it exists so a typo fails fast — parity with run.
@@ -590,5 +712,100 @@ mod tests {
             1
         );
         assert_eq!(print_envelope_and_exit_code("garbage"), 1);
+    }
+
+    // ---- local input validation (fix A): fail fast, NO Modal call ----
+
+    /// Write a fake `modal_runner` that mimics the runner's `--check-input` contract:
+    /// it exits 1 + prints the frozen `decode_error` envelope when the input is the
+    /// "bad" sentinel, else exits 0 + prints `{"ok":true}`. Stands in for the real
+    /// built runner so the test exercises `validate_input_locally` with NO Modal call,
+    /// NO cargo build, and NO network — purely the local decode-only seam.
+    #[cfg(unix)]
+    fn write_fake_runner(behavior: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "fake-modal-runner-{}-{}",
+            std::process::id(),
+            // a per-call nonce so concurrent tests never share a path
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, behavior).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_input_locally_rejects_bad_input_without_network() {
+        // A runner that ALWAYS reports a decode failure (the `embed`-with-no-input case).
+        let runner = write_fake_runner(
+            "#!/bin/sh\n\
+             echo '{\"ok\":false,\"error\":{\"kind\":\"decode_error\",\"message\":\"missing field `text`\",\"details\":null,\"backtrace\":\"\"}}'\n\
+             exit 1\n",
+        );
+        let err = validate_input_locally(&runner, "embed", r#"{"a":40,"b":2}"#).unwrap_err();
+        let msg = err.to_string();
+        // Names the entrypoint, surfaces the runner's decode diagnostic, and states the
+        // call was NOT sent to Modal (fail fast, no remote).
+        assert!(msg.contains("entrypoint 'embed'"), "{msg}");
+        assert!(msg.contains("missing field `text`"), "{msg}");
+        assert!(msg.contains("NOT sent to Modal"), "{msg}");
+        let _ = std::fs::remove_file(&runner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_input_locally_accepts_good_input() {
+        // A runner that reports the input decoded fine → validation passes (proceeds).
+        let runner = write_fake_runner("#!/bin/sh\necho '{\"ok\":true}'\nexit 0\n");
+        assert!(validate_input_locally(&runner, "add", r#"{"a":40,"b":2}"#).is_ok());
+        let _ = std::fs::remove_file(&runner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_input_locally_passes_when_no_local_checker() {
+        // A handler-only entrypoint reports `checked:false` (exit 0) → do not block; the
+        // remote decode check still applies, exactly the prior behavior.
+        let runner =
+            write_fake_runner("#!/bin/sh\necho '{\"ok\":true,\"checked\":false}'\nexit 0\n");
+        assert!(validate_input_locally(&runner, "add", "{}").is_ok());
+        let _ = std::fs::remove_file(&runner);
+    }
+
+    #[test]
+    fn validate_input_locally_degrades_when_runner_missing() {
+        // A non-existent runner binary must NOT block the run (degrade to remote check).
+        let missing = std::path::Path::new("/no/such/modal_runner-xyz");
+        assert!(validate_input_locally(missing, "add", "{}").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_input_locally_degrades_on_unknown_entrypoint() {
+        // The shared `modal_runner` path can hold a DIFFERENT generatable crate's last
+        // build (all generated runners collide on `<target>/debug/modal_runner`). When the
+        // describe cache skips the rebuild, the on-disk runner may not register THIS
+        // crate's entrypoint and reports `unknown_entrypoint`. Since the caller already
+        // confirmed the entrypoint exists in the held manifest, this is a stale/wrong
+        // binary — NOT a user input error — so validation must degrade to the remote check
+        // (return Ok), never false-reject the run.
+        let runner = write_fake_runner(
+            "#!/bin/sh\n\
+             echo '{\"ok\":false,\"error\":{\"kind\":\"unknown_entrypoint\",\"message\":\"unknown entrypoint \\\"score\\\"; known entrypoints: [\\\"analyze\\\"]\",\"details\":null,\"backtrace\":\"\"}}'\n\
+             exit 1\n",
+        );
+        assert!(
+            validate_input_locally(&runner, "score", r#"{"name":"ada","hits":7,"shots":10}"#)
+                .is_ok(),
+            "unknown_entrypoint from a stale shared runner must degrade, not fail fast"
+        );
+        let _ = std::fs::remove_file(&runner);
     }
 }

@@ -87,5 +87,95 @@ pub(crate) fn describe_failure(
         msg.push('\n');
         msg.push_str(&result.traceback);
     }
+    // A TERMINATED/TIMEOUT status with an EMPTY exception + traceback gives the user
+    // nothing to act on — the container was killed before it could report. The common
+    // cause on the RUN path is the remote process being OOM-killed during a heavy
+    // in-body `cargo build` (a GPU/ML crate like `burn-add`/`cuda-vector-add`), which
+    // loses the client-visible build output. Append an actionable hint pointing at
+    // `deploy` (builds at image-build time with full resources) + a CUDA base image +
+    // a higher `memory=`. See docs/local/burn-add-run-failure.md for the confirmed root
+    // cause. Skipped when the remote DID report an exception/traceback (the real error
+    // is already above).
+    let no_remote_detail = result.exception.is_empty() && result.traceback.is_empty();
+    if no_remote_detail && matches!(status, GenericStatus::Terminated | GenericStatus::Timeout) {
+        msg.push_str(
+            "\n\nhint: the remote container was killed with no error output — most often \
+             an OUT-OF-MEMORY kill during a heavy in-body `cargo build` (e.g. a GPU/ML \
+             crate). For such crates, prefer `modal-rust deploy` (builds at image-build \
+             time with full resources, not in the function body) with a CUDA base image \
+             and more memory:\n  \
+             MODAL_RUST_BASE_IMAGE=nvidia/cuda:<tag>-devel MODAL_RUST_INSTALL_RUST=1 \
+             modal-rust deploy <fn> --app <name>\n\
+             then call it with `modal-rust call <fn> --app <name> --input '{...}'`. Also \
+             raise `memory=` on the #[modal_rust::function]. The build log (lost \
+             client-side when the container is killed) is in `modal app logs`. See \
+             docs/local/burn-add-run-failure.md.",
+        );
+    }
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(status: GenericStatus, exception: &str, traceback: &str) -> GenericResult {
+        GenericResult {
+            status: status as i32,
+            exception: exception.to_string(),
+            traceback: traceback.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn terminated_with_no_detail_appends_oom_deploy_hint() {
+        let r = result(GenericStatus::Terminated, "", "");
+        let msg = describe_failure("run", GenericStatus::Terminated, &r);
+        assert!(
+            msg.contains("GENERIC_STATUS_TERMINATED"),
+            "names the status: {msg}"
+        );
+        // The actionable hint: OOM cause + deploy + base image + memory + logs pointer.
+        assert!(msg.contains("OUT-OF-MEMORY"), "{msg}");
+        assert!(msg.contains("modal-rust deploy"), "{msg}");
+        assert!(msg.contains("MODAL_RUST_BASE_IMAGE"), "{msg}");
+        assert!(msg.contains("memory="), "{msg}");
+        assert!(msg.contains("modal app logs"), "{msg}");
+        assert!(msg.contains("docs/local/burn-add-run-failure.md"), "{msg}");
+    }
+
+    #[test]
+    fn timeout_with_no_detail_also_gets_the_hint() {
+        let r = result(GenericStatus::Timeout, "", "");
+        let msg = describe_failure("run", GenericStatus::Timeout, &r);
+        assert!(
+            msg.contains("hint:"),
+            "TIMEOUT with no detail gets the hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn terminated_with_remote_exception_does_not_append_hint() {
+        // When the remote DID report an exception, the real error is shown and the
+        // speculative OOM hint is suppressed (no double-talk).
+        let r = result(GenericStatus::Terminated, "RuntimeError: boom", "");
+        let msg = describe_failure("run", GenericStatus::Terminated, &r);
+        assert!(msg.contains("RuntimeError: boom"), "{msg}");
+        assert!(
+            !msg.contains("hint:"),
+            "no OOM hint when a real exception exists: {msg}"
+        );
+    }
+
+    #[test]
+    fn ordinary_failure_status_is_unchanged() {
+        // A plain FAILURE with an exception is rendered exactly as before — no hint.
+        let r = result(GenericStatus::Failure, "ValueError: x", "Traceback...");
+        let msg = describe_failure("call", GenericStatus::Failure, &r);
+        assert_eq!(
+            msg,
+            "call failed with GENERIC_STATUS_FAILURE: ValueError: x\nTraceback..."
+        );
+    }
 }

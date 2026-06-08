@@ -409,6 +409,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             &func,
             &entry_name,
             quote! { #facade::__private::runtime::typed!(#fn_ident) },
+            quote! { #facade::__private::runtime::typed_check!(#fn_ident) },
             &facade,
             &gpu,
             timeout_secs,
@@ -537,6 +538,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let registration = build_registration(
         &entry_name,
         quote! { #facade::__private::runtime::typed!(#shim_ident) },
+        quote! { #facade::__private::runtime::typed_check!(#shim_ident) },
         &facade,
         &gpu,
         timeout_secs,
@@ -1251,6 +1253,11 @@ fn emit_cls(
                 #facade::Registration {
                     name: #entry_name,
                     handler: #facade::__private::runtime::typed!(#shim_ident),
+                    // DECODE-ONLY companion for `--check-input` local validation
+                    // (fail fast before any Modal call); same `In` as the handler.
+                    check: ::core::option::Option::Some(
+                        #facade::__private::runtime::typed_check!(#shim_ident)
+                    ),
                     config: #config,
                     package: ::core::env!("CARGO_PKG_NAME"),
                 }
@@ -1484,6 +1491,7 @@ fn emit_registration(
     func: &ItemFn,
     entry_name: &str,
     handler_expr: proc_macro2::TokenStream,
+    check_expr: proc_macro2::TokenStream,
     facade: &proc_macro2::TokenStream,
     gpu: &Option<LitStr>,
     timeout_secs: Option<u64>,
@@ -1502,6 +1510,7 @@ fn emit_registration(
     let registration = build_registration(
         entry_name,
         handler_expr,
+        check_expr,
         facade,
         gpu,
         timeout_secs,
@@ -1546,6 +1555,7 @@ fn emit_registration(
 fn build_registration(
     entry_name: &str,
     handler_expr: proc_macro2::TokenStream,
+    check_expr: proc_macro2::TokenStream,
     facade: &proc_macro2::TokenStream,
     gpu: &Option<LitStr>,
     timeout_secs: Option<u64>,
@@ -1632,6 +1642,12 @@ fn build_registration(
             #facade::Registration {
                 name: #entry_name,
                 handler: #handler_expr,
+                // The DECODE-ONLY `typed_check!` companion: powers the runner's
+                // `--check-input` LOCAL validation so `modal-rust run` fails fast on a
+                // bad-shape `--input` before any Modal call. Same `In` type as the
+                // handler decodes; const-valid in the `static` initializer (a `fn`
+                // pointer coercion, exactly like `handler`).
+                check: ::core::option::Option::Some(#check_expr),
                 config: #facade::FunctionConfig {
                     gpu: #gpu_tok,
                     timeout_secs: #timeout_tok,
