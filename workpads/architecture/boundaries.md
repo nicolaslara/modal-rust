@@ -317,8 +317,11 @@ def main(entrypoint: str, input_json: str = "{}"):
 
 Invoked arg + return are plain `str` (the JSON envelope text) — well under the
 ~100 MB gRPC limit. Large I/O routes via a Volume/object storage (out of scope for
-the `add` POC). Web endpoints are **opt-in, authenticated** only — never
-auto-exposed public on deploy.
+the `add` POC). Web endpoints follow **Modal's model**: a deployed endpoint is
+**public by default** (Modal assigns it a URL), and privacy is opt-in **the way
+Modal does it** — proxy-auth tokens (`requires_proxy_auth`; the `Modal-Key` /
+`Modal-Secret` header pair). This supersedes the earlier "authenticated only,
+never auto-public" stance, dropped for Modal parity (2026-06-08).
 
 ---
 
