@@ -227,6 +227,98 @@ pub(crate) fn apply_image_steps(
     spec
 }
 
+/// A parsed per-function `image = Image(..)` declaration (C1, PARITY.md §4
+/// image=Partial), deserialized from the macro-canonicalized JSON SPEC string on
+/// [`crate::FunctionConfig::image`]. v0 scope: a base image + install_rust + the
+/// existing apt/pip/run `ImageStep` vocabulary. Every field is optional; an unset field
+/// keeps the build-path default (so a bare `Image()` is a no-op).
+///
+/// This is decorator-level config that, unusually, folds into the BUILD-path image
+/// (`base_image`/`install_rust`/`image_steps`) for THIS entrypoint's build, letting a
+/// function declare its OWN image (e.g. a GPU function's CUDA base) instead of the
+/// env-only `MODAL_RUST_BASE_IMAGE`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct ImageOptions {
+    /// Base image tag (overrides the env-only base). `None` keeps the path default base.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Install the rustup toolchain + CUDA env (for a non-Rust base). `None` keeps the
+    /// path default (env `MODAL_RUST_INSTALL_RUST`).
+    #[serde(default)]
+    pub install_rust: Option<bool>,
+    /// `apt_install` packages (one [`ImageStep::Apt`] when non-empty).
+    #[serde(default)]
+    pub apt: Vec<String>,
+    /// `pip_install` packages (one [`ImageStep::Pip`] when non-empty).
+    #[serde(default)]
+    pub pip: Vec<String>,
+    /// `run_commands` (one [`ImageStep::Run`] when non-empty).
+    #[serde(default)]
+    pub run: Vec<String>,
+}
+
+impl ImageOptions {
+    /// The ordered [`ImageStep`]s this image declares (apt → pip → run), skipping empty
+    /// lists. PREPENDED to any build-path [`RemoteConfig::image_steps`] so a decorator
+    /// image's deps are installed before the path-level steps (the decorator owns the
+    /// base, so its provisioning comes first).
+    fn steps(&self) -> Vec<ImageStep> {
+        let mut steps = Vec::new();
+        if !self.apt.is_empty() {
+            steps.push(ImageStep::Apt(self.apt.clone()));
+        }
+        if !self.pip.is_empty() {
+            steps.push(ImageStep::Pip(self.pip.clone()));
+        }
+        if !self.run.is_empty() {
+            steps.push(ImageStep::Run(self.run.clone()));
+        }
+        steps
+    }
+}
+
+/// Parse the macro-canonicalized per-function image SPEC (compact JSON) into
+/// [`ImageOptions`]. Returns an [`Error::build`](modal_rust_sdk::Error) on a malformed
+/// spec (which only a hand-built [`crate::FunctionConfig`] could produce; the macro
+/// always emits valid JSON). The empty object `{}` (a bare `Image()`) yields the
+/// all-default no-op.
+pub(crate) fn parse_image_spec(spec: &str) -> crate::Result<ImageOptions> {
+    serde_json::from_str(spec).map_err(|e| {
+        crate::Error::config(format!("invalid `image = Image(..)` spec {spec:?}: {e}"))
+    })
+}
+
+/// Fold a per-function `image = Image(..)` declaration (the [`crate::FunctionOptions::image`]
+/// SPEC) into a [`RemoteConfig`]'s BUILD-path image fields, so THIS entrypoint builds on
+/// the declared base. Precedence: an explicit decorator `base`/`install_rust` OVERRIDES
+/// the path default; the decorator's apt/pip/run steps are PREPENDED to the path-level
+/// `image_steps`. `None`/`{}` ⇒ the config is returned unchanged (byte-identical default
+/// path). Shared by the run live path AND the run/deploy offline dumps so the rendered
+/// image cannot drift.
+pub(crate) fn apply_function_image(
+    mut config: RemoteConfig,
+    image_spec: Option<&str>,
+) -> crate::Result<RemoteConfig> {
+    let Some(spec) = image_spec else {
+        return Ok(config);
+    };
+    let image = parse_image_spec(spec)?;
+    // Compute the steps (borrows `&image`) BEFORE moving `base`/`install_rust` out of
+    // `image`, otherwise the partial move makes the `image.steps()` borrow illegal.
+    let mut steps = image.steps();
+    if !steps.is_empty() {
+        steps.extend(config.image_steps);
+        config.image_steps = steps;
+    }
+    if let Some(base) = image.base {
+        config.base_image = base;
+    }
+    if let Some(install_rust) = image.install_rust {
+        config.install_rust = install_rust;
+    }
+    Ok(config)
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
     /// Directory uploaded as the source mount (defaults to the cargo workspace
@@ -621,6 +713,43 @@ mod tests {
         let without = rendered(base.clone());
         let with = rendered(apply_image_steps(base, &[]));
         assert_eq!(with, without);
+    }
+
+    #[test]
+    fn apply_function_image_folds_base_install_rust_and_prepends_steps() {
+        // C1: a per-function `image = Image(base=.., install_rust=true, apt=[..])` spec
+        // OVERRIDES base/install_rust and PREPENDS its steps before the path-level
+        // `image_steps`. Doubles as a regression guard: `base` is moved out of the parsed
+        // image AND `steps()` is still read afterwards (the partial-move this fold once had).
+        let mut config = RemoteConfig::default();
+        config.image_steps = vec![ImageStep::run(["echo path-level"])];
+        let spec = r#"{"base":"nvidia/cuda:12.6.3-devel-ubuntu22.04","install_rust":true,"apt":["libpng-dev"]}"#;
+        let folded = apply_function_image(config, Some(spec)).expect("fold the image spec");
+
+        assert_eq!(folded.base_image, "nvidia/cuda:12.6.3-devel-ubuntu22.04");
+        assert!(
+            folded.install_rust,
+            "decorator install_rust=true overrides the default"
+        );
+        // The decorator's apt step is PREPENDED before the pre-existing path-level step.
+        assert_eq!(folded.image_steps.len(), 2);
+        assert_eq!(folded.image_steps[0], ImageStep::apt(["libpng-dev"]));
+        assert_eq!(folded.image_steps[1], ImageStep::run(["echo path-level"]));
+    }
+
+    #[test]
+    fn apply_function_image_is_a_noop_for_none_and_empty_spec() {
+        // No spec / a bare `Image()` (`{}`) ⇒ the config is returned unchanged (the
+        // purely-additive default path is never perturbed).
+        let base = RemoteConfig::default();
+        let none = apply_function_image(base.clone(), None).expect("none");
+        assert_eq!(none.base_image, base.base_image);
+        assert_eq!(none.install_rust, base.install_rust);
+        assert!(none.image_steps.is_empty());
+        let empty = apply_function_image(base.clone(), Some("{}")).expect("empty `{}`");
+        assert_eq!(empty.base_image, base.base_image);
+        assert_eq!(empty.install_rust, base.install_rust);
+        assert!(empty.image_steps.is_empty());
     }
 
     #[test]

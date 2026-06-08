@@ -437,7 +437,13 @@ impl App {
         };
         let function_id = cell
             .get_or_try_init(|| async {
-                let mut run_config = handle.config.clone();
+                let run_config = handle.config.clone();
+                // C1: fold a per-function `image = Image(..)` into THIS entrypoint's
+                // build image (base/install_rust/steps) before the create. The cache key
+                // already includes `options.image`, so divergent per-entrypoint images
+                // build distinct functions (like gpu/timeout).
+                let mut run_config =
+                    crate::remote::apply_function_image(run_config, options.image.as_deref())?;
                 run_config.options = options.clone();
                 let mut client = handle.client.lock().await;
                 // The publish set is the cumulative union across entrypoints (AppPublish
@@ -795,6 +801,7 @@ mod tests {
                 max_containers: None,
                 buffer_containers: None,
                 scaledown_window: None,
+                image: None,
             },
             package: "modal-rust",
         }
@@ -822,6 +829,7 @@ mod tests {
                 max_containers: None,
                 buffer_containers: None,
                 scaledown_window: None,
+                image: None,
             },
             package: "modal-rust",
         }

@@ -470,9 +470,14 @@ impl crate::App {
         // dumped manifest matches what `.remote()` would send for this entrypoint.
         let mut options = self.config_for(entrypoint);
         let cfg = {
-            let mut c = config.clone();
+            let c = config.clone();
             let effective_cache = options.cache.unwrap_or(c.cache);
             options.cache = Some(effective_cache);
+            // C1: a per-function `image = Image(..)` folds into THIS entrypoint's build
+            // image (base/install_rust/steps) BEFORE the dump renders the image, so the
+            // dry-run manifest matches what `.remote()` would build for this entrypoint.
+            let c = crate::remote::apply_function_image(c, options.image.as_deref())?;
+            let mut c = c;
             c.options = options;
             c
         };
@@ -528,6 +533,11 @@ impl crate::App {
         // function per entrypoint (object tag = entrypoint) with its OWN config; the
         // manual/no-decorator path falls back to a single default function.
         let plan = self.deploy_entrypoints_for_dump(&config);
+        // C1: fold a per-function `image = Image(..)` into the SHARED deploy image (v0:
+        // first declared wins), so the dumped manifest's image layers match what
+        // `deploy` would build. Same fold as the live `deploy_function`.
+        let config =
+            config.with_function_image(plan.iter().map(|ep| ep.options.image.as_deref()))?;
         let entrypoints: Vec<Entrypoint> = plan
             .iter()
             .map(|ep| Entrypoint {

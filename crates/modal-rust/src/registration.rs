@@ -86,6 +86,16 @@ pub struct FunctionConfig {
     /// Idle-before-scaledown window in seconds (`scaledown_window = N`): how long an
     /// idle container waits before being scaled down. `None` => server default.
     pub scaledown_window: Option<u32>,
+    /// Per-function IMAGE spec string (`image = Image(base = .., apt = [..], ..)`, the
+    /// struct form). `None` => the path's env-driven base image + no extra steps
+    /// (byte-identical to before). The macro canonicalizes the `Image(..)` form to a
+    /// compact JSON `&'static str` the facade parses via
+    /// [`crate::remote::parse_image_spec`] (base image / install_rust / apt/pip/run
+    /// `ImageStep`s), folded into the build config for THIS entrypoint's image. Lets a
+    /// function declare its OWN image (e.g. a GPU function's CUDA base) instead of the
+    /// env-only `MODAL_RUST_BASE_IMAGE`. Const-valid in the `static` initializer like
+    /// `gpu`/`schedule`.
+    pub image: Option<&'static str>,
 }
 
 impl FunctionConfig {
@@ -109,6 +119,7 @@ impl FunctionConfig {
             max_containers: None,
             buffer_containers: None,
             scaledown_window: None,
+            image: None,
         }
     }
 }
@@ -177,6 +188,13 @@ pub struct FunctionOptions {
     /// default.
     #[serde(default)]
     pub scaledown_window: Option<u32>,
+    /// Per-function IMAGE spec string (`image = Image(..)`). `None` => the path's
+    /// env-driven base image. Owned form of the `&'static str` JSON spec; the facade
+    /// parses it via [`crate::remote::parse_image_spec`] and folds the base image /
+    /// install_rust / apt/pip/run steps into THIS entrypoint's build config (run +
+    /// deploy). Rides the `--describe` manifest so the CLI path resolves it too.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 impl FunctionOptions {
@@ -220,6 +238,7 @@ impl From<&FunctionConfig> for FunctionOptions {
             max_containers: config.max_containers,
             buffer_containers: config.buffer_containers,
             scaledown_window: config.scaledown_window,
+            image: config.image.map(str::to_string),
         }
     }
 }
@@ -436,6 +455,9 @@ mod tests {
                 max_containers: Some(5),
                 buffer_containers: Some(2),
                 scaledown_window: Some(120),
+                image: Some(
+                    r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#.to_string(),
+                ),
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -473,6 +495,10 @@ mod tests {
         assert_eq!(eps[0]["config"]["max_containers"], 5);
         assert_eq!(eps[0]["config"]["buffer_containers"], 2);
         assert_eq!(eps[0]["config"]["scaledown_window"], 120);
+        assert_eq!(
+            eps[0]["config"]["image"],
+            r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#
+        );
         assert_eq!(eps[1]["name"], "other");
         assert_eq!(eps[1]["config"]["gpu"], serde_json::Value::Null);
         assert_eq!(eps[1]["config"]["secrets"], serde_json::json!([]));
@@ -492,6 +518,7 @@ mod tests {
         assert!(d.env.is_empty());
         assert!(d.volumes.is_empty());
         assert!(d.retries_spec.is_none());
+        assert!(d.image.is_none());
         let c = FunctionConfig::new();
         assert_eq!(d, c);
     }
@@ -515,6 +542,7 @@ mod tests {
             max_containers: Some(5),
             buffer_containers: Some(2),
             scaledown_window: Some(120),
+            image: Some(r#"{"base":"rust:1-slim"}"#),
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -536,6 +564,7 @@ mod tests {
         assert_eq!(options.max_containers, Some(5));
         assert_eq!(options.buffer_containers, Some(2));
         assert_eq!(options.scaledown_window, Some(120));
+        assert_eq!(options.image.as_deref(), Some(r#"{"base":"rust:1-slim"}"#));
     }
 
     #[test]

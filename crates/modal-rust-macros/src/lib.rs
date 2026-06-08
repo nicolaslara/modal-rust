@@ -219,6 +219,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut required_keys: Vec<String> = Vec::new(); // required_keys = ["API_KEY", ..]
     let mut env: Vec<(String, String)> = Vec::new(); // env = {"K" = "V", ..} -> inline secret
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
+    let mut image: Option<String> = None; // image = Image(base=.., apt=[..], ..) -> spec string
     if !attr.is_empty() {
         let parser = syn::meta::parser(|meta| {
             if meta.path.is_ident("name") {
@@ -358,6 +359,18 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                     volumes.push((mount.to_string(), name.to_string()));
                 }
                 Ok(())
+            } else if meta.path.is_ident("image") {
+                // image = Image(base = "...", install_rust = <bool>, apt = ["..."],
+                // pip = ["..."], run = ["..."]) — a PER-FUNCTION image declaration,
+                // call-shaped like `Retries(..)`/`Cron(..)`. Lets a function declare its
+                // OWN base image + the existing apt/pip/run `ImageStep` vocabulary
+                // (PARITY.md §4 image=Partial), so e.g. a GPU function declares its CUDA
+                // base in the decorator instead of `MODAL_RUST_BASE_IMAGE`. Canonicalized
+                // to a const SPEC string the facade parses (`remote::parse_image_spec`),
+                // so `FunctionConfig.image` stays an `Option<&'static str>` const-valid in
+                // the `static` `inventory::submit!` initializer (like `schedule`/`gpu`).
+                image = Some(parse_image_to_spec(meta.value()?)?);
+                Ok(())
             } else {
                 Err(meta.error(
                     "unsupported `#[modal_rust::function]` argument; recognized: \
@@ -368,7 +381,8 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                      `min_containers = <N>`, `max_containers = <N>`, \
                      `buffer_containers = <N>`, `scaledown_window = <secs>`, \
                      `secrets = [\"name\", ..]`, `required_keys = [\"KEY\", ..]`, \
-                     `env = {\"K\" = \"V\", ..}`, `volumes = [\"/mount=name\", ..]`",
+                     `env = {\"K\" = \"V\", ..}`, `volumes = [\"/mount=name\", ..]`, \
+                     `image = Image(base = \"..\", apt = [..], pip = [..], run = [..])`",
                 ))
             }
         });
@@ -461,6 +475,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             &required_keys,
             &env,
             &volumes,
+            image.as_deref(),
         );
     }
 
@@ -593,6 +608,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         &required_keys,
         &env,
         &volumes,
+        image.as_deref(),
     );
 
     quote! {
@@ -631,6 +647,8 @@ struct ClsConfig {
     required_keys: Option<Vec<String>>,
     env: Option<Vec<(String, String)>>,
     volumes: Option<Vec<(String, String)>>,
+    // `None` = unset (inherit). `Some(spec)` = an explicit `image = Image(..)` override.
+    image: Option<String>,
 }
 
 impl ClsConfig {
@@ -662,6 +680,7 @@ impl ClsConfig {
                 .or_else(|| self.required_keys.clone()),
             env: over.env.clone().or_else(|| self.env.clone()),
             volumes: over.volumes.clone().or_else(|| self.volumes.clone()),
+            image: over.image.clone().or_else(|| self.image.clone()),
         }
     }
 }
@@ -775,6 +794,9 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
             }
             cfg.volumes = Some(vols);
             Ok(())
+        } else if meta.path.is_ident("image") {
+            cfg.image = Some(parse_image_to_spec(meta.value()?)?);
+            Ok(())
         } else if meta.path.is_ident("name") {
             Err(meta.error(
                 "`name` is not valid on `#[cls]`/`#[method]`: the entrypoint name is \
@@ -785,7 +807,8 @@ fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> 
                 "unsupported `#[cls]`/`#[method]` argument; recognized: `gpu`, \
                  `timeout`, `cache`, `cpu`, `memory`, `retries`, `schedule`, \
                  `min_containers`, `max_containers`, `buffer_containers`, \
-                 `scaledown_window`, `secrets`, `required_keys`, `env`, `volumes`",
+                 `scaledown_window`, `secrets`, `required_keys`, `env`, `volumes`, \
+                 `image`",
             ))
         }
     });
@@ -1461,6 +1484,10 @@ fn cls_config_to_registration(
             .collect::<Vec<_>>();
         quote! { &[ #( #items ),* ] }
     };
+    let image_tok = match &cfg.image {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
 
     quote! {
         #facade::FunctionConfig {
@@ -1480,6 +1507,7 @@ fn cls_config_to_registration(
             required_keys: #required_keys_tok,
             env: #env_tok,
             volumes: #volumes_tok,
+            image: #image_tok,
         }
     }
 }
@@ -1605,6 +1633,7 @@ fn emit_registration(
     required_keys: &[String],
     env: &[(String, String)],
     volumes: &[(String, String)],
+    image: Option<&str>,
 ) -> TokenStream {
     let registration = build_registration(
         entry_name,
@@ -1627,6 +1656,7 @@ fn emit_registration(
         required_keys,
         env,
         volumes,
+        image,
     );
     quote! {
         #func
@@ -1675,6 +1705,7 @@ fn build_registration(
     required_keys: &[String],
     env: &[(String, String)],
     volumes: &[(String, String)],
+    image: Option<&str>,
 ) -> proc_macro2::TokenStream {
     let gpu_tok = match gpu {
         Some(s) => quote! { ::core::option::Option::Some(#s) }, // &'static str literal
@@ -1761,6 +1792,14 @@ fn build_registration(
             .map(|(mount, name)| quote! { (#mount, #name) });
         quote! { &[ #( #items ),* ] }
     };
+    // `image` is the canonicalized per-function `Image(..)` SPEC string as a
+    // `&'static str` (the facade parses it via `remote::parse_image_spec`), const-valid
+    // in the `static` initializer exactly like `schedule`/`gpu`. `None` emits `None` =>
+    // byte-identical to a bare decorator (the env-only base image stays in effect).
+    let image_tok = match image {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
 
     quote! {
         #facade::__private::inventory::submit! {
@@ -1790,6 +1829,7 @@ fn build_registration(
                     required_keys: #required_keys_tok,
                     env: #env_tok,
                     volumes: #volumes_tok,
+                    image: #image_tok,
                 },
                 // Capture the USER crate's cargo package name HERE — this macro
                 // expands in the user's crate, so `env!("CARGO_PKG_NAME")` is the
@@ -2150,6 +2190,193 @@ fn secs_lit_to_ms(expr: &Expr) -> syn::Result<u32> {
         ));
     }
     Ok((secs * 1000.0) as u32)
+}
+
+/// Parse an `image = Image(..)` value into a canonical SPEC string the facade's
+/// `remote::parse_image_spec` understands. Call-shaped (like `Retries(..)`/`Cron(..)`),
+/// mirroring a v0 slice of Modal's `Image` builder (PARITY.md §4 image=Partial). Lets a
+/// function declare its OWN base image + the existing apt/pip/run `ImageStep` vocabulary:
+///
+/// - `base = "registry/tag"` (optional `LitStr`) → the base image tag (overrides the
+///   env-only `MODAL_RUST_BASE_IMAGE`). Omit to keep the path default base.
+/// - `install_rust = <bool>` (optional) → install the rustup toolchain + CUDA env into
+///   the image (set for a non-Rust base, e.g. a `nvidia/cuda:*-devel` base).
+/// - `apt = ["pkg", ..]` (optional) → an `ImageStep::Apt`.
+/// - `pip = ["pkg", ..]` (optional) → an `ImageStep::Pip`.
+/// - `run = ["cmd", ..]` (optional) → an `ImageStep::Run`.
+///
+/// Emitted as a compact JSON object (escaped here, so arbitrary `run` commands round-trip
+/// safely) the facade deserializes once. A malformed form becomes a `compile_error!` so
+/// the user learns at compile time, never on the wire. v0 scope: base + install_rust +
+/// the existing apt/pip/run steps; a fully general `Image` builder type is a follow-up.
+fn parse_image_to_spec(input: syn::parse::ParseStream) -> syn::Result<String> {
+    let call: syn::ExprCall = input.parse().map_err(|_| {
+        syn::Error::new(
+            input.span(),
+            "`image` must be the struct form `image = Image(base = \"..\"[, \
+             install_rust = <bool>][, apt = [..]][, pip = [..]][, run = [..]])`",
+        )
+    })?;
+    let kind = match call.func.as_ref() {
+        Expr::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default(),
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                "`image` struct form must call `Image(..)`",
+            ))
+        }
+    };
+    if kind != "Image" {
+        return Err(syn::Error::new_spanned(
+            &call.func,
+            format!("unknown image kind {kind:?}; expected the `Image(..)` struct form"),
+        ));
+    }
+    let mut base: Option<String> = None;
+    let mut install_rust: Option<bool> = None;
+    let mut apt: Vec<String> = Vec::new();
+    let mut pip: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    for arg in &call.args {
+        let Expr::Assign(assign) = arg else {
+            return Err(syn::Error::new_spanned(
+                arg,
+                "Image components must be `name = value`, e.g. `base = \"rust:1-slim\"`",
+            ));
+        };
+        let Expr::Path(name_path) = assign.left.as_ref() else {
+            return Err(syn::Error::new_spanned(
+                &assign.left,
+                "Image component name must be a bare identifier (e.g. `base`, `apt`)",
+            ));
+        };
+        let name = name_path
+            .path
+            .get_ident()
+            .map(|i| i.to_string())
+            .ok_or_else(|| {
+                syn::Error::new_spanned(&assign.left, "Image component name must be an identifier")
+            })?;
+        match name.as_str() {
+            "base" => {
+                let Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) = assign.right.as_ref()
+                else {
+                    return Err(syn::Error::new_spanned(
+                        &assign.right,
+                        "`base` must be a string literal, e.g. `base = \"rust:1-slim\"`",
+                    ));
+                };
+                base = Some(s.value());
+            }
+            "install_rust" => {
+                let Expr::Lit(ExprLit {
+                    lit: Lit::Bool(b), ..
+                }) = assign.right.as_ref()
+                else {
+                    return Err(syn::Error::new_spanned(
+                        &assign.right,
+                        "`install_rust` must be a bool literal, e.g. `install_rust = true`",
+                    ));
+                };
+                install_rust = Some(b.value);
+            }
+            "apt" => apt = image_str_list(&assign.right)?,
+            "pip" => pip = image_str_list(&assign.right)?,
+            "run" => run = image_str_list(&assign.right)?,
+            other => {
+                return Err(syn::Error::new_spanned(
+                    &assign.left,
+                    format!(
+                        "unknown Image component {other:?}; expected one of \
+                         `base`, `install_rust`, `apt`, `pip`, `run`"
+                    ),
+                ))
+            }
+        }
+    }
+    // Build a compact JSON object the facade deserializes. All fields optional; emit only
+    // what was set (and never emit an empty step list) so the spec is minimal and a
+    // bare `Image()` is the no-op default. JSON-escape every string so arbitrary `run`
+    // commands round-trip without a delimiter collision.
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(b) = base {
+        parts.push(format!("\"base\":\"{}\"", json_escape(&b)));
+    }
+    if let Some(r) = install_rust {
+        parts.push(format!("\"install_rust\":{r}"));
+    }
+    let json_arr = |items: &[String]| -> String {
+        let inner = items
+            .iter()
+            .map(|s| format!("\"{}\"", json_escape(s)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{inner}]")
+    };
+    if !apt.is_empty() {
+        parts.push(format!("\"apt\":{}", json_arr(&apt)));
+    }
+    if !pip.is_empty() {
+        parts.push(format!("\"pip\":{}", json_arr(&pip)));
+    }
+    if !run.is_empty() {
+        parts.push(format!("\"run\":{}", json_arr(&run)));
+    }
+    Ok(format!("{{{}}}", parts.join(",")))
+}
+
+/// Parse a bracketed list of string literals from an `Image(..)` component value
+/// expression (`apt = ["a", "b"]`). Shared by `apt`/`pip`/`run`. Rejects a non-list /
+/// non-string-literal element with a clear `compile_error!`.
+fn image_str_list(expr: &Expr) -> syn::Result<Vec<String>> {
+    let Expr::Array(arr) = expr else {
+        return Err(syn::Error::new_spanned(
+            expr,
+            "expected a bracketed list of string literals, e.g. `[\"libpng-dev\"]`",
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.elems.len());
+    for elem in &arr.elems {
+        let Expr::Lit(ExprLit {
+            lit: Lit::Str(s), ..
+        }) = elem
+        else {
+            return Err(syn::Error::new_spanned(
+                elem,
+                "image step entries must be string literals",
+            ));
+        };
+        out.push(s.value());
+    }
+    Ok(out)
+}
+
+/// Minimal JSON string escaper for the compile-time `image` spec (the macro crate has no
+/// serde dep). Escapes the seven characters JSON requires; control chars below 0x20 go to
+/// `\u00XX`. Sufficient for image tags + apt/pip/run command strings.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The seven `Period(..)` component names, in Modal's large→small order

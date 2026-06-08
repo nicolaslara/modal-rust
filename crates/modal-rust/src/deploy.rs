@@ -217,6 +217,37 @@ impl DeployConfig {
             options: FunctionOptions::default(),
         }
     }
+
+    /// C1: fold a per-function `image = Image(..)` declaration into the SHARED deploy
+    /// image (base/install_rust/steps). Deploy bakes ONE `modal_runner` over ONE image,
+    /// so v0 uses a single shared image for all entrypoints: the FIRST entrypoint that
+    /// declares an `image` wins (entrypoints are visited in deploy-plan order). A
+    /// distinct second image declaration is a known v0 limitation — the env-only base
+    /// (`MODAL_RUST_BASE_IMAGE`) + path `image_steps` still apply when no entrypoint
+    /// declares one. Reuses [`crate::remote::apply_function_image`] via a throwaway
+    /// [`RemoteConfig`] view so run and deploy fold images identically (no drift).
+    pub(crate) fn with_function_image<'a>(
+        mut self,
+        entrypoint_images: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Result<Self> {
+        let Some(spec) = entrypoint_images.into_iter().flatten().next() else {
+            return Ok(self);
+        };
+        // Borrow the deploy build fields into a RemoteConfig view, fold the image, copy
+        // back. (RemoteConfig is the canonical build-config carrier the fold helper
+        // operates on; deploy reuses the same fields.)
+        let view = RemoteConfig {
+            base_image: std::mem::take(&mut self.base_image),
+            install_rust: self.install_rust,
+            image_steps: std::mem::take(&mut self.image_steps),
+            ..RemoteConfig::default()
+        };
+        let view = crate::remote::apply_function_image(view, Some(spec))?;
+        self.base_image = view.base_image;
+        self.install_rust = view.install_rust;
+        self.image_steps = view.image_steps;
+        Ok(self)
+    }
 }
 
 impl Default for DeployConfig {
@@ -284,6 +315,14 @@ pub(crate) async fn deploy_function(
         provision, Entrypoint, LiveControlPlane, ProvisionInputs, Published, SourceInputs,
         DEPLOY_BOUNDARY,
     };
+
+    // C1: fold a per-function `image = Image(..)` into the SHARED deploy image (v0: the
+    // first entrypoint that declares one wins). Done up front so the build context +
+    // both image layers render on the declared base.
+    let config = config
+        .clone()
+        .with_function_image(entrypoints.iter().map(|ep| ep.options.image.as_deref()))?;
+    let config = &config;
 
     // ONE Modal function PER ENTRYPOINT over the SHARED image: the deployed
     // `modal_runner` handles every entrypoint by dispatch, so each entrypoint is its
