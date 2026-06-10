@@ -149,6 +149,13 @@ pub(crate) struct ProvisionInputs<'a> {
     /// Enable the P6 cargo build cache (RUN path only; DEPLOY ignores it — it builds
     /// at image-build time).
     pub cache: bool,
+    /// OPT-IN: degrade a FAILED memory-snapshot prime to lazy `#[enter]` instead of
+    /// failing the container init loudly (DEPLOY path only; bakes
+    /// `ENV MODAL_RUST_SNAPSHOT_BEST_EFFORT=1` next to the prime ENV). Default `false`
+    /// = STRICT: a broken `#[enter]`/prime fails the deploy visibly rather than hiding
+    /// as a per-cold-start perf cliff. From [`crate::DeployConfig::snapshot_best_effort`]
+    /// (env `MODAL_RUST_SNAPSHOT_BEST_EFFORT`).
+    pub snapshot_best_effort: bool,
     /// The entrypoints to create (one DISTINCT Modal function per entrypoint).
     pub entrypoints: &'a [Entrypoint],
 }
@@ -247,6 +254,7 @@ pub(crate) fn build_deploy_top_layer_spec(
     source_mount_id: &str,
     package: &str,
     bake_snapshot_prime: bool,
+    bake_snapshot_best_effort: bool,
 ) -> ImageSpec {
     let mut spec = ImageSpec::from_registry(String::new()) // FROM replaced by `FROM base`.
         .with_base_image(base_image_id)
@@ -268,6 +276,12 @@ pub(crate) fn build_deploy_top_layer_spec(
     // snapshot, so the default deploy image is byte-identical (no extra ENV layer).
     if bake_snapshot_prime {
         spec = spec.with_command("ENV MODAL_RUST_SNAPSHOT_PRIME=1");
+        // STRICT by default: a failed prime FAILS the container init loudly (a hidden
+        // perf cliff otherwise). The operator opts into degrade-to-lazy explicitly
+        // (DeployConfig::snapshot_best_effort / MODAL_RUST_SNAPSHOT_BEST_EFFORT).
+        if bake_snapshot_best_effort {
+            spec = spec.with_command("ENV MODAL_RUST_SNAPSHOT_BEST_EFFORT=1");
+        }
     }
     spec.with_command("ENTRYPOINT []")
 }
@@ -598,6 +612,7 @@ pub(crate) async fn provision<C: ControlPlane>(
                 &source_mount_id,
                 inputs.source.package,
                 bake_snapshot_prime,
+                inputs.snapshot_best_effort,
             );
             cp.ensure_image(&app_id, &top_spec, 1).await?
         }
@@ -925,6 +940,7 @@ mod tests {
             install_rust: false,
             image_steps: &[],
             cache: true,
+            snapshot_best_effort: false,
             entrypoints,
         }
     }
@@ -983,7 +999,8 @@ mod tests {
         // DEPLOY top layer: bases on layer 1 (FROM base), the source rides this
         // layer's build CONTEXT so cargo compiles it AT image-build time, then the
         // binary is baked to /app/modal_runner.
-        let spec = build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", false);
+        let spec =
+            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", false, false);
         assert_eq!(spec.base_image_id.as_deref(), Some("im-layer1"));
         assert_eq!(spec.context_mount_id.as_deref(), Some("mo-deploy-src"));
         assert!(spec
@@ -1013,7 +1030,8 @@ mod tests {
         // A deployed entrypoint opted into memory snapshot ⇒ the top layer bakes
         // `ENV MODAL_RUST_SNAPSHOT_PRIME=1` next to `RUST_BACKTRACE`, so the wrapper's
         // import-time prime fires before Modal's snapshot point.
-        let spec = build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", true);
+        let spec =
+            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", true, false);
         assert!(
             spec.extra_commands
                 .iter()
@@ -1026,6 +1044,38 @@ mod tests {
             .extra_commands
             .iter()
             .any(|c| c == "ENV RUST_BACKTRACE=1"));
+        // STRICT is the default: no best-effort ENV unless the operator opted in.
+        assert!(
+            !spec
+                .extra_commands
+                .iter()
+                .any(|c| c.contains("MODAL_RUST_SNAPSHOT_BEST_EFFORT")),
+            "strict default must NOT bake the best-effort ENV"
+        );
+    }
+
+    #[test]
+    fn deploy_top_layer_bakes_best_effort_env_only_on_opt_in() {
+        // The opt-in degrade (DeployConfig::snapshot_best_effort /
+        // MODAL_RUST_SNAPSHOT_BEST_EFFORT) bakes the best-effort ENV NEXT TO the prime
+        // ENV — and only when the prime itself is baked (it is meaningless without it).
+        let spec =
+            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", true, true);
+        assert!(spec
+            .extra_commands
+            .iter()
+            .any(|c| c == "ENV MODAL_RUST_SNAPSHOT_PRIME=1"));
+        assert!(spec
+            .extra_commands
+            .iter()
+            .any(|c| c == "ENV MODAL_RUST_SNAPSHOT_BEST_EFFORT=1"));
+        // best_effort WITHOUT the prime bakes neither (no orphan knob).
+        let spec =
+            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", false, true);
+        assert!(!spec
+            .extra_commands
+            .iter()
+            .any(|c| c.contains("MODAL_RUST_SNAPSHOT")));
     }
 
     #[test]

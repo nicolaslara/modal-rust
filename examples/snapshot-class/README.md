@@ -68,6 +68,13 @@ on `deploy`, not `run`:
 
 So you `run` to iterate locally and `deploy` to get the cold-start snapshot win.
 
+**A failed prime fails loud.** If `#[enter]` errors (or panics) during the snapshot
+prime, the container init **fails visibly at deploy time** instead of silently
+re-running `#[enter]` on every cold start (a hidden perf cliff). To opt into
+degrading — log the failure and fall back to lazy `#[enter]` on the first request —
+set `MODAL_RUST_SNAPSHOT_BEST_EFFORT=1` at deploy time (or
+`DeployConfig::snapshot_best_effort`).
+
 ## Deploy and call it
 
 ```bash

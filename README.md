@@ -581,10 +581,14 @@ Three things to know:
   snapshot the class; on `run` it is suppressed and the wire stays byte-identical to a
   non-snapshot `#[cls]` (which falls back to ordinary load-once, once per warm
   container). So you `run` to iterate and `deploy` to get the cold-start win.
-- **The prime.** A deploy makes `#[enter]` run *inside* Modal's snapshot window
-  (otherwise it would run after restore — too late). If the prime ever fails to run,
-  the first real request still lazily runs `#[enter]`: correctness is preserved, only
-  the snapshot speedup is lost.
+- **The prime — fails loud by default.** A deploy makes `#[enter]` run *inside*
+  Modal's snapshot window (otherwise it would run after restore — too late). If the
+  prime **fails** (your `#[enter]` returned an error or panicked, or the prime path
+  broke), the container init **fails visibly at deploy time** — a broken snapshot
+  must never hide as a silent perf cliff where every cold start quietly re-pays the
+  load. To opt into degrading instead (log the failure, fall back to lazy `#[enter]`
+  on the first request), set `MODAL_RUST_SNAPSHOT_BEST_EFFORT=1` at deploy time (or
+  `DeployConfig::snapshot_best_effort`).
 - **Frozen-`#[enter]`-state caveat.** A snapshot freezes the *entire* process state at
   the moment `#[enter]` finishes and restores it on every cold container. Anything
   `#[enter]` captures — **environment variables, the wall clock / timestamps, RNG

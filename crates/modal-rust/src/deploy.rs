@@ -150,18 +150,44 @@ def _snapshot_prime_enabled():
     )
 
 
+def _snapshot_best_effort():
+    # OPT-IN: degrade a FAILED prime to lazy `#[enter]` instead of failing loudly. Default
+    # OFF (strict) — a broken prime must never be a hidden perf cliff. Baked from the
+    # deploy-time MODAL_RUST_SNAPSHOT_BEST_EFFORT env when the operator opts in.
+    return os.environ.get("MODAL_RUST_SNAPSHOT_BEST_EFFORT", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _snapshot_prime_fail(msg, proc):
+    # STRICT default: a failed prime FAILS LOUD — raise at import so the container fails to
+    # boot and Modal surfaces it at DEPLOY time, instead of silently re-running `#[enter]`
+    # on every cold start (a hidden perf cliff). The opt-in MODAL_RUST_SNAPSHOT_BEST_EFFORT
+    # degrades to lazy `#[enter]` instead (the import continues; the first real request
+    # runs `#[enter]` lazily). Drop the child so the lazy path respawns cleanly.
+    global _SERVE
+    if _snapshot_best_effort():
+        print(f"[deploy] snapshot prime FAILED: {msg}; degrading to lazy #[enter] "
+              "(MODAL_RUST_SNAPSHOT_BEST_EFFORT)", file=sys.stderr)
+        _SERVE = None
+        return
+    raise RuntimeError(
+        f"modal-rust memory-snapshot prime FAILED at container init: {msg}. Fix the "
+        f"failing #[enter] (or the prime path), or set MODAL_RUST_SNAPSHOT_BEST_EFFORT=1 "
+        "to degrade to lazy #[enter] instead of failing the deploy."
+    )
+
+
 def _snapshot_prime():
     # MODULE-GLOBAL eager prime (memory-snapshot v0 §6): runs at IMPORT, BEFORE Modal's
     # snapshot point, so the snapshot-enabled `#[cls]` `#[enter]` lands INSIDE the freeze
     # window and is restored (load-once-EVER) rather than re-run on every cold start.
     # Baked on ONLY when a deployed entrypoint opted into `enable_memory_snapshot`
-    # (the MODAL_RUST_SNAPSHOT_PRIME ENV); off ⇒ this is a no-op and the import is
-    # byte-identical to a non-snapshot deploy.
+    # (the MODAL_RUST_SNAPSHOT_PRIME ENV); off ⇒ no-op + byte-identical import.
     #
-    # BEST-EFFORT: the whole block is wrapped so it NEVER fails the import. If the prime
-    # frame is never sent, the child fails, or a prime errors, the FIRST real request
-    # still lazily runs `#[enter]` via the runner's OnceLock path — correctness is
-    # preserved; only the snapshot perf win is lost (the §9 correctness floor).
+    # STRICT BY DEFAULT: any prime failure (IO error, missing/garbled ack, or a reported
+    # `#[enter]` failure) FAILS LOUD via _snapshot_prime_fail. Opt into degrade-to-lazy
+    # with MODAL_RUST_SNAPSHOT_BEST_EFFORT.
     if not (_serve_enabled() and _snapshot_prime_enabled()):
         return
     try:
@@ -169,9 +195,23 @@ def _snapshot_prime():
         proc.stdin.write(json.dumps({"kind": "prime"}) + "\n")
         proc.stdin.flush()
         ack = proc.stdout.readline().strip()
-        print(f"[deploy] snapshot prime ack: {ack!r}", file=sys.stderr)
-    except Exception as e:  # noqa: BLE001 — prime must never fail the import.
-        print(f"[deploy] snapshot prime failed ({e!r}); lazy #[enter] fallback", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        _snapshot_prime_fail(f"prime frame IO failed: {e!r}", _SERVE)
+        return
+    if not ack:
+        _snapshot_prime_fail(f"runner produced no prime ack (child exit={proc.poll()})", proc)
+        return
+    try:
+        report = json.loads(ack)
+        failed = int(report.get("failed", 0))
+        errors = report.get("errors", [])
+    except Exception as e:  # noqa: BLE001
+        _snapshot_prime_fail(f"unparseable prime ack {ack!r}: {e!r}", proc)
+        return
+    if failed:
+        _snapshot_prime_fail(f"{failed} #[enter] prime(s) failed: {errors}", proc)
+        return
+    print(f"[deploy] snapshot prime ack: {ack!r}", file=sys.stderr)
 
 
 _snapshot_prime()
@@ -225,10 +265,32 @@ pub struct DeployConfig {
     /// config (like [`base_image`](DeployConfig::base_image)), not decorator config.
     /// Default empty ⇒ byte-identical default path.
     pub image_steps: Vec<crate::ImageStep>,
+    /// OPT-IN: degrade a FAILED memory-snapshot prime to lazy `#[enter]` instead of
+    /// failing the container init loudly. Default `false` = STRICT — a broken
+    /// `#[enter]`/prime FAILS the deploy visibly (raising at wrapper import) rather
+    /// than hiding as a silent per-cold-start perf cliff. When `true` (or the deploy-time
+    /// env `MODAL_RUST_SNAPSHOT_BEST_EFFORT` is truthy), the image bakes
+    /// `ENV MODAL_RUST_SNAPSHOT_BEST_EFFORT=1` and the wrapper logs + falls back to the
+    /// lazy `#[enter]` path instead. Only meaningful when an entrypoint sets
+    /// `enable_memory_snapshot`.
+    pub snapshot_best_effort: bool,
     /// Owned per-function Modal options used by the manual/no-decorator fallback
     /// function. Decorated entrypoints carry their own [`FunctionOptions`] in
     /// [`DeployEntrypoint`].
     pub options: FunctionOptions,
+}
+
+/// Deploy-time env discovery for [`DeployConfig::snapshot_best_effort`]
+/// (`MODAL_RUST_SNAPSHOT_BEST_EFFORT` truthy ⇒ opt into degrade-to-lazy).
+fn discover_snapshot_best_effort() -> bool {
+    std::env::var("MODAL_RUST_SNAPSHOT_BEST_EFFORT")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl DeployConfig {
@@ -247,6 +309,7 @@ impl DeployConfig {
             timeout_secs: 300,
             install_rust: base.install_rust,
             image_steps: base.image_steps,
+            snapshot_best_effort: discover_snapshot_best_effort(),
             options: FunctionOptions::default(),
         }
     }
@@ -400,6 +463,7 @@ pub(crate) async fn deploy_function(
         install_rust: config.install_rust,
         image_steps: &config.image_steps,
         cache: false, // DEPLOY builds at image-build time — no run-path cargo cache.
+        snapshot_best_effort: config.snapshot_best_effort,
         entrypoints: &plan,
     };
     let mut published = Published::default();
@@ -529,10 +593,27 @@ mod tests {
             call_at > def_at,
             "the module-global prime call must come AFTER its definition"
         );
-        // BEST-EFFORT: a try/except guards it so it never fails the import.
+        // FAIL-LOUD CONTRACT: a failed prime RAISES at import by default (the container
+        // fails to boot, surfacing the broken `#[enter]` at deploy time instead of
+        // hiding it as a per-cold-start perf cliff)...
         assert!(
-            src.contains("snapshot prime failed"),
-            "the prime must be wrapped so it never fails the import"
+            src.contains("raise RuntimeError"),
+            "a failed prime must raise (strict default), not be swallowed"
+        );
+        assert!(
+            src.contains("memory-snapshot prime FAILED"),
+            "the raise must carry an actionable message"
+        );
+        // ...and the ack's failure report is what drives it (failed/errors from the
+        // runner's prime ack — a reported #[enter] failure counts as failure).
+        assert!(
+            src.contains(r#"report.get("failed""#),
+            "the wrapper must parse the ack's failure report"
+        );
+        // The degrade-to-lazy path exists ONLY behind the explicit opt-in env.
+        assert!(
+            src.contains("MODAL_RUST_SNAPSHOT_BEST_EFFORT"),
+            "degrade-to-lazy must be gated on the explicit best-effort opt-in"
         );
     }
 

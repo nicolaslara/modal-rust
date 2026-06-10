@@ -589,6 +589,8 @@ pub(crate) async fn ensure_function(
         // the run-level default (`config.cache`) — symmetric with `timeout` above. The
         // flat `config.cache` is the default only; it is never overwritten per entrypoint.
         cache: config.options.cache.unwrap_or(config.cache),
+        // RUN never snapshots (deploy-only feature), so the strictness knob is moot here.
+        snapshot_best_effort: false,
         entrypoints: &entrypoints,
     };
 

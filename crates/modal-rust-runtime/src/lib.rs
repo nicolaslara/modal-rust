@@ -898,37 +898,45 @@ pub fn run_serve_with_io<R: std::io::BufRead, W: std::io::Write>(
     0
 }
 
-/// Handle ONE `{"kind":"prime"}` frame: run every registered snapshot prime
-/// BEST-EFFORT (a per-fn `Err` or panic is logged to stderr and skipped, NEVER
-/// crashing the serve loop), then write exactly ONE ack line `{"primed":<n_ok>}`
-/// where `n_ok` counts the primes that returned `Ok`. Serves no user request.
+/// Handle ONE `{"kind":"prime"}` frame: run every registered snapshot prime and REPORT
+/// the outcome in the ack `{"primed":<n_ok>,"failed":<n_err>,"errors":[<msg>,..]}`.
+/// Serves no user request.
 ///
-/// Each prime forces a `#[cls]` singleton's `get_or_init`, so its `#[enter]` runs
-/// INSIDE Modal's memory-snapshot freeze window. Idempotence is owned by `OnceLock`:
-/// a class shared by several method-registrations is primed once even though its
-/// prime fn appears multiple times. If a prime never runs (frame never sent, child
-/// died, or it errored), the FIRST real request still lazily runs `#[enter]` via the
-/// existing `OnceLock` path — correctness holds; only the snapshot perf win is lost.
+/// A failing prime is NOT silently swallowed — it is COUNTED and its message returned in
+/// the ack, so the caller (the deploy wrapper) can FAIL LOUDLY by default (a broken
+/// `#[enter]` or prime path is a hidden perf cliff otherwise: the deploy looks healthy
+/// while every cold start silently re-pays the load). The serve loop still `catch_unwind`s
+/// each prime so one bad prime cannot poison the warm container — but the failure is
+/// reported, not hidden. The wrapper decides STRICT (raise → container fails to boot,
+/// loud) vs the opt-in `MODAL_RUST_SNAPSHOT_BEST_EFFORT` degrade-to-lazy.
+///
+/// Each prime forces a `#[cls]` singleton's `get_or_init`, so its `#[enter]` runs INSIDE
+/// Modal's snapshot freeze window. Idempotence is owned by `OnceLock`: a class shared by
+/// several method-registrations is primed once even though its prime fn appears N times.
 fn serve_prime<W: std::io::Write>(registry: &Registry, out: &mut W) {
     // Install the quiet panic hook so a panicking prime does not dump the default
-    // message to stderr (we log our own one-line diagnostic and continue).
+    // message to stderr (we log our own one-line diagnostic + report it in the ack).
     install_panic_hook();
     let mut primed_ok: usize = 0;
+    let mut errors: Vec<String> = Vec::new();
     for prime in &registry.primes {
-        // Catch a panicking prime too: a bad `#[enter]` must degrade to lazy init, not
-        // poison the warm container's serve loop (architecture §4 correctness floor).
+        // `catch_unwind` so ONE bad prime can't poison the serve loop; the failure is
+        // REPORTED in the ack (the wrapper enforces strict-fail vs opt-in degrade), not
+        // silently dropped.
         let outcome = panic::catch_unwind(AssertUnwindSafe(prime));
         match outcome {
             Ok(Ok(())) => primed_ok += 1,
             Ok(Err(e)) => {
                 eprintln!("modal_runner --serve: snapshot prime failed: {e}");
+                errors.push(e.to_string());
             }
             Err(_) => {
                 eprintln!("modal_runner --serve: snapshot prime panicked");
+                errors.push("snapshot prime panicked".to_string());
             }
         }
     }
-    let ack = serde_json::json!({ "primed": primed_ok });
+    let ack = serde_json::json!({ "primed": primed_ok, "failed": errors.len(), "errors": errors });
     let _ = emit_line(out, &ack);
 }
 
@@ -1384,8 +1392,12 @@ mod tests {
                 ],
             );
             assert_eq!(envelopes.len(), 2, "one ack + one request envelope");
-            // The prime acked with the count of primes that returned Ok (both did).
-            assert_eq!(envelopes[0], serde_json::json!({"primed": 2}));
+            // The prime acked with the count of primes that returned Ok (both did) and
+            // an explicit zero-failure report (the wrapper's strict default keys off it).
+            assert_eq!(
+                envelopes[0],
+                serde_json::json!({"primed": 2, "failed": 0, "errors": []})
+            );
             // The request reused the primed singleton.
             assert_eq!(envelopes[1], serde_json::json!({"ok": true, "value": 42}));
             // The whole point: `#[enter]` (the `OnceLock` init) ran EXACTLY once across
@@ -1412,7 +1424,65 @@ mod tests {
                 ],
             );
             assert_eq!(envelopes.len(), 2);
-            assert_eq!(envelopes[0], serde_json::json!({"primed": 0}));
+            assert_eq!(
+                envelopes[0],
+                serde_json::json!({"primed": 0, "failed": 0, "errors": []})
+            );
+            assert_eq!(envelopes[1]["ok"], true);
+        }
+
+        #[test]
+        fn failing_and_panicking_primes_are_reported_in_the_ack_not_swallowed() {
+            // FAIL-LOUD contract: a prime that returns Err (or panics) is COUNTED and its
+            // message rides the ack's `failed`/`errors`, so the deploy wrapper can fail
+            // the container init by default instead of hiding a broken `#[enter]` as a
+            // silent perf cliff. The serve loop itself keeps serving (one bad prime can't
+            // poison the warm container) — the POLICY lives in the wrapper.
+            fn err_prime() -> Result<(), RunnerError> {
+                Err(RunnerError::Function {
+                    message: "enter exploded".into(),
+                    details: None,
+                })
+            }
+            fn panic_prime() -> Result<(), RunnerError> {
+                panic!("enter panicked");
+            }
+            fn ok_prime() -> Result<(), RunnerError> {
+                Ok(())
+            }
+            let registry = Registry::new()
+                .function("Embedder.dim", typed!(b_dim))
+                .snapshot_prime(ok_prime)
+                .snapshot_prime(err_prime)
+                .snapshot_prime(panic_prime);
+            let envelopes = drive(
+                registry,
+                &[
+                    r#"{"kind":"prime"}"#,
+                    r#"{"entrypoint":"Embedder.dim","input":"null"}"#, // loop still serves
+                ],
+            );
+            assert_eq!(envelopes.len(), 2);
+            assert_eq!(envelopes[0]["primed"], 1, "the ok prime counted");
+            assert_eq!(
+                envelopes[0]["failed"], 2,
+                "both failures REPORTED, not hidden"
+            );
+            let errors = envelopes[0]["errors"].as_array().expect("errors array");
+            assert_eq!(errors.len(), 2);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.as_str().unwrap_or("").contains("enter exploded")),
+                "the Err prime's message rides the ack"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.as_str().unwrap_or("").contains("panicked")),
+                "the panicking prime is reported too"
+            );
+            // The loop survived and served the follow-up request.
             assert_eq!(envelopes[1]["ok"], true);
         }
 

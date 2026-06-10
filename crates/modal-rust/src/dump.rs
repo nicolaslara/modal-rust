@@ -517,6 +517,8 @@ impl crate::App {
             install_rust: cfg.install_rust,
             image_steps: &cfg.image_steps,
             cache: cfg.options.cache.unwrap_or(cfg.cache),
+            // RUN never snapshots; the strictness knob is deploy-only.
+            snapshot_best_effort: false,
             entrypoints: &entrypoints,
         };
 
@@ -572,6 +574,7 @@ impl crate::App {
             install_rust: config.install_rust,
             image_steps: &config.image_steps,
             cache: false,
+            snapshot_best_effort: config.snapshot_best_effort,
             entrypoints: &entrypoints,
         };
 
