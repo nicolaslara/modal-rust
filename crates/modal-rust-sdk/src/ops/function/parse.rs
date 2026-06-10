@@ -139,7 +139,7 @@ pub(super) fn parse_schedule(spec: &str) -> Result<Schedule> {
     } else if let Some(rest) = spec.strip_prefix("period:") {
         let mut period = Period::default();
         // Empty component list (`"period:"`) is a zero period; otherwise parse each
-        // `key=value`. Unknown keys / bad numbers map to `Error::build`.
+        // `key=value`. Unknown keys / bad numbers map to `Error::invalid`.
         for part in rest.split(',').filter(|p| !p.is_empty()) {
             let (key, value) = part.split_once('=').ok_or_else(|| {
                 Error::invalid(format!(
