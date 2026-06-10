@@ -141,7 +141,7 @@ workload.
 ## 4. Function config (the decorator)
 
 Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
-(`modal-rust-macros/src/lib.rs`) carries: `gpu`, `timeout_secs`, `cache`, `milli_cpu`,
+(`modal-rust/src/registration.rs`, emitted by the macros) carries: `gpu`, `timeout_secs`, `cache`, `milli_cpu`,
 `memory_mb`, `retries`, `schedule`, `min_containers`, `max_containers`,
 `buffer_containers`, `scaledown_window`, `secrets`, `volumes`. `cache` is
 **modal-rust-specific** (cargo build cache toggle), not a Modal concept.
@@ -154,7 +154,7 @@ Modal `app.function` signature: `app.py:778-815`. Our `FunctionConfig`
 | `volumes` (789) | **Have** (Volume only) | `CloudBucketMount` value variant Missing — see §5. |
 | `image` (782) | **Have** (per-function custom image) | `#[function(image = Image(base = "..", install_rust = <bool>, apt = [..], pip = [..], run = [..]))]` mirrors Modal's `app.function(image=..)` — that entrypoint builds on the declared base. `base`/`install_rust` **override** the path-level default; `apt`/`pip`/`run` **prepend** to the path-level `image_steps`. Path-level defaults still exist too (`RemoteConfig::base_image`/`install_rust` or `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`; `examples/custom-base`). Remaining gap: the richer Modal `Image` builder chain (`from_registry` layering, `dockerfile_commands`, etc. — see §3), not a fully chainable per-function `Image` algebra. |
 | `name` (801) | **Have** | `#[function(name = "...")]`. |
-| `cpu` (790) | **Have** | `#[function(cpu = 2.0)]` → `FunctionResources.milli_cpu` (`ops/function.rs:55`) → `Resources` (the macro parses `is_ident("cpu")` and converts the `float` cores to milli-CPU). Remaining gap: Modal's `(request, limit)` tuple form — we take only the scalar request. |
+| `cpu` (790) | **Have** | `#[function(cpu = 2.0)]` → `FunctionResources.milli_cpu` (`ops/function/spec.rs:22`) → `Resources` (the macro parses `is_ident("cpu")` and converts the `float` cores to milli-CPU). Remaining gap: Modal's `(request, limit)` tuple form — we take only the scalar request. |
 | `memory` (791) | **Have** | `#[function(memory = 4096)]` → `FunctionResources.memory_mb` (the macro parses `is_ident("memory")`; e.g. `examples/burn-add` uses `memory = 8192`). Remaining gap: Modal's `(request, limit)` tuple form — we take only the scalar request. |
 | `retries` (798) | **Have** (int + struct form) | `#[function(retries = N)]` → Modal's fixed-interval `FunctionRetryPolicy` (backoff `1.0`, 1s initial / 60s max delay, N retries), mirroring `_parse_retries(int)`. The STRUCT form `#[function(retries = Retries(max_retries = N[, backoff_coefficient = f][, initial_delay = s][, max_delay = s]))]` sets custom backoff/delays (seconds → `initial_delay_ms`/`max_delay_ms`), mirroring `Retries(..)` (`retries.py`). Both ride into `Function.retry_policy`. `ops/function.rs` `with_retries` / `with_retry_policy`. |
 | `schedule` (783) | **Have** | `#[function(schedule = Cron("..")/Period(..))]` → `Function.schedule` (field 72) as a `Schedule.Cron`/`Schedule.Period`, mirroring `schedule.py:12/61`. The macro canonicalizes the call form to a spec the SDK's `parse_schedule` parses; `with_schedule` rides it into the deploy FunctionCreate. See §8. |
@@ -224,7 +224,7 @@ We do attach + mount; we do **not** offer any of Modal's volume *data* API
 | `.remote_gen()` (1724) / generators | **Missing** | Streaming/generator returns — depends on `is_generator`; no Rust analogue yet. |
 | `FunctionCall.get(timeout)` partial-timeout, `cancel`, `gather` | **Partial** | We have `get(timeout)`; no `cancel`; Modal's free `gather()` (`_functions.py:2099`) over many calls is absent. |
 | `get_current_stats` (1895) / `update_autoscaler` (1152) | **Missing** | Runtime introspection / live autoscaler control. |
-| Multi-arg / positional args | **Missing (by design today)** | The macro accepts exactly one named-object `In` (`modal-rust-macros/src/lib.rs:187`); multi-arg + `starmap` are reserved but unimplemented. Modal passes `*args, **kwargs`. |
+| Multi-arg / positional args | **Missing (by design today)** | The macro accepts exactly one named-object `In` (`modal-rust-macros/src/emit.rs:104`); multi-arg + `starmap` are reserved but unimplemented. Modal passes `*args, **kwargs`. |
 
 ---
 

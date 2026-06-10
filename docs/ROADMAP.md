@@ -117,8 +117,12 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   re-exports the facade's single constant.
 - ~~Runner-bin boilerplate~~ — FIXED: the CLI generates the runner for bin-less crates
   (runner-bin-removal).
-- Large files: `runtime/lib.rs` ~1113, `remote.rs` ~980, `image.rs` ~935. Both wrappers
-  are now real `.py` files (`remote/wrapper.py`, `deploy/wrapper.py` via `include_str!`).
+- Large files: the M1 mechanical splits landed — sdk `ops/function/{parse,spec,rpc}.rs`,
+  `ops/image/{render,build}.rs`, macros `src/{args,cls,emit,specs}.rs` (all public paths
+  preserved via re-exports). Remaining: `runtime/lib.rs` ~1620, `control_plane.rs` ~1420
+  (deliberately unsplit — one cohesive provision pipeline, pending review items M12/M13),
+  `remote.rs` ~1110. Both wrappers are real `.py` files (`remote/wrapper.py`,
+  `deploy/wrapper.py` via `include_str!`).
 - The testkit duplicates the 4129-line proto + a 201-RPC server (its own `build_server`) —
   acceptable for a dev crate, but heavy.
 
