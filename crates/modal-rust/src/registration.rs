@@ -120,6 +120,10 @@ pub struct FunctionConfig {
 impl FunctionConfig {
     /// A `const` all-default config usable in a `static` `inventory::submit!`
     /// initializer.
+    ///
+    /// Mirror site 2-of-2: every field must appear here with its default value.
+    /// Adding a knob? the round-trip test (`config_round_trip_no_field_survives_default`)
+    /// will catch a forgotten line here.
     pub const fn new() -> Self {
         FunctionConfig {
             gpu: None,
@@ -254,6 +258,9 @@ impl FunctionOptions {
 }
 
 impl From<&FunctionConfig> for FunctionOptions {
+    /// Mirror site 1-of-2: every field of `FunctionConfig` must appear here.
+    /// Adding a knob? the round-trip test (`config_round_trip_no_field_survives_default`)
+    /// will catch a forgotten line here.
     fn from(config: &FunctionConfig) -> Self {
         FunctionOptions {
             gpu: config.gpu.map(str::to_string),
@@ -636,6 +643,99 @@ mod tests {
         assert!(options.enable_memory_snapshot);
         assert_eq!(options.webhook_method.as_deref(), Some("POST"));
         assert!(options.webhook_requires_proxy_auth);
+    }
+
+    /// Round-trip test: every field of a fully-populated `FunctionConfig` must
+    /// survive the `FunctionConfig → FunctionOptions` conversion at a non-default
+    /// value.  The exhaustive destructuring of `opts` below means that **adding a
+    /// field to `FunctionOptions` without updating this test breaks compilation
+    /// here**, so a forgotten mirror line in any of the ~2 mirror sites is caught
+    /// before it silently defaults in production.
+    #[test]
+    fn config_round_trip_no_field_survives_default() {
+        // Every field is set to a DISTINCTLY NON-DEFAULT value so that a missed
+        // mirror line (which would leave the field at its `Default`) causes an
+        // assertion failure.
+        let config = FunctionConfig {
+            gpu: Some("H100"),
+            timeout_secs: Some(600),
+            cache: Some(true),
+            milli_cpu: Some(4000),
+            memory_mb: Some(8192),
+            secrets: &["sec-a", "sec-b"],
+            required_keys: &["REQUIRED_KEY"],
+            env: &[("ENV_KEY", "env-val")],
+            volumes: &[("/mnt/data", "vol-name")],
+            retries: Some(5),
+            retries_spec: Some("retries:max=5,backoff=2.0,initial_delay=1,max_delay=30"),
+            schedule: Some("cron:UTC:0 0 * * *"),
+            min_containers: Some(2),
+            max_containers: Some(10),
+            buffer_containers: Some(3),
+            scaledown_window: Some(300),
+            image: Some(r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#),
+            enable_memory_snapshot: true,
+            webhook_method: Some("POST"),
+            webhook_requires_proxy_auth: true,
+        };
+
+        let opts = FunctionOptions::from(&config);
+
+        // Exhaustive destructuring — adding a field to `FunctionOptions` without
+        // updating this pattern is a COMPILE ERROR, forcing the author to add an
+        // assertion for the new field and update both mirror sites.
+        let FunctionOptions {
+            gpu,
+            timeout_secs,
+            cache,
+            milli_cpu,
+            memory_mb,
+            secrets,
+            required_keys,
+            env,
+            volumes,
+            retries,
+            retries_spec,
+            schedule,
+            min_containers,
+            max_containers,
+            buffer_containers,
+            scaledown_window,
+            image,
+            enable_memory_snapshot,
+            webhook_method,
+            webhook_requires_proxy_auth,
+        } = opts;
+
+        assert_eq!(gpu.as_deref(), Some("H100"));
+        assert_eq!(timeout_secs, Some(600));
+        assert_eq!(cache, Some(true));
+        assert_eq!(milli_cpu, Some(4000));
+        assert_eq!(memory_mb, Some(8192));
+        assert_eq!(secrets, vec!["sec-a".to_string(), "sec-b".to_string()]);
+        assert_eq!(required_keys, vec!["REQUIRED_KEY".to_string()]);
+        assert_eq!(env, vec![("ENV_KEY".to_string(), "env-val".to_string())]);
+        assert_eq!(
+            volumes,
+            vec![("/mnt/data".to_string(), "vol-name".to_string())]
+        );
+        assert_eq!(retries, Some(5));
+        assert_eq!(
+            retries_spec.as_deref(),
+            Some("retries:max=5,backoff=2.0,initial_delay=1,max_delay=30")
+        );
+        assert_eq!(schedule.as_deref(), Some("cron:UTC:0 0 * * *"));
+        assert_eq!(min_containers, Some(2));
+        assert_eq!(max_containers, Some(10));
+        assert_eq!(buffer_containers, Some(3));
+        assert_eq!(scaledown_window, Some(300));
+        assert_eq!(
+            image.as_deref(),
+            Some(r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#)
+        );
+        assert!(enable_memory_snapshot);
+        assert_eq!(webhook_method.as_deref(), Some("POST"));
+        assert!(webhook_requires_proxy_auth);
     }
 
     #[test]
