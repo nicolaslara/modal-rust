@@ -66,6 +66,7 @@ pub use error::{Error, Result};
 pub use ops::app::PublishedApp;
 pub use ops::function::{
     CreatedFunction, FunctionAutoscaler, FunctionResources, FunctionSpec, FunctionVolumeMount,
+    WebhookSpec,
 };
 pub use ops::image::ImageSpec;
 pub use ops::invoke::Invocation;

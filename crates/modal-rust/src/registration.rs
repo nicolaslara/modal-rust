@@ -102,6 +102,19 @@ pub struct FunctionConfig {
     /// wire-identical even when the decorator opts in. A bare `bool`, const-valid in the
     /// `static` `inventory::submit!` initializer (like `cache`).
     pub enable_memory_snapshot: bool,
+    /// Web-endpoint HTTP method (`#[endpoint(method = "POST")]`). `None` (the default)
+    /// ⇒ not an endpoint ⇒ byte-identical to before web endpoints. The facade only lets
+    /// it take effect on the DEPLOY boundary (the URL is deploy-only in v0), so a RUN
+    /// stays wire-identical even when the decorator opts in — exactly like
+    /// `enable_memory_snapshot`. `Option<&'static str>` (not `String`), const-valid in
+    /// the `static` `inventory::submit!` initializer (like `gpu`/`schedule`).
+    pub webhook_method: Option<&'static str>,
+    /// Modal proxy-auth opt-in for the endpoint (`#[endpoint(.., requires_proxy_auth =
+    /// true)]`). `false` (the default, matching Modal) = public URL; `true` = Modal
+    /// rejects requests lacking the `Modal-Key`/`Modal-Secret` proxy-auth header pair
+    /// BEFORE they reach the container. Inert unless `webhook_method` is set. A bare
+    /// `bool`, const-valid in the `static` initializer (like `enable_memory_snapshot`).
+    pub webhook_requires_proxy_auth: bool,
 }
 
 impl FunctionConfig {
@@ -127,6 +140,8 @@ impl FunctionConfig {
             scaledown_window: None,
             image: None,
             enable_memory_snapshot: false,
+            webhook_method: None,
+            webhook_requires_proxy_auth: false,
         }
     }
 }
@@ -209,6 +224,19 @@ pub struct FunctionOptions {
     /// CLI path resolves it too.
     #[serde(default)]
     pub enable_memory_snapshot: bool,
+    /// Web-endpoint HTTP method (`#[endpoint(method = "POST")]`). `None` (the default)
+    /// ⇒ not an endpoint ⇒ byte-identical to before web endpoints. The facade only lets
+    /// it take effect on the DEPLOY boundary (the URL is deploy-only in v0); RUN stays
+    /// wire-identical even when the decorator opts in — exactly like
+    /// `enable_memory_snapshot`. Owned form of the `&'static str`; rides the
+    /// `--describe` manifest so the CLI path resolves it too.
+    #[serde(default)]
+    pub webhook_method: Option<String>,
+    /// Modal proxy-auth opt-in for the endpoint (`requires_proxy_auth = true`).
+    /// `false` (the default, matching Modal) = public URL. Inert unless
+    /// `webhook_method` is set. Rides the `--describe` manifest like the rest.
+    #[serde(default)]
+    pub webhook_requires_proxy_auth: bool,
 }
 
 impl FunctionOptions {
@@ -254,6 +282,8 @@ impl From<&FunctionConfig> for FunctionOptions {
             scaledown_window: config.scaledown_window,
             image: config.image.map(str::to_string),
             enable_memory_snapshot: config.enable_memory_snapshot,
+            webhook_method: config.webhook_method.map(str::to_string),
+            webhook_requires_proxy_auth: config.webhook_requires_proxy_auth,
         }
     }
 }
@@ -488,6 +518,8 @@ mod tests {
                     r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#.to_string(),
                 ),
                 enable_memory_snapshot: false,
+                webhook_method: None,
+                webhook_requires_proxy_auth: false,
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -550,6 +582,8 @@ mod tests {
         assert!(d.retries_spec.is_none());
         assert!(d.image.is_none());
         assert!(!d.enable_memory_snapshot);
+        assert!(d.webhook_method.is_none());
+        assert!(!d.webhook_requires_proxy_auth);
         let c = FunctionConfig::new();
         assert_eq!(d, c);
     }
@@ -575,6 +609,8 @@ mod tests {
             scaledown_window: Some(120),
             image: Some(r#"{"base":"rust:1-slim"}"#),
             enable_memory_snapshot: true,
+            webhook_method: Some("POST"),
+            webhook_requires_proxy_auth: true,
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -598,6 +634,8 @@ mod tests {
         assert_eq!(options.scaledown_window, Some(120));
         assert_eq!(options.image.as_deref(), Some(r#"{"base":"rust:1-slim"}"#));
         assert!(options.enable_memory_snapshot);
+        assert_eq!(options.webhook_method.as_deref(), Some("POST"));
+        assert!(options.webhook_requires_proxy_auth);
     }
 
     #[test]

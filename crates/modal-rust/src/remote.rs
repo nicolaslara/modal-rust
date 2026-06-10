@@ -54,6 +54,29 @@ pub(crate) fn sanitize_object_tag(entrypoint: &str) -> String {
         tag
     }
 }
+
+/// The PER-ENDPOINT deploy-wrapper adapter attribute for a web-endpoint entrypoint:
+/// `web_<sanitized>`. Mirrors [`sanitize_object_tag`] but is STRICTER — it also maps
+/// `-`/`.` to `_` because the result must be a valid Python identifier (the FILE-mode
+/// `getattr` target / `implementation_name`), whereas the object TAG keeps dots and
+/// dashes. The deploy bake generates a matching module-level
+/// `web_<sanitized> = _make_web_handler("<entrypoint>")` line per endpoint, so the
+/// deployed endpoint function's `implementation_name` resolves the adapter
+/// in-container while the object TAG stays the entrypoint name (the typed
+/// `FunctionGet`-by-tag path is unaffected).
+pub(crate) fn web_endpoint_attr(entrypoint: &str) -> String {
+    let sanitized: String = entrypoint
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("web_{sanitized}")
+}
 /// Where the uploaded source mount lands inside the container.
 pub(crate) const REMOTE_SRC: &str = "/src";
 /// Rust base image major version tag (`rust:{ver}-slim`).
@@ -768,6 +791,19 @@ mod tests {
         assert_eq!(sanitize_object_tag("a b/c"), "a_b_c");
         // An empty/all-mapped name never yields an empty tag.
         assert_eq!(sanitize_object_tag(""), WRAPPER_CALLABLE);
+    }
+
+    #[test]
+    fn web_endpoint_attr_is_a_python_identifier_prefixed_web() {
+        // Rust fn names pass through under the `web_` prefix.
+        assert_eq!(web_endpoint_attr("add"), "web_add");
+        assert_eq!(web_endpoint_attr("add_gpu"), "web_add_gpu");
+        // STRICTER than the object tag: `-`/`.` map to `_` too (a Python identifier —
+        // the FILE-mode getattr target — cannot carry them; the TAG keeps them).
+        assert_eq!(web_endpoint_attr("my-fn.v2"), "web_my_fn_v2");
+        assert_eq!(web_endpoint_attr("a b/c"), "web_a_b_c");
+        // Never empty: the `web_` prefix keeps even a degenerate name an identifier.
+        assert_eq!(web_endpoint_attr(""), "web_");
     }
 
     #[test]

@@ -196,12 +196,109 @@ fn facade_path() -> proc_macro2::TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let func = parse_macro_input!(item as ItemFn);
+    expand_handler(attr, item, HandlerKind::Function)
+}
 
-    // Parse the optional arguments. All are optional; the bare
-    // `#[modal_rust::function]` (and `name = "..."`) set none of gpu/timeout/cache,
-    // so the emitted facade `FunctionConfig` is `default()` (all `None`) —
-    // runtime-observable behavior stays byte-identical.
+/// Attribute macro that registers a WEB-ENDPOINT handler: everything
+/// [`macro@function`] does (the same auto-IO Mode A/B, the same `Registration` +
+/// typed `app.<fn>(..)` surface, the same decorator vocabulary — ONE shared
+/// parse+emit path), PLUS the web-endpoint marker
+/// (`webhook_method`/`webhook_requires_proxy_auth`) on the emitted facade
+/// `FunctionConfig`. On `modal-rust deploy` the function ALSO gets an HTTP URL
+/// (Modal `WEBHOOK_TYPE_FUNCTION`); `modal-rust run` and the typed call path are
+/// unchanged (the facade suppresses the webhook on the RUN boundary).
+///
+/// `method` is REQUIRED — one of `"GET" | "POST" | "PUT" | "DELETE" | "PATCH"`
+/// (explicit, no silent default). `requires_proxy_auth = true` opts into Modal
+/// proxy-auth (the `Modal-Key`/`Modal-Secret` header pair); the default is PUBLIC
+/// (matches Modal). Every other argument is the shared `#[function]` vocabulary
+/// (`gpu`/`timeout`/`secrets`/`volumes`/…).
+///
+/// ```ignore
+/// #[modal_rust::endpoint(method = "POST", gpu = "T4", timeout = 600)]
+/// fn add(a: i64, b: i64) -> anyhow::Result<i64> { Ok(a + b) }
+/// // deploy ⇒ POST {"a":40,"b":2} -> 42 at the printed URL;
+/// // app.add(40, 2).remote() still works (the dual surface).
+/// ```
+///
+/// v0 limits: free fns only — `#[endpoint]` on a `#[cls]` method is a compile
+/// error (stateful endpoints are a follow-up); the URL is DEPLOY-only.
+#[proc_macro_attribute]
+pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_handler(attr, item, HandlerKind::Endpoint)
+}
+
+/// Which user-facing attribute is expanding through the SHARED `#[function]`
+/// parse+emit path: `#[function]` (the plain handler) or `#[endpoint]` (the same
+/// handler + the web-endpoint marker). ONE parser/emitter serves both (web-endpoints
+/// spec §5 — no forked grammar); the kind only gates the endpoint-only keys
+/// (`method`/`requires_proxy_auth`) and the attribute name in diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandlerKind {
+    Function,
+    Endpoint,
+}
+
+impl HandlerKind {
+    /// The attribute name as the user spells it, for diagnostics.
+    fn display(self) -> &'static str {
+        match self {
+            HandlerKind::Function => "#[modal_rust::function]",
+            HandlerKind::Endpoint => "#[modal_rust::endpoint]",
+        }
+    }
+}
+
+/// The HTTP verbs `#[endpoint(method = ..)]` accepts (uppercase, validated at
+/// expansion time so a typo is a compile error, never a live-deploy surprise).
+const ENDPOINT_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH"];
+
+/// The expected `#[endpoint]` syntax, embedded in the missing/invalid-`method`
+/// compile errors so the fix is copy-pasteable from the diagnostic.
+const ENDPOINT_EXPECTED_SYNTAX: &str = "#[modal_rust::endpoint(method = \"GET\"|\"POST\"|\"PUT\"|\"DELETE\"|\"PATCH\", <any #[function] config>)]";
+
+/// Every argument the SHARED `#[function]`/`#[endpoint]` decorator grammar parses, in
+/// ONE record so the parse ([`parse_function_args`]) and emit ([`build_registration`])
+/// paths have a single seam. The `webhook_*` fields are the `#[endpoint]`-only extras
+/// (always `None`/`false` for a plain `#[function]` ⇒ inert, byte-identical wire).
+#[derive(Default)]
+struct FunctionArgs {
+    explicit_name: Option<LitStr>,
+    gpu: Option<LitStr>,
+    timeout_secs: Option<u64>,
+    cache: Option<bool>,
+    milli_cpu: Option<u32>,
+    memory_mb: Option<u32>,
+    retries: Option<u32>,
+    retries_spec: Option<String>,
+    schedule: Option<String>,
+    min_containers: Option<u32>,
+    max_containers: Option<u32>,
+    buffer_containers: Option<u32>,
+    scaledown_window: Option<u32>,
+    secrets: Vec<String>,
+    required_keys: Vec<String>,
+    env: Vec<(String, String)>,
+    volumes: Vec<(String, String)>,
+    image: Option<String>,
+    /// `method = "POST"` — the validated HTTP verb (`#[endpoint]`-only; REQUIRED there).
+    webhook_method: Option<LitStr>,
+    /// `requires_proxy_auth = true` — Modal proxy-auth opt-in (`#[endpoint]`-only;
+    /// default `false` = PUBLIC, matching Modal).
+    webhook_requires_proxy_auth: bool,
+}
+
+/// Parse a `#[function(..)]` / `#[endpoint(..)]` decorator argument list — the ONE
+/// shared grammar (web-endpoints spec §5). All arguments are optional for a
+/// `#[function]`; an `#[endpoint]` additionally accepts `requires_proxy_auth = <bool>`
+/// and REQUIRES `method = "GET"|"POST"|"PUT"|"DELETE"|"PATCH"`. The bare
+/// `#[modal_rust::function]` (and `name = "..."`) set none of gpu/timeout/cache, so
+/// the emitted facade `FunctionConfig` is `default()` (all `None`) —
+/// runtime-observable behavior stays byte-identical.
+fn parse_function_args(
+    tokens: proc_macro2::TokenStream,
+    kind: HandlerKind,
+) -> syn::Result<FunctionArgs> {
     let mut explicit_name: Option<LitStr> = None;
     let mut gpu: Option<LitStr> = None; // gpu = "T4"
     let mut timeout_secs: Option<u64> = None; // timeout = 1800   (LitInt -> u64, narrow at emit)
@@ -220,7 +317,9 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut env: Vec<(String, String)> = Vec::new(); // env = {"K" = "V", ..} -> inline secret
     let mut volumes: Vec<(String, String)> = Vec::new(); // volumes = ["/data=vol"] -> (mount, name)
     let mut image: Option<String> = None; // image = Image(base=.., apt=[..], ..) -> spec string
-    if !attr.is_empty() {
+    let mut webhook_method: Option<LitStr> = None; // method = "POST" (endpoint-only; REQUIRED there)
+    let mut webhook_requires_proxy_auth: Option<bool> = None; // requires_proxy_auth = true (endpoint-only)
+    if !tokens.is_empty() {
         let parser = syn::meta::parser(|meta| {
             if meta.path.is_ident("name") {
                 explicit_name = Some(meta.value()?.parse()?);
@@ -371,6 +470,50 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // the `static` `inventory::submit!` initializer (like `schedule`/`gpu`).
                 image = Some(parse_image_to_spec(meta.value()?)?);
                 Ok(())
+            } else if meta.path.is_ident("method") {
+                // method = "GET"|"POST"|"PUT"|"DELETE"|"PATCH" — the REQUIRED HTTP verb
+                // of a `#[modal_rust::endpoint]` (explicit, no silent default). Validated
+                // HERE so a typo is a compile error with the expected syntax, never a
+                // live-deploy surprise. On a plain `#[function]` it is rejected with a
+                // pointer at `#[endpoint]` (pointed diagnostic, like
+                // `enable_memory_snapshot` below).
+                if kind != HandlerKind::Endpoint {
+                    return Err(meta.error(
+                        "`method` is `#[endpoint]`-only: it sets the HTTP verb of a web \
+                         endpoint. To expose this handler over HTTP, decorate it \
+                         `#[modal_rust::endpoint(method = \"POST\", ..)]` instead.",
+                    ));
+                }
+                let lit: LitStr = meta.value()?.parse()?;
+                let value = lit.value();
+                if !ENDPOINT_METHODS.contains(&value.as_str()) {
+                    return Err(syn::Error::new_spanned(
+                        &lit,
+                        format!(
+                            "invalid endpoint method {value:?}; expected one of \
+                             \"GET\", \"POST\", \"PUT\", \"DELETE\", \"PATCH\" \
+                             (uppercase): {ENDPOINT_EXPECTED_SYNTAX}"
+                        ),
+                    ));
+                }
+                webhook_method = Some(lit);
+                Ok(())
+            } else if meta.path.is_ident("requires_proxy_auth") {
+                // requires_proxy_auth = <bool> — Modal proxy-auth opt-in for an
+                // `#[endpoint]` (the `Modal-Key`/`Modal-Secret` header pair). Default
+                // unset ⇒ `false` = PUBLIC (matches Modal). `#[function]` rejects it
+                // with a pointer at `#[endpoint]`.
+                if kind != HandlerKind::Endpoint {
+                    return Err(meta.error(
+                        "`requires_proxy_auth` is `#[endpoint]`-only: it gates the web \
+                         endpoint behind Modal proxy-auth. Use \
+                         `#[modal_rust::endpoint(method = \"..\", requires_proxy_auth = \
+                         true)]` instead.",
+                    ));
+                }
+                let lit: LitBool = meta.value()?.parse()?;
+                webhook_requires_proxy_auth = Some(lit.value);
+                Ok(())
             } else if meta.path.is_ident("enable_memory_snapshot") {
                 // Memory snapshot is `#[cls]`-only in v0: it captures the `#[enter]`
                 // load into the deploy-time snapshot, and a free `#[function]` has no
@@ -382,8 +525,17 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                      `#[cls(enable_memory_snapshot = true)]`.",
                 ))
             } else {
-                Err(meta.error(
-                    "unsupported `#[modal_rust::function]` argument; recognized: \
+                // The recognized list names the attribute that is actually expanding,
+                // and an `#[endpoint]` additionally lists its two extra keys.
+                let endpoint_extras = match kind {
+                    HandlerKind::Endpoint => {
+                        "`method = \"GET\"|\"POST\"|\"PUT\"|\"DELETE\"|\"PATCH\"` \
+                         (REQUIRED), `requires_proxy_auth = <bool>`, "
+                    }
+                    HandlerKind::Function => "",
+                };
+                Err(meta.error(format!(
+                    "unsupported `{}` argument; recognized: {}\
                      `name = \"...\"`, `gpu = \"...\"`, `timeout = <int secs>`, \
                      `cache = <bool>`, `cpu = <cores>`, `memory = <MiB>`, \
                      `retries = <count>` or `retries = Retries(max_retries = N, ..)`, \
@@ -391,16 +543,80 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
                      `min_containers = <N>`, `max_containers = <N>`, \
                      `buffer_containers = <N>`, `scaledown_window = <secs>`, \
                      `secrets = [\"name\", ..]`, `required_keys = [\"KEY\", ..]`, \
-                     `env = {\"K\" = \"V\", ..}`, `volumes = [\"/mount=name\", ..]`, \
+                     `env = {{\"K\" = \"V\", ..}}`, `volumes = [\"/mount=name\", ..]`, \
                      `image = Image(base = \"..\", apt = [..], pip = [..], run = [..])`",
-                ))
+                    kind.display(),
+                    endpoint_extras,
+                )))
             }
         });
-        parse_macro_input!(attr with parser);
+        syn::parse::Parser::parse2(parser, tokens)?;
     }
 
+    // An endpoint's HTTP verb is REQUIRED — no silent default. (A plain `#[function]`
+    // never sets it; the `method =` branch above is endpoint-gated.)
+    if kind == HandlerKind::Endpoint && webhook_method.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "{} requires `method = ...` (the HTTP verb; no silent default): \
+                 {ENDPOINT_EXPECTED_SYNTAX}",
+                kind.display(),
+            ),
+        ));
+    }
+
+    Ok(FunctionArgs {
+        explicit_name,
+        gpu,
+        timeout_secs,
+        cache,
+        milli_cpu,
+        memory_mb,
+        retries,
+        retries_spec,
+        schedule,
+        min_containers,
+        max_containers,
+        buffer_containers,
+        scaledown_window,
+        secrets,
+        required_keys,
+        env,
+        volumes,
+        image,
+        webhook_method,
+        webhook_requires_proxy_auth: webhook_requires_proxy_auth.unwrap_or(false),
+    })
+}
+
+/// The ONE shared expansion path behind `#[function]` and `#[endpoint]`
+/// (web-endpoints spec §5): parse the shared decorator grammar, classify Mode A/B,
+/// and emit the SAME original fn + `Registration` + typed surface. The kind only
+/// changes the endpoint-only keys (`method`/`requires_proxy_auth`, threaded into the
+/// emitted `FunctionConfig`) and the attribute name in diagnostics.
+fn expand_handler(attr: TokenStream, item: TokenStream, kind: HandlerKind) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+
+    // Parse the decorator arguments through the SHARED grammar. On a parse error,
+    // keep the original fn (so the rest of the user's crate still type-checks) and
+    // surface the diagnostic.
+    let args = match parse_function_args(attr.into(), kind) {
+        Ok(args) => args,
+        Err(e) => {
+            let err = e.to_compile_error();
+            return quote! {
+                #func
+                #err
+            }
+            .into();
+        }
+    };
+
     let fn_ident = func.sig.ident.clone();
-    let entry_name = explicit_name
+    let entry_name = args
+        .explicit_name
+        .as_ref()
         .map(|s| s.value())
         .unwrap_or_else(|| fn_ident.to_string());
 
@@ -412,10 +628,12 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     // implemented in the runtime. Reject clearly; keep the original fn so the rest
     // of the user's crate still type-checks, and do NOT touch the sync path.
     if let Some(async_token) = func.sig.asyncness {
-        let msg = "#[modal_rust::function] does not yet support `async fn`: the \
-                   reserved `typed_async!` shape (boundaries.md §3) is not yet \
-                   implemented in modal-rust-runtime. Use a synchronous handler \
-                   (it may `block_on` internally) for now.";
+        let msg = format!(
+            "{} does not yet support `async fn`: the reserved `typed_async!` shape \
+             (boundaries.md §3) is not yet implemented in modal-rust-runtime. Use a \
+             synchronous handler (it may `block_on` internally) for now.",
+            kind.display(),
+        );
         let err = syn::Error::new_spanned(async_token, msg).to_compile_error();
         return quote! {
             #func
@@ -430,8 +648,11 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Some(FnArg::Receiver(recv)) = func.sig.inputs.first() {
         let err = syn::Error::new_spanned(
             recv,
-            "#[modal_rust::function] applies to free functions only; a `self` \
-             receiver cannot be a runner entrypoint",
+            format!(
+                "{} applies to free functions only; a `self` receiver cannot be a \
+                 runner entrypoint",
+                kind.display(),
+            ),
         )
         .to_compile_error();
         return quote! {
@@ -469,23 +690,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #facade::__private::runtime::typed!(#fn_ident) },
             quote! { #facade::__private::runtime::typed_check!(#fn_ident) },
             &facade,
-            &gpu,
-            timeout_secs,
-            cache,
-            milli_cpu,
-            memory_mb,
-            retries,
-            retries_spec.as_deref(),
-            schedule.as_deref(),
-            min_containers,
-            max_containers,
-            buffer_containers,
-            scaledown_window,
-            &secrets,
-            &required_keys,
-            &env,
-            &volumes,
-            image.as_deref(),
+            &args,
         );
     }
 
@@ -494,7 +699,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `ident: Type` (no `self`, already excluded above) and the handler carries no
     // generics/lifetimes/where-clause (the generated Input/shim can't be
     // monomorphized generically).
-    if let Some(err) = mode_b_signature_error(&func, &params) {
+    if let Some(err) = mode_b_signature_error(&func, &params, kind) {
         return quote! {
             #func
             #err
@@ -602,23 +807,7 @@ pub fn function(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { #facade::__private::runtime::typed!(#shim_ident) },
         quote! { #facade::__private::runtime::typed_check!(#shim_ident) },
         &facade,
-        &gpu,
-        timeout_secs,
-        cache,
-        milli_cpu,
-        memory_mb,
-        retries,
-        retries_spec.as_deref(),
-        schedule.as_deref(),
-        min_containers,
-        max_containers,
-        buffer_containers,
-        scaledown_window,
-        &secrets,
-        &required_keys,
-        &env,
-        &volumes,
-        image.as_deref(),
+        &args,
     );
 
     quote! {
@@ -1037,6 +1226,25 @@ fn take_cls_marker(method: &mut syn::ImplItemFn) -> syn::Result<Option<ClsMarker
     let mut found: Option<ClsMarker> = None;
     let mut kept = Vec::with_capacity(method.attrs.len());
     for attr in method.attrs.drain(..) {
+        // `#[endpoint]` is free-fn-only in v0 (web-endpoints spec §5): a stateful
+        // `#[cls]`+web method is an explicit follow-up, NOT silently ignored. The cls
+        // expansion sees the method attrs before rustc would resolve them, so reject
+        // HERE with a pointed diagnostic. Match the LAST path segment so the
+        // facade-qualified `#[modal_rust::endpoint]` spelling is caught too.
+        if attr
+            .path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "endpoint")
+        {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                "#[endpoint] is free-fn-only in v0: it cannot be applied to a #[cls] \
+                 method (stateful web endpoints are a follow-up). Move the handler to \
+                 a free fn decorated `#[modal_rust::endpoint(method = \"...\")]` — it \
+                 is still a normal function and may call into the class.",
+            ));
+        }
         let ident = attr.path().get_ident().map(|i| i.to_string());
         let marker = match ident.as_deref() {
             Some("enter") => Some(ClsMarker::Enter),
@@ -1582,6 +1790,10 @@ fn cls_config_to_registration(
             // const-valid in the `static` `inventory::submit!` initializer and keeps the
             // wire byte-identical; `true` rides into the deploy-time `FunctionCreate`.
             enable_memory_snapshot: #snapshot_tok,
+            // Web endpoints are free-fn-only in v0 (`#[endpoint]` on a `#[cls]` method
+            // is a compile_error), so the inert defaults keep the wire byte-identical.
+            webhook_method: ::core::option::Option::None,
+            webhook_requires_proxy_auth: false,
         }
     }
 }
@@ -1684,54 +1896,15 @@ pub fn modal_runner(input: TokenStream) -> TokenStream {
 /// Mode-A emission helper: keep the original fn verbatim and submit one facade
 /// `Registration` whose handler is `#handler_expr` (here `typed!(#fn_ident)`),
 /// with the decorator config in the same record.
-#[allow(clippy::too_many_arguments)]
 fn emit_registration(
     func: &ItemFn,
     entry_name: &str,
     handler_expr: proc_macro2::TokenStream,
     check_expr: proc_macro2::TokenStream,
     facade: &proc_macro2::TokenStream,
-    gpu: &Option<LitStr>,
-    timeout_secs: Option<u64>,
-    cache: Option<bool>,
-    milli_cpu: Option<u32>,
-    memory_mb: Option<u32>,
-    retries: Option<u32>,
-    retries_spec: Option<&str>,
-    schedule: Option<&str>,
-    min_containers: Option<u32>,
-    max_containers: Option<u32>,
-    buffer_containers: Option<u32>,
-    scaledown_window: Option<u32>,
-    secrets: &[String],
-    required_keys: &[String],
-    env: &[(String, String)],
-    volumes: &[(String, String)],
-    image: Option<&str>,
+    args: &FunctionArgs,
 ) -> TokenStream {
-    let registration = build_registration(
-        entry_name,
-        handler_expr,
-        check_expr,
-        facade,
-        gpu,
-        timeout_secs,
-        cache,
-        milli_cpu,
-        memory_mb,
-        retries,
-        retries_spec,
-        schedule,
-        min_containers,
-        max_containers,
-        buffer_containers,
-        scaledown_window,
-        secrets,
-        required_keys,
-        env,
-        volumes,
-        image,
-    );
+    let registration = build_registration(entry_name, handler_expr, check_expr, facade, args);
     quote! {
         #func
         #registration
@@ -1757,60 +1930,43 @@ fn emit_registration(
 /// narrowed `u64 -> u32` here. The bare form sets all three to `None` =>
 /// `FunctionConfig::default()`, which runtime dispatch ignores (so behavior is
 /// byte-identical; only the facade reads `config` for control-plane work).
-#[allow(clippy::too_many_arguments)]
 fn build_registration(
     entry_name: &str,
     handler_expr: proc_macro2::TokenStream,
     check_expr: proc_macro2::TokenStream,
     facade: &proc_macro2::TokenStream,
-    gpu: &Option<LitStr>,
-    timeout_secs: Option<u64>,
-    cache: Option<bool>,
-    milli_cpu: Option<u32>,
-    memory_mb: Option<u32>,
-    retries: Option<u32>,
-    retries_spec: Option<&str>,
-    schedule: Option<&str>,
-    min_containers: Option<u32>,
-    max_containers: Option<u32>,
-    buffer_containers: Option<u32>,
-    scaledown_window: Option<u32>,
-    secrets: &[String],
-    required_keys: &[String],
-    env: &[(String, String)],
-    volumes: &[(String, String)],
-    image: Option<&str>,
+    args: &FunctionArgs,
 ) -> proc_macro2::TokenStream {
-    let gpu_tok = match gpu {
+    let gpu_tok = match &args.gpu {
         Some(s) => quote! { ::core::option::Option::Some(#s) }, // &'static str literal
         None => quote! { ::core::option::Option::None },
     };
-    let timeout_tok = match timeout_secs {
+    let timeout_tok = match args.timeout_secs {
         Some(n) => {
             let n = n as u32;
             quote! { ::core::option::Option::Some(#n) }
         }
         None => quote! { ::core::option::Option::None },
     };
-    let cache_tok = match cache {
+    let cache_tok = match args.cache {
         Some(b) => quote! { ::core::option::Option::Some(#b) },
         None => quote! { ::core::option::Option::None },
     };
     // `cpu`/`memory` are resolved to wire units (milli-cores / MiB) at parse time, so
     // each is a plain `Option<u32>` const-valid in the `static` initializer (exactly
     // like `timeout`). `None` emits `None` => byte-identical to a bare decorator.
-    let milli_cpu_tok = match milli_cpu {
+    let milli_cpu_tok = match args.milli_cpu {
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
-    let memory_mb_tok = match memory_mb {
+    let memory_mb_tok = match args.memory_mb {
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
     // `retries` is a plain `Option<u32>` const-valid in the `static` initializer
     // (exactly like `timeout`). `None` emits `None` => byte-identical to a bare
     // decorator (no retry policy on the wire).
-    let retries_tok = match retries {
+    let retries_tok = match args.retries {
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
@@ -1818,7 +1974,7 @@ fn build_registration(
     // SPEC (the facade hands it to the SDK's `parse_retries_spec`), const-valid in the
     // `static` initializer exactly like `gpu`/`schedule`. `None` emits `None` =>
     // byte-identical to a bare decorator (the int form / no retries stays unchanged).
-    let retries_spec_tok = match retries_spec {
+    let retries_spec_tok = match &args.retries_spec {
         Some(s) => quote! { ::core::option::Option::Some(#s) },
         None => quote! { ::core::option::Option::None },
     };
@@ -1829,15 +1985,15 @@ fn build_registration(
         Some(n) => quote! { ::core::option::Option::Some(#n) },
         None => quote! { ::core::option::Option::None },
     };
-    let min_containers_tok = opt_u32_tok(min_containers);
-    let max_containers_tok = opt_u32_tok(max_containers);
-    let buffer_containers_tok = opt_u32_tok(buffer_containers);
-    let scaledown_window_tok = opt_u32_tok(scaledown_window);
+    let min_containers_tok = opt_u32_tok(args.min_containers);
+    let max_containers_tok = opt_u32_tok(args.max_containers);
+    let buffer_containers_tok = opt_u32_tok(args.buffer_containers);
+    let scaledown_window_tok = opt_u32_tok(args.scaledown_window);
     // `schedule` is canonicalized to a `&'static str` SPEC string (the facade hands it
     // to the SDK's `parse_schedule`), so it stays const-valid in the `static`
     // initializer exactly like `gpu`. `None` emits `None` => byte-identical to a bare
     // decorator (no schedule on the wire).
-    let schedule_tok = match schedule {
+    let schedule_tok = match &args.schedule {
         Some(s) => quote! { ::core::option::Option::Some(#s) },
         None => quote! { ::core::option::Option::None },
     };
@@ -1845,7 +2001,7 @@ fn build_registration(
     // the `static` `inventory::submit!` initializer, exactly like `gpu`/`name`). An
     // empty list emits `&[]`, byte-identical to the bare default.
     let secrets_tok = {
-        let items = secrets.iter();
+        let items = args.secrets.iter();
         quote! { &[ #( #items ),* ] }
     };
     // `required_keys` (asserted on the named secrets) + `env` (inline-secret key/values)
@@ -1853,15 +2009,16 @@ fn build_registration(
     // exactly like `secrets`/`volumes`. Empty lists emit `&[]`, byte-identical to the
     // bare default.
     let required_keys_tok = {
-        let items = required_keys.iter();
+        let items = args.required_keys.iter();
         quote! { &[ #( #items ),* ] }
     };
     let env_tok = {
-        let items = env.iter().map(|(k, v)| quote! { (#k, #v) });
+        let items = args.env.iter().map(|(k, v)| quote! { (#k, #v) });
         quote! { &[ #( #items ),* ] }
     };
     let volumes_tok = {
-        let items = volumes
+        let items = args
+            .volumes
             .iter()
             .map(|(mount, name)| quote! { (#mount, #name) });
         quote! { &[ #( #items ),* ] }
@@ -1870,10 +2027,20 @@ fn build_registration(
     // `&'static str` (the facade parses it via `remote::parse_image_spec`), const-valid
     // in the `static` initializer exactly like `schedule`/`gpu`. `None` emits `None` =>
     // byte-identical to a bare decorator (the env-only base image stays in effect).
-    let image_tok = match image {
+    let image_tok = match &args.image {
         Some(s) => quote! { ::core::option::Option::Some(#s) },
         None => quote! { ::core::option::Option::None },
     };
+    // Web-endpoint marker: `#[endpoint]` threads the VALIDATED `method` (+ the
+    // proxy-auth opt-in); a plain `#[function]` keeps the inert `None`/`false`
+    // defaults ⇒ byte-identical wire. A `&'static str` literal / plain `bool`,
+    // const-valid in the `static` initializer exactly like `gpu`/
+    // `enable_memory_snapshot`.
+    let webhook_method_tok = match &args.webhook_method {
+        Some(s) => quote! { ::core::option::Option::Some(#s) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let webhook_requires_proxy_auth = args.webhook_requires_proxy_auth;
 
     quote! {
         #facade::__private::inventory::submit! {
@@ -1907,10 +2074,15 @@ fn build_registration(
                     env: #env_tok,
                     volumes: #volumes_tok,
                     image: #image_tok,
-                    // Phase 2 adds the field with its inert default; the `#[cls]` parser
-                    // threads the real opt-in in a later phase. `false` is const-valid in
-                    // the `static` initializer and keeps the wire byte-identical.
+                    // Memory snapshot is `#[cls]`-only in v0 (the shared parser rejects
+                    // the arg here), so the inert `false` keeps the wire byte-identical.
                     enable_memory_snapshot: false,
+                    // Web-endpoint config: `#[endpoint]` threads its validated
+                    // `method`/`requires_proxy_auth`; `#[function]` keeps the inert
+                    // `None`/`false` ⇒ byte-identical wire. Const-valid in the `static`
+                    // initializer.
+                    webhook_method: #webhook_method_tok,
+                    webhook_requires_proxy_auth: #webhook_requires_proxy_auth,
                 },
                 // Capture the USER crate's cargo package name HERE — this macro
                 // expands in the user's crate, so `env!("CARGO_PKG_NAME")` is the
@@ -1957,16 +2129,23 @@ fn is_mode_a_param_type(ty: &Type) -> bool {
 /// the first violation, else `None`. Enforces: every param is a plain `ident: Type`
 /// (no destructuring, no `mut`), owned (no `&T`/reference), and the handler carries
 /// no generics/lifetimes/where-clause.
-fn mode_b_signature_error(func: &ItemFn, params: &[&PatType]) -> Option<proc_macro2::TokenStream> {
+fn mode_b_signature_error(
+    func: &ItemFn,
+    params: &[&PatType],
+    kind: HandlerKind,
+) -> Option<proc_macro2::TokenStream> {
     // No generics / lifetimes / where-clauses on the handler: the generated Input /
     // shim cannot be monomorphized generically.
     if !func.sig.generics.params.is_empty() || func.sig.generics.where_clause.is_some() {
         return Some(
             syn::Error::new_spanned(
                 &func.sig.generics,
-                "plain #[modal_rust::function] handlers cannot be generic (no type/\
-                 lifetime params or where-clauses): the generated input type cannot \
-                 be monomorphized. Use concrete owned param types.",
+                format!(
+                    "plain {} handlers cannot be generic (no type/lifetime params or \
+                     where-clauses): the generated input type cannot be monomorphized. \
+                     Use concrete owned param types.",
+                    kind.display(),
+                ),
             )
             .to_compile_error(),
         );
@@ -1992,8 +2171,11 @@ fn mode_b_signature_error(func: &ItemFn, params: &[&PatType]) -> Option<proc_mac
             return Some(
                 syn::Error::new_spanned(
                     pt,
-                    "plain #[modal_rust::function] params must be owned; use String / \
-                     Vec<u8> instead of a borrowed `&str` / `&[u8]`",
+                    format!(
+                        "plain {} params must be owned; use String / Vec<u8> instead \
+                         of a borrowed `&str` / `&[u8]`",
+                        kind.display(),
+                    ),
                 )
                 .to_compile_error(),
             );
@@ -3061,5 +3243,206 @@ mod tests {
             off.contains("snapshot_prime : :: core :: option :: Option :: None"),
             "non-snapshot method must keep `snapshot_prime: None`, got: {off}"
         );
+    }
+
+    // =======================================================================
+    // `#[endpoint]` — the SHARED `#[function]` grammar + the endpoint-only keys
+    // (web-endpoints spec §5).
+    // =======================================================================
+
+    /// Parse a decorator argument list through the SHARED grammar as the given kind.
+    fn parse_args(src: &str, kind: HandlerKind) -> syn::Result<FunctionArgs> {
+        let tokens: proc_macro2::TokenStream = syn::parse_str(src).expect("tokenizable args");
+        parse_function_args(tokens, kind)
+    }
+
+    /// Unwrap the parse ERROR (syn types are not `Debug` without `extra-traits`, so
+    /// `expect_err` does not apply; a plain match does).
+    fn parse_err(src: &str, kind: HandlerKind) -> syn::Error {
+        match parse_args(src, kind) {
+            Err(e) => e,
+            Ok(_) => panic!("args {src:?} must be rejected"),
+        }
+    }
+
+    #[test]
+    fn endpoint_parses_method_and_proxy_auth_with_shared_vocab() {
+        // The ONE shared parser: an `#[endpoint]` accepts `method` (validated) +
+        // `requires_proxy_auth` ALONGSIDE the unchanged `#[function]` vocabulary.
+        let args = parse_args(
+            r#"method = "POST", requires_proxy_auth = true, gpu = "T4", timeout = 600"#,
+            HandlerKind::Endpoint,
+        )
+        .expect("valid endpoint args");
+        assert_eq!(args.webhook_method.as_ref().unwrap().value(), "POST");
+        assert!(args.webhook_requires_proxy_auth);
+        // The shared `#[function]` vocab flows through the SAME parse (no fork).
+        assert_eq!(args.gpu.as_ref().unwrap().value(), "T4");
+        assert_eq!(args.timeout_secs, Some(600));
+
+        // Every accepted verb parses; proxy-auth defaults to PUBLIC (false).
+        for verb in ENDPOINT_METHODS {
+            let args = parse_args(&format!(r#"method = "{verb}""#), HandlerKind::Endpoint)
+                .unwrap_or_else(|e| panic!("verb {verb} must parse: {e}"));
+            assert_eq!(args.webhook_method.as_ref().unwrap().value(), *verb);
+            assert!(
+                !args.webhook_requires_proxy_auth,
+                "default exposure is PUBLIC (requires_proxy_auth = false), like Modal"
+            );
+        }
+
+        // An explicit `requires_proxy_auth = false` is also accepted (a no-op).
+        let public = parse_args(
+            r#"method = "GET", requires_proxy_auth = false"#,
+            HandlerKind::Endpoint,
+        )
+        .expect("explicit public endpoint");
+        assert!(!public.webhook_requires_proxy_auth);
+    }
+
+    #[test]
+    fn endpoint_missing_method_errors_with_expected_syntax() {
+        // `method` is REQUIRED on an `#[endpoint]` (D3 — no silent default): a bare
+        // attribute AND an attribute with only `#[function]` vocab both fail, and the
+        // diagnostic carries the copy-pasteable expected syntax.
+        for src in ["", r#"gpu = "T4""#, "requires_proxy_auth = true"] {
+            let msg = parse_err(src, HandlerKind::Endpoint).to_string();
+            assert!(
+                msg.contains("requires `method ="),
+                "missing-method diagnostic must say method is required, got: {msg}"
+            );
+            assert!(
+                msg.contains(ENDPOINT_EXPECTED_SYNTAX),
+                "missing-method diagnostic must carry the expected syntax, got: {msg}"
+            );
+        }
+        // The same args are FINE on a plain `#[function]` (method is endpoint-only).
+        assert!(parse_args(r#"gpu = "T4""#, HandlerKind::Function).is_ok());
+    }
+
+    #[test]
+    fn endpoint_invalid_method_errors_with_expected_syntax() {
+        // The verb is VALIDATED at expansion time (uppercase GET/POST/PUT/DELETE/PATCH
+        // only) so a typo is a compile error, never a live-deploy surprise.
+        for src in [
+            r#"method = "post""#,    // lowercase
+            r#"method = "HEAD""#,    // unsupported verb
+            r#"method = "OPTIONS""#, // unsupported verb
+            r#"method = """#,        // empty
+        ] {
+            let msg = parse_err(src, HandlerKind::Endpoint).to_string();
+            assert!(
+                msg.contains("invalid endpoint method"),
+                "invalid-method diagnostic, got: {msg}"
+            );
+            assert!(
+                msg.contains(ENDPOINT_EXPECTED_SYNTAX),
+                "invalid-method diagnostic must carry the expected syntax, got: {msg}"
+            );
+        }
+        // A non-bool proxy-auth value is rejected too.
+        assert!(parse_args(
+            r#"method = "GET", requires_proxy_auth = "yes""#,
+            HandlerKind::Endpoint
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn function_rejects_endpoint_only_keys_with_pointer() {
+        // The endpoint-only keys on a plain `#[function]` get a POINTED diagnostic
+        // (use `#[endpoint]` instead), not the generic unsupported-argument error.
+        let err = parse_err(r#"method = "POST""#, HandlerKind::Function);
+        assert!(
+            err.to_string().contains("`method` is `#[endpoint]`-only"),
+            "got: {err}"
+        );
+        let err = parse_err("requires_proxy_auth = true", HandlerKind::Function);
+        assert!(
+            err.to_string()
+                .contains("`requires_proxy_auth` is `#[endpoint]`-only"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_config_threads_webhook_into_registration() {
+        // The SHARED emitter threads the validated endpoint config onto the emitted
+        // facade `FunctionConfig` (webhook_method = Some(verb), proxy-auth bool).
+        let facade = quote! { ::modal_rust };
+        let args = parse_args(
+            r#"method = "POST", requires_proxy_auth = true"#,
+            HandlerKind::Endpoint,
+        )
+        .expect("valid endpoint args");
+        let tokens = build_registration(
+            "add",
+            quote! { handler_expr },
+            quote! { check_expr },
+            &facade,
+            &args,
+        )
+        .to_string();
+        assert!(
+            tokens.contains(r#"webhook_method : :: core :: option :: Option :: Some ("POST")"#),
+            "the validated method must ride the emitted FunctionConfig, got: {tokens}"
+        );
+        assert!(
+            tokens.contains("webhook_requires_proxy_auth : true"),
+            "the proxy-auth opt-in must ride the emitted FunctionConfig, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn function_registration_keeps_inert_webhook_defaults() {
+        // A plain `#[function]` through the SAME emitter keeps the inert webhook
+        // defaults (`None`/`false`) ⇒ byte-identical wire when no endpoint exists.
+        let facade = quote! { ::modal_rust };
+        let args = parse_args(r#"gpu = "T4""#, HandlerKind::Function).expect("valid fn args");
+        let tokens = build_registration(
+            "add",
+            quote! { handler_expr },
+            quote! { check_expr },
+            &facade,
+            &args,
+        )
+        .to_string();
+        assert!(
+            tokens.contains("webhook_method : :: core :: option :: Option :: None"),
+            "a plain #[function] must emit webhook_method: None, got: {tokens}"
+        );
+        assert!(
+            tokens.contains("webhook_requires_proxy_auth : false"),
+            "a plain #[function] must emit webhook_requires_proxy_auth: false, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn cls_method_rejects_endpoint_attribute() {
+        // `#[endpoint]` on a `#[cls]` method is a compile error in v0 (free fns only;
+        // stateful web endpoints are a follow-up). Both the bare and the
+        // facade-qualified spellings are caught.
+        for attr in ["#[endpoint(method = \"POST\")]", "#[modal_rust::endpoint]"] {
+            let mut method: syn::ImplItemFn = syn::parse_str(&format!(
+                "{attr}\nfn serve(&self, q: String) -> anyhow::Result<String> {{ Ok(q) }}"
+            ))
+            .expect("parseable method");
+            let err = match take_cls_marker(&mut method) {
+                Err(e) => e,
+                Ok(_) => panic!("{attr} on a #[cls] method must be rejected"),
+            };
+            assert!(
+                err.to_string().contains("free-fn-only"),
+                "diagnostic must say endpoint is free-fn-only, got: {err}"
+            );
+        }
+        // A plain `#[method]` marker still parses fine (the rejection is targeted).
+        let mut ok: syn::ImplItemFn =
+            syn::parse_str("#[method]\nfn dim(&self) -> anyhow::Result<usize> { Ok(1) }")
+                .expect("parseable method");
+        assert!(matches!(
+            take_cls_marker(&mut ok),
+            Ok(Some(ClsMarker::Method(_)))
+        ));
     }
 }

@@ -7,7 +7,10 @@ facade parses it).
 """
 import json, os, subprocess, sys
 
-_RUNNER = "/app/modal_runner"   # baked at IMAGE-BUILD time; never rebuilt
+# Baked at IMAGE-BUILD time; never rebuilt. The env override exists ONLY so
+# wrapper_test.py can exercise this module against a fake runner (H3); deployed
+# containers never set it.
+_RUNNER = os.environ.get("MODAL_RUST_RUNNER", "/app/modal_runner")
 
 # ONE persistent `/app/modal_runner --serve` child per warm container so a `#[cls]`
 # `#[enter]` runs once and is reused across calls (cls-design.md §2.1). Module-global,
@@ -73,6 +76,34 @@ def handler(entrypoint, input_json):
         _SERVE = None
         return _run_one_shot(entrypoint, input_json)
     return out
+
+
+def _make_web_handler(entrypoint):
+    # Web endpoints §4: the PER-ENDPOINT HTTP adapter FACTORY. Modal's FUNCTION
+    # webhook introspects the implementation callable's signature, so the deploy
+    # bake GENERATES one module-level `web_<sanitized> = _make_web_handler("<ep>")`
+    # line per endpoint entrypoint after this static source. FastAPI is imported
+    # LOCALLY (in-image only for endpoint deploys): a non-endpoint deploy never
+    # calls this factory, so its import stays byte-identical off-path.
+    from fastapi import Request, Response
+
+    async def _web(request: Request):
+        # The raw request body IS the entrypoint's input JSON (same shape as
+        # --input). Frame it through the SAME handler() -> the SAME serve child,
+        # so `#[cls]` load-once + the memory-snapshot prime compose for free.
+        body = (await request.body()).decode() or "{}"
+        env = json.loads(handler(entrypoint, body))
+        if env.get("ok"):
+            # FastAPI JSON-encodes the decoded envelope value as the response body.
+            return env.get("value")
+        err = env.get("error") or {}
+        code = 422 if err.get("kind") == "decode_error" else 500
+        # REDACT: expose only {kind, message} to HTTP callers. The full error envelope
+        # (backtrace, internal context) stays on stderr/logs, never in the response.
+        redacted = {"kind": err.get("kind"), "message": err.get("message")}
+        return Response(json.dumps(redacted), status_code=code, media_type="application/json")
+
+    return _web
 
 
 def _snapshot_prime_enabled():

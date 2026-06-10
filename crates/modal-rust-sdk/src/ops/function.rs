@@ -18,8 +18,9 @@ use crate::error::{Error, Result};
 use crate::proto::api::function::{DefinitionType, FunctionType};
 use crate::proto::api::schedule::{Cron, Period, ScheduleOneof};
 use crate::proto::api::{
-    AutoscalerSettings, DataFormat, Function, FunctionCreateRequest, FunctionGetRequest,
-    FunctionPrecreateRequest, FunctionRetryPolicy, GpuConfig, Resources, Schedule, VolumeMount,
+    AutoscalerSettings, DataFormat, Function, FunctionCreateRequest, FunctionCreateResponse,
+    FunctionGetRequest, FunctionPrecreateRequest, FunctionRetryPolicy, GpuConfig, Resources,
+    Schedule, VolumeMount, WebhookConfig, WebhookType,
 };
 
 /// Default backoff coefficient for the bare integer `retries = N` form, mirroring
@@ -317,6 +318,30 @@ impl FunctionAutoscaler {
     }
 }
 
+/// Web-endpoint opt-in for a function → `Function.webhook_config` (proto field 15),
+/// the single-function `@modal.fastapi_endpoint` shape (`WEBHOOK_TYPE_FUNCTION`).
+///
+/// Carried on [`FunctionSpec::webhook`]; `None` (the default) keeps the create
+/// byte-identical to before web endpoints — no `webhook_config` on the wire AND the
+/// advertised data formats stay `[PICKLE, CBOR]`. When set,
+/// [`build_function_create_request`] ALSO swaps the advertised formats to the ASGI
+/// pair Modal's web layer requires (spike finding 3: a web-endpoint function must
+/// advertise `supported_input_formats = [ASGI]` and `supported_output_formats =
+/// [ASGI, GENERATOR_DONE]`, else modal-http rejects the response as "unexpected data
+/// format: Pickle").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookSpec {
+    /// HTTP method for the single-function endpoint (`"GET"`/`"POST"`/`"PUT"`/
+    /// `"DELETE"`/`"PATCH"`) → `WebhookConfig.method` (proto field 2). Validated
+    /// upstream by the `#[endpoint(method = ..)]` macro; the SDK passes it verbatim.
+    pub method: String,
+    /// Modal proxy-auth opt-in → `WebhookConfig.requires_proxy_auth` (proto field
+    /// 10). `false` (Modal's default) = public URL; `true` = Modal rejects requests
+    /// lacking the `Modal-Key`/`Modal-Secret` proxy-auth header pair BEFORE they
+    /// reach the container.
+    pub requires_proxy_auth: bool,
+}
+
 /// Declarative spec for a FILE-mode function create.
 ///
 /// FILE mode carries NO serialized bytecode: the function is identified by
@@ -402,6 +427,14 @@ pub struct FunctionSpec {
     /// [`with_memory_snapshot`](FunctionSpec::with_memory_snapshot); RUN stays
     /// wire-identical even when the decorator opts in.
     pub checkpointing_enabled: bool,
+    /// Web-endpoint opt-in → `Function.webhook_config` (proto field 15) + the ASGI
+    /// data-format swap. DEFAULT `None`: prost omits field 15 AND the advertised
+    /// formats stay `[PICKLE, CBOR]` ⇒ the create is byte-identical to before web
+    /// endpoints for every non-endpoint function. The facade only sets this on the
+    /// DEPLOY boundary (the URL is deploy-only in v0), via
+    /// [`with_webhook`](FunctionSpec::with_webhook); RUN stays wire-identical even
+    /// when the decorator opts in — exactly like `checkpointing_enabled`.
+    pub webhook: Option<WebhookSpec>,
 }
 
 impl FunctionSpec {
@@ -427,6 +460,7 @@ impl FunctionSpec {
             schedule: None,
             autoscaler: FunctionAutoscaler::default(),
             checkpointing_enabled: false,
+            webhook: None,
         }
     }
 
@@ -622,6 +656,31 @@ impl FunctionSpec {
         self.checkpointing_enabled = on;
         self
     }
+
+    /// Expose this function as a web endpoint (`WEBHOOK_TYPE_FUNCTION`). When `Some`,
+    /// the built [`Function`] carries `webhook_config` (proto field 15) AND advertises
+    /// the ASGI data formats Modal's web layer requires (input `[ASGI]`, output
+    /// `[ASGI, GENERATOR_DONE]`); when `None` (the default) the wire is byte-identical
+    /// to before — no `webhook_config`, formats stay `[PICKLE, CBOR]`. The facade
+    /// gates this to the DEPLOY boundary only (the URL is deploy-only in v0), so RUN
+    /// stays wire-identical — exactly like
+    /// [`with_memory_snapshot`](FunctionSpec::with_memory_snapshot).
+    /// A malformed `method` is rejected AT SET TIME like every sibling knob
+    /// (gpu/retries/schedule/autoscaler validate at set time): the macro allowlists the
+    /// same five methods, but the SDK is a public crate and must not trust upstream.
+    pub fn with_webhook(mut self, webhook: Option<WebhookSpec>) -> Result<Self> {
+        if let Some(w) = &webhook {
+            const METHODS: [&str; 5] = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+            if !METHODS.contains(&w.method.as_str()) {
+                return Err(Error::build(format!(
+                    "invalid webhook method {:?}: expected one of GET, POST, PUT, DELETE, PATCH",
+                    w.method
+                )));
+            }
+        }
+        self.webhook = webhook;
+        Ok(self)
+    }
 }
 
 /// Result of [`ModalClient::function_create`].
@@ -632,6 +691,10 @@ pub struct CreatedFunction {
     /// `definition_id` from the create's `handle_metadata` (for `AppPublish`'s
     /// `definition_ids` map). Empty if the server did not return one.
     pub definition_id: String,
+    /// Assigned web-endpoint URL from the create's `handle_metadata.web_url`
+    /// (e.g. `https://{workspace}--{app}-{fn}.modal.run`). EMPTY for non-webhook
+    /// functions — Modal only assigns a URL when `webhook_config` is set.
+    pub web_url: String,
     /// Advisory server warnings (rendered text).
     pub warnings: Vec<String>,
 }
@@ -705,6 +768,26 @@ pub(crate) fn build_function_create_request(
     let concurrency_limit = spec.autoscaler.max_containers.unwrap_or(0);
     let experimental_buffer_containers = spec.autoscaler.buffer_containers.unwrap_or(0);
     let task_idle_timeout_secs = spec.autoscaler.scaledown_window.unwrap_or(0);
+    // Web endpoint: `None` ⇒ no `webhook_config` (prost omits field 15) AND the
+    // advertised formats stay `[PICKLE, CBOR]` ⇒ byte-identical to before web
+    // endpoints. `Some` ⇒ a FUNCTION-type webhook rides field 15 AND the formats
+    // swap to the ASGI pair Modal's web layer requires (spike finding 3 — advertising
+    // PICKLE on a webhook makes modal-http reject the ASGI response). `function_type`
+    // stays FUNCTION either way (webhooks cannot be generators at the user level).
+    let webhook_config = spec.webhook.as_ref().map(|w| WebhookConfig {
+        r#type: WebhookType::Function as i32,
+        method: w.method.clone(),
+        requires_proxy_auth: w.requires_proxy_auth,
+        ..Default::default()
+    });
+    let (supported_input_formats, supported_output_formats) = if spec.webhook.is_some() {
+        (
+            vec![DataFormat::Asgi as i32],
+            vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
+        )
+    } else {
+        (supported_formats(), supported_formats())
+    };
     let function = Function {
         module_name: spec.module_name.clone(),
         function_name: object_tag,
@@ -716,8 +799,8 @@ pub(crate) fn build_function_create_request(
         function_type: FunctionType::Function as i32,
         resources: Some(spec.resources.to_proto()), // fix #1: always set.
         timeout_secs: spec.timeout_secs,
-        supported_input_formats: supported_formats(),
-        supported_output_formats: supported_formats(),
+        supported_input_formats,
+        supported_output_formats,
         // Worker injects the client dep closure at container start (modern
         // builder), so the add_python image needs no `pip install modal` layer.
         mount_client_dependencies: spec.mount_client_dependencies,
@@ -752,6 +835,10 @@ pub(crate) fn build_function_create_request(
         // `spec.checkpointing_enabled` on the DEPLOY boundary, so RUN stays wire-identical.
         checkpointing_enabled: spec.checkpointing_enabled,
         is_checkpointing_function: spec.checkpointing_enabled,
+        // `None` ⇒ prost omits field 15 ⇒ byte-identical for every non-endpoint
+        // function. The facade only sets `spec.webhook` on the DEPLOY boundary,
+        // so RUN stays wire-identical.
+        webhook_config,
         ..Default::default()
     };
 
@@ -762,6 +849,37 @@ pub(crate) fn build_function_create_request(
         function_data: None, // fix #1: XOR — never both.
         ..Default::default()
     }
+}
+
+/// Project a `FunctionCreateResponse` into [`CreatedFunction`] — pure, no I/O.
+///
+/// Extracted from [`ModalClient::function_create`]. Surfaces `definition_id` (for
+/// `AppPublish`) and `web_url` (the assigned endpoint URL; empty for non-webhooks)
+/// from the create's `handle_metadata`, and renders the advisory server warnings.
+/// An empty `function_id` maps to [`Error::build`].
+pub(crate) fn created_function_from_response(
+    resp: FunctionCreateResponse,
+) -> Result<CreatedFunction> {
+    if resp.function_id.is_empty() {
+        return Err(Error::build(
+            "FunctionCreate returned an empty function_id".to_string(),
+        ));
+    }
+    let (definition_id, web_url) = resp
+        .handle_metadata
+        .as_ref()
+        .map(|h| (h.definition_id.clone(), h.web_url.clone()))
+        .unwrap_or_default();
+    Ok(CreatedFunction {
+        function_id: resp.function_id,
+        definition_id,
+        web_url,
+        warnings: resp
+            .server_warnings
+            .iter()
+            .map(|w| w.message.clone())
+            .collect(),
+    })
 }
 
 /// Build the `FunctionGet` / `from_name` request (api.proto:4242) — pure, no I/O.
@@ -835,27 +953,7 @@ impl ModalClient {
             })
             .await?;
 
-        if resp.function_id.is_empty() {
-            return Err(Error::build(
-                "FunctionCreate returned an empty function_id".to_string(),
-            ));
-        }
-
-        let definition_id = resp
-            .handle_metadata
-            .as_ref()
-            .map(|h| h.definition_id.clone())
-            .unwrap_or_default();
-
-        Ok(CreatedFunction {
-            function_id: resp.function_id,
-            definition_id,
-            warnings: resp
-                .server_warnings
-                .iter()
-                .map(|w| w.message.clone())
-                .collect(),
-        })
+        created_function_from_response(resp)
     }
 
     /// `FunctionGet` / `from_name` (api.proto:4242). Resolves a deployed function
@@ -1605,5 +1703,152 @@ mod tests {
             .expect("function set");
         assert!(!off_fn.checkpointing_enabled);
         assert!(!off_fn.is_checkpointing_function);
+    }
+
+    #[test]
+    fn webhook_defaults_none_and_is_wire_identical() {
+        // DEFAULT None: a bare spec leaves `webhook_config` (field 15) unset AND the
+        // advertised formats at `[PICKLE, CBOR]` — byte-identical to before web
+        // endpoints for every non-endpoint function.
+        let spec = FunctionSpec::new("m", "handler", "im-1");
+        assert!(spec.webhook.is_none(), "webhook must default None");
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        assert!(
+            function.webhook_config.is_none(),
+            "no webhook ⇒ webhook_config unset (wire-identical)"
+        );
+        assert_eq!(
+            function.supported_input_formats,
+            supported_formats(),
+            "no webhook ⇒ input formats stay [PICKLE, CBOR] (wire-identical)"
+        );
+        assert_eq!(
+            function.supported_output_formats,
+            supported_formats(),
+            "no webhook ⇒ output formats stay [PICKLE, CBOR] (wire-identical)"
+        );
+
+        // `with_webhook(None)` is the same wire-identical path (the facade's RUN leg).
+        let run = FunctionSpec::new("m", "handler", "im-1")
+            .with_webhook(None)
+            .expect("None is always a valid webhook");
+        let run_fn = build_function_create_request("ap-1", "fu-pre-1", &run)
+            .function
+            .expect("function set");
+        assert!(run_fn.webhook_config.is_none());
+        assert_eq!(run_fn.supported_input_formats, supported_formats());
+        assert_eq!(run_fn.supported_output_formats, supported_formats());
+    }
+
+    #[test]
+    fn with_webhook_rides_config_and_swaps_formats_to_asgi() {
+        // `Some(WebhookSpec)` ⇒ a FUNCTION-type webhook_config rides field 15 AND the
+        // advertised formats swap to the ASGI pair (spike finding 3): input [ASGI],
+        // output [ASGI, GENERATOR_DONE]. `function_type` stays FUNCTION.
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_webhook(Some(WebhookSpec {
+                method: "POST".to_string(),
+                requires_proxy_auth: false,
+            }))
+            .expect("POST is a valid method");
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        let webhook = function
+            .webhook_config
+            .expect("webhook set ⇒ webhook_config present");
+        assert_eq!(webhook.r#type, WebhookType::Function as i32);
+        assert_eq!(webhook.method, "POST");
+        assert!(!webhook.requires_proxy_auth, "public by default (D4)");
+        // The rest of WebhookConfig stays at its zero default (FUNCTION shape).
+        assert!(webhook.requested_suffix.is_empty());
+        assert_eq!(webhook.web_server_port, 0);
+        assert!(webhook.custom_domains.is_empty());
+        // Formats swap to ASGI (advertising PICKLE breaks modal-http on webhooks).
+        assert_eq!(
+            function.supported_input_formats,
+            vec![DataFormat::Asgi as i32],
+            "webhook ⇒ input formats [ASGI]"
+        );
+        assert_eq!(
+            function.supported_output_formats,
+            vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
+            "webhook ⇒ output formats [ASGI, GENERATOR_DONE]"
+        );
+        // The function stays a normal FUNCTION (webhooks are not generators).
+        assert_eq!(function.function_type, FunctionType::Function as i32);
+    }
+
+    #[test]
+    fn with_webhook_requires_proxy_auth_rides_through() {
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_webhook(Some(WebhookSpec {
+                method: "GET".to_string(),
+                requires_proxy_auth: true,
+            }))
+            .expect("GET is a valid method");
+        // And the set-time allowlist REJECTS a malformed method (in-flight fix #5).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_webhook(Some(WebhookSpec {
+                method: "BREW".to_string(),
+                requires_proxy_auth: false,
+            }))
+            .is_err());
+        let webhook = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set")
+            .webhook_config
+            .expect("webhook_config present");
+        assert_eq!(webhook.method, "GET");
+        assert!(
+            webhook.requires_proxy_auth,
+            "proxy-auth opt-in rides WebhookConfig.requires_proxy_auth (field 10)"
+        );
+    }
+
+    #[test]
+    fn created_function_surfaces_web_url_from_handle_metadata() {
+        use crate::proto::api::FunctionHandleMetadata;
+
+        // web_url plumbed from the create response's handle_metadata.
+        let resp = FunctionCreateResponse {
+            function_id: "fu-1".to_string(),
+            handle_metadata: Some(FunctionHandleMetadata {
+                definition_id: "de-1".to_string(),
+                web_url: "https://ws--app-add.modal.run".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = created_function_from_response(resp).expect("valid response");
+        assert_eq!(created.function_id, "fu-1");
+        assert_eq!(created.definition_id, "de-1");
+        assert_eq!(created.web_url, "https://ws--app-add.modal.run");
+
+        // Non-webhook create: Modal leaves web_url empty — surfaced as empty.
+        let plain = FunctionCreateResponse {
+            function_id: "fu-2".to_string(),
+            handle_metadata: Some(FunctionHandleMetadata {
+                definition_id: "de-2".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = created_function_from_response(plain).expect("valid response");
+        assert_eq!(created.web_url, "");
+
+        // No handle_metadata at all: both ids default empty.
+        let bare = FunctionCreateResponse {
+            function_id: "fu-3".to_string(),
+            ..Default::default()
+        };
+        let created = created_function_from_response(bare).expect("valid response");
+        assert_eq!(created.definition_id, "");
+        assert_eq!(created.web_url, "");
+
+        // An empty function_id is still rejected (the pre-existing guard).
+        assert!(created_function_from_response(FunctionCreateResponse::default()).is_err());
     }
 }

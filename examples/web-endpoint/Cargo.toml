@@ -1,0 +1,30 @@
+[package]
+name = "web-endpoint"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: `#[modal_rust::endpoint(method = \"POST\")]` — expose a plain `#[function]`-shaped handler over HTTP. The handler (a frequency-based extractive text summarizer, the real computation in `src/extractive.rs`) stays an ordinary Rust fn with the full typed call surface (`app.summarize(..).local()/.remote()`), and on `modal-rust deploy` it ALSO gets a public URL: Modal wraps it in a FastAPI app (`WEBHOOK_TYPE_FUNCTION`), POSTs the JSON request body as the function's input, and returns the output JSON. DEPLOY-only (proven offline by `tests/manifest.rs`): `modal-rust run` stays wire-identical to a plain `#[function]`."
+publish = false
+
+[lib]
+name = "web_endpoint"
+path = "src/lib.rs"
+
+[dependencies]
+# SINGLE modal dependency — exactly what a fresh external user writes. The
+# `#[modal_rust::endpoint]` macro routes its generated code through this facade, so
+# there is no `modal-rust-runtime` / `inventory` to add and no rename. LIGHT (no gRPC
+# client) so the in-container `modal_runner` build the CLI generates is tonic-free.
+# NO web-framework dependency either — that is the whole point of `#[endpoint]` v0:
+# Modal's FastAPI wrapper drives the HTTP side in-container.
+modal-rust = { path = "../../crates/modal-rust" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+# The example LIB is a pure `#[modal_rust::endpoint]` library and stays LIGHT (no gRPC
+# client). The OFFLINE tests need the `dry_run`/`dump_deploy_manifest` projection,
+# which lives behind the facade `client` feature — so we enable it on a SECOND,
+# dev-only dependency edge. Cargo unifies a crate's own deps + dev-deps only when
+# BUILDING TESTS, so the standalone lib build (and the CLI-generated runner build)
+# stays light while the test target gets `client`.
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }

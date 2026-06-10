@@ -5566,6 +5566,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-endpoint"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "modal-rust",
+ "serde",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -45,10 +45,11 @@
 
 use std::collections::HashMap;
 
-use modal_rust_sdk::{FunctionAutoscaler, FunctionSpec, ImageSpec, ModalClient};
+use modal_rust_sdk::{FunctionAutoscaler, FunctionSpec, ImageSpec, ModalClient, WebhookSpec};
 
 use crate::deploy::{
-    DEPLOY_RUNNER, DEPLOY_SRC, DEPLOY_WRAPPER_CALLABLE, DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC,
+    baked_deploy_wrapper_src, DEPLOY_RUNNER, DEPLOY_SRC, DEPLOY_WRAPPER_CALLABLE,
+    DEPLOY_WRAPPER_MODULE,
 };
 use crate::remote::{
     run_wrapper_config_env, run_wrapper_src, CACHE_MOUNT, CACHE_VOLUME_NAME, PYTHON_SERIES,
@@ -249,16 +250,26 @@ pub(crate) fn build_image_spec(
 /// fires before Modal's snapshot point. It is `true` only when ANY deployed entrypoint
 /// opted into `enable_memory_snapshot`; when `false` the layer renders byte-identically
 /// to a non-snapshot deploy (the off-path forward-safety guarantee).
+///
+/// `endpoint_entrypoints` (web endpoints §4) are the deployed entrypoints that declared
+/// `webhook_method`: the baked wrapper module becomes [`baked_deploy_wrapper_src`] —
+/// the static source plus one generated `web_<sanitized> = _make_web_handler("<ep>")`
+/// adapter line per endpoint, the FILE-mode `implementation_name` target. Empty ⇒ the
+/// plain static wrapper source, byte-identical (the same off-path guarantee).
 pub(crate) fn build_deploy_top_layer_spec(
     base_image_id: &str,
     source_mount_id: &str,
     package: &str,
     bake_snapshot_prime: bool,
     bake_snapshot_best_effort: bool,
+    endpoint_entrypoints: &[&str],
 ) -> ImageSpec {
     let mut spec = ImageSpec::from_registry(String::new()) // FROM replaced by `FROM base`.
         .with_base_image(base_image_id)
-        .with_wrapper_module(DEPLOY_WRAPPER_MODULE, DEPLOY_WRAPPER_SRC)
+        .with_wrapper_module(
+            DEPLOY_WRAPPER_MODULE,
+            baked_deploy_wrapper_src(endpoint_entrypoints),
+        )
         .with_context_mount(source_mount_id)
         // Context root → /, so the /app/src-prefixed tree lands at /app/src.
         .with_command("COPY . /")
@@ -318,18 +329,43 @@ fn build_function_spec(
     res: &AttachedResources,
 ) -> Result<FunctionSpec> {
     let object_tag = crate::remote::sanitize_object_tag(&ep.name);
+    // Web endpoint is DEPLOY-only in v0 (D5: the URL is deploy-only), so build the
+    // webhook spec ONLY when this is the DEPLOY boundary AND the entrypoint declared
+    // `#[endpoint(method = ..)]`. RUN stays wire-identical even when decorated —
+    // exactly like `enable_memory_snapshot` below.
+    let webhook = match (&ep.options.webhook_method, boundary.app_state) {
+        (Some(method), AppState::Deployed) => Some(WebhookSpec {
+            method: method.clone(),
+            requires_proxy_auth: ep.options.webhook_requires_proxy_auth,
+        }),
+        _ => None,
+    };
     let (module, callable, mount_ids) = match boundary.source_delivery {
         SourceDelivery::RunMount => (
             WRAPPER_MODULE,
-            WRAPPER_CALLABLE,
+            WRAPPER_CALLABLE.to_string(),
             vec![res.client_mount_id.clone(), res.source_mount_id.clone()],
         ),
         // DEPLOY attaches the CLIENT mount ONLY (no source mount).
-        SourceDelivery::DeployContext => (
-            DEPLOY_WRAPPER_MODULE,
-            DEPLOY_WRAPPER_CALLABLE,
-            vec![res.client_mount_id.clone()],
-        ),
+        SourceDelivery::DeployContext => {
+            // An ENDPOINT's FILE-mode callable is its PER-ENDPOINT adapter
+            // (`web_<sanitized>`, generated into the baked deploy wrapper) instead of
+            // the shared `handler` dispatch — Modal's FUNCTION webhook introspects the
+            // callable's signature, so each endpoint needs its own `(request)` adapter.
+            // The object TAG below stays the entrypoint name, so the typed
+            // FunctionGet-by-tag path resolves the SAME function (the D2 dual surface).
+            // Non-endpoints (webhook None) keep the shared dispatch — byte-identical.
+            let callable = if webhook.is_some() {
+                crate::remote::web_endpoint_attr(&ep.name)
+            } else {
+                DEPLOY_WRAPPER_CALLABLE.to_string()
+            };
+            (
+                DEPLOY_WRAPPER_MODULE,
+                callable,
+                vec![res.client_mount_id.clone()],
+            )
+        }
     };
     let mut fn_spec = FunctionSpec::new(module, callable, image_id)
         .with_app_function_name(&object_tag)
@@ -360,7 +396,11 @@ fn build_function_spec(
         // entrypoint opted in. RUN stays wire-identical even if the decorator opts in.
         .with_memory_snapshot(
             ep.options.enable_memory_snapshot && boundary.app_state == AppState::Deployed,
-        );
+        )
+        // The deploy-only webhook spec built above (`None` on RUN / non-endpoints ⇒
+        // no `webhook_config` on the wire AND the formats stay PICKLE/CBOR —
+        // byte-identical to before web endpoints).
+        .with_webhook(webhook)?;
     // retries ride into Function.retry_policy. The `Retries(..)` STRUCT form (custom
     // backoff/delays, `retries_spec`) wins when present; otherwise the bare-int
     // `retries` fixed-interval shortcut applies. Both `None` ⇒ no policy ⇒ byte-identical
@@ -453,13 +493,14 @@ pub(crate) trait ControlPlane {
     /// `FunctionPrecreate` under the per-entrypoint object tag → precreate id.
     async fn precreate(&mut self, app_id: &str, object_tag: &str) -> Result<String>;
 
-    /// `FunctionCreate` (FILE mode) → `(function_id, definition_id)`.
+    /// `FunctionCreate` (FILE mode) → [`Created`] (ids + the served `web_url` for
+    /// webhook functions; empty otherwise / on the recording plane).
     async fn create(
         &mut self,
         app_id: &str,
         precreate_id: &str,
         spec: &FunctionSpec,
-    ) -> Result<(String, String)>;
+    ) -> Result<Created>;
 
     /// `AppPublish` the cumulative `(function_ids, definition_ids)` union in `state`.
     /// Returns the deployed app URL (empty for ephemeral / recording).
@@ -486,6 +527,17 @@ pub(crate) struct Provisioned {
     pub publish_url: String,
 }
 
+/// What ONE `FunctionCreate` returned: the invokable id, the definition id (may be
+/// empty), and — for webhook (web-endpoint) functions — the server-assigned `web_url`
+/// from the create response's handle metadata (empty for plain functions and on the
+/// recording plane, which never talks to a server).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Created {
+    pub function_id: String,
+    pub definition_id: String,
+    pub web_url: String,
+}
+
 /// The cumulative set of functions published into ONE app. Because `AppPublish` is a
 /// SET-STATE publish (it REPLACES the app's function set, not appends), creating a
 /// second per-entrypoint function and re-publishing must carry the UNION of every
@@ -501,15 +553,22 @@ pub(crate) struct Published {
     pub function_ids: HashMap<String, String>,
     /// `function_id` → `definition_id` (only for functions that returned one).
     pub definition_ids: HashMap<String, String>,
+    /// Object tag → served `web_url` (only for webhook functions that returned one).
+    /// BTreeMap so callers print endpoint URLs in a deterministic order.
+    pub endpoint_urls: std::collections::BTreeMap<String, String>,
 }
 
 impl Published {
-    fn record(&mut self, object_tag: &str, function_id: &str, definition_id: &str) {
+    fn record(&mut self, object_tag: &str, created: &Created) {
         self.function_ids
-            .insert(object_tag.to_string(), function_id.to_string());
-        if !definition_id.is_empty() {
+            .insert(object_tag.to_string(), created.function_id.clone());
+        if !created.definition_id.is_empty() {
             self.definition_ids
-                .insert(function_id.to_string(), definition_id.to_string());
+                .insert(created.function_id.clone(), created.definition_id.clone());
+        }
+        if !created.web_url.is_empty() {
+            self.endpoint_urls
+                .insert(object_tag.to_string(), created.web_url.clone());
         }
     }
 }
@@ -607,12 +666,24 @@ pub(crate) async fn provision<C: ControlPlane>(
                 .entrypoints
                 .iter()
                 .any(|ep| ep.options.enable_memory_snapshot);
+            // Web endpoints §4: every deployed entrypoint that declared
+            // `webhook_method` gets a generated `web_<sanitized>` adapter line in the
+            // baked wrapper (the endpoint function's `implementation_name`). Reached
+            // only on the DEPLOY boundary (like the snapshot-prime gate above); none
+            // ⇒ the plain static wrapper, byte-identical.
+            let endpoint_entrypoints: Vec<&str> = inputs
+                .entrypoints
+                .iter()
+                .filter(|ep| ep.options.webhook_method.is_some())
+                .map(|ep| ep.name.as_str())
+                .collect();
             let top_spec = build_deploy_top_layer_spec(
                 &base_image_id,
                 &source_mount_id,
                 inputs.source.package,
                 bake_snapshot_prime,
                 inputs.snapshot_best_effort,
+                &endpoint_entrypoints,
             );
             cp.ensure_image(&app_id, &top_spec, 1).await?
         }
@@ -655,8 +726,8 @@ pub(crate) async fn provision<C: ControlPlane>(
             user_volume_mounts,
         };
         let fn_spec = build_function_spec(boundary, ep, &image_id, &res)?;
-        let (function_id, definition_id) = cp.create(&app_id, &precreate_id, &fn_spec).await?;
-        published.record(&object_tag, &function_id, &definition_id);
+        let created = cp.create(&app_id, &precreate_id, &fn_spec).await?;
+        published.record(&object_tag, &created);
 
         // RUN re-publishes the CUMULATIVE union after EACH create — `AppPublish`
         // REPLACES the function set, so a per-entrypoint create must re-publish every
@@ -886,12 +957,16 @@ impl ControlPlane for LiveControlPlane<'_> {
         app_id: &str,
         precreate_id: &str,
         spec: &FunctionSpec,
-    ) -> Result<(String, String)> {
+    ) -> Result<Created> {
         let created = self
             .client
             .function_create(app_id, precreate_id, spec)
             .await?;
-        Ok((created.function_id, created.definition_id))
+        Ok(Created {
+            function_id: created.function_id,
+            definition_id: created.definition_id,
+            web_url: created.web_url,
+        })
     }
 
     async fn publish(
@@ -999,8 +1074,14 @@ mod tests {
         // DEPLOY top layer: bases on layer 1 (FROM base), the source rides this
         // layer's build CONTEXT so cargo compiles it AT image-build time, then the
         // binary is baked to /app/modal_runner.
-        let spec =
-            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", false, false);
+        let spec = build_deploy_top_layer_spec(
+            "im-layer1",
+            "mo-deploy-src",
+            "example-add",
+            false,
+            false,
+            &[],
+        );
         assert_eq!(spec.base_image_id.as_deref(), Some("im-layer1"));
         assert_eq!(spec.context_mount_id.as_deref(), Some("mo-deploy-src"));
         assert!(spec
@@ -1030,8 +1111,14 @@ mod tests {
         // A deployed entrypoint opted into memory snapshot ⇒ the top layer bakes
         // `ENV MODAL_RUST_SNAPSHOT_PRIME=1` next to `RUST_BACKTRACE`, so the wrapper's
         // import-time prime fires before Modal's snapshot point.
-        let spec =
-            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", true, false);
+        let spec = build_deploy_top_layer_spec(
+            "im-layer1",
+            "mo-deploy-src",
+            "example-add",
+            true,
+            false,
+            &[],
+        );
         assert!(
             spec.extra_commands
                 .iter()
@@ -1059,8 +1146,14 @@ mod tests {
         // The opt-in degrade (DeployConfig::snapshot_best_effort /
         // MODAL_RUST_SNAPSHOT_BEST_EFFORT) bakes the best-effort ENV NEXT TO the prime
         // ENV — and only when the prime itself is baked (it is meaningless without it).
-        let spec =
-            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", true, true);
+        let spec = build_deploy_top_layer_spec(
+            "im-layer1",
+            "mo-deploy-src",
+            "example-add",
+            true,
+            true,
+            &[],
+        );
         assert!(spec
             .extra_commands
             .iter()
@@ -1070,12 +1163,71 @@ mod tests {
             .iter()
             .any(|c| c == "ENV MODAL_RUST_SNAPSHOT_BEST_EFFORT=1"));
         // best_effort WITHOUT the prime bakes neither (no orphan knob).
-        let spec =
-            build_deploy_top_layer_spec("im-layer1", "mo-deploy-src", "example-add", false, true);
+        let spec = build_deploy_top_layer_spec(
+            "im-layer1",
+            "mo-deploy-src",
+            "example-add",
+            false,
+            true,
+            &[],
+        );
         assert!(!spec
             .extra_commands
             .iter()
             .any(|c| c.contains("MODAL_RUST_SNAPSHOT")));
+    }
+
+    #[test]
+    fn deploy_top_layer_bakes_plain_wrapper_when_no_endpoint() {
+        // Off-path forward safety (web endpoints §6): NO endpoint ⇒ the baked wrapper
+        // module is the plain static DEPLOY_WRAPPER_SRC, BYTE-IDENTICAL (no generated
+        // adapter suffix, no trailing newline drift).
+        let spec = build_deploy_top_layer_spec(
+            "im-layer1",
+            "mo-deploy-src",
+            "example-add",
+            false,
+            false,
+            &[],
+        );
+        assert_eq!(spec.wrapper_modules.len(), 1);
+        let (module, src) = &spec.wrapper_modules[0];
+        assert_eq!(module, DEPLOY_WRAPPER_MODULE);
+        assert_eq!(
+            src,
+            crate::deploy::DEPLOY_WRAPPER_SRC,
+            "no-endpoint deploy must bake the static wrapper source byte-identically"
+        );
+    }
+
+    #[test]
+    fn deploy_top_layer_appends_web_adapter_lines_per_endpoint() {
+        // Web endpoints §4: each endpoint entrypoint gets a GENERATED module-level
+        // `web_<sanitized> = _make_web_handler("<entrypoint>")` line appended after
+        // the static wrapper source — the FILE-mode `implementation_name` target
+        // (`web_<sanitized>`, matching `remote::web_endpoint_attr`).
+        let spec = build_deploy_top_layer_spec(
+            "im-layer1",
+            "mo-deploy-src",
+            "example-add",
+            false,
+            false,
+            &["predict", "my-fn.v2"],
+        );
+        let (module, src) = &spec.wrapper_modules[0];
+        assert_eq!(module, DEPLOY_WRAPPER_MODULE);
+        assert!(
+            src.starts_with(crate::deploy::DEPLOY_WRAPPER_SRC),
+            "the static wrapper source must come first, unmodified"
+        );
+        assert!(
+            src.contains("\nweb_predict = _make_web_handler(\"predict\")\n"),
+            "per-endpoint adapter line must be generated, got tail: {:?}",
+            &src[crate::deploy::DEPLOY_WRAPPER_SRC.len()..]
+        );
+        // The attr is sanitized to a Python identifier (dots/dashes -> `_`) while the
+        // handler arg keeps the RAW entrypoint name (the dispatch key).
+        assert!(src.contains("\nweb_my_fn_v2 = _make_web_handler(\"my-fn.v2\")\n"));
     }
 
     #[test]
@@ -1143,6 +1295,84 @@ mod tests {
             "deploy attaches the client mount ONLY"
         );
         assert!(spec.volume_mounts.is_empty(), "no cargo cache on deploy");
+        // Off-path forward safety: a non-endpoint deploy carries NO webhook and keeps
+        // the shared dispatch callable — byte-identical to before web endpoints.
+        assert!(spec.webhook.is_none(), "non-endpoint deploy has no webhook");
+    }
+
+    #[test]
+    fn deploy_endpoint_sets_webhook_and_per_endpoint_adapter_callable() {
+        // An `#[endpoint(method = "POST")]` entrypoint on the DEPLOY boundary: the
+        // webhook spec rides the FunctionSpec AND the FILE-mode callable becomes the
+        // PER-ENDPOINT adapter `web_<sanitized_tag>` (the baked deploy wrapper's
+        // generated attr), while the object TAG stays the entrypoint name — so the
+        // typed FunctionGet-by-tag path resolves the same function (D2 dual surface).
+        let ep = Entrypoint {
+            name: "add".to_string(),
+            options: FunctionOptions {
+                webhook_method: Some("POST".to_string()),
+                webhook_requires_proxy_auth: true,
+                ..FunctionOptions::default()
+            },
+            timeout_secs: 900,
+        };
+        let spec = build_function_spec(
+            &DEPLOY_BOUNDARY,
+            &ep,
+            "im-1",
+            &AttachedResources {
+                client_mount_id: "mo-client".to_string(),
+                source_mount_id: "mo-source".to_string(),
+                cache_vol_id: None,
+                secret_ids: vec![],
+                user_volume_mounts: vec![],
+            },
+        )
+        .expect("deploy endpoint fn spec");
+        let webhook = spec.webhook.as_ref().expect("DEPLOY endpoint sets webhook");
+        assert_eq!(webhook.method, "POST");
+        assert!(
+            webhook.requires_proxy_auth,
+            "proxy-auth opt-in rides through"
+        );
+        // implementation callable = the per-endpoint adapter; TAG = the entrypoint.
+        assert_eq!(spec.module_name, DEPLOY_WRAPPER_MODULE);
+        assert_eq!(spec.function_name, "web_add");
+        assert_eq!(spec.object_tag(), "add", "object TAG stays the entrypoint");
+    }
+
+    #[test]
+    fn run_endpoint_suppresses_webhook_and_stays_wire_identical() {
+        // D5: the URL is DEPLOY-only. A RUN of a decorated endpoint suppresses the
+        // webhook entirely — same module/callable/spec as a plain `#[function]` run.
+        let options = FunctionOptions {
+            webhook_method: Some("POST".to_string()),
+            webhook_requires_proxy_auth: true,
+            ..FunctionOptions::default()
+        };
+        let ep = Entrypoint {
+            name: "add".to_string(),
+            options,
+            timeout_secs: 1800,
+        };
+        let res = AttachedResources {
+            client_mount_id: "mo-client".to_string(),
+            source_mount_id: "mo-source".to_string(),
+            cache_vol_id: None,
+            secret_ids: vec![],
+            user_volume_mounts: vec![],
+        };
+        let spec = build_function_spec(&RUN_BOUNDARY, &ep, "im-1", &res).expect("run fn spec");
+        assert!(
+            spec.webhook.is_none(),
+            "RUN suppresses the webhook even when decorated"
+        );
+        assert_eq!(spec.module_name, WRAPPER_MODULE);
+        assert_eq!(
+            spec.function_name, WRAPPER_CALLABLE,
+            "RUN keeps the shared dispatch callable (wire-identical to a plain fn)"
+        );
+        assert_eq!(spec.object_tag(), "add");
     }
 
     #[test]
@@ -1150,13 +1380,31 @@ mod tests {
         // AppPublish REPLACES the function set, so a second per-entrypoint create must
         // re-publish the UNION (else the first entrypoint is de-invoked).
         let mut p = Published::default();
-        p.record("add", "fu-1", "de-1");
+        let created = |f: &str, d: &str, url: &str| Created {
+            function_id: f.to_string(),
+            definition_id: d.to_string(),
+            web_url: url.to_string(),
+        };
+        p.record("add", &created("fu-1", "de-1", ""));
         assert_eq!(p.function_ids.get("add"), Some(&"fu-1".to_string()));
         assert_eq!(p.definition_ids.get("fu-1"), Some(&"de-1".to_string()));
-        p.record("add_gpu", "fu-2", "de-2");
+        // No web_url ⇒ no endpoint entry (plain functions never list a URL).
+        assert!(p.endpoint_urls.is_empty());
+        p.record("add_gpu", &created("fu-2", "de-2", ""));
         assert_eq!(p.function_ids.len(), 2);
         assert_eq!(p.function_ids.get("add"), Some(&"fu-1".to_string()));
         assert_eq!(p.function_ids.get("add_gpu"), Some(&"fu-2".to_string()));
+        assert_eq!(p.definition_ids.len(), 2);
+        // A webhook create's web_url is recorded under its object tag.
+        p.record(
+            "web_greet",
+            &created("fu-3", "", "https://ws--app-web-greet.modal.run"),
+        );
+        assert_eq!(
+            p.endpoint_urls.get("web_greet").map(String::as_str),
+            Some("https://ws--app-web-greet.modal.run")
+        );
+        // Empty definition_id is NOT recorded.
         assert_eq!(p.definition_ids.len(), 2);
     }
 

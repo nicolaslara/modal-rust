@@ -601,6 +601,94 @@ v0 is CPU-only and `#[cls]`-only — `#[function(enable_memory_snapshot = true)]
 compile error. The GPU snap/restore split and a `#[restore]` hook are tracked in
 [`docs/ROADMAP.md`](docs/ROADMAP.md); see [`docs/PARITY.md`](docs/PARITY.md) for status.
 
+### Web endpoints — `#[endpoint]`: expose a function over HTTP
+
+`#[modal_rust::endpoint(method = "POST")]` is `#[function]` plus an HTTP URL — the
+`@modal.fastapi_endpoint` analogue (`WEBHOOK_TYPE_FUNCTION`). The handler stays an
+ordinary Rust fn — same auto-IO, same decorator vocabulary (`gpu`/`timeout`/
+`secrets`/…) — and on **deploy** Modal wraps the in-container callable in a FastAPI
+app and assigns a stable URL. **No web-framework dependency in your crate.** With
+`use modal_rust::endpoint;` in scope, the authored surface is exactly the
+[`examples/web-endpoint`](examples/web-endpoint) crate (this block is drift-guarded
+against it by `examples/web-endpoint/tests/readme_drift.rs` — a stale README is a
+test failure):
+
+```rust endpoint
+/// The summary a POST returns — the response body, as JSON. Every field is computed
+/// by the frequency model in `extractive.rs`, not fixed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Summary {
+    /// The selected sentences, joined in their original order.
+    pub summary: String,
+    /// How many sentences the summary kept.
+    pub sentences_kept: usize,
+    /// How many sentences the input text held.
+    pub sentences_total: usize,
+    /// How many words the input text held.
+    pub words_total: usize,
+}
+
+/// Boil `text` down to its `max_sentences` most representative sentences. A normal
+/// handler — IDENTICAL to a `#[function]` — but `#[endpoint]` ALSO exposes it over
+/// HTTP on deploy: POST `{"text":"..","max_sentences":2}` (the auto-IO input JSON)
+/// to the deployed URL and the response body is the [`Summary`] JSON. The typed call
+/// surface keeps working alongside the URL: `app.summarize(text, 2).local()`.
+#[endpoint(method = "POST")]
+pub fn summarize(text: String, max_sentences: usize) -> anyhow::Result<Summary> {
+    anyhow::ensure!(max_sentences > 0, "max_sentences must be at least 1");
+    let sentences = extractive::split_sentences(&text);
+    anyhow::ensure!(
+        !sentences.is_empty(),
+        "text holds no sentences to summarize"
+    );
+    let picked = extractive::pick_top(&sentences, max_sentences);
+    Ok(Summary {
+        sentences_kept: picked.len(),
+        sentences_total: sentences.len(),
+        words_total: extractive::word_count(&text),
+        summary: picked.join(" "),
+    })
+}
+```
+
+The HTTP contract is the auto-IO contract: the request body **is** the function's
+input JSON (the same shape `--input` takes, here `{"text":"..","max_sentences":2}`)
+and the response body is the output JSON (the `Summary`). Errors come back as
+`{"kind","message"}` JSON — **422** for a body that fails to decode, **500** for a
+handler error. `method` is **required** — one of `"GET" | "POST" | "PUT" | "DELETE" |
+"PATCH"` (a missing or invalid method is a compile error, never a deploy surprise).
+
+```bash
+cd examples/web-endpoint
+modal-rust deploy summarize --app modal-rust-web-endpoint
+curl -X POST "https://<workspace>--modal-rust-web-endpoint-summarize.modal.run" \
+  -H 'content-type: application/json' \
+  -d '{"text":"Rust guarantees memory safety. The borrow checker proves it.","max_sentences":1}'
+```
+
+Three things to know:
+
+- **The URL is deploy-only (v0).** `modal-rust run summarize --input '{..}'` still
+  works as a normal one-shot typed call, but the webhook is **suppressed** on the RUN
+  boundary — the wire stays byte-identical to a plain `#[function]` and no URL exists.
+  Deploying auto-installs `fastapi[standard]` into the deploy image (Modal requires
+  FastAPI in the image for FUNCTION webhooks) — nothing to declare.
+- **Public by default** (matching Modal): anyone with the URL can call it. Opt into
+  auth with `#[endpoint(method = "POST", requires_proxy_auth = true)]` — Modal then
+  rejects requests lacking the `Modal-Key`/`Modal-Secret` proxy-auth header pair
+  *before* they reach the container.
+- **The deployed endpoint is HTTP-only (v0).** The fn remains a normal function for
+  `.local()` and `modal-rust run` (webhook suppressed), but Modal's worker wraps a
+  webhook function's in-container callable in an ASGI app, so the typed envelope path
+  (`.remote()` / `modal-rust call`) against the *deployed* app is rejected
+  (live-verified). Want both surfaces on one deploy? Use Modal's own idiom: a plain
+  `#[function]` for compute plus a thin `#[endpoint]` fn that calls it.
+
+v0 is one method + one request/response per free fn. Routing, multiple methods,
+streaming, and websockets are the `#[web_server]` follow-up, and `#[endpoint]` on a
+`#[cls]` method is a compile error for now — see [`docs/ROADMAP.md`](docs/ROADMAP.md)
+and [`docs/PARITY.md`](docs/PARITY.md) §8.
+
 ## How It Works
 
 Every user function is erased into a static handler table:
@@ -841,6 +929,7 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/burn-add` | **(macro)** A real ML workload — a Burn/CubeCL tensor op (NVRTC at runtime) authored with `#[modal_rust::function(gpu = "T4", name = "burn_add")]`, deployed and called on a T4. |
 | `examples/stateful-class` | **(macro / `Cls`)** Load-once-serve-many: a `#[modal_rust::cls]` impl with `#[enter]` (load an embedding model ONCE per warm container) + `#[method]`s reusing it by `&self`, called `app.embedder().embed("hi".into()).remote().await?`. Each method is its own dotted `Embedder.embed` / `Embedder.dim` entrypoint; live-confirmed on a T4. |
 | `examples/snapshot-class` | **(macro / `Cls` / memory snapshot)** Pay `#[enter]` ONCE EVER: a `#[modal_rust::cls(enable_memory_snapshot = true)]` whose `#[enter]` builds a sorted word-concordance index. On a *deployed* app Modal snapshots the loaded process and restores it on every container — cold ones included — so the build is not re-run per cold start. Deploy-only (`run` stays wire-identical); offline tests prove load-once + that the flag rides into the DEPLOY `FunctionCreate` and not the RUN one. |
+| `examples/web-endpoint` | **(macro / web endpoint)** Expose a plain function over HTTP with ONE attribute: `#[modal_rust::endpoint(method = "POST")]` on a real frequency-based extractive summarizer. On `modal-rust deploy` Modal wraps the in-container callable in a FastAPI app and assigns a public URL — `curl -X POST` the input JSON, get the output JSON back. The fn stays a normal function for `.local()` and `modal-rust run` (webhook suppressed, wire-identical); the *deployed* endpoint itself is HTTP-only in v0 (Modal's worker ASGI-wraps the callable). Offline tests prove the webhook rides the DEPLOY `FunctionCreate` and not the RUN one. |
 | `examples/custom-types` | **(macro / I/O)** Real functions take and return your own `struct`s: derive `Serialize`/`Deserialize`, take a struct, return a struct, and the macro infers the typed I/O from the signature. `score(Player) -> Scored` turns a match record into a score. |
 | `examples/ways-to-call` | **(macro / call shapes)** One function (`square(n: i64)`), four invocation patterns side by side — `.local()`, `.remote().await`, `.spawn()` + `.get()`, and `.map([..])` — all through the same typed `app.square(n)` method. The "how do I actually call this" tour. |
 | `examples/deploy-and-call` | **(run vs deploy)** The build boundary made concrete: `.remote()` rebuilds in the function body on each cold start, while `deploy` runs `cargo build --release` ONCE at image-build time and bakes the binary in so each `call` skips the rebuild. |

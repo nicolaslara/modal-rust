@@ -805,6 +805,8 @@ mod tests {
                 scaledown_window: None,
                 image: None,
                 enable_memory_snapshot: false,
+                webhook_method: None,
+                webhook_requires_proxy_auth: false,
             },
             package: "modal-rust",
         }
@@ -835,6 +837,8 @@ mod tests {
                 scaledown_window: None,
                 image: None,
                 enable_memory_snapshot: false,
+                webhook_method: None,
+                webhook_requires_proxy_auth: false,
             },
             package: "modal-rust",
         }

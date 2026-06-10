@@ -145,6 +145,11 @@ pub enum PlannedRequest {
         /// `is_checkpointing_function`). DEPLOY-only: `true` only when the entrypoint
         /// opted in AND this is the DEPLOY boundary; always `false` on RUN.
         checkpointing_enabled: bool,
+        /// The web-endpoint HTTP method on the WIRE (`Function.webhook_config.method`).
+        /// DEPLOY-only (D5: the URL is deploy-only in v0): `Some` only when the
+        /// entrypoint declared `#[endpoint(method = ..)]` AND this is the DEPLOY
+        /// boundary; always `None` on RUN, even when decorated.
+        webhook_method: Option<String>,
         /// The FILE-mode XOR invariant: `function_data` is unset.
         function_data_is_none: bool,
     },
@@ -250,6 +255,7 @@ impl Manifest {
                     buffer_containers,
                     scaledown_window,
                     checkpointing_enabled,
+                    webhook_method,
                     function_data_is_none,
                 } => format!(
                     "FunctionCreate         module={module:?} function={function:?} \
@@ -263,6 +269,7 @@ impl Manifest {
                      buffer_containers={buffer_containers:?} \
                      scaledown_window={scaledown_window:?} \
                      checkpointing_enabled={checkpointing_enabled} \
+                     webhook_method={webhook_method:?} \
                      function_data_is_none={function_data_is_none}"
                 ),
                 PlannedRequest::AppPublish { app_state } => {
@@ -411,7 +418,7 @@ impl ControlPlane for RecordingControlPlane {
         app_id: &str,
         precreate_id: &str,
         spec: &FunctionSpec,
-    ) -> Result<(String, String)> {
+    ) -> Result<crate::control_plane::Created> {
         // Project the SAME FunctionSpec the live path builds through the typed planning
         // API (which calls the SDK's internal builder, then returns an SDK-owned
         // struct — no raw proto crosses the boundary).
@@ -435,16 +442,22 @@ impl ControlPlane for RecordingControlPlane {
             max_containers: planned.max_containers,
             buffer_containers: planned.buffer_containers,
             scaledown_window: planned.scaledown_window,
-            // Surfaced directly from the FunctionSpec the live path builds (the planning
-            // projection does not carry it). DEPLOY-only: the facade's
-            // `build_function_spec` only sets it on the DEPLOY boundary, so a RUN dump
-            // records `false` even when the decorator opts in.
-            checkpointing_enabled: spec.checkpointing_enabled,
+            // Surfaced from the PROJECTION of the wire-built request (not the input
+            // spec), so the dump reflects what the wire actually carries. DEPLOY-only:
+            // the facade's `build_function_spec` only sets these on the DEPLOY
+            // boundary, so a RUN dump records `false`/`None` even when decorated.
+            checkpointing_enabled: planned.checkpointing_enabled,
+            webhook_method: planned.webhook_method,
             function_data_is_none: planned.function_data_is_none,
         });
         // A deterministic function id keeps the cumulative publish union non-empty;
         // it never appears in the recorded manifest (the publish carries no ids).
-        Ok(("fu-1".to_string(), String::new()))
+        // No web_url: the recording plane never talks to a server.
+        Ok(crate::control_plane::Created {
+            function_id: "fu-1".to_string(),
+            definition_id: String::new(),
+            web_url: String::new(),
+        })
     }
 
     async fn publish(
@@ -1364,5 +1377,84 @@ mod tests {
             !checkpointing_enabled(&manifest),
             "flag off ⇒ checkpointing_enabled false on DEPLOY too"
         );
+        // No endpoint decorated ⇒ no webhook method on the DEPLOY FunctionCreate
+        // either (the §6 off-path wire guarantee).
+        assert!(
+            webhook_method(&manifest).is_none(),
+            "no #[endpoint] ⇒ webhook_method absent on DEPLOY too"
+        );
+    }
+
+    /// Pull the (single) FunctionCreate's `webhook_method` out of a manifest.
+    fn webhook_method(manifest: &Manifest) -> Option<String> {
+        manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::FunctionCreate { webhook_method, .. } => {
+                    Some(webhook_method.clone())
+                }
+                _ => None,
+            })
+            .expect("FunctionCreate")
+    }
+
+    #[test]
+    fn webhook_method_rides_into_deploy_function_create_only() {
+        // `#[endpoint(method = "POST")]` takes effect DEPLOY-only (D5: the URL is
+        // deploy-only in v0): the method rides into the DEPLOY
+        // FunctionCreate.webhook_config but is suppressed on the RUN dump — a RUN of
+        // an endpoint fn stays wire-identical to a plain `#[function]`.
+        let cfg = FunctionConfig {
+            webhook_method: Some("POST"),
+            cache: Some(false), // keep the RUN manifest minimal
+            ..FunctionConfig::default()
+        };
+
+        // RUN: the webhook does NOT take effect, even though the fn is decorated.
+        let run_app = App::from_manifest([("add".to_string(), cfg.clone())]);
+        let run_manifest = run_app.dry_run("add", &run_cfg()).expect("dry_run");
+        assert!(
+            webhook_method(&run_manifest).is_none(),
+            "RUN suppresses the webhook — wire-identical to a plain #[function]"
+        );
+        assert!(
+            run_manifest.render().contains("webhook_method=None"),
+            "RUN render shows the webhook off"
+        );
+
+        // DEPLOY: the method rides into FunctionCreate's webhook config, and the
+        // FILE-mode callable is the PER-ENDPOINT adapter while the TAG stays "add".
+        let deploy_app = App::from_manifest([("add".to_string(), cfg)]);
+        let dcfg = DeployConfig {
+            app_name: "web-deploy".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: false,
+            ..DeployConfig::for_app("web-deploy")
+        };
+        let deploy_manifest = deploy_app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+        assert_eq!(
+            webhook_method(&deploy_manifest).as_deref(),
+            Some("POST"),
+            "DEPLOY: the endpoint method rides into FunctionCreate"
+        );
+        assert!(
+            deploy_manifest
+                .render()
+                .contains("webhook_method=Some(\"POST\")"),
+            "DEPLOY render shows the method"
+        );
+        // The object TAG (the projected `function_name`) stays the entrypoint — the
+        // adapter swap rides `implementation_name`, not the tag.
+        let tag = deploy_manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::FunctionCreate { function, .. } => Some(function.clone()),
+                _ => None,
+            })
+            .expect("FunctionCreate");
+        assert_eq!(tag, "add", "object TAG stays the entrypoint name");
     }
 }

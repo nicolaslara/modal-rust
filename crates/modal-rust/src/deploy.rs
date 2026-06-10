@@ -69,6 +69,37 @@ pub(crate) const DEPLOY_CALL_DEADLINE: Duration = Duration::from_secs(600);
 /// verbatim — so [`crate::remote::parse_envelope`] is REUSED unchanged.
 pub(crate) const DEPLOY_WRAPPER_SRC: &str = include_str!("deploy/wrapper.py");
 
+/// Web endpoints §4: the GENERATED per-endpoint adapter suffix appended to
+/// [`DEPLOY_WRAPPER_SRC`] at deploy-bake time — one module-level
+/// `web_<sanitized> = _make_web_handler("<entrypoint>")` line per endpoint
+/// entrypoint, so the deployed endpoint function's `implementation_name`
+/// ([`crate::remote::web_endpoint_attr`], `web_<sanitized>`) resolves a REAL
+/// module attribute in-container. Pure (no I/O); empty input ⇒ empty suffix.
+pub(crate) fn web_adapter_suffix(endpoint_entrypoints: &[&str]) -> String {
+    endpoint_entrypoints
+        .iter()
+        .map(|ep| {
+            let attr = crate::remote::web_endpoint_attr(ep);
+            format!("{attr} = _make_web_handler(\"{ep}\")\n")
+        })
+        .collect()
+}
+
+/// The deploy-wrapper source actually BAKED into the image
+/// ([`crate::control_plane::build_deploy_top_layer_spec`]): the static
+/// [`DEPLOY_WRAPPER_SRC`] plus the generated [`web_adapter_suffix`] when any deployed
+/// entrypoint is a web endpoint. NO endpoints ⇒ the plain [`DEPLOY_WRAPPER_SRC`],
+/// byte-identical (web endpoints forward-safety §6).
+pub(crate) fn baked_deploy_wrapper_src(endpoint_entrypoints: &[&str]) -> String {
+    if endpoint_entrypoints.is_empty() {
+        return DEPLOY_WRAPPER_SRC.to_string();
+    }
+    format!(
+        "{DEPLOY_WRAPPER_SRC}\n{}",
+        web_adapter_suffix(endpoint_entrypoints)
+    )
+}
+
 /// All knobs for the DEPLOY path. Mirrors [`RemoteConfig`] but adds the STABLE
 /// `app_name` and drops the runtime source-mount knobs (the deploy image COPYs the
 /// source into a layer at the fixed [`DEPLOY_SRC`]).
@@ -221,6 +252,10 @@ pub struct DeployedApp {
     pub image_id: String,
     /// Deployed app URL (may be empty depending on the server response).
     pub url: String,
+    /// Entrypoint name → served web endpoint URL, for entrypoints declared with
+    /// `#[endpoint(..)]` (empty for plain functions). BTreeMap so iteration (and any
+    /// printed listing) is deterministically ordered.
+    pub endpoint_urls: std::collections::BTreeMap<String, String>,
 }
 
 /// One entrypoint to deploy: its NAME (the Modal object tag) plus its effective
@@ -236,6 +271,53 @@ pub(crate) struct DeployEntrypoint {
     pub name: String,
     /// Owned per-entrypoint Modal options.
     pub options: FunctionOptions,
+}
+
+/// The pip requirement the deploy BASE layer auto-installs for web endpoints. Modal's
+/// `WEBHOOK_TYPE_FUNCTION` worker wraps the in-container callable in a FastAPI app, and
+/// FunctionCreate REJECTS an endpoint function whose image lacks FastAPI — so an
+/// endpoint deploy must carry it (web endpoints §3, spike finding 2). `fastapi[standard]`
+/// is Modal's own recommended extra.
+const ENDPOINT_FASTAPI_REQUIREMENT: &str = "fastapi[standard]";
+
+/// Web endpoints §3: append `pip_install(["fastapi[standard]"])` to the deploy
+/// BASE-layer image steps when ANY deployed entrypoint declares `webhook_method`.
+///
+/// Deploy-time and deploy-only — called where the deploy plan is assembled in
+/// [`deploy_function`] (NOT in [`DeployConfig::for_app`]), so constructing a config
+/// never mutates the steps and the RUN path is untouched. The step rides the BASE
+/// layer, so the TOP layer's image-build-time `cargo build` AND the deployed runtime
+/// inherit FastAPI (exactly like user `image_steps`).
+///
+/// SKIPPED when the user's own steps already pip-install fastapi (package-NAME match
+/// over `pip_install` packages), so a user-pinned `fastapi==..` / `fastapi[standard]` wins —
+/// including pins folded from a per-function `image = Image(pip = [..])`, which is why
+/// this runs AFTER the C1 image fold. No endpoint ⇒ the steps are left UNTOUCHED ⇒ the
+/// rendered image stays byte-identical (forward-safety §6).
+fn append_endpoint_pip_step<'a>(
+    image_steps: &mut Vec<crate::ImageStep>,
+    entrypoint_options: impl IntoIterator<Item = &'a FunctionOptions>,
+) {
+    let any_endpoint = entrypoint_options
+        .into_iter()
+        .any(|options| options.webhook_method.is_some());
+    if !any_endpoint {
+        return;
+    }
+    let user_pip_installs_fastapi = image_steps.iter().any(|step| match step {
+        crate::ImageStep::Pip(packages) => packages.iter().any(|pkg| {
+            // Match the PACKAGE NAME, not a substring: `fastapi`, `fastapi[standard]`,
+            // `fastapi==0.110`, `FastAPI >=0.1` all count; `fastapi-utils` must NOT.
+            let name_end = pkg
+                .find(['[', '=', '<', '>', '!', '~', ' ', ';'])
+                .unwrap_or(pkg.len());
+            pkg[..name_end].trim().eq_ignore_ascii_case("fastapi")
+        }),
+        _ => false,
+    });
+    if !user_pip_installs_fastapi {
+        image_steps.push(crate::ImageStep::pip([ENDPOINT_FASTAPI_REQUIREMENT]));
+    }
 }
 
 /// Deploy (persistently) ONE Modal function PER ENTRYPOINT under the STABLE app name
@@ -267,10 +349,9 @@ pub(crate) async fn deploy_function(
     // C1: fold a per-function `image = Image(..)` into the SHARED deploy image (v0: the
     // first entrypoint that declares one wins). Done up front so the build context +
     // both image layers render on the declared base.
-    let config = config
+    let mut config = config
         .clone()
         .with_function_image(entrypoints.iter().map(|ep| ep.options.image.as_deref()))?;
-    let config = &config;
 
     // ONE Modal function PER ENTRYPOINT over the SHARED image: the deployed
     // `modal_runner` handles every entrypoint by dispatch, so each entrypoint is its
@@ -293,6 +374,15 @@ pub(crate) async fn deploy_function(
             })
             .collect()
     };
+
+    // Web endpoints §3: ANY planned entrypoint with `webhook_method` ⇒ the deploy BASE
+    // layer auto-installs FastAPI (Modal's FUNCTION webhook requires it in the image).
+    // Gated over the PLAN (like the control plane's snapshot-prime gate) so the
+    // manual/no-decorator fallback options count too, and AFTER the C1 fold so a
+    // user-declared image's own fastapi pip step suppresses the auto-step. No endpoint
+    // ⇒ steps untouched ⇒ the deploy image stays byte-identical.
+    append_endpoint_pip_step(&mut config.image_steps, plan.iter().map(|ep| &ep.options));
+    let config = &config;
     let first_tag = crate::remote::sanitize_object_tag(&plan[0].name);
 
     // The whole MountGetOrCreate→persistent AppGetOrCreate→TWO image layers (the top
@@ -328,11 +418,25 @@ pub(crate) async fn deploy_function(
         .function_from_name(&config.app_name, &first_tag, None)
         .await?;
 
+    // Map served endpoint URLs back from object tags to the user's entrypoint names
+    // (provision keys `endpoint_urls` on the sanitized object tag).
+    let endpoint_urls = plan
+        .iter()
+        .filter_map(|ep| {
+            let tag = crate::remote::sanitize_object_tag(&ep.name);
+            published
+                .endpoint_urls
+                .get(&tag)
+                .map(|url| (ep.name.clone(), url.clone()))
+        })
+        .collect();
+
     Ok(DeployedApp {
         name: config.app_name.clone(),
         function_id,
         image_id: provisioned.image_id,
         url: provisioned.publish_url,
+        endpoint_urls,
     })
 }
 
@@ -470,6 +574,97 @@ mod tests {
     }
 
     #[test]
+    fn deploy_wrapper_src_has_web_handler_factory() {
+        let src = DEPLOY_WRAPPER_SRC;
+        // The per-endpoint adapter FACTORY (web endpoints §4): the deploy bake appends
+        // generated `web_<sanitized> = _make_web_handler("<ep>")` lines that call it.
+        let def_at = src
+            .find("def _make_web_handler(entrypoint):")
+            .expect("the web-handler factory must be defined");
+        // The adapter is ASYNC and takes the FastAPI Request (Modal's FUNCTION webhook
+        // introspects this signature), reads the RAW body (empty body -> "{}")...
+        assert!(
+            src.contains("async def _web(request: Request):"),
+            "the adapter must be async over the FastAPI Request"
+        );
+        assert!(
+            src.contains(r#"(await request.body()).decode() or "{}""#),
+            "the adapter must read the raw body, defaulting empty to {{}}"
+        );
+        // ...frames through the EXISTING handler() ⇒ the SAME serve child (so `#[cls]`
+        // load-once + the memory-snapshot prime compose with endpoints for free)...
+        assert!(
+            src.contains("handler(entrypoint, body)"),
+            "the adapter must frame through the existing handler()"
+        );
+        // ...returns the decoded envelope value on ok, else a JSON error Response:
+        // decode_error -> 422, anything else -> 500.
+        assert!(src.contains(r#"if env.get("ok"):"#));
+        assert!(
+            src.contains(r#"422 if err.get("kind") == "decode_error" else 500"#),
+            "the error contract must map decode_error to 422, otherwise 500"
+        );
+        assert!(
+            src.contains(r#"media_type="application/json""#),
+            "the error Response must be JSON"
+        );
+        // FastAPI is imported LOCALLY inside the factory — a non-endpoint deploy never
+        // calls it, so the import never runs off-path. Exactly ONE fastapi import, and
+        // it sits AFTER the factory def (i.e. inside it, not at module top level).
+        let import_at = src
+            .find("from fastapi import Request, Response")
+            .expect("the factory must import fastapi locally");
+        assert!(
+            import_at > def_at,
+            "the fastapi import must be INSIDE the factory, not module-level"
+        );
+        assert_eq!(
+            src.matches("fastapi").count(),
+            1,
+            "exactly one (local) fastapi import — module import must stay fastapi-free"
+        );
+    }
+
+    #[test]
+    fn web_adapter_suffix_generates_one_line_per_endpoint() {
+        // The pure suffix builder (web endpoints §4): one module-level
+        // `web_<sanitized> = _make_web_handler("<entrypoint>")` line per endpoint.
+        assert_eq!(
+            web_adapter_suffix(&["add"]),
+            "web_add = _make_web_handler(\"add\")\n"
+        );
+        // The attr sanitizes dots/dashes to `_` (a valid Python identifier) while the
+        // factory arg keeps the RAW entrypoint name (the handler dispatch key).
+        assert_eq!(
+            web_adapter_suffix(&["predict", "my-fn.v2"]),
+            "web_predict = _make_web_handler(\"predict\")\n\
+             web_my_fn_v2 = _make_web_handler(\"my-fn.v2\")\n"
+        );
+        assert_eq!(web_adapter_suffix(&[]), "", "no endpoints ⇒ empty suffix");
+    }
+
+    #[test]
+    fn baked_deploy_wrapper_src_is_byte_identical_without_endpoints() {
+        // Off-path forward safety (web endpoints §6): no endpoints ⇒ the baked wrapper
+        // is the plain static source, BYTE-IDENTICAL.
+        assert_eq!(baked_deploy_wrapper_src(&[]), DEPLOY_WRAPPER_SRC);
+    }
+
+    #[test]
+    fn baked_deploy_wrapper_src_appends_the_adapter_suffix_after_the_static_source() {
+        let src = baked_deploy_wrapper_src(&["add"]);
+        assert!(
+            src.starts_with(DEPLOY_WRAPPER_SRC),
+            "the static wrapper source must lead, unmodified"
+        );
+        assert_eq!(
+            &src[DEPLOY_WRAPPER_SRC.len()..],
+            "\nweb_add = _make_web_handler(\"add\")\n",
+            "the generated adapter lines ride after a separating newline"
+        );
+    }
+
+    #[test]
     fn deploy_config_default_has_stable_app_name() {
         // Serialized against other env-mutating tests (reads default MODAL_RUST_*);
         // see `crate::ENV_TEST_LOCK`.
@@ -514,6 +709,113 @@ mod tests {
         assert_eq!(
             cfg.options.volumes,
             vec![("/models".to_string(), "weights".to_string())]
+        );
+    }
+
+    #[test]
+    fn endpoint_deploy_appends_and_bakes_the_fastapi_pip_step() {
+        use crate::control_plane::{
+            build_image_spec, Entrypoint, ProvisionInputs, SourceInputs, DEPLOY_BOUNDARY,
+        };
+        // Web endpoints §3 (spike finding 2): ANY deployed endpoint ⇒ the deploy BASE
+        // layer gains pip_install(["fastapi[standard]"]) AFTER the user's own steps.
+        let plan = [Entrypoint {
+            name: "predict".to_string(),
+            options: FunctionOptions {
+                webhook_method: Some("POST".to_string()),
+                ..FunctionOptions::default()
+            },
+            timeout_secs: 300,
+        }];
+        let mut steps = vec![crate::ImageStep::apt(["libssl-dev"])];
+        append_endpoint_pip_step(&mut steps, plan.iter().map(|ep| &ep.options));
+        assert_eq!(
+            steps,
+            vec![
+                crate::ImageStep::apt(["libssl-dev"]),
+                crate::ImageStep::pip(["fastapi[standard]"]),
+            ],
+            "endpoint deploy appends the fastapi auto-step after the user steps"
+        );
+        // ...and the DEPLOY BASE layer bakes it as the canonical pip RUN line (the TOP
+        // layer + deployed runtime inherit it).
+        let inputs = ProvisionInputs {
+            app_name: "app",
+            app_id: Some("ap-1"),
+            source: SourceInputs {
+                local_root: std::path::Path::new("/ws"),
+                package: "example-add",
+                use_cargo_scoping: false,
+                modalignore_name: ".modalignore",
+                remote_src: DEPLOY_SRC,
+            },
+            base_image: "rust:1-slim",
+            install_rust: false,
+            image_steps: &steps,
+            cache: false,
+            snapshot_best_effort: false,
+            entrypoints: &plan,
+        };
+        let base = build_image_spec(&DEPLOY_BOUNDARY, &inputs, "mo-py-standalone");
+        assert!(
+            base.builder_steps
+                .iter()
+                .any(|c| c == "RUN python3 -m pip install --no-cache-dir fastapi[standard]"),
+            "deploy BASE layer must bake the fastapi pip step, got: {:?}",
+            base.builder_steps
+        );
+    }
+
+    #[test]
+    fn non_endpoint_deploy_image_steps_stay_byte_identical() {
+        // Off-path forward safety (web endpoints §6): NO endpoint ⇒ the steps are
+        // UNTOUCHED (both the empty default and user-supplied steps) ⇒ the rendered
+        // deploy image is byte-identical to before web endpoints.
+        let plain = FunctionOptions::default();
+        let mut steps: Vec<crate::ImageStep> = Vec::new();
+        append_endpoint_pip_step(&mut steps, [&plain]);
+        assert!(
+            steps.is_empty(),
+            "no endpoint ⇒ no auto-step on the default path"
+        );
+
+        let user = vec![
+            crate::ImageStep::pip(["requests"]),
+            crate::ImageStep::run(["echo ok"]),
+        ];
+        let mut steps = user.clone();
+        append_endpoint_pip_step(&mut steps, [&plain]);
+        assert_eq!(steps, user, "no endpoint ⇒ user steps stay byte-identical");
+    }
+
+    #[test]
+    fn endpoint_deploy_skips_the_auto_step_when_user_pip_installs_fastapi() {
+        // Dedup (§3): the user already pip-installs fastapi (substring check over
+        // pip_install packages — a pinned `fastapi==..` counts) ⇒ the auto-step is
+        // SKIPPED so the user's pin wins.
+        let endpoint = FunctionOptions {
+            webhook_method: Some("GET".to_string()),
+            ..FunctionOptions::default()
+        };
+        let user = vec![crate::ImageStep::pip(["fastapi==0.115.0", "uvloop"])];
+        let mut steps = user.clone();
+        append_endpoint_pip_step(&mut steps, [&endpoint]);
+        assert_eq!(
+            steps, user,
+            "a user fastapi pip step suppresses the auto-step"
+        );
+
+        // Only pip_install packages count: a non-pip step mentioning fastapi does not
+        // install the Python package, so the auto-step still rides.
+        let mut steps = vec![crate::ImageStep::run(["echo fastapi"])];
+        append_endpoint_pip_step(&mut steps, [&endpoint]);
+        assert_eq!(
+            steps,
+            vec![
+                crate::ImageStep::run(["echo fastapi"]),
+                crate::ImageStep::pip(["fastapi[standard]"]),
+            ],
+            "non-pip steps do not suppress the auto-step"
         );
     }
 }

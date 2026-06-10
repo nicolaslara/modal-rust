@@ -13,7 +13,7 @@ Modal references are file:line into `references/modal-client/py/modal/` (the
 official client; `_*.py` files hold the real implementations — the public
 `image.py`/`functions.py` etc. are thin `synchronize_api` shims). Everything below
 was checked against the actual Rust source and the Modal source on
-2026-06-05; no Modal feature is asserted that is not in that tree.
+2026-06-10; no Modal feature is asserted that is not in that tree.
 
 ---
 
@@ -37,10 +37,12 @@ dispatches to the registered Rust handler over a JSON envelope. There is **no Ru
 equivalent of cloudpickle**, and Modal's container entrypoint
 (`_container_entrypoint.py`) is Python-callable-shaped, so a "serialized Rust
 closure" mode is not on the table. This is a deliberate, foundational choice, not a
-gap to close — but it explains why several Modal surfaces (web endpoints, generators,
-and the deeper `Cls` lifecycle bits like `@exit`) do not map cleanly. The core `Cls`
+gap to close — but it explains why several Modal surfaces (generators, and the deeper
+`Cls` lifecycle bits like `@exit`) do not map cleanly. The core `Cls`
 load-once-serve-many pattern still landed in FILE mode (a per-method dotted
-entrypoint + a warm-container `--serve` loop — see §7).
+entrypoint + a warm-container `--serve` loop — see §7), and so did single-function
+**web endpoints** (a per-endpoint FastAPI-shaped adapter in the baked wrapper, fed by
+the same `--serve` loop — see §8).
 
 ---
 
@@ -268,8 +270,8 @@ and class parameters (`modal.parameter`). Until then, inject config via
 
 | Surface | Status | Modal ref |
 |---|---|---|
-| **Web endpoints** — `@fastapi_endpoint`/`@web_endpoint` | **Missing** | `_partial_function.py:336` / `400`. |
-| `@asgi_app` / `@wsgi_app` / `@web_server` | **Missing** | `_partial_function.py:413` / `468` / `525`. |
+| **Web endpoints** — `@fastapi_endpoint`/`@web_endpoint` | **Have** (`#[endpoint]`, FUNCTION type; live-proven 2026-06-10: POST 200 + computed JSON, GET 405, 422/500 redacted) | `_partial_function.py:336` / `400`. `#[modal_rust::endpoint(method = "POST", <any #[function] config>)]` on a plain handler → `webhook_config{type: FUNCTION, method, requires_proxy_auth}` + the ASGI data-format pair on the DEPLOY `FunctionCreate`; DEPLOY-ONLY (the URL is assigned on deploy; RUN stays wire-identical, like `enable_memory_snapshot`). The deploy image auto-adds `fastapi[standard]` (Modal rejects FUNCTION webhooks without it) and the baked wrapper gains a per-endpoint `(request: Request)` adapter reusing the SAME `--serve` child — so `#[cls]` load-once and memory snapshot compose with endpoints. HTTP contract = the auto-IO contract (body in, value out; envelope errors → 422 decode / 500 handler). Public by default; `requires_proxy_auth = true` opts into Modal proxy-auth. The fn stays a normal function for `.local()` and RUN (webhook suppressed); the DEPLOYED endpoint is HTTP-only in v0 — Modal's worker ASGI-wraps the callable, so envelope `.remote()`/`call` against it is rejected (live-verified); both-surfaces = Modal's own idiom (plain `#[function]` + thin `#[endpoint]` caller). `examples/web-endpoint`, §8. Remaining gaps: custom domains, `requested_suffix`, `web_endpoint_docs`, the ephemeral `modal serve`-style dev URL, `#[endpoint]` on `#[cls]` methods. |
+| `@asgi_app` / `@wsgi_app` / `@web_server` | **Missing** | `_partial_function.py:413` / `468` / `525`. `#[web_server]` (a Rust `Router` behind `WEBHOOK_TYPE_WEB_SERVER`) is the designed follow-up — it reuses `#[endpoint]`'s `webhook_config` plumbing; `#[asgi_app]` (a *Python* ASGI callable) almost certainly never maps to Rust. |
 | **Sandboxes** (`Sandbox.create`, `exec`, filesystem, tunnels, snapshots) | **Missing** | `sandbox.py:450`, `1605`, `1907`, `1427`. A large, self-contained subsystem. |
 | **`Dict`** (distributed key/value) | **Missing** | `dict.py` (`get`/`put`/`pop`/`keys`/...). |
 | **`Queue`** (distributed queue) | **Missing** | `queue.py` (`put`/`get`/`get_many`/partitions). |
@@ -277,7 +279,7 @@ and class parameters (`modal.parameter`). Until then, inject config via
 | **`Proxy`** (static-egress proxy) | **Missing** | `proxy.py`. |
 | **Scaling / autoscaler control** | **Partial** | Static config `min/max/buffer_containers` + `scaledown_window` are **Have** (§4) → `Function.autoscaler_settings`. Live `update_autoscaler` (§6) is still Missing. |
 | **Tunnels** (`forward`) | **Missing** | `_tunnel.py`. |
-| **Cls-based memory snapshot / checkpointing** | **Have** (`#[cls]`, CPU) | `snapshot.py`. `#[cls(enable_memory_snapshot = true)]` pays the expensive `#[enter]` load **once ever**, snapshots the loaded process, and restores it on every (even cold) container start — extending load-once-serve-many across cold starts. DEPLOY-ONLY (RUN stays wire-identical); a typed `prime` lifecycle frame on the `--serve` loop runs `#[enter]` inside Modal's snapshot window, degrading to the lazy `#[enter]` path if the prime ever fails. `examples/snapshot-class`, §4. The GPU snap/restore split (load CPU in the snapshot window, move to GPU after a `restore` frame + `#[restore]` hook) is the remaining gap. |
+| **Cls-based memory snapshot / checkpointing** | **Have** (`#[cls]`, CPU) | `snapshot.py`. `#[cls(enable_memory_snapshot = true)]` pays the expensive `#[enter]` load **once ever**, snapshots the loaded process, and restores it on every (even cold) container start — extending load-once-serve-many across cold starts. DEPLOY-ONLY (RUN stays wire-identical); a typed `prime` lifecycle frame on the `--serve` loop runs `#[enter]` inside Modal's snapshot window; a FAILED prime fails container init loudly by default (`MODAL_RUST_SNAPSHOT_BEST_EFFORT=1` opts into degrading to the lazy `#[enter]` path). `examples/snapshot-class`, §4. The GPU snap/restore split (load CPU in the snapshot window, move to GPU after a `restore` frame + `#[restore]` hook) is the remaining gap. |
 | **Logs streaming / `modal logs`** | **Partial** | We stream image-build logs (`ImageJoinStreaming`) and function-output logs inline; no general `app logs` / live function log tail API. |
 | **Environments / Workspaces management** | **Partial** | We resolve/use the configured environment (`env_or_default`); no create/list environment RPCs (`environments.py`, `workspace.py`). |
 | **Billing / call graph / clustered functions** | **Missing** | `billing.py`, `call_graph.py`, `_clustered_functions.py`. |
@@ -333,6 +335,7 @@ Ordered by value-to-effort for a Rust-on-Modal runtime:
    dotted `"<Class>.<method>"` entrypoints with merged config; live-confirmed on a T4.
    `examples/stateful-class`. Deferred to Shape B: `#[exit]` + `modal.parameter` class
    params (see §7).
-9. **Bigger subsystems** (web endpoints, Sandboxes, Dict, Queue) — each is a
-   milestone-sized effort. With `Cls` v0 landed, **web endpoints** are now the largest
-   remaining gap.
+9. **Bigger subsystems** — each is a milestone-sized effort. ~~**Web endpoints**~~ —
+   DONE (v0, `#[endpoint]`, FUNCTION type; see §8 — `@web_server`/ASGI shapes and
+   custom domains remain follow-ups). With endpoints landed, **Sandboxes / Dict /
+   Queue** are the largest remaining gaps.

@@ -84,6 +84,22 @@ pub struct PlannedFunction {
     /// Idle-before-scaledown seconds — `Function.autoscaler_settings.scaledown_window`;
     /// `None` = unset.
     pub scaledown_window: Option<u32>,
+    /// Memory-snapshot opt-in (`Function.checkpointing_enabled`, field 41; field 40
+    /// `is_checkpointing_function` always mirrors it).
+    pub checkpointing_enabled: bool,
+    /// Web-endpoint HTTP method (`Function.webhook_config.method`); `None` = not a
+    /// web endpoint.
+    pub webhook_method: Option<String>,
+    /// Web-endpoint proxy-auth requirement
+    /// (`Function.webhook_config.requires_proxy_auth`); `false` when not a web
+    /// endpoint (and public-by-default when one).
+    pub webhook_requires_proxy_auth: bool,
+    /// Advertised input data formats (`Function.supported_input_formats`) as enum
+    /// names (`"PICKLE"`, `"CBOR"`, `"ASGI"`, …) — surfaces the non-obvious ASGI swap
+    /// a web endpoint performs, exactly the wire effect a dry-run exists to reveal.
+    pub supported_input_formats: Vec<String>,
+    /// Advertised output data formats (`Function.supported_output_formats`).
+    pub supported_output_formats: Vec<String>,
     /// The FILE-mode XOR invariant: `FunctionCreateRequest.function_data` is unset.
     pub function_data_is_none: bool,
 }
@@ -163,7 +179,38 @@ pub fn plan_function_request(
         max_containers,
         buffer_containers,
         scaledown_window,
+        checkpointing_enabled: function.checkpointing_enabled,
+        webhook_method: function.webhook_config.as_ref().map(|w| w.method.clone()),
+        webhook_requires_proxy_auth: function
+            .webhook_config
+            .as_ref()
+            .map(|w| w.requires_proxy_auth)
+            .unwrap_or(false),
+        supported_input_formats: function
+            .supported_input_formats
+            .iter()
+            .map(|f| data_format_name(*f))
+            .collect(),
+        supported_output_formats: function
+            .supported_output_formats
+            .iter()
+            .map(|f| data_format_name(*f))
+            .collect(),
         function_data_is_none,
+    }
+}
+
+/// Render a `DataFormat` enum value as its short name — keeps the proto enum from
+/// leaking across the crate boundary.
+fn data_format_name(value: i32) -> String {
+    use crate::proto::api::DataFormat;
+    match DataFormat::try_from(value) {
+        Ok(DataFormat::Pickle) => "PICKLE".to_string(),
+        Ok(DataFormat::Cbor) => "CBOR".to_string(),
+        Ok(DataFormat::Asgi) => "ASGI".to_string(),
+        Ok(DataFormat::GeneratorDone) => "GENERATOR_DONE".to_string(),
+        Ok(other) => format!("{other:?}").to_uppercase(),
+        Err(_) => format!("UNKNOWN({value})"),
     }
 }
 
@@ -260,6 +307,94 @@ mod tests {
         assert!(
             planned.function_data_is_none,
             "FILE-mode XOR: function_data is None"
+        );
+    }
+
+    /// COMPLETENESS GUARD (architecture review 2026-06-10, in-flight #4): prove the
+    /// dump's projection covers EVERY wire field the builder sets. Build a MAXIMAL
+    /// spec, then clear (a) every field [`PlannedFunction`] projects and (b) every
+    /// field the projection CONSCIOUSLY skips (each with its reason). If the cleared
+    /// proto is not `Function::default()`, the builder started setting a wire field
+    /// nobody projected or consciously skipped — the dump would silently
+    /// under-report the wire. Fix by projecting it into [`PlannedFunction`] or
+    /// adding it to the skip list below WITH a reason.
+    #[test]
+    fn plan_function_projection_is_complete_over_the_builder() {
+        use crate::ops::function::{FunctionAutoscaler, FunctionVolumeMount, WebhookSpec};
+        use crate::proto::api::Function;
+
+        // MAXIMAL spec: every FunctionSpec knob set, so the builder emits every
+        // wire field it knows how to set.
+        let spec = FunctionSpec::new("modal_rust_deploy_wrapper", "handler", "im-1")
+            .with_app_function_name("web_greet")
+            .with_mount_ids(vec!["mo-1".to_string()])
+            .with_timeout_secs(600)
+            .with_gpu(Some("T4"))
+            .expect("valid gpu")
+            .with_milli_cpu(Some(1000))
+            .with_memory_mb(Some(2048))
+            .with_mount_client_dependencies(true)
+            .with_volume_mounts(vec![FunctionVolumeMount::new("vo-1", "/data")])
+            .with_secret_ids(vec!["st-1".to_string()])
+            .with_retry_policy(Some("retries:max=2,backoff=2.0,initial_ms=100,max_ms=1000"))
+            .expect("valid retries")
+            .with_schedule(Some("cron:UTC:0 9 * * 1"))
+            .expect("valid schedule")
+            .with_autoscaler(FunctionAutoscaler {
+                min_containers: Some(1),
+                max_containers: Some(2),
+                buffer_containers: Some(1),
+                scaledown_window: Some(60),
+            })
+            .expect("valid autoscaler")
+            .with_memory_snapshot(true)
+            .with_webhook(Some(WebhookSpec {
+                method: "POST".to_string(),
+                requires_proxy_auth: true,
+            }))
+            .expect("valid webhook");
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+        let mut function = req.function.expect("FILE mode sets `function`");
+
+        // (a) Every field the PlannedFunction projection covers:
+        function.module_name = String::new();
+        function.function_name = String::new();
+        function.mount_ids.clear();
+        function.resources = None; // projected as gpu / milli_cpu / memory_mb
+        function.timeout_secs = 0;
+        function.volume_mounts.clear();
+        function.secret_ids.clear();
+        function.retry_policy = None;
+        function.schedule = None;
+        function.autoscaler_settings = None;
+        function.checkpointing_enabled = false;
+        function.webhook_config = None; // projected as webhook_method + proxy_auth
+        function.supported_input_formats.clear();
+        function.supported_output_formats.clear();
+
+        // (b) Fields the builder sets that the projection CONSCIOUSLY skips:
+        // derived from the projected function_name decoupling, not independent config.
+        function.implementation_name = String::new();
+        // an input id threaded by the caller (the dump records the image separately).
+        function.image_id = String::new();
+        // constants pinned by build_function_create_request_file_mode_xor_and_wrapper.
+        function.definition_type = 0;
+        function.function_type = 0;
+        // builder constant (modern image builder always mounts client deps).
+        function.mount_client_dependencies = false;
+        // legacy MIRRORS of the projected autoscaler knobs (same values by construction).
+        function.warm_pool_size = 0;
+        function.concurrency_limit = 0;
+        function.experimental_buffer_containers = 0;
+        function.task_idle_timeout_secs = 0;
+        // mirror of the projected checkpointing_enabled (field 40 always equals 41).
+        function.is_checkpointing_function = false;
+
+        assert_eq!(
+            function,
+            Function::default(),
+            "builder sets a wire field the dump projection does not cover; project it \
+             into PlannedFunction or consciously skip it above with a reason"
         );
     }
 
