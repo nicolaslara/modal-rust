@@ -220,6 +220,10 @@ recommendation confidence, open questions.
 criteria, user-sensitive decisions called out.
 
 **Implementation (once a Cargo workspace exists):** `cargo fmt --check`,
-`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, plus
-the milestone's manual smoke (local dispatch, remote run, deploy/call, or GPU as
-applicable). Record skipped verification with a reason.
+`cargo clippy --all-targets -- -D warnings`, the light facade lint
+`cargo clippy -p modal-rust -p modal-rust-macros -- -D warnings` (lib-only — the
+self dev-dep makes test targets non-light), and `cargo test` — all on
+`default-members`, NEVER `--workspace`/`--all-features` (they pull the CUDA-only
+`example-burn-add`; matches WORKING.md and CI exactly) — plus the milestone's
+manual smoke (local dispatch, remote run, deploy/call, or GPU as applicable).
+Record skipped verification with a reason.

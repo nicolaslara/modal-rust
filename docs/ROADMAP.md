@@ -5,10 +5,12 @@ Living backlog. Source for the ergonomics/docs items: `docs/local/ergonomics-and
 
 ---
 
-## Active: newcomer ergonomics + real README examples (the P0s)
+## DONE: newcomer ergonomics + real README examples (the P0s)
 
-Being addressed by the ergonomics-hardening workflow. Verify each claimed bug against the
-code before fixing.
+All six landed via the ergonomics-hardening + runner-bin-removal workflows (the CLI
+generates the runner for bin-less crates; README snippets are extracted-from real,
+tested crates; the `AddCall` import is documented in the snippet itself). Kept for
+history — details below describe the PRE-fix state.
 
 1. **`modal_runner!()` macro.** Every crate hand-writes `src/bin/modal_runner.rs` + a
    `[[bin]]` stanza, and the macro-path version reaches into `__private::runtime`, which
@@ -58,8 +60,32 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   merged class/method config; live-confirmed on a T4. `examples/stateful-class`.
   Deferred to Shape B: `#[exit]` (marker reserved, emits `compile_error`) +
   `modal.parameter` class params (use `#[cls(secrets=[..])]` + `std::env` for now).
-- Web endpoints (`@fastapi_endpoint`/`@asgi_app`) — now the largest remaining gap —
-  then `Dict`/`Queue`/`Sandbox`/NFS.
+- ~~Web endpoints (`@fastapi_endpoint`)~~ — DONE (v0, `#[endpoint]`, FUNCTION type):
+  `#[modal_rust::endpoint(method = "POST", <any #[function] config>)]` exposes a plain
+  `#[function]`-shaped handler over HTTP on a **deployed** app — `webhook_config{type:
+  FUNCTION, method, requires_proxy_auth}` + the ASGI data formats ride the DEPLOY
+  `FunctionCreate` only (RUN stays wire-identical; the URL is deploy-only, D5). The
+  deploy image auto-adds `fastapi[standard]`; the baked wrapper gains a per-endpoint
+  `(request: Request)` adapter reusing the SAME `--serve` child (so `#[cls]`
+  load-once + memory snapshot compose with endpoints). Public by default,
+  `requires_proxy_auth = true` opts into Modal proxy-auth; `method` is required and
+  validated at compile time. DUAL surface: the fn keeps its typed
+  `.local()`/`.remote()` path alongside the URL. `examples/web-endpoint`. Named
+  follow-ups:
+  - **`#[web_server]`** — the full-app shape (a Rust `Router`/real HTTP server behind
+    `WEBHOOK_TYPE_WEB_SERVER`): routing, multiple methods, streaming, websockets.
+    Reuses v0's `webhook_config` plumbing; needs the new `--web` runtime mode.
+    (`#[asgi_app]` stays reserved-only — a Rust fn cannot return a Python ASGI app.)
+  - **Custom domains / `requested_suffix` / `web_endpoint_docs`** — the remaining
+    `WebhookConfig` knobs (v0 takes Modal's default URL label, no OpenAPI docs page).
+  - **`#[endpoint]` on a `#[cls]` method** (stateful endpoints) — currently a
+    compile error.
+  - **Ephemeral dev URL** — the `modal serve`-style URL on the RUN boundary (v0 is
+    deploy-only).
+  - **Surface the assigned `web_url`** — print it from `modal-rust deploy` / carry it
+    on `DeployedApp` (the SDK already returns it on the create:
+    `CreatedFunction.web_url`).
+- Next big subsystems: `Dict`/`Queue`/`Sandbox`/NFS.
 - ~~**`enable_memory_snapshot` / Cls memory-checkpointing** (high value, `snapshot.py`)~~
   — DONE (v0, CPU-only, `#[cls]`-only): `#[cls(enable_memory_snapshot = true)]` makes the
   expensive `#[enter]` load run **once ever** on a *deployed* app — Modal snapshots the
@@ -87,13 +113,12 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
 ## Tech debt
 
 ### Real (worth fixing)
-- The two `DEFAULT_DEPLOY_APP` constants hold **different strings** (`modal-rust-add-poc` in the
-  CLI vs `modal-rust-add-deploy` in the facade) — flagged in the architecture review, never
-  reconciled.
-- Runner-bin boilerplate (→ Active #1).
-- Large files: `runtime/lib.rs` ~1113, `remote.rs` ~980, `image.rs` ~935;
-  the RUN wrapper has been extracted to `remote/wrapper.py`, while the smaller
-  `DEPLOY_WRAPPER_SRC` is still an inline Python heredoc embedded in a Rust string.
+- ~~The two `DEFAULT_DEPLOY_APP` constants hold different strings~~ — FIXED: the CLI
+  re-exports the facade's single constant.
+- ~~Runner-bin boilerplate~~ — FIXED: the CLI generates the runner for bin-less crates
+  (runner-bin-removal).
+- Large files: `runtime/lib.rs` ~1113, `remote.rs` ~980, `image.rs` ~935. Both wrappers
+  are now real `.py` files (`remote/wrapper.py`, `deploy/wrapper.py` via `include_str!`).
 - The testkit duplicates the 4129-line proto + a 201-RPC server (its own `build_server`) —
   acceptable for a dev crate, but heavy.
 

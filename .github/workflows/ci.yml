@@ -66,6 +66,19 @@ jobs:
         # (set in Cargo.toml) excludes it; it is built/verified on Modal.
         run: cargo +"$RUST_TOOLCHAIN" clippy --all-targets -- -D warnings
 
+      - name: Lint (light facade — default features, no client)
+        if: steps.detect.outputs.has_cargo == 'true'
+        # AGENTS.md's key correctness gate (architecture review H1): the facade must
+        # ALSO compile/lint LIGHT — default features, no gRPC client — because that is
+        # the configuration every external function-only crate AND the in-container
+        # modal_runner build get. The workspace invocation above never sees it:
+        # feature unification (the CLI's `modal-rust/client`, the facade's self
+        # dev-dep `testkit`) lights `client` everywhere. LIB-ONLY on purpose:
+        # `--all-targets` pulls the self dev-dep back in (verified — it compiles
+        # tonic), so the facade's test targets can never be light; the light surface
+        # IS the lib.
+        run: cargo +"$RUST_TOOLCHAIN" clippy -p modal-rust -p modal-rust-macros -- -D warnings
+
       - name: Test
         if: steps.detect.outputs.has_cargo == 'true'
         run: cargo +"$RUST_TOOLCHAIN" test

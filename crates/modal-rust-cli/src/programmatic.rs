@@ -10,8 +10,10 @@
 //!    ONLY; the REMOTE build still happens per the frozen build boundary (in-body for
 //!    `run`, at image-build for `deploy`, both `--release`). The CLI does NOT upload
 //!    this local binary.
-//! 2. Run `<target>/debug/modal_runner --describe`, parse the `modal-rust/describe@1`
-//!    manifest (entrypoints + per-entrypoint `FunctionOptions`).
+//! 2. Run the built runner's `--describe` (exec'd from a PACKAGE-SCOPED hard link,
+//!    `<target>/.modal-rust/runner-<package>` — see H2 in `build_and_describe`) and
+//!    parse the `modal-rust/describe@1` manifest (entrypoints + per-entrypoint
+//!    `FunctionOptions`).
 //!
 //! A MANIFEST CACHE (`describe_cache`) keyed on the closure source + `Cargo.lock` short-
 //! circuits steps 1+2 entirely on a hit (0s): the manifest is the only thing the CLI
@@ -114,15 +116,20 @@ fn check_schema(schema: &str) -> Result<()> {
 ///
 /// Auto-detect (inject-bin, design B):
 /// - If the target crate ALREADY ships a `modal_runner` bin → build it DEBUG at the
-///   real workspace root and run `<target>/debug/modal_runner --describe` (today's
-///   path, backward-compatible, byte-identical manifest — only the profile changed).
+///   real workspace root (backward-compatible, byte-identical manifest — only the
+///   profile changed).
 /// - Otherwise GENERATE: materialize a temp SHADOW copy of the crate's cargo
 ///   dependency closure with the generated `src/bin/modal_runner.rs` injected, build
 ///   `-p <pkg> --bin modal_runner` (DEBUG) THERE (cwd = shadow root) but with
 ///   `CARGO_TARGET_DIR` pointed at the USER's shared target so the ~190 dep crates are
-///   CACHE HITS (only the copied lib + the tiny generated bin recompile, ~0.5s), then
-///   run the shared target's `debug/modal_runner --describe`. The user's on-disk `src/`
-///   is never touched; the shadow resolves `modal-rust` identically to the real upload.
+///   CACHE HITS (only the copied lib + the tiny generated bin recompile, ~0.5s). The
+///   user's on-disk `src/` is never touched; the shadow resolves `modal-rust`
+///   identically to the real upload.
+///
+/// Either way the built runner is exec'd from a PACKAGE-SCOPED hard link
+/// (`<target>/.modal-rust/runner-<package>`, H2) of the exact artifact cargo
+/// reported — never from the one shared `debug/modal_runner` uplift path another
+/// crate's build can overwrite.
 ///
 /// A debug profile (not `--release`) is correct because `--describe` only reads the
 /// inventory registry + per-entrypoint `FunctionOptions` and serializes JSON — the
@@ -231,10 +238,14 @@ fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
                 }
                 eprintln!("modal-rust: describe cache hit ({package}); skipping build");
                 // The cache skips the build, so the runner binary MAY be absent (e.g.
-                // after `cargo clean`). Surface it for `--check-input` only when it is
-                // actually on disk; otherwise validation degrades to the remote decode
-                // check (no forced rebuild — keeps the cache-hit happy path fast).
-                let runner_bin = shared_target.join("debug").join("modal_runner");
+                // after `cargo clean`). Probe the PACKAGE-SCOPED pin (H2) — never the
+                // shared uplift path, which may hold ANOTHER crate's last build —
+                // and surface it for `--check-input` only when actually on disk;
+                // otherwise validation degrades to the remote decode check (no forced
+                // rebuild — keeps the cache-hit happy path fast).
+                let runner_bin = shared_target
+                    .join(".modal-rust")
+                    .join(format!("runner-{package}"));
                 let runner_bin = runner_bin.is_file().then_some(runner_bin);
                 return Ok(DescribeOutcome {
                     manifest,
@@ -276,15 +287,41 @@ fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
     } else {
         eprintln!("modal-rust: building {package} modal_runner (cargo) for --describe …");
     }
+    // `json-render-diagnostics`: rustc errors/warnings still render to the inherited
+    // stderr (the streamed compile log is unchanged), while stdout carries cargo's
+    // artifact messages — the `compiler-artifact` line for the runner bin holds the
+    // REAL `executable` path, honoring `CARGO_TARGET_DIR` AND any `.cargo/config.toml`
+    // `build.target-dir` for BOTH arms (H2: the own-bin arm previously assumed
+    // `<root>/target` and could exec a wrong-or-stale binary under a custom target dir).
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "-p", &package, "--bin", "modal_runner"])
-        .current_dir(build_root);
+    cmd.args([
+        "build",
+        "-p",
+        &package,
+        "--bin",
+        "modal_runner",
+        "--message-format",
+        "json-render-diagnostics",
+    ])
+    .current_dir(build_root)
+    .stdout(std::process::Stdio::piped());
     if generate {
         cmd.env("CARGO_TARGET_DIR", &shared_target);
     }
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
         .context("failed to spawn `cargo` (is it on $PATH? run `modal-rust doctor --rust`)")?;
+    let mut build_json = String::new();
+    {
+        use std::io::Read as _;
+        child
+            .stdout
+            .take()
+            .expect("stdout piped above")
+            .read_to_string(&mut build_json)
+            .context("failed to read cargo's artifact messages")?;
+    }
+    let status = child.wait().context("failed to wait for `cargo build`")?;
     if !status.success() {
         bail!(
             "cargo build of `{package}` modal_runner failed (exit {})",
@@ -292,15 +329,19 @@ fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
         );
     }
 
-    // 2. Run `modal_runner --describe`, capture stdout, parse the manifest. The shadow
-    //    build deposits into the SHARED target (via the env above); the own-bin build
-    //    deposits into the build root's own target (= the shared target, since cwd=root).
-    let target_dir = if generate {
-        shared_target.clone()
-    } else {
-        build_root.join("target")
+    // 2. Run the runner's `--describe`, capture stdout, parse the manifest. H2: every
+    //    generated runner used to be exec'd from the ONE shared `<target>/debug/
+    //    modal_runner` uplift path, so crate B's build could shadow crate A's between
+    //    A's build and A's exec (cross-crate manifest/validation poisoning). Now the
+    //    artifact cargo just reported is hard-linked to a PACKAGE-SCOPED name and only
+    //    that scoped path is ever exec'd — interleaved builds of OTHER packages can no
+    //    longer swap the binary under us.
+    let runner_bin = match runner_artifact_path(&build_json) {
+        Some(artifact) => scope_runner_artifact(&shared_target, &package, &artifact),
+        // No artifact message (unexpected cargo output): fall back to the legacy
+        // shared uplift path — now env-aware for both arms via `shared_target`.
+        None => shared_target.join("debug").join("modal_runner"),
     };
-    let runner_bin = target_dir.join("debug").join("modal_runner");
     let out = Command::new(&runner_bin)
         .arg("--describe")
         .output()
@@ -353,11 +394,12 @@ fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
 /// `unknown_entrypoint`). We key off the exit code + the envelope's `error.kind`:
 /// `decode_error` is a real input-shape mismatch (fail fast); `unknown_entrypoint`
 /// means the on-disk runner does NOT register this entrypoint, which — since the
-/// caller already confirmed it exists in the held describe manifest — can only mean the
-/// runner binary at the shared `<target>/debug/modal_runner` path is a DIFFERENT
-/// generatable crate's last build (all generated runners collide on that one path). In
-/// that case the local check is not authoritative for THIS crate, so we degrade to the
-/// remote decode check rather than false-rejecting a valid run.
+/// caller already confirmed it exists in the held describe manifest — means the binary
+/// is STALE relative to the manifest (e.g. a cache-hit probed a package-scoped pin
+/// from an older source state; before H2's scoping it could even be a DIFFERENT
+/// crate's build on the one shared uplift path). Either way the local check is not
+/// authoritative for THIS crate, so we degrade to the remote decode check rather than
+/// false-rejecting a valid run.
 fn validate_input_locally(runner_bin: &Path, entrypoint: &str, input_json: &str) -> Result<()> {
     let out = match Command::new(runner_bin)
         .args(["--check-input", "--entrypoint", entrypoint, "--input-json"])
@@ -431,6 +473,53 @@ impl Drop for ShadowDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Extract the runner bin's REAL executable path from cargo's
+/// `--message-format=json-render-diagnostics` stdout: one JSON object per line; the
+/// `compiler-artifact` message whose target is `modal_runner` carries `executable` —
+/// the uplifted path under whatever target dir cargo ACTUALLY used (env var,
+/// `.cargo/config.toml` `build.target-dir`, or the default). Last match wins
+/// (a rebuild re-emits the artifact). `None` when no artifact line matched (e.g. a
+/// fully-fresh build that errored earlier, or unexpected cargo output).
+fn runner_artifact_path(build_json: &str) -> Option<PathBuf> {
+    let mut found = None;
+    for line in build_json.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        if v.pointer("/target/name").and_then(|n| n.as_str()) != Some("modal_runner") {
+            continue;
+        }
+        if let Some(exe) = v.get("executable").and_then(|e| e.as_str()) {
+            found = Some(PathBuf::from(exe));
+        }
+    }
+    found
+}
+
+/// H2: pin the just-built runner under a PACKAGE-SCOPED name —
+/// `<shared_target>/.modal-rust/runner-<package>` — and return that path. Every
+/// generated runner used to share ONE `<target>/debug/modal_runner` uplift path, so
+/// another crate's build (even in plain serial use) replaced the binary the manifest
+/// cache and `--check-input` later exec'd: same-named entrypoints with different input
+/// shapes were FALSELY rejected, and an interleaved build could cache crate B's
+/// manifest under crate A's key. A hard link is free and atomic-enough (created
+/// immediately after cargo returns, from the exact artifact cargo reported); falls
+/// back to a copy across filesystems, and to the raw artifact path if even that fails
+/// (never an error — scoping is a hazard fix, not a correctness gate for THIS run).
+fn scope_runner_artifact(shared_target: &Path, package: &str, artifact: &Path) -> PathBuf {
+    let dir = shared_target.join(".modal-rust");
+    let dest = dir.join(format!("runner-{package}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::remove_file(&dest);
+    if std::fs::hard_link(artifact, &dest).is_err() && std::fs::copy(artifact, &dest).is_err() {
+        return artifact.to_path_buf();
+    }
+    dest
 }
 
 /// A unique, gitignored temp dir for the `--describe` shadow build (PID + monotonic
@@ -551,6 +640,9 @@ pub async fn cmd_deploy_programmatic(
         "modal-rust: deployed app {:?} (function_id={}, image_id={}, url={:?})",
         deployed.name, deployed.function_id, deployed.image_id, deployed.url
     );
+    for (name, url) in &deployed.endpoint_urls {
+        eprintln!("modal-rust: endpoint {name} => {url}");
+    }
     println!("deployed: {}", deployed.name);
     Ok(0)
 }
@@ -584,6 +676,63 @@ mod tests {
     #[test]
     fn schema_accepts_describe_v1() {
         assert!(check_schema("modal-rust/describe@1").is_ok());
+    }
+
+    #[test]
+    fn runner_artifact_path_picks_the_runner_bin_executable() {
+        // Non-artifact reasons, other targets, null executables, and non-JSON noise
+        // are all skipped; the LAST modal_runner artifact wins (rebuilds re-emit).
+        let json = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"some_lib"},"executable":null}"#,
+            "\n",
+            "not json at all\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"modal_runner"},"executable":"/t/debug/modal_runner"}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        assert_eq!(
+            runner_artifact_path(json),
+            Some(PathBuf::from("/t/debug/modal_runner"))
+        );
+        // No artifact message at all → None (caller falls back to the legacy path).
+        assert_eq!(
+            runner_artifact_path(r#"{"reason":"build-finished","success":true}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_runner_artifact_pins_and_replaces_per_package() {
+        let tmp = std::env::temp_dir().join(format!(
+            "modal-rust-scope-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let artifact = tmp.join("modal_runner");
+        std::fs::write(&artifact, b"build-A").unwrap();
+
+        let pinned = scope_runner_artifact(&tmp, "crate-a", &artifact);
+        assert_eq!(pinned, tmp.join(".modal-rust").join("runner-crate-a"));
+        assert_eq!(std::fs::read(&pinned).unwrap(), b"build-A");
+
+        // A DIFFERENT package pins under its OWN name — no collision (the H2 fix).
+        let pinned_b = scope_runner_artifact(&tmp, "crate-b", &artifact);
+        assert_ne!(pinned, pinned_b);
+
+        // A rebuild of the SAME package replaces its pin (write a NEW artifact file:
+        // overwriting in place would mutate through the hard link).
+        let artifact2 = tmp.join("modal_runner2");
+        std::fs::write(&artifact2, b"build-A2").unwrap();
+        let repinned = scope_runner_artifact(&tmp, "crate-a", &artifact2);
+        assert_eq!(repinned, pinned);
+        assert_eq!(std::fs::read(&repinned).unwrap(), b"build-A2");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -789,8 +938,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn validate_input_locally_degrades_on_unknown_entrypoint() {
-        // The shared `modal_runner` path can hold a DIFFERENT generatable crate's last
-        // build (all generated runners collide on `<target>/debug/modal_runner`). When the
+        // The on-disk runner can be STALE relative to the held manifest (a cache-hit
+        // probes the package-scoped pin from an older source state; pre-H2 it could
+        // even be a DIFFERENT crate's build on the shared uplift path). When the
         // describe cache skips the rebuild, the on-disk runner may not register THIS
         // crate's entrypoint and reports `unknown_entrypoint`. Since the caller already
         // confirmed the entrypoint exists in the held manifest, this is a stale/wrong
