@@ -520,13 +520,61 @@ mod tests {
         assert_eq!(r.milli_cpu, 2000);
         assert_eq!(r.memory_mb, 4096);
 
-        // `None` leaves the server default (0) — wire-identical to today.
+        // `None` clears to 0 (server default) — wire-identical to unset.
         let bare = FunctionSpec::new("m", "handler", "im-1")
             .with_milli_cpu(None)
             .with_memory_mb(None);
         let rb = bare.resources.to_proto();
         assert_eq!(rb.milli_cpu, 0);
         assert_eq!(rb.memory_mb, 0);
+    }
+
+    // M8: every Option-taking setter clears on None (never keep-previous).
+    // Rule: None == "server default / unset on the wire"; 0 is the numeric sentinel.
+    #[test]
+    fn all_option_setters_clear_on_none() {
+        // Start with a maximally-populated spec, then call every Option setter with None.
+        // All should produce the same result as a fresh spec that never called them.
+
+        let populated = FunctionSpec::new("m", "handler", "im-1")
+            .with_milli_cpu(Some(2000))
+            .with_memory_mb(Some(4096))
+            .with_gpu(Some("T4"))
+            .expect("valid gpu")
+            .with_retries(Some(3))
+            .with_retry_policy(Some("retries:max=5"))
+            .expect("valid policy")
+            .with_schedule(Some("cron:UTC:0 9 * * 1"))
+            .expect("valid schedule")
+            .with_webhook(Some(WebhookSpec {
+                method: "GET".to_string(),
+                requires_proxy_auth: false,
+            }))
+            .expect("valid webhook");
+
+        // Now clear every optional setter.
+        let cleared = populated
+            .with_milli_cpu(None)
+            .with_memory_mb(None)
+            .with_gpu(None::<String>)
+            .expect("None gpu always ok")
+            .with_retries(None)
+            .with_retry_policy(None)
+            .expect("None policy always ok")
+            .with_schedule(None)
+            .expect("None schedule always ok")
+            .with_webhook(None)
+            .expect("None webhook always ok");
+
+        // Numeric fields clear to 0 (server-default sentinel).
+        assert_eq!(cleared.resources.milli_cpu, 0, "milli_cpu cleared");
+        assert_eq!(cleared.resources.memory_mb, 0, "memory_mb cleared");
+        assert!(cleared.resources.gpu.is_none(), "gpu cleared");
+
+        // Option fields clear to None (proto fields unset on the wire).
+        assert!(cleared.retry_policy.is_none(), "retry_policy cleared");
+        assert!(cleared.schedule.is_none(), "schedule cleared");
+        assert!(cleared.webhook.is_none(), "webhook cleared");
     }
 
     #[test]

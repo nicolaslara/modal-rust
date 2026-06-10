@@ -161,6 +161,17 @@ pub struct WebhookSpec {
 /// FILE mode carries NO serialized bytecode: the function is identified by
 /// `module_name` + `function_name` and resolved in-container via
 /// `importlib.import_module(module_name)` + `getattr(module, function_name)`.
+///
+/// # `None`-semantics rule (M8)
+///
+/// Every `Option`-taking `with_*` setter **clears** on `None` — it does NOT
+/// keep the previous value. `None` always means "server default / unset on
+/// the wire": for numeric fields (`milli_cpu`, `memory_mb`) `0` is already
+/// the server-default sentinel that prost transmits as an omitted field; for
+/// optional proto messages (`retry_policy`, `schedule`, `webhook`) `None`
+/// leaves the proto field unset; for enum-like knobs (`gpu`) `None` means
+/// CPU-only. Callers that want to PRESERVE an existing value must NOT call the
+/// setter with `None`.
 #[derive(Debug, Clone)]
 pub struct FunctionSpec {
     /// Importable module name (e.g. the baked wrapper, `"spike_wrapper"`).
@@ -322,23 +333,19 @@ impl FunctionSpec {
         self
     }
 
-    /// Set the requested CPU (milli-cores) on the function's resources. `None` keeps
-    /// the server default (`milli_cpu = 0`, byte-identical to today). Mirrors
-    /// [`with_gpu`](FunctionSpec::with_gpu): a `None` leaves the field at its zero
-    /// default so an unset decorator is wire-identical.
+    /// Set the requested CPU (milli-cores) on the function's resources.
+    /// `None` **clears** to `0` (server default, wire-identical to unset).
+    /// See the [`FunctionSpec`] `None`-semantics rule.
     pub fn with_milli_cpu(mut self, milli_cpu: Option<u32>) -> Self {
-        if let Some(v) = milli_cpu {
-            self.resources.milli_cpu = v;
-        }
+        self.resources.milli_cpu = milli_cpu.unwrap_or(0);
         self
     }
 
-    /// Set the requested memory (MiB) on the function's resources. `None` keeps the
-    /// server default (`memory_mb = 0`, byte-identical to today).
+    /// Set the requested memory (MiB) on the function's resources.
+    /// `None` **clears** to `0` (server default, wire-identical to unset).
+    /// See the [`FunctionSpec`] `None`-semantics rule.
     pub fn with_memory_mb(mut self, memory_mb: Option<u32>) -> Self {
-        if let Some(v) = memory_mb {
-            self.resources.memory_mb = v;
-        }
+        self.resources.memory_mb = memory_mb.unwrap_or(0);
         self
     }
 
