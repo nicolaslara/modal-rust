@@ -110,6 +110,10 @@ pub mod __private {
 // `config_for`/`known_names` path. The client-bearing pieces inside it (RemoteHandle,
 // connect*, remote_*, deploy*, call*) are gated internally on `client`.
 mod app;
+// The MODAL_RUST_* env-var registry (M4): every name as a const + the ONE truthy
+// parser. UNGATED and public (pure std) so the CLI and external tooling spell the
+// same names the facade reads, instead of re-copying string literals.
+pub mod env;
 // These modules reference SDK types (ModalClient/ImageSpec/FunctionSpec/planning), so
 // they only compile with the gRPC client. The dump (`dump.rs`) is offline but compiles
 // against SDK spec/planning TYPES, so it lives under `client` too.

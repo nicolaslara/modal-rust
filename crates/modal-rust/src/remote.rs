@@ -102,7 +102,8 @@ pub(crate) const CACHE_ARCHIVE_NAME: &str = "cache.tar.zst";
 pub(crate) const CACHE_VOLUME_NAME: &str = "modal-rust-cargo-cache";
 
 /// The env var carrying the base64-encoded JSON config read by [`WRAPPER_SRC`].
-pub(crate) const WRAPPER_CONFIG_ENV: &str = "MODAL_RUST_RUN_CONFIG_JSON_B64";
+/// An alias of the registry name (`crate::env` owns every `MODAL_RUST_*` name).
+pub(crate) const WRAPPER_CONFIG_ENV: &str = crate::env::RUN_CONFIG_JSON_B64;
 
 /// The FILE-mode run wrapper, ported from `workpads/prototype/dev_app.py`'s
 /// `run_entrypoint`.
@@ -445,7 +446,7 @@ impl Default for RemoteConfig {
 /// nearest ancestor `Cargo.toml` containing `[workspace]` (walking up from CWD),
 /// else the nearest `Cargo.toml` dir, else CWD.
 fn discover_local_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("MODAL_RUST_SOURCE_DIR") {
+    if let Ok(dir) = std::env::var(crate::env::SOURCE_DIR) {
         return PathBuf::from(dir);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -480,7 +481,7 @@ fn discover_local_root() -> PathBuf {
 /// decorated handler (a manual registry with no `#[function]`), in which case the
 /// user supplies an explicit `RemoteConfig` or sets `MODAL_RUST_PACKAGE`.
 fn discover_package() -> String {
-    std::env::var("MODAL_RUST_PACKAGE").unwrap_or_else(|_| DEFAULT_PACKAGE.to_string())
+    std::env::var(crate::env::PACKAGE).unwrap_or_else(|_| DEFAULT_PACKAGE.to_string())
 }
 
 /// Discover the run base image: `MODAL_RUST_BASE_IMAGE` if set, else the default
@@ -488,7 +489,7 @@ fn discover_package() -> String {
 /// (e.g. `nvidia/cuda:12.6.3-devel-ubuntu22.04`) without touching code — parity with
 /// `MODAL_RUST_SOURCE_DIR` / `MODAL_RUST_PACKAGE`.
 fn discover_base_image() -> String {
-    std::env::var("MODAL_RUST_BASE_IMAGE").unwrap_or_else(|_| format!("rust:{RUST_VER}-slim"))
+    std::env::var(crate::env::BASE_IMAGE).unwrap_or_else(|_| format!("rust:{RUST_VER}-slim"))
 }
 
 /// Discover whether to install the Rust toolchain into the run image:
@@ -496,25 +497,13 @@ fn discover_base_image() -> String {
 /// `true`, else `false`. Paired with `MODAL_RUST_BASE_IMAGE` for an env-driven CUDA
 /// run path (the CUDA base has no Rust).
 fn discover_install_rust() -> bool {
-    std::env::var("MODAL_RUST_INSTALL_RUST")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    crate::env::env_bool(crate::env::INSTALL_RUST)
 }
 
 /// Discover whether the cargo build cache is ON: default ON; `MODAL_RUST_NO_CACHE`
 /// truthy (`1`/`true`/`yes`/`on`, case-insensitive) ⇒ OFF.
 fn discover_cache() -> bool {
-    !std::env::var("MODAL_RUST_NO_CACHE")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    !crate::env::env_bool(crate::env::NO_CACHE)
 }
 
 /// Discover whether to ALSO archive `target/` (not just CARGO_HOME) in the cache:
@@ -523,14 +512,7 @@ fn discover_cache() -> bool {
 /// into the image ENV so the remote wrapper packs/unpacks `target/` too — the local
 /// process env does NOT otherwise reach the Modal container.
 pub(crate) fn discover_cache_target() -> bool {
-    std::env::var("MODAL_RUST_CACHE_TARGET")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    crate::env::env_bool(crate::env::CACHE_TARGET)
 }
 
 /// Ensure the run function for `entrypoint` exists on Modal and return its invokable

@@ -821,6 +821,30 @@ export RUSTC_WRAPPER=sccache   # in your shell profile or CI env
 
 That is purely local hygiene — it never changes wire bytes or build outputs.
 
+### Environment variables
+
+Every `MODAL_RUST_*` variable is declared once in `modal_rust::env` (the consts the
+facade reads; a drift-guard test keeps every literal in the codebase — including
+the Python wrappers — tied to that registry). Boolean knobs parse truthily:
+`1`/`true`/`yes`/`on`, case-insensitive. The names are baked into deployed images,
+so they never get renamed.
+
+| Variable | Purpose | Read where | Audience |
+| --- | --- | --- | --- |
+| `MODAL_RUST_PACKAGE` | Cargo package to build/invoke remotely (overrides the macro-detected crate name) | local process (run/deploy config) | public |
+| `MODAL_RUST_SOURCE_DIR` | Source dir to upload (default: nearest `[workspace]` `Cargo.toml`, else nearest `Cargo.toml`, else CWD) | local process (run/deploy config) | public |
+| `MODAL_RUST_BASE_IMAGE` | Base image for the remote build (default `rust:<ver>-slim`); pair with `MODAL_RUST_INSTALL_RUST` for CUDA bases | local process (run/deploy config) | public |
+| `MODAL_RUST_INSTALL_RUST` | Truthy ⇒ install the Rust toolchain into the image (for bases without one) | local process (run/deploy config) | public |
+| `MODAL_RUST_NO_CACHE` | Truthy ⇒ disable the run-path build cache (default ON; see [Build cache](#build-cache)) | local process (run config) | public |
+| `MODAL_RUST_CACHE_TARGET` | Truthy ⇒ also archive `target/` (not just `CARGO_HOME`) in the build cache | local process; baked into the run image `ENV` for the container wrapper | public |
+| `MODAL_RUST_DEPLOY_APP` | Stable deploy app name override | local process (deploy config) | public |
+| `MODAL_RUST_SNAPSHOT_BEST_EFFORT` | Truthy ⇒ a failed snapshot prime degrades to lazy `#[enter]` instead of failing container init | local process at deploy; baked into the image `ENV` for the deploy wrapper | public |
+| `MODAL_RUST_SERVE` | Container-side escape hatch: falsy ⇒ wrappers print build/exec commands instead of running them | container (Python wrappers) | internal |
+| `MODAL_RUST_SNAPSHOT_PRIME` | Baked when any entrypoint enables `enable_memory_snapshot`; gates the deploy wrapper's import-time prime | container (deploy wrapper) | internal |
+| `MODAL_RUST_RUN_CONFIG_JSON_B64` | Base64 JSON run config the facade bakes for the run wrapper | container (run wrapper) | internal |
+| `MODAL_RUST_TEST_SECRET` | Secret key round-tripped by the live secrets/volumes test | live test | test-only |
+| `MODAL_RUST_RUNNER` | Overrides the deploy wrapper's `/app/modal_runner` path so its test can exec a stub | container (deploy wrapper test) | test-only |
+
 ## Architecture
 
 The workspace is split into focused crates:

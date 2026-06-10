@@ -166,14 +166,7 @@ pub struct DeployConfig {
 /// Deploy-time env discovery for [`DeployConfig::snapshot_best_effort`]
 /// (`MODAL_RUST_SNAPSHOT_BEST_EFFORT` truthy ⇒ opt into degrade-to-lazy).
 fn discover_snapshot_best_effort() -> bool {
-    std::env::var("MODAL_RUST_SNAPSHOT_BEST_EFFORT")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    crate::env::env_bool(crate::env::SNAPSHOT_BEST_EFFORT)
 }
 
 impl DeployConfig {
@@ -232,7 +225,7 @@ impl DeployConfig {
 impl Default for DeployConfig {
     fn default() -> Self {
         DeployConfig::for_app(
-            std::env::var("MODAL_RUST_DEPLOY_APP")
+            std::env::var(crate::env::DEPLOY_APP)
                 .unwrap_or_else(|_| DEFAULT_DEPLOY_APP.to_string()),
         )
     }

@@ -218,7 +218,7 @@ pub(crate) fn build_image_spec(
             // does not cross to Modal, so when caching is on AND the var is set
             // locally we BAKE it into the image ENV. Default path renders identically.
             if inputs.cache && crate::remote::discover_cache_target() {
-                spec = spec.with_command("ENV MODAL_RUST_CACHE_TARGET=1");
+                spec = spec.with_command(format!("ENV {}=1", crate::env::CACHE_TARGET));
             }
             spec.with_command("ENTRYPOINT []")
         }
@@ -286,12 +286,12 @@ pub(crate) fn build_deploy_top_layer_spec(
     // Snapshot prime is opt-in: only baked when a deployed entrypoint enabled memory
     // snapshot, so the default deploy image is byte-identical (no extra ENV layer).
     if bake_snapshot_prime {
-        spec = spec.with_command("ENV MODAL_RUST_SNAPSHOT_PRIME=1");
+        spec = spec.with_command(format!("ENV {}=1", crate::env::SNAPSHOT_PRIME));
         // STRICT by default: a failed prime FAILS the container init loudly (a hidden
         // perf cliff otherwise). The operator opts into degrade-to-lazy explicitly
         // (DeployConfig::snapshot_best_effort / MODAL_RUST_SNAPSHOT_BEST_EFFORT).
         if bake_snapshot_best_effort {
-            spec = spec.with_command("ENV MODAL_RUST_SNAPSHOT_BEST_EFFORT=1");
+            spec = spec.with_command(format!("ENV {}=1", crate::env::SNAPSHOT_BEST_EFFORT));
         }
     }
     spec.with_command("ENTRYPOINT []")

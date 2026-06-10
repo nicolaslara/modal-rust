@@ -145,7 +145,7 @@ impl App {
         // OVERRIDES (it is applied first inside `RemoteConfig::default()`), so this
         // only fills in the package when the env var is unset.
         let run_config = RemoteConfig::default().with_detected_package(
-            std::env::var("MODAL_RUST_PACKAGE").ok().as_deref(),
+            std::env::var(crate::env::PACKAGE).ok().as_deref(),
             crate::package_from_inventory(),
         );
         App::connect_inner(name, registry, configs, run_config).await
