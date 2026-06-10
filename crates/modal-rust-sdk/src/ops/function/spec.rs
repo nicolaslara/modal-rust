@@ -355,7 +355,7 @@ impl FunctionSpec {
     ///
     /// Mirrors `parse_gpu_config`: `"TYPE"`, `"TYPE:count"`, or `"TYPE-MEM"` (the
     /// mem suffix rides inside `gpu_type`); uppercased; `count` defaults to `1`. A
-    /// bad (non-integer) count returns [`Error::build`].
+    /// bad (non-integer) count returns [`Error::invalid`] — fix the decorator value.
     pub fn with_gpu(mut self, gpu: Option<impl Into<String>>) -> Result<Self> {
         let gpu = gpu.map(Into::into);
         if let Some(spec) = gpu.as_deref() {
@@ -425,9 +425,9 @@ impl FunctionSpec {
     /// initial_delay = s, max_delay = s))]`), parsed by [`parse_retries_spec`] into the
     /// four [`FunctionRetryPolicy`] fields. `None` leaves the field UNSET so the create
     /// is byte-identical to before (no `retry_policy` on the wire). A malformed spec
-    /// returns [`Error::build`]. This is the custom-backoff sibling of [`with_retries`]
-    /// (the bare-int fixed-interval shortcut); the two are mutually exclusive (the macro
-    /// emits at most one).
+    /// returns [`Error::invalid`] — fix the spec string. This is the custom-backoff
+    /// sibling of [`with_retries`] (the bare-int fixed-interval shortcut); the two are
+    /// mutually exclusive (the macro emits at most one).
     pub fn with_retry_policy(mut self, spec: Option<&str>) -> Result<Self> {
         self.retry_policy = spec.map(parse_retries_spec).transpose()?;
         Ok(self)
@@ -437,7 +437,7 @@ impl FunctionSpec {
     /// (`#[function(schedule = Cron("..")/Period(..))]`), parsed by [`parse_schedule`]
     /// into Modal's `Schedule` (a `Cron`/`Period` oneof). `None` leaves the field UNSET
     /// so the create is byte-identical to before (no `schedule` on the wire). A
-    /// malformed spec returns [`Error::build`].
+    /// malformed spec returns [`Error::invalid`] — fix the spec string.
     pub fn with_schedule(mut self, spec: Option<&str>) -> Result<Self> {
         self.schedule = spec.map(parse_schedule).transpose()?;
         Ok(self)
@@ -450,18 +450,18 @@ impl FunctionSpec {
     ///
     /// Mirrors Modal's validation (`_functions.py:755-762`): `max_containers` must be
     /// >= `min_containers` when both are set, and `scaledown_window` (when set) must be
-    /// > 0. A violation returns [`Error::build`] (Modal's `InvalidError`).
+    /// > 0. A violation returns [`Error::invalid`] — fix the decorator value.
     pub fn with_autoscaler(mut self, autoscaler: FunctionAutoscaler) -> Result<Self> {
         if let (Some(min), Some(max)) = (autoscaler.min_containers, autoscaler.max_containers) {
             if max < min {
-                return Err(Error::build(format!(
+                return Err(Error::invalid(format!(
                     "`min_containers` ({min}) cannot be greater than `max_containers` ({max})"
                 )));
             }
         }
         if let Some(window) = autoscaler.scaledown_window {
             if window == 0 {
-                return Err(Error::build("`scaledown_window` must be > 0".to_string()));
+                return Err(Error::invalid("`scaledown_window` must be > 0".to_string()));
             }
         }
         self.autoscaler = autoscaler;
@@ -493,7 +493,7 @@ impl FunctionSpec {
         if let Some(w) = &webhook {
             const METHODS: [&str; 5] = ["GET", "POST", "PUT", "DELETE", "PATCH"];
             if !METHODS.contains(&w.method.as_str()) {
-                return Err(Error::build(format!(
+                return Err(Error::invalid(format!(
                     "invalid webhook method {:?}: expected one of GET, POST, PUT, DELETE, PATCH",
                     w.method
                 )));

@@ -29,11 +29,11 @@ pub(super) const RETRY_DEFAULT_MAX_DELAY_MS: u32 = 60_000;
 /// `max=` component (the retry COUNT) is REQUIRED; the rest default to Modal's
 /// `Retries` defaults (`backoff_coefficient=1.0`, `initial_delay=1s ⇒ 1000ms`,
 /// `max_delay=60s ⇒ 60000ms`). The macro converts seconds→ms at parse time so the
-/// spec carries integer millisecond delays. A malformed spec maps to [`Error::build`]
+/// spec carries integer millisecond delays. A malformed spec maps to [`Error::invalid`]
 /// (mirroring Python's `InvalidError`).
 pub(super) fn parse_retries_spec(spec: &str) -> Result<FunctionRetryPolicy> {
     let rest = spec.strip_prefix("retries:").ok_or_else(|| {
-        Error::build(format!(
+        Error::invalid(format!(
             "Invalid retries spec {spec:?}: expected a \"retries:..\" prefix"
         ))
     })?;
@@ -43,33 +43,33 @@ pub(super) fn parse_retries_spec(spec: &str) -> Result<FunctionRetryPolicy> {
     let mut max_delay_ms = RETRY_DEFAULT_MAX_DELAY_MS;
     for part in rest.split(',').filter(|p| !p.is_empty()) {
         let (key, value) = part.split_once('=').ok_or_else(|| {
-            Error::build(format!(
+            Error::invalid(format!(
                 "Invalid retries component {part:?} in spec {spec:?}: expected key=value"
             ))
         })?;
         let parse_u32 = |v: &str| -> Result<u32> {
             v.trim()
                 .parse()
-                .map_err(|_| Error::build(format!("Invalid integer {v:?} for retries {key:?}")))
+                .map_err(|_| Error::invalid(format!("Invalid integer {v:?} for retries {key:?}")))
         };
         match key.trim() {
             "max" => retries = Some(parse_u32(value)?),
             "backoff" => {
                 backoff_coefficient = value.trim().parse().map_err(|_| {
-                    Error::build(format!("Invalid float {value:?} for retries \"backoff\""))
+                    Error::invalid(format!("Invalid float {value:?} for retries \"backoff\""))
                 })?
             }
             "initial_ms" => initial_delay_ms = parse_u32(value)?,
             "max_ms" => max_delay_ms = parse_u32(value)?,
             other => {
-                return Err(Error::build(format!(
+                return Err(Error::invalid(format!(
                     "Unknown retries component {other:?} in spec {spec:?}"
                 )))
             }
         }
     }
     let retries = retries.ok_or_else(|| {
-        Error::build(format!(
+        Error::invalid(format!(
             "Invalid retries spec {spec:?}: missing required \"max\" (the retry count)"
         ))
     })?;
@@ -87,13 +87,13 @@ pub(super) fn parse_retries_spec(spec: &str) -> Result<FunctionRetryPolicy> {
 /// The MEM suffix (`"A100-80GB"`) is NOT split — it stays inside `gpu_type`
 /// verbatim. `gpu_type` is uppercased; `count` defaults to `1`; the deprecated
 /// `type` field (proto field 1, `GPUType`) stays `0` (Python never sets it). A
-/// non-integer count maps to [`Error::build`], mirroring Python's `InvalidError`.
+/// non-integer count maps to [`Error::invalid`], mirroring Python's `InvalidError`.
 pub(super) fn parse_gpu_config(spec: &str) -> Result<GpuConfig> {
     // `split_once(':')` = Python's `value.split(":", 1)`.
     let (type_part, count) = match spec.split_once(':') {
         Some((lhs, rhs)) => {
             let count: u32 = rhs.trim().parse().map_err(|_| {
-                Error::build(format!(
+                Error::invalid(format!(
                     "Invalid GPU count: {rhs}. Value must be an integer."
                 ))
             })?;
@@ -122,13 +122,13 @@ pub(super) fn parse_gpu_config(spec: &str) -> Result<GpuConfig> {
 ///   `Schedule.Period { .. }`. Components are comma-separated `key=value`; any subset
 ///   may appear and omitted components default to `0` (only `seconds` is a float).
 ///
-/// A malformed spec maps to [`Error::build`], mirroring Python's `InvalidError`.
+/// A malformed spec maps to [`Error::invalid`], mirroring Python's `InvalidError`.
 pub(super) fn parse_schedule(spec: &str) -> Result<Schedule> {
     let oneof = if let Some(rest) = spec.strip_prefix("cron:") {
         // `<timezone>:<cron_string>` — timezone first (colon-free), cron string is the
         // remainder verbatim (it contains spaces, never a colon).
         let (timezone, cron_string) = rest.split_once(':').ok_or_else(|| {
-            Error::build(format!(
+            Error::invalid(format!(
                 "Invalid cron schedule spec {spec:?}: expected \"cron:<timezone>:<cron_string>\""
             ))
         })?;
@@ -142,14 +142,14 @@ pub(super) fn parse_schedule(spec: &str) -> Result<Schedule> {
         // `key=value`. Unknown keys / bad numbers map to `Error::build`.
         for part in rest.split(',').filter(|p| !p.is_empty()) {
             let (key, value) = part.split_once('=').ok_or_else(|| {
-                Error::build(format!(
+                Error::invalid(format!(
                     "Invalid period component {part:?} in schedule spec {spec:?}: expected key=value"
                 ))
             })?;
             let parse_i32 = |v: &str| -> Result<i32> {
-                v.trim()
-                    .parse()
-                    .map_err(|_| Error::build(format!("Invalid integer {v:?} for period {key:?}")))
+                v.trim().parse().map_err(|_| {
+                    Error::invalid(format!("Invalid integer {v:?} for period {key:?}"))
+                })
             };
             match key.trim() {
                 "years" => period.years = parse_i32(value)?,
@@ -160,11 +160,11 @@ pub(super) fn parse_schedule(spec: &str) -> Result<Schedule> {
                 "minutes" => period.minutes = parse_i32(value)?,
                 "seconds" => {
                     period.seconds = value.trim().parse().map_err(|_| {
-                        Error::build(format!("Invalid float {value:?} for period \"seconds\""))
+                        Error::invalid(format!("Invalid float {value:?} for period \"seconds\""))
                     })?
                 }
                 other => {
-                    return Err(Error::build(format!(
+                    return Err(Error::invalid(format!(
                         "Unknown period component {other:?} in schedule spec {spec:?}"
                     )))
                 }
@@ -172,7 +172,7 @@ pub(super) fn parse_schedule(spec: &str) -> Result<Schedule> {
         }
         ScheduleOneof::Period(period)
     } else {
-        return Err(Error::build(format!(
+        return Err(Error::invalid(format!(
             "Invalid schedule spec {spec:?}: expected a \"cron:..\" or \"period:..\" prefix"
         )));
     };

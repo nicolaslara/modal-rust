@@ -252,7 +252,7 @@ impl ModalClient {
 
         loop {
             if started.elapsed() > deadline {
-                return Err(Error::build(format!(
+                return Err(Error::deadline(format!(
                     "function call {function_call_id} produced no output within {}s",
                     deadline.as_secs()
                 )));
@@ -439,7 +439,7 @@ impl ModalClient {
         let mut last_entry_id = LAST_ENTRY_ID_INITIAL.to_string();
         while got.len() < n {
             if started.elapsed() > deadline {
-                return Err(Error::build(format!(
+                return Err(Error::deadline(format!(
                     "map call {function_call_id} produced {} of {n} outputs within {}s",
                     got.len(),
                     deadline.as_secs()
@@ -583,7 +583,7 @@ impl ModalClient {
     {
         let n = inputs.len();
         if n == 0 {
-            return Err(Error::build(
+            return Err(Error::invalid(
                 "spawn_map called with zero inputs".to_string(),
             ));
         }

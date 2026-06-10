@@ -4,6 +4,31 @@
 //! config resolution, channel/transport construction, gRPC status responses, and
 //! the operation surface. Helper constructors keep call sites terse; `From` impls
 //! make `?` ergonomic against the underlying tonic / toml / io errors.
+//!
+//! # Error taxonomy
+//!
+//! The three application-level variants encode distinct user actions:
+//!
+//! - [`Error::Invalid`] — **fix your code / decorator**. A value the *caller*
+//!   supplied was rejected before anything was sent to Modal: a malformed
+//!   retries/schedule spec string, a bad GPU count, an autoscaler bounds
+//!   violation, an unrecognised webhook method. The user must change the
+//!   argument; retrying unchanged is pointless.
+//!
+//! - [`Error::Build`] — **look at Modal logs**. A remote operation that Modal
+//!   accepted and ran returned a failure result: an image build that exited
+//!   non-zero, a function call whose container raised an unhandled exception, a
+//!   protocol shape violation (missing fields in a server response). The failure
+//!   happened on Modal's side; reading the build/run logs is the next step.
+//!
+//! - [`Error::Deadline`] — **raise the timeout (or the function is hung)**.
+//!   The client-side poll deadline expired before the function produced output.
+//!   The function may still be running on Modal. Increasing
+//!   `invoke_cbor_with_deadline`'s deadline (or the function's `timeout_secs`)
+//!   is the fix; alternatively the function itself may be hung.
+//!
+//! [`Error::Config`] / [`Error::Transport`] / [`Error::Status`] / [`Error::Codec`]
+//! cover configuration, network, gRPC, and serialisation failures respectively.
 
 use std::fmt;
 
@@ -18,13 +43,20 @@ pub enum Error {
     /// A gRPC call returned a non-OK status (includes auth rejections).
     Status(tonic::Status),
     /// Invalid input or unsupported configuration prepared client-side
-    /// (e.g. a server URL that cannot be parsed, an un-encodable header value).
+    /// (e.g. a server URL that cannot be parsed, an un-encodable header value,
+    /// a malformed retries/schedule spec, a bad GPU count, autoscaler bounds
+    /// violation, unrecognised webhook method). **Fix your code.**
     Invalid(String),
     /// CBOR (or other payload) encode/decode failure.
     Codec(String),
     /// A Modal build/operation terminated with a remote failure result
     /// (surfaces `GenericResult.exception` for image/function builds).
+    /// **Look at Modal logs.**
     Build(String),
+    /// The client-side poll deadline expired before the function produced
+    /// output. The function may still be running on Modal.
+    /// **Raise the timeout or investigate a hung function.**
+    Deadline(String),
 }
 
 impl Error {
@@ -46,6 +78,11 @@ impl Error {
     /// Construct a [`Error::Build`] from any displayable value.
     pub fn build(msg: impl fmt::Display) -> Self {
         Error::Build(msg.to_string())
+    }
+
+    /// Construct a [`Error::Deadline`] from any displayable value.
+    pub fn deadline(msg: impl fmt::Display) -> Self {
+        Error::Deadline(msg.to_string())
     }
 
     /// Map a header-value parse failure (token/version/platform metadata that is
@@ -106,6 +143,7 @@ impl fmt::Display for Error {
             Error::Invalid(msg) => write!(f, "invalid input: {msg}"),
             Error::Codec(msg) => write!(f, "codec error: {msg}"),
             Error::Build(msg) => write!(f, "build error: {msg}"),
+            Error::Deadline(msg) => write!(f, "deadline exceeded: {msg}"),
         }
     }
 }
@@ -115,7 +153,11 @@ impl std::error::Error for Error {
         match self {
             Error::Transport(e) => Some(e),
             Error::Status(e) => Some(e),
-            Error::Config(_) | Error::Invalid(_) | Error::Codec(_) | Error::Build(_) => None,
+            Error::Config(_)
+            | Error::Invalid(_)
+            | Error::Codec(_)
+            | Error::Build(_)
+            | Error::Deadline(_) => None,
         }
     }
 }
@@ -201,6 +243,7 @@ mod tests {
         assert!(!Error::config("missing token").is_transient());
         assert!(!Error::invalid("bad arg").is_transient());
         assert!(!Error::codec("bad cbor").is_transient());
+        assert!(!Error::deadline("timed out").is_transient());
     }
 
     #[test]
