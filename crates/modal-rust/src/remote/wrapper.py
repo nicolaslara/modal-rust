@@ -6,6 +6,7 @@ execs the frozen modal_runner, and returns the one-line JSON envelope verbatim.
 """
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -111,6 +112,65 @@ def _existing_archive():
     return None
 
 
+def _source_key():
+    # Content-address THIS build's inputs: sha256 over every uploaded source file's
+    # (path, content-hash), sorted, plus the cargo package name (two packages can
+    # share one workspace upload). Sub-second even for large crates, and it needs
+    # NO local→container protocol change — the mounted /src IS the build input.
+    h = hashlib.sha256()
+    h.update(PACKAGE.encode())
+    for root, dirs, files in os.walk(REMOTE_SRC):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, REMOTE_SRC)
+            h.update(rel.encode())
+            try:
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+            except OSError:
+                # Unreadable file: fold the miss into the key rather than failing —
+                # worst case is a spurious cache miss (a rebuild), never a wrong hit.
+                h.update(b"<unreadable>")
+    return h.hexdigest()
+
+
+def _runner_cache_path(key):
+    return f"{_CONFIG['cache_mount']}/runner-{key}"
+
+
+def _try_cached_runner(key):
+    # The FAST path (runner-binary cache): if a binary built from EXACTLY this
+    # source key exists on the volume, copy it local and exec it — no archive
+    # unpack, no cargo, sub-second. Volumes may be mounted noexec, so always run
+    # the local copy.
+    cached = _runner_cache_path(key)
+    if not os.path.exists(cached):
+        return False
+    try:
+        os.makedirs(os.path.dirname(_RUNNER), exist_ok=True)
+        shutil.copyfile(cached, _RUNNER)
+        os.chmod(_RUNNER, 0o755)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[cache] cached runner copy failed ({e!r}); falling back to build", file=sys.stderr)
+        return False
+
+
+def _store_cached_runner(key):
+    # Atomic publish (tmp + rename) so a concurrent container never sees a torn
+    # binary. Best-effort: a failed store only costs the NEXT cold container.
+    cached = _runner_cache_path(key)
+    try:
+        tmp = cached + ".tmp"
+        shutil.copyfile(_RUNNER, tmp)
+        os.replace(tmp, cached)
+        print(f"[cache] stored runner {cached}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[cache] runner store failed (ignored): {e!r}", file=sys.stderr)
+
+
 def _unpack_cache():
     # Restore warm CARGO_HOME (and optionally target/) onto /tmp before cargo runs.
     # A missing/corrupt archive is treated as cold; it only costs time.
@@ -158,19 +218,21 @@ def _pack_cache():
     dirs = ["cargo"]
     if _cache_target_on():
         dirs.append("target")
-    existing = _existing_archive()
     try:
-        if existing == _ARCHIVE_GZIP:
+        try:
+            # Always PREFER zstd (the image now installs it): several times faster
+            # than gzip in both directions on a target/-bearing archive. On success,
+            # remove a stale gzip archive left by a pre-zstd image so the volume
+            # doesn't carry two diverging copies.
+            _pack_one(_ARCHIVE_ZSTD, "--zstd", dirs)
+            if os.path.exists(_ARCHIVE_GZIP):
+                os.remove(_ARCHIVE_GZIP)
+        except Exception as e:
+            print(
+                f"[cache] zstd pack unavailable ({e!r}); falling back to gzip",
+                file=sys.stderr,
+            )
             _pack_one(_ARCHIVE_GZIP, "-z", dirs)
-        else:
-            try:
-                _pack_one(_ARCHIVE_ZSTD, "--zstd", dirs)
-            except Exception as e:
-                print(
-                    f"[cache] zstd pack unavailable ({e!r}); falling back to gzip",
-                    file=sys.stderr,
-                )
-                _pack_one(_ARCHIVE_GZIP, "-z", dirs)
     except Exception as e:
         print(f"[cache] pack failed (ignored): {e!r}", file=sys.stderr)
 
@@ -201,7 +263,19 @@ def _build(env):
         _BUILT = True
         print("[run] build cached (warm container); skipping cargo build", file=sys.stderr)
         return
-    print(f"[cache] {_unpack_cache()}", file=sys.stderr)
+    # FAST PATH: a runner binary content-addressed to exactly this source +
+    # package may already be on the volume — exec it without unpacking the
+    # archive or running cargo at all (fresh-container warm path, sub-second).
+    key = None
+    if CACHE_ON:
+        key = _source_key()
+        if _try_cached_runner(key):
+            print(f"[cache] runner HIT runner-{key[:12]}… (no unpack, no cargo)", file=sys.stderr)
+            open(_MARKER, "w").close()
+            _BUILT = True
+            return
+    unpack_state = _unpack_cache()
+    print(f"[cache] {unpack_state}", file=sys.stderr)
     build_dir = _build_dir()
     build = subprocess.run(
         ["cargo", "build", "--release", "-p", PACKAGE, "--bin", "modal_runner"],
@@ -221,7 +295,17 @@ def _build(env):
         )
     open(_MARKER, "w").close()
     _BUILT = True
-    _pack_cache()
+    if key is not None:
+        _store_cached_runner(key)
+    # Re-packing the archive costs tens of seconds for a large target/ — only pay
+    # it when this build actually ENRICHED the cache: cargo compiled something, or
+    # there was no archive to begin with. A WARM unpack + all-Fresh build changes
+    # nothing worth persisting.
+    compiled = "Compiling " in (build.stderr or "") or "Compiling " in (build.stdout or "")
+    if compiled or unpack_state != "WARM":
+        _pack_cache()
+    else:
+        print("[cache] all Fresh on a WARM unpack; skipping re-pack", file=sys.stderr)
 
 
 def _serve_enabled():

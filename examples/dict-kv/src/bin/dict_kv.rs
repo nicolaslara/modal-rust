@@ -72,6 +72,13 @@ async fn run_live(words: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Clean up the demo object entirely (irreversible, like Python's delete).
+    // DICT_KV_KEEP=1 skips it so you can inspect the entries from Modal's own
+    // tooling — `modal dict items dict-kv-scores` shows them as plain str -> int,
+    // the cross-language interop proof made visible.
+    if std::env::var("DICT_KV_KEEP").ok().as_deref() == Some("1") {
+        println!("kept: inspect with `modal dict items {SCORES_DICT}` (delete with `modal dict delete {SCORES_DICT}`)");
+        return Ok(());
+    }
     Dict::delete(SCORES_DICT).await?;
     println!("cleaned up: Dict::delete({SCORES_DICT:?})");
     Ok(())

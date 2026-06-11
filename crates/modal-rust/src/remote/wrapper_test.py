@@ -175,6 +175,108 @@ class WrapperTests(unittest.TestCase):
 
         self.assertEqual(out, '{"ok":true,"value":1}')
 
+    def test_cache_target_default_on_mirrors_rust(self):
+        # CROSS-LANGUAGE DRIFT GUARD: the Rust `discover_cache_target()` and this
+        # wrapper's `_cache_target_on()` must agree — default ON, the falsy set
+        # opts out. (The cache pair was the one env knob WITHOUT this guard, and
+        # the default mismatch went unnoticed — see 2026-06-11.)
+        module = load_wrapper()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MODAL_RUST_CACHE_TARGET", None)
+            self.assertTrue(module._cache_target_on(), "default must be ON")
+            for falsy in ("0", "false", "NO", "Off"):
+                os.environ["MODAL_RUST_CACHE_TARGET"] = falsy
+                self.assertFalse(module._cache_target_on(), falsy)
+            os.environ["MODAL_RUST_CACHE_TARGET"] = "1"
+            self.assertTrue(module._cache_target_on())
+
+    def test_pack_cache_includes_target_by_default(self):
+        # The user-visible promise: fresh containers reuse COMPILED deps. That is
+        # only true if target/ actually rides the archive.
+        module = load_wrapper()
+        calls = []
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MODAL_RUST_CACHE_TARGET", None)
+            with mock.patch.object(module, "_pack_one", lambda a, f, dirs: calls.append(dirs)):
+                module._pack_cache()
+        self.assertEqual(calls, [["cargo", "target"]])
+
+    def test_source_key_is_content_addressed_and_package_scoped(self):
+        import tempfile
+
+        src = tempfile.mkdtemp(prefix="wrapper-src-")
+        with open(os.path.join(src, "lib.rs"), "w") as f:
+            f.write("fn a() {}")
+        module = load_wrapper(
+            {
+                "package": "pkg-a",
+                "cache": True,
+                "remote_src": src,
+                "cache_mount": "/cache",
+                "cache_archive_name": "cache.tar.zst",
+            }
+        )
+        k1 = module._source_key()
+        self.assertEqual(k1, module._source_key(), "key must be deterministic")
+        # Content change changes the key.
+        with open(os.path.join(src, "lib.rs"), "w") as f:
+            f.write("fn b() {}")
+        self.assertNotEqual(k1, module._source_key())
+        # Same source, different package: different key (one shared workspace
+        # upload can build two different -p targets).
+        module_b = load_wrapper(
+            {
+                "package": "pkg-b",
+                "cache": True,
+                "remote_src": src,
+                "cache_mount": "/cache",
+                "cache_archive_name": "cache.tar.zst",
+            }
+        )
+        self.assertNotEqual(module.PACKAGE, module_b.PACKAGE)
+        self.assertNotEqual(module._source_key(), module_b._source_key())
+
+    def test_runner_binary_cache_roundtrip_and_hit_skips_build(self):
+        import tempfile
+
+        src = tempfile.mkdtemp(prefix="wrapper-src-")
+        with open(os.path.join(src, "lib.rs"), "w") as f:
+            f.write("fn a() {}")
+        cache = tempfile.mkdtemp(prefix="wrapper-cache-")
+        module = load_wrapper(
+            {
+                "package": "pkg-a",
+                "cache": True,
+                "remote_src": src,
+                "cache_mount": cache,
+                "cache_archive_name": "cache.tar.zst",
+            }
+        )
+        tmp = tempfile.mkdtemp(prefix="wrapper-tmp-")
+        runner = os.path.join(tmp, "modal_runner")
+        marker = os.path.join(tmp, ".built")
+        with mock.patch.object(module, "_RUNNER", runner), mock.patch.object(
+            module, "_MARKER", marker
+        ):
+            key = module._source_key()
+            # Miss: nothing stored yet.
+            self.assertFalse(module._try_cached_runner(key))
+            # Store, then a fresh "container" (no marker, no /tmp runner) hits.
+            with open(runner, "wb") as f:
+                f.write(b"\x7fELF fake-runner-bytes")
+            module._store_cached_runner(key)
+            os.remove(runner)
+            self.assertTrue(module._try_cached_runner(key))
+            with open(runner, "rb") as f:
+                self.assertEqual(f.read(), b"\x7fELF fake-runner-bytes")
+            # The full _build flow on the hit path: NO cargo run at all.
+            def boom(*a, **k):
+                raise AssertionError("cargo must not run on a runner-cache hit")
+
+            with mock.patch.object(module.subprocess, "run", boom):
+                module._build(dict(os.environ))
+            self.assertTrue(os.path.exists(marker))
+
 
 if __name__ == "__main__":
     unittest.main()

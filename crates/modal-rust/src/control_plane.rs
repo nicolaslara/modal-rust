@@ -265,6 +265,15 @@ pub(crate) fn build_image_spec(
             let mut spec = ImageSpec::from_registry(inputs.base_image.to_string())
                 .with_add_python(PYTHON_SERIES)
                 .with_python_standalone_mount_id(py_mount_id.to_string());
+            // `zstd` for the build-cache archive: without the binary, `tar --zstd`
+            // fails and the wrapper silently degrades to gzip — several times
+            // slower both packing and unpacking the (now target/-bearing) archive,
+            // which dominated warm fresh-container latency. One tiny apt package.
+            if inputs.cache {
+                spec = spec.with_command(
+                    "RUN apt-get update && apt-get install -y --no-install-recommends zstd && rm -rf /var/lib/apt/lists/*",
+                );
+            }
             if inputs.install_rust {
                 spec = spec.with_rust_toolchain();
             }

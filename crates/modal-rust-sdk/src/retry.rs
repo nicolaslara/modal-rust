@@ -86,10 +86,15 @@ where
                 if !e.is_transient() || last_attempt || over_deadline {
                     return Err(e);
                 }
-                eprintln!(
-                    "[retry] {name} attempt {attempt}/{} after transient: {e}",
-                    policy.max_attempts
-                );
+                // A SINGLE transient blip (long-poll connection resets are routine —
+                // Modal's own client retries them silently) is not worth alarming
+                // the user; log only when trouble REPEATS.
+                if attempt >= 2 {
+                    eprintln!(
+                        "[retry] {name} attempt {attempt}/{} after transient: {e}",
+                        policy.max_attempts
+                    );
+                }
                 let jittered = jitter(delay);
                 tokio::time::sleep(jittered).await;
                 delay = delay.mul_f64(policy.delay_factor).min(policy.max_delay);
