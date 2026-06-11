@@ -17,7 +17,11 @@ live = []
 [dependencies]
 # gRPC stack — versions MATCH the proven modal-rs stack so the vendored proto compiles cleanly.
 # default-features = false + explicit client features DROPS the axum (server) dependency.
-tonic = { version = "0.14.3", default-features = false, features = ["channel", "transport", "tls-native-roots", "tls-ring", "codegen"] }
+# tls-webpki-roots IN ADDITION to native: slim container images ship no
+# /etc/ssl/certs, so the in-container client (Dict/Queue handles inside a
+# `#[function]` body) needs the bundled Mozilla roots to reach api.modal.com —
+# the Python client gets this for free via certifi.
+tonic = { version = "0.14.3", default-features = false, features = ["channel", "transport", "tls-native-roots", "tls-webpki-roots", "tls-ring", "codegen"] }
 tonic-prost = "0.14.3"
 prost = "0.14.3"
 prost-types = "0.14.3"
@@ -35,6 +39,11 @@ ignore = "0.4"                # ripgrep's gitignore engine: .modalignore/.gitign
 # HTTP PUT for large mount-file blobs. rustls only (no default features) so the
 # no-CUDA CI box needs no system OpenSSL; tonic already pulls ring/rustls.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# In-container channel: MODAL_SERVER_URL is `unix:/run/modal.sock` (a worker-local
+# socket that IS the credential — see channel.rs). tower::service_fn + TokioIo are
+# the standard tonic unix-connector pair; both are already transitive via tonic.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.3"

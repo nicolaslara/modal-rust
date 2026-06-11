@@ -3243,6 +3243,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "hyper-util",
  "ignore",
  "modal-rust-testkit",
  "prost",
@@ -3259,6 +3260,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "walkdir",
 ]
 
@@ -5106,6 +5108,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
