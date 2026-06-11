@@ -1,0 +1,35 @@
+[package]
+name = "example-dict-kv"
+version = "0.0.0"
+edition = "2021"
+description = "Teaches ONE concept: shared state through a named modal.Dict — a #[modal_rust::function] computes Scrabble scores and writes them into Dict::from_name(\"dict-kv-scores\"); the CALLER (a different process) opens the same name and reads them back typed. Plain data (str keys, i64 values) round-trips with Python; the offline test proves the write→read round-trip against the in-process mock."
+publish = false
+
+[lib]
+name = "example_dict_kv"
+path = "src/lib.rs"
+
+[[bin]]
+# The driver tour: the offline scoring runs in `cargo run`; the live write-via-
+# function + read-via-Dict round-trip compiles always, runs only with credentials.
+name = "dict_kv"
+path = "src/bin/dict_kv.rs"
+
+[dependencies]
+# Dict handles ARE orchestration (they open a gRPC client), so unlike the pure
+# decorator examples this lib needs the `client` feature in [dependencies] — the
+# same place `examples/orchestrate` puts it.
+modal-rust = { path = "../../crates/modal-rust", features = ["client"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+# `Dict` methods are async; the handler body (a sync fn by contract) drives them
+# with its own runtime, and the driver binary uses #[tokio::main].
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# Activates the facade's `testkit` seam (`Dict::from_name_at`) so the offline test
+# can do a REAL write→read round-trip against the in-process mock. NOT part of the
+# example's authoring surface — it is used only by `tests/mock_dict.rs`.
+modal-rust = { path = "../../crates/modal-rust", features = ["testkit"] }
+# The in-process gRPC mock backend with the stateful Dict store (loopback only).
+modal-rust-testkit = { path = "../../crates/modal-rust-testkit" }

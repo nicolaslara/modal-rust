@@ -121,10 +121,18 @@ pub mod env;
 mod control_plane;
 #[cfg(feature = "client")]
 mod deploy;
+// Typed handles over modal.Dict / modal.Queue (named, server-side shared state).
+// Pure orchestration — they own a `ModalClient` like `App::connect`'s RemoteHandle —
+// so the whole modules are client-gated; the LIGHT build is byte-identical without
+// them (no new deps, no new exports on the default path).
+#[cfg(feature = "client")]
+pub(crate) mod dict;
 #[cfg(feature = "client")]
 mod dump;
 mod error;
 mod function;
+#[cfg(feature = "client")]
+mod queue;
 mod registration;
 #[cfg(feature = "client")]
 mod remote;
@@ -134,12 +142,18 @@ mod scope;
 pub use app::App;
 #[cfg(feature = "client")]
 pub use deploy::{DeployConfig, DeployedApp, DEFAULT_DEPLOY_APP};
+// Typed Dict/Queue handles — client-gated like `App::connect` (they ARE the
+// control plane; there is no light-path surface for them).
+#[cfg(feature = "client")]
+pub use dict::Dict;
 // The additive, network-free dry-run / dump (the deferred P8). New types/methods —
 // the facade's run/deploy/call public signatures are unchanged.
 #[cfg(feature = "client")]
 pub use dump::{Manifest, MountRole, PlannedRequest, RunMode};
 pub use error::{Error, Result};
 pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
+#[cfg(feature = "client")]
+pub use queue::Queue;
 pub use registration::{
     from_inventory_with_configs, package_from_inventory, registry_from_inventory,
     run_cli_from_inventory, run_cli_with_args_and_configs, run_cli_with_args_from_inventory,

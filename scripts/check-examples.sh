@@ -39,8 +39,8 @@ SKIP_COVERAGE=()
 
 covered_examples=(
   add add-macro autoscaling background-jobs burn-add cli-workflow cpu-memory
-  cuda-vector-add custom-base custom-types deploy-and-call error-handling
-  fan-out-map orchestrate own-runner-bin pip-apt-image quickstart retries
+  cuda-vector-add custom-base custom-types deploy-and-call dict-kv error-handling
+  fan-out-map orchestrate own-runner-bin pip-apt-image queue-pipeline quickstart retries
   scheduled-job secrets snapshot-class spawn-map-foreach stateful-class
   timeout-and-cache volumes ways-to-call web-endpoint
 )
@@ -275,6 +275,26 @@ run "pip-apt-image: dry-run renders a pip install image-builder step" 'pip: RUN 
 # function with no rebuild. Modal-requiring deploy/call commands are compile-only.
 run "deploy-and-call: deploy builds once, call invokes with no rebuild" 'boundary: deploy builds ONCE at image-build, call invokes with no rebuild' \
   "cargo run -q -p example-deploy-and-call --bin deploy_and_call"
+
+# dict-kv — shared state through a named modal.Dict. The offline driver runs the
+# honest computation (Scrabble scores) and prints the entries the live path writes;
+# the mock-backed test (tests/mock_dict.rs) does the REAL write→read round-trip:
+# the function's write core puts typed entries through one handle, an independent
+# caller handle resolved from the SAME name reads them back (stateful mock store).
+run "dict-kv: offline scoring (what the function writes to the Dict)" 'local: jazz -> 29' \
+  "cargo run -q -p example-dict-kv --bin dict_kv"
+run "dict-kv: function writes, caller reads — mock Dict round-trip (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-dict-kv 2>&1"
+
+# queue-pipeline — producer/consumer through a named modal.Queue. The offline driver
+# runs the honest computation (Collatz stopping times) per job; the mock-backed test
+# (tests/mock_queue.rs) does the REAL produce→drain round-trip: put_many through one
+# handle, blocking get(idle-timeout) drain through an independent handle on the SAME
+# name, asserting FIFO order, the typed summary, and the clean empty-queue exit.
+run "queue-pipeline: offline Collatz jobs (what the consumer computes)" 'local: 27 -> 111 steps' \
+  "cargo run -q -p example-queue-pipeline --bin queue_pipeline"
+run "queue-pipeline: produce → blocking-get drain — mock Queue round-trip (cargo test)" 'test result: ok' \
+  "cargo test -q -p example-queue-pipeline 2>&1"
 
 # cli-workflow — drive a crate from the generic `modal-rust` CLI, no driver binary.
 # The OFFLINE-tested verb is `doctor`: the preflight that needs no Modal (it prints

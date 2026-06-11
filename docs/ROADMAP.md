@@ -85,7 +85,27 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   - **Surface the assigned `web_url`** — print it from `modal-rust deploy` / carry it
     on `DeployedApp` (the SDK already returns it on the create:
     `CreatedFunction.web_url`).
-- Next big subsystems: `Dict`/`Queue`/`Sandbox`/NFS.
+- ~~`Dict` / `Queue` (distributed key/value + queue)~~ — DONE (v0 subset):
+  `modal_rust::Dict` / `modal_rust::Queue` typed handles (client-gated, app-independent)
+  over the full unary RPC surface — named lifecycle (`from_name`/`lookup`/
+  `from_name_in`/`delete`), Dict `get`/`put`/`put_if_absent`/`pop`/`contains`/`len`/
+  `clear`, Queue `put`/`put_many`/blocking `get`/`get_many`/`len`/`clear`, plus `_raw`
+  byte escape hatches. Values ride a **restricted-pickle codec** (the Go/JS-client
+  precedent): plain data round-trips with Python; `&str` keys are byte-exact
+  CPython protocol-4 pickle so key lookup interops both ways; a pickled Python
+  custom class fails with a typed codec error. Blocking `get(timeout)` mirrors
+  Python via a client-side poll loop (`None` = forever, `Some(d)` = timeout →
+  `Ok(None)`, `Some(ZERO)` = non-blocking). `examples/dict-kv` +
+  `examples/queue-pipeline`, stateful mock store in the testkit. Named follow-ups:
+  - **Iteration** — `keys()/values()/items()` (`DictContents`, the surface's only
+    streaming RPC) and Queue `iterate()` (`QueueNextItems` cursor).
+  - **Ephemeral objects** — `Dict::ephemeral()`/`Queue::ephemeral()` guard types +
+    the 300 s heartbeat task (design fixed in `docs/local/dict-queue-design.md` §3.3).
+  - **Queue partitions + TTL knobs** — the builders already carry
+    `partition_key`/`partition_ttl_seconds` internally (empty / 24 h defaults), so
+    exposing them is additive.
+  - **Dict batch `update(many)`** and block-on-full `put` retry.
+- Next big subsystems: `Sandbox`/NFS.
 - ~~**`enable_memory_snapshot` / Cls memory-checkpointing** (high value, `snapshot.py`)~~
   — DONE (v0, CPU-only, `#[cls]`-only): `#[cls(enable_memory_snapshot = true)]` makes the
   expensive `#[enter]` load run **once ever** on a *deployed* app — Modal snapshots the

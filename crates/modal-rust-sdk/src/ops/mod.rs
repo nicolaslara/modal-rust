@@ -11,6 +11,8 @@
 //! - [`invoke`] — `FunctionMap` → `FunctionPutInputs` fallback (fix #3) → poll `FunctionGetOutputs`.
 //! - [`volume`] — `VolumeGetOrCreate` (create-if-missing, V2) → `volume_id` (P6 cargo cache).
 //! - [`secret`] — `SecretGetOrCreate` (from_name lookup / from_dict create) → `secret_id`.
+//! - [`dict`]   — modal.Dict v0: `DictGetOrCreate` + get/update/pop/contains/len/clear/delete (raw bytes).
+//! - [`queue`]  — modal.Queue v0: `QueueGetOrCreate` + put/get (blocking poll loop)/len/clear/delete (raw bytes).
 //!
 //! ## The three fixes (why modal-rs failed; see `workpads/shim-backend/spike-notes.md`)
 //!
@@ -22,12 +24,14 @@
 
 pub mod app;
 pub mod blob;
+pub mod dict;
 pub mod function;
 pub mod image;
 pub mod invoke;
 pub mod local_dir;
 pub mod mount;
 pub mod planning;
+pub mod queue;
 pub mod secret;
 mod transport;
 pub mod volume;

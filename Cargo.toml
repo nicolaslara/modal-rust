@@ -44,6 +44,8 @@ members = [
     "examples/pip-apt-image",
     "examples/deploy-and-call",
     "examples/cli-workflow",
+    "examples/dict-kv",
+    "examples/queue-pipeline",
     "examples/cuda-vector-add",
     "examples/burn-add",
 ]
@@ -86,6 +88,8 @@ default-members = [
     "examples/pip-apt-image",
     "examples/deploy-and-call",
     "examples/cli-workflow",
+    "examples/dict-kv",
+    "examples/queue-pipeline",
     "examples/cuda-vector-add",
 ]
 

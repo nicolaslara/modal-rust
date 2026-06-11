@@ -72,6 +72,13 @@ pub(crate) struct Responses {
         Option<OverrideFn<gen::SecretGetOrCreateRequest, gen::SecretGetOrCreateResponse>>,
     pub(crate) on_volume_get_or_create:
         Option<OverrideFn<gen::VolumeGetOrCreateRequest, gen::VolumeGetOrCreateResponse>>,
+    /// Dict/Queue resolve hooks. When set they BYPASS the stateful mock store
+    /// for that RPC (useful to force a specific id or a resolve-time error);
+    /// the data-op arms always hit the real store.
+    pub(crate) on_dict_get_or_create:
+        Option<OverrideFn<gen::DictGetOrCreateRequest, gen::DictGetOrCreateResponse>>,
+    pub(crate) on_queue_get_or_create:
+        Option<OverrideFn<gen::QueueGetOrCreateRequest, gen::QueueGetOrCreateResponse>>,
 }
 
 impl Responses {

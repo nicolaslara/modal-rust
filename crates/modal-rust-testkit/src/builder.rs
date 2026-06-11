@@ -202,6 +202,34 @@ impl MockModalBuilder {
         self
     }
 
+    /// ESCAPE HATCH: steer `dict_get_or_create` (e.g. a specific `dict_id` or a
+    /// resolve-time error `Status`). NOTE: an override BYPASSES the stateful
+    /// mock store for this RPC, so the returned id won't be backed by store
+    /// state — pair it with error-path tests, not round-trip tests.
+    pub fn on_dict_get_or_create<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&gen::DictGetOrCreateRequest) -> Result<gen::DictGetOrCreateResponse, Status>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.responses.on_dict_get_or_create = Some(boxed(f));
+        self
+    }
+
+    /// ESCAPE HATCH: steer `queue_get_or_create` — same bypass caveat as
+    /// [`on_dict_get_or_create`](Self::on_dict_get_or_create).
+    pub fn on_queue_get_or_create<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&gen::QueueGetOrCreateRequest) -> Result<gen::QueueGetOrCreateResponse, Status>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.responses.on_queue_get_or_create = Some(boxed(f));
+        self
+    }
+
     /// Bind a loopback port, start the in-process server task, and return the live
     /// [`MockModal`] handle. The handle owns the task (aborted on `Drop`).
     pub async fn start(self) -> std::io::Result<MockModal> {

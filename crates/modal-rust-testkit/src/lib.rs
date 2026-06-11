@@ -58,6 +58,7 @@ mod record;
 mod responder;
 mod server;
 mod servicer;
+mod store;
 
 pub use builder::MockModalBuilder;
 pub use record::{FromRecorded, RecordedRequest, RequestLog};

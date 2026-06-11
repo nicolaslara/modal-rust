@@ -919,6 +919,42 @@ per-function `image` — is sourced from the registry at call time. The decorato
 config; there are no extra CLI flags. (Non-macro users can set the same fields on
 `RemoteConfig` / `DeployConfig`.)
 
+## Dicts and Queues
+
+Share state between functions and callers through named, server-side objects —
+`modal_rust::Dict` (key/value) and `modal_rust::Queue` (FIFO), mirroring
+`modal.Dict`/`modal.Queue`. Both are app-independent handles behind the `client`
+feature; `from_name` creates if missing (idempotent):
+
+```rust
+use modal_rust::{Dict, Queue};
+use std::time::Duration;
+
+// Dict: heterogeneous values, typed per call. Keys are &str.
+let d = Dict::from_name("scores").await?;
+d.put("alice", &42_i64).await?;
+let v: Option<i64> = d.get("alice").await?;            // None = key absent
+let created = d.put_if_absent("alice", &7_i64).await?; // false: already present
+
+// Queue: blocking get with a timeout (None = block forever, ZERO = poll once).
+let q = Queue::from_name("jobs").await?;
+q.put_many(&[27_u64, 97, 9]).await?;
+let next: Option<u64> = q.get(Some(Duration::from_secs(30))).await?; // None = timed out
+
+Dict::delete("scores").await?;                          // by name; irreversible
+Queue::delete("jobs").await?;
+```
+
+**The Python interop boundary (by design):** values ride a restricted-pickle
+codec matching Modal's own Go/JS clients, so *plain data* (str/int/float/bool/
+bytes/lists/dicts/structs-as-dicts) round-trips with Python, and `&str` Dict
+keys are byte-exact CPython pickle so key lookups work both ways. Pickled
+Python custom classes/functions do NOT interop — reading one is a typed codec
+error, never a panic or a silent `None`. `get_raw`/`put_raw` are the
+bring-your-own-codec escape hatch. v0 is named-only (ephemeral objects,
+iteration, and queue partitions/TTL knobs are deferred). See
+`examples/dict-kv` and `examples/queue-pipeline`.
+
 ## Development
 
 Useful checks:
@@ -967,6 +1003,8 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/volumes` | **(decorator config)** Mount a Volume (`#[function(volumes = ["/data=my-vol"])]`), write a file, and read it back on the next call — persistent storage across invocations. `record_visit` appends to a log and returns the running count. |
 | `examples/autoscaling` | **(decorator config)** Control warm capacity and scale-to-zero (`min`/`max`/`buffer_containers`, `scaledown_window`) for the latency-vs-cost tradeoff. `embed` turns a document into an L2-normalized feature vector — a believable unit of work to scale out. |
 | `examples/scheduled-job` | **(decorator config)** A deployed function that runs on a cron cadence with no caller (`#[function(schedule = Cron("0 9 * * 1"))]`): once deployed, Modal triggers `weekly_report` automatically. |
+| `examples/dict-kv` | **(shared state / Dict)** Two parties that share only a NAME: a `#[function]` computes Scrabble scores and writes them into `Dict::from_name("dict-kv-scores")`; the caller opens the same name and reads them back typed. Plain data interops with Python by design; a mock-backed test proves the write→read round-trip offline. |
+| `examples/queue-pipeline` | **(shared state / Queue)** A producer/consumer pipeline: the caller `put_many`s jobs into a named Queue; a `#[function]` consumer drains it with blocking `get(timeout)` (idle-timeout = batch done) and returns a typed summary of the Collatz stopping times it computed. FIFO + blocking-get proven offline against the mock. |
 | `examples/custom-base` | **(image config)** Pick the RUN base image and install the Rust toolchain via the path-level knobs (`RemoteConfig.base_image`/`.install_rust`, or `MODAL_RUST_BASE_IMAGE`/`MODAL_RUST_INSTALL_RUST`) without editing the body. `probe` checksums an input so you can confirm the body ran on your chosen image. |
 | `examples/pip-apt-image` | **(image config)** The image-builder steps API: add system packages, Python packages, and shell commands via `RemoteConfig::image_steps` (`ImageStep::apt`/`pip`/`run`), mirroring Python's `Image.apt_install(..)`/`pip_install(..)`/`run_commands(..)`. |
 

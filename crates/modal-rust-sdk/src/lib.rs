@@ -48,6 +48,7 @@ pub mod codec;
 pub mod config;
 pub mod error;
 pub mod ops;
+pub mod pickle;
 pub(crate) mod retry;
 
 /// Generated Modal control-plane protobuf types and the `ModalClient` gRPC stub

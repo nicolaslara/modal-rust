@@ -25,6 +25,7 @@ prost-types = "0.14.3"
 tokio = { version = "1.49", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_cbor = "0.11"            # MATCH modal-rs cbor.rs codec
+serde-pickle = "1.2"           # Dict/Queue value codec: Python-pickle interop (src/pickle.rs)
 toml = "0.9"                   # parse ~/.modal.toml
 base64 = "0.22"               # bake wrapper source into dockerfile_commands
 sha2 = "0.10"                 # content hashing for mounts/images

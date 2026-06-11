@@ -11,7 +11,8 @@
 //! distinct ids (`mo-1`, `mo-2`, …).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
 
@@ -20,6 +21,11 @@ use crate::proto::api as gen;
 use crate::proto::api::modal_client_server::ModalClient;
 use crate::record::{RecordedRequest, RequestLog};
 use crate::responder::Responses;
+use crate::store::ObjectStore;
+
+/// How often the mock's server-side-blocking `QueueGet` re-polls its store while
+/// the request's `timeout` window is open (the real server blocks natively).
+const QUEUE_GET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The in-process mock backend's gRPC servicer. Cheap to clone (everything shared
 /// is behind an `Arc`), so the running server task and the test handle observe the
@@ -33,6 +39,9 @@ pub(crate) struct MockServicer {
     /// Monotonic counter for incrementing ids (mounts, volumes) so a manifest with
     /// several mounts records distinct `mo-{n}` ids.
     counter: Arc<AtomicU64>,
+    /// STATEFUL Dict/Queue backing store (real put→get round-trips offline).
+    /// Locks are short and never held across an await.
+    store: Arc<Mutex<ObjectStore>>,
 }
 
 impl MockServicer {
@@ -41,6 +50,7 @@ impl MockServicer {
             log,
             responses: Arc::new(responses),
             counter: Arc::new(AtomicU64::new(0)),
+            store: Arc::new(Mutex::new(ObjectStore::default())),
         }
     }
 
@@ -48,6 +58,18 @@ impl MockServicer {
     fn next_id(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
+
+    /// Short-lived lock on the stateful Dict/Queue store (never held across an
+    /// await; a poisoned lock is a test-infra bug worth a loud panic).
+    fn store_lock(&self) -> std::sync::MutexGuard<'_, ObjectStore> {
+        self.store.lock().expect("object store poisoned")
+    }
+}
+
+/// The not-found `Status` an op on an unknown/deleted object id gets (the real
+/// server's behavior for a stale id).
+fn unknown_id(kind: &str, id: &str) -> Status {
+    Status::not_found(format!("{kind} with id '{id}' not found"))
 }
 
 /// Pull the raw `input_json` string out of the inbound CBOR `(args, kwargs)` an
@@ -394,6 +416,256 @@ impl ModalClient for MockServicer {
         }))
     }
 
+    // ---------- HAND-WRITTEN + STATEFUL: the Dict/Queue v0 RPCs ----------
+    //
+    // These arms back real state transitions against the shared [`ObjectStore`]
+    // (in-memory BTreeMap per dict / VecDeque per queue), so offline tests do
+    // genuine put→get round-trips through the facade handles. Unknown ids and
+    // pure-lookup misses surface as `Status::not_found`, mirroring the server.
+
+    /// `DictGetOrCreate`: named resolve. CREATE_IF_MISSING is idempotent (same
+    /// name → same `di-{n}` id); UNSPECIFIED ("just lookup") not-founds on a miss.
+    async fn dict_get_or_create(
+        &self,
+        request: Request<gen::DictGetOrCreateRequest>,
+    ) -> Result<Response<gen::DictGetOrCreateResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictGetOrCreate(req.clone()));
+        if let Some(f) = &self.responses.on_dict_get_or_create {
+            return f(&req).map(Response::new);
+        }
+        let create = req.object_creation_type != gen::ObjectCreationType::Unspecified as i32;
+        let candidate = format!("di-{}", self.next_id());
+        let resolved = self
+            .store_lock()
+            .resolve_dict(&req.deployment_name, create, candidate);
+        match resolved {
+            Some(dict_id) => Ok(Response::new(gen::DictGetOrCreateResponse {
+                dict_id,
+                ..Default::default()
+            })),
+            None => Err(Status::not_found(format!(
+                "Dict '{}' not found",
+                req.deployment_name
+            ))),
+        }
+    }
+
+    /// `DictGet`: byte-equality lookup → `{found, value}`.
+    async fn dict_get(
+        &self,
+        request: Request<gen::DictGetRequest>,
+    ) -> Result<Response<gen::DictGetResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictGet(req.clone()));
+        let value = self
+            .store_lock()
+            .dict_get(&req.dict_id, &req.key)
+            .map_err(|()| unknown_id("Dict", &req.dict_id))?;
+        Ok(Response::new(gen::DictGetResponse {
+            found: value.is_some(),
+            value,
+        }))
+    }
+
+    /// `DictUpdate`: put / put-if-absent / batch are all this RPC. `created`
+    /// reports whether the entry was actually inserted (the `put_if_absent` flag).
+    async fn dict_update(
+        &self,
+        request: Request<gen::DictUpdateRequest>,
+    ) -> Result<Response<gen::DictUpdateResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictUpdate(req.clone()));
+        let entries = req.updates.iter().map(|e| (e.key.clone(), e.value.clone()));
+        let created = self
+            .store_lock()
+            .dict_update(&req.dict_id, entries, req.if_not_exists)
+            .map_err(|()| unknown_id("Dict", &req.dict_id))?;
+        Ok(Response::new(gen::DictUpdateResponse { created }))
+    }
+
+    /// `DictPop`: remove + return → `{found, value}`.
+    async fn dict_pop(
+        &self,
+        request: Request<gen::DictPopRequest>,
+    ) -> Result<Response<gen::DictPopResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictPop(req.clone()));
+        let value = self
+            .store_lock()
+            .dict_pop(&req.dict_id, &req.key)
+            .map_err(|()| unknown_id("Dict", &req.dict_id))?;
+        Ok(Response::new(gen::DictPopResponse {
+            found: value.is_some(),
+            value,
+        }))
+    }
+
+    /// `DictContains`: byte-equality presence.
+    async fn dict_contains(
+        &self,
+        request: Request<gen::DictContainsRequest>,
+    ) -> Result<Response<gen::DictContainsResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictContains(req.clone()));
+        let found = self
+            .store_lock()
+            .dict_contains(&req.dict_id, &req.key)
+            .map_err(|()| unknown_id("Dict", &req.dict_id))?;
+        Ok(Response::new(gen::DictContainsResponse { found }))
+    }
+
+    /// `DictLen`: entry count (`int32` on the wire, like the real server).
+    async fn dict_len(
+        &self,
+        request: Request<gen::DictLenRequest>,
+    ) -> Result<Response<gen::DictLenResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictLen(req.clone()));
+        let len = self
+            .store_lock()
+            .dict_len(&req.dict_id)
+            .map_err(|()| unknown_id("Dict", &req.dict_id))?;
+        Ok(Response::new(gen::DictLenResponse {
+            len: i32::try_from(len).unwrap_or(i32::MAX),
+        }))
+    }
+
+    /// `DictClear`: drop all entries (the object survives).
+    async fn dict_clear(
+        &self,
+        request: Request<gen::DictClearRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictClear(req.clone()));
+        self.store_lock()
+            .dict_clear(&req.dict_id)
+            .map_err(|()| unknown_id("Dict", &req.dict_id))?;
+        Ok(Response::new(()))
+    }
+
+    /// `DictDelete`: delete the Dict OBJECT (id + name mapping).
+    async fn dict_delete(
+        &self,
+        request: Request<gen::DictDeleteRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::DictDelete(req.clone()));
+        if !self.store_lock().delete_dict(&req.dict_id) {
+            return Err(unknown_id("Dict", &req.dict_id));
+        }
+        Ok(Response::new(()))
+    }
+
+    /// `QueueGetOrCreate`: named resolve — same lifecycle contract as the dict arm.
+    async fn queue_get_or_create(
+        &self,
+        request: Request<gen::QueueGetOrCreateRequest>,
+    ) -> Result<Response<gen::QueueGetOrCreateResponse>, Status> {
+        let req = request.into_inner();
+        self.log
+            .push(RecordedRequest::QueueGetOrCreate(req.clone()));
+        if let Some(f) = &self.responses.on_queue_get_or_create {
+            return f(&req).map(Response::new);
+        }
+        let create = req.object_creation_type != gen::ObjectCreationType::Unspecified as i32;
+        let candidate = format!("qu-{}", self.next_id());
+        let resolved = self
+            .store_lock()
+            .resolve_queue(&req.deployment_name, create, candidate);
+        match resolved {
+            Some(queue_id) => Ok(Response::new(gen::QueueGetOrCreateResponse {
+                queue_id,
+                ..Default::default()
+            })),
+            None => Err(Status::not_found(format!(
+                "Queue '{}' not found",
+                req.deployment_name
+            ))),
+        }
+    }
+
+    /// `QueuePut`: append `values` in order (put / put_many are the same RPC;
+    /// default partition only — v0 always sends an empty `partition_key`).
+    async fn queue_put(
+        &self,
+        request: Request<gen::QueuePutRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::QueuePut(req.clone()));
+        self.store_lock()
+            .queue_put(&req.queue_id, req.values.clone())
+            .map_err(|()| unknown_id("Queue", &req.queue_id))?;
+        Ok(Response::new(()))
+    }
+
+    /// `QueueGet`: pop up to `n_values` FIFO, honoring the SERVER-side blocking
+    /// `timeout` window like the real backend — poll the store every
+    /// [`QUEUE_GET_POLL_INTERVAL`] until something is available or the window
+    /// closes (empty response = timed out). The lock is re-taken per tick, so a
+    /// concurrent `QueuePut` from another connection gets through mid-wait.
+    async fn queue_get(
+        &self,
+        request: Request<gen::QueueGetRequest>,
+    ) -> Result<Response<gen::QueueGetResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::QueueGet(req.clone()));
+        let n = usize::try_from(req.n_values.max(1)).unwrap_or(1);
+        let deadline = Instant::now() + Duration::from_secs_f32(req.timeout.max(0.0));
+        loop {
+            let values = self
+                .store_lock()
+                .queue_pop(&req.queue_id, n)
+                .map_err(|()| unknown_id("Queue", &req.queue_id))?;
+            if !values.is_empty() || Instant::now() >= deadline {
+                return Ok(Response::new(gen::QueueGetResponse { values }));
+            }
+            tokio::time::sleep(QUEUE_GET_POLL_INTERVAL).await;
+        }
+    }
+
+    /// `QueueLen`: item count (single default partition, so `total` is moot).
+    async fn queue_len(
+        &self,
+        request: Request<gen::QueueLenRequest>,
+    ) -> Result<Response<gen::QueueLenResponse>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::QueueLen(req.clone()));
+        let len = self
+            .store_lock()
+            .queue_len(&req.queue_id)
+            .map_err(|()| unknown_id("Queue", &req.queue_id))?;
+        Ok(Response::new(gen::QueueLenResponse {
+            len: i32::try_from(len).unwrap_or(i32::MAX),
+        }))
+    }
+
+    /// `QueueClear`: drop all items (the object survives).
+    async fn queue_clear(
+        &self,
+        request: Request<gen::QueueClearRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::QueueClear(req.clone()));
+        self.store_lock()
+            .queue_clear(&req.queue_id)
+            .map_err(|()| unknown_id("Queue", &req.queue_id))?;
+        Ok(Response::new(()))
+    }
+
+    /// `QueueDelete`: delete the Queue OBJECT (id + name mapping).
+    async fn queue_delete(
+        &self,
+        request: Request<gen::QueueDeleteRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::QueueDelete(req.clone()));
+        if !self.store_lock().delete_queue(&req.queue_id) {
+            return Err(unknown_id("Queue", &req.queue_id));
+        }
+        Ok(Response::new(()))
+    }
+
     /// The one server-streaming RPC our flow can touch. The happy path never reaches
     /// it (image get-or-create short-circuits on inline success), but it is wired as
     /// a concrete boxed stream yielding a single terminal SUCCESS so a streaming RPC
@@ -460,17 +732,9 @@ impl ModalClient for MockServicer {
     unary container_log(gen::ContainerLogRequest) -> ();
     unary container_reload_volumes(gen::ContainerReloadVolumesRequest) -> gen::ContainerReloadVolumesResponse;
     unary container_stop(gen::ContainerStopRequest) -> gen::ContainerStopResponse;
-    unary dict_clear(gen::DictClearRequest) -> ();
-    unary dict_contains(gen::DictContainsRequest) -> gen::DictContainsResponse;
-    unary dict_delete(gen::DictDeleteRequest) -> ();
-    unary dict_get(gen::DictGetRequest) -> gen::DictGetResponse;
     unary dict_get_by_id(gen::DictGetByIdRequest) -> gen::DictGetByIdResponse;
-    unary dict_get_or_create(gen::DictGetOrCreateRequest) -> gen::DictGetOrCreateResponse;
     unary dict_heartbeat(gen::DictHeartbeatRequest) -> ();
-    unary dict_len(gen::DictLenRequest) -> gen::DictLenResponse;
     unary dict_list(gen::DictListRequest) -> gen::DictListResponse;
-    unary dict_pop(gen::DictPopRequest) -> gen::DictPopResponse;
-    unary dict_update(gen::DictUpdateRequest) -> gen::DictUpdateResponse;
     unary domain_certificate_verify(gen::DomainCertificateVerifyRequest) -> gen::DomainCertificateVerifyResponse;
     unary domain_create(gen::DomainCreateRequest) -> gen::DomainCreateResponse;
     unary domain_list(gen::DomainListRequest) -> gen::DomainListResponse;
@@ -517,16 +781,10 @@ impl ModalClient for MockServicer {
     unary proxy_get_or_create(gen::ProxyGetOrCreateRequest) -> gen::ProxyGetOrCreateResponse;
     unary proxy_list(()) -> gen::ProxyListResponse;
     unary proxy_remove_ip(gen::ProxyRemoveIpRequest) -> ();
-    unary queue_clear(gen::QueueClearRequest) -> ();
-    unary queue_delete(gen::QueueDeleteRequest) -> ();
-    unary queue_get(gen::QueueGetRequest) -> gen::QueueGetResponse;
     unary queue_get_by_id(gen::QueueGetByIdRequest) -> gen::QueueGetByIdResponse;
-    unary queue_get_or_create(gen::QueueGetOrCreateRequest) -> gen::QueueGetOrCreateResponse;
     unary queue_heartbeat(gen::QueueHeartbeatRequest) -> ();
-    unary queue_len(gen::QueueLenRequest) -> gen::QueueLenResponse;
     unary queue_list(gen::QueueListRequest) -> gen::QueueListResponse;
     unary queue_next_items(gen::QueueNextItemsRequest) -> gen::QueueNextItemsResponse;
-    unary queue_put(gen::QueuePutRequest) -> ();
     unary sandbox_create(gen::SandboxCreateRequest) -> gen::SandboxCreateResponse;
     unary sandbox_create_connect_token(gen::SandboxCreateConnectTokenRequest) -> gen::SandboxCreateConnectTokenResponse;
     unary sandbox_create_v2(gen::SandboxCreateV2Request) -> gen::SandboxCreateV2Response;
