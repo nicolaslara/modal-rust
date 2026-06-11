@@ -28,6 +28,42 @@ cd "$(dirname "$0")/.."
 pass=0
 fail=0
 
+# ───────────────────────── Completeness check ──────────────────────────
+# Every example dir must appear in at least one tier (OFFLINE, LIVE, or GPU).
+# Add a new entry here when adding an example; the check below fails loudly
+# naming any example dir that falls through every tier without an entry.
+#
+# SKIP_COVERAGE: examples in NO tier at all. Add only with a documented reason.
+# (Currently empty — all examples are exercised in at least one tier above.)
+SKIP_COVERAGE=()
+
+covered_examples=(
+  add add-macro autoscaling background-jobs burn-add cli-workflow cpu-memory
+  cuda-vector-add custom-base custom-types deploy-and-call error-handling
+  fan-out-map orchestrate own-runner-bin pip-apt-image quickstart retries
+  scheduled-job secrets snapshot-class spawn-map-foreach stateful-class
+  timeout-and-cache volumes ways-to-call web-endpoint
+)
+
+completeness_fail=0
+while IFS= read -r dir; do
+  name="$(basename "$dir")"
+  covered=0
+  for c in "${covered_examples[@]}"; do [[ "$c" == "$name" ]] && covered=1 && break; done
+  if [[ "$covered" -eq 0 ]]; then
+    skipped=0
+    for s in ${SKIP_COVERAGE[@]+"${SKIP_COVERAGE[@]}"}; do [[ "$s" == "$name" ]] && skipped=1 && break; done
+    if [[ "$skipped" -eq 0 ]]; then
+      echo "COMPLETENESS ERROR: examples/$name is not exercised in any tier and not in SKIP_COVERAGE." >&2
+      completeness_fail=1
+    fi
+  fi
+done < <(find examples -maxdepth 1 -mindepth 1 -type d | sort)
+if [[ "$completeness_fail" -ne 0 ]]; then
+  echo "Add the missing example(s) to a tier in scripts/check-examples.sh (or to SKIP_COVERAGE with a reason)." >&2
+  exit 1
+fi
+
 # run "<description>" "<expected substring>" "<bash command>"
 run() {
   local desc="$1" expect="$2" cmd="$3" out
@@ -265,6 +301,29 @@ run "cuda-vector-add: doctor offline preflight (gpu decorator via CLI path)" 'mo
 # This exercises the "auto-detect: use the existing bin" path end-to-end.
 run "own-runner-bin: auto-detect existing modal_runner (cargo test)" 'test result: ok' \
   "cargo test -q -p own-runner-bin 2>&1"
+
+# snapshot-class — `#[cls(enable_memory_snapshot = true)]`: a load-once Cls whose
+# expensive `#[enter]` build (a sorted concordance index) runs ONCE per warm container
+# like any `#[cls]`, and on DEPLOY Modal also snapshots the loaded process so cold
+# containers restore the pre-built index. Proven OFFLINE via cargo test:
+#   - tests/local.rs: `#[enter]` runs exactly once across many `.local()` calls AND
+#     the concordance is real (deterministic prefix-search results).
+#   - tests/manifest.rs: `enable_memory_snapshot = true` rides into
+#     `checkpointing_enabled` on the DEPLOY manifest for every entrypoint, and stays
+#     false on the RUN manifest (RUN stays wire-identical to a non-snapshot Cls).
+run "snapshot-class: load-once #[enter] + checkpointing_enabled in deploy manifest (cargo test)" 'test result: ok' \
+  "cargo test -q -p snapshot-class 2>&1"
+
+# web-endpoint — `#[endpoint(method = "POST")]`: expose a plain function as an HTTP
+# endpoint. DEPLOY-only feature (the webhook config + ASGI format swap only take
+# effect at deploy time; RUN stays wire-identical to a plain `#[function]`). Proven
+# OFFLINE via cargo test:
+#   - tests/manifest.rs: `webhook_method = Some("POST")` rides into the DEPLOY
+#     FunctionCreate (triggering the webhook config + ASGI format swap on the wire),
+#     and is None on the RUN manifest.
+#   - tests/readme_drift.rs: verifies the README example matches the crate source.
+run "web-endpoint: webhook_method in deploy manifest, suppressed on run (cargo test)" 'test result: ok' \
+  "cargo test -q -p web-endpoint 2>&1"
 
 # ───────────────────────── 2 & 3. LIVE / GPU ─────────────────────────
 
