@@ -1,60 +1,42 @@
-//! `#[cls]` — load-once stateful classes (Cls v0, Shape A / Shape 1): the config
-//! walker/validator ([`ClsConfig`], the markers) and the emitter ([`emit_cls`]).
-//! Split out of `lib.rs` mechanically (M1); the `#[proc_macro_attribute]`
-//! entrypoint stays in `lib.rs` and delegates to [`expand_cls`].
+//! `#[cls]` — load-once stateful classes (Cls v0, Shape A / Shape 1): the impl
+//! walker/validator (the markers) and the emitter ([`emit_cls`]). Split out of
+//! `lib.rs` mechanically (M1); the `#[proc_macro_attribute]` entrypoint stays in
+//! `lib.rs` and delegates to [`expand_cls`].
+//!
+//! The decorator GRAMMAR does not live here: `#[cls(..)]`/`#[method(..)]` parse
+//! through the SHARED [`parse_decorator_config`] (with [`HandlerKind::Cls`] as the
+//! allow-set) and emit through the SHARED [`function_config_tokens`] (M2). The only
+//! cls-specific config semantics is [`DecoratorConfig::merge_over`] below — the
+//! class-default/method-override field-by-field merge.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, FnArg, GenericArgument, ImplItem, ItemImpl, LitBool, LitInt, LitStr,
-    PathArguments, ReturnType, Type,
+    parse_macro_input, FnArg, GenericArgument, ImplItem, ItemImpl, PathArguments, ReturnType, Type,
 };
 
+use crate::args::{function_config_tokens, parse_decorator_config, DecoratorConfig, HandlerKind};
 use crate::emit::result_ok_type;
-use crate::specs::{
-    parse_cpu_to_milli, parse_image_to_spec, parse_retries_to_spec, parse_schedule_to_spec,
-    parse_str_list, parse_str_map,
-};
 use crate::{facade_path, CLS_ENTRYPOINT_SEPARATOR};
 
-/// The parsed decorator config shared by `#[cls(<class config>)]` and each inner
-/// `#[method(<override>)]` marker. Every field is optional; an unset class field
-/// inherits, an unset method field falls back to the class value. This is the SAME
-/// vocabulary the `#[function]` arg parser accepts (gpu/timeout/cache/cpu/memory/
-/// retries/schedule/autoscaler/secrets/volumes), parsed by the SAME helpers.
-#[derive(Default, Clone)]
-pub(crate) struct ClsConfig {
-    pub(crate) gpu: Option<LitStr>,
-    pub(crate) timeout_secs: Option<u64>,
-    pub(crate) cache: Option<bool>,
-    pub(crate) milli_cpu: Option<u32>,
-    pub(crate) memory_mb: Option<u32>,
-    pub(crate) retries: Option<u32>,
-    pub(crate) retries_spec: Option<String>,
-    pub(crate) schedule: Option<String>,
-    pub(crate) min_containers: Option<u32>,
-    pub(crate) max_containers: Option<u32>,
-    pub(crate) buffer_containers: Option<u32>,
-    pub(crate) scaledown_window: Option<u32>,
-    // `None` = unset (inherit). `Some(vec)` = explicitly set (override, even if empty).
-    pub(crate) secrets: Option<Vec<String>>,
-    pub(crate) required_keys: Option<Vec<String>>,
-    pub(crate) env: Option<Vec<(String, String)>>,
-    pub(crate) volumes: Option<Vec<(String, String)>>,
-    // `None` = unset (inherit). `Some(spec)` = an explicit `image = Image(..)` override.
-    pub(crate) image: Option<String>,
-    // `None` = unset (inherit). `Some(bool)` = an explicit `enable_memory_snapshot = ..`
-    // opt-in (memory snapshot is `#[cls]`-only in v0; it captures the `#[enter]` load).
-    pub(crate) enable_memory_snapshot: Option<bool>,
-}
-
-impl ClsConfig {
+impl DecoratorConfig {
     /// Merge a per-method override ON TOP of `self` (the class default), field by field:
     /// a `Some` method value wins, otherwise the class value is inherited. This is done
     /// at expansion time so the emitted `Registration` carries a fully-resolved config,
     /// byte-identical in shape to what `#[function]` emits (cls-design.md §4).
-    pub(crate) fn merge_over(&self, over: &ClsConfig) -> ClsConfig {
-        ClsConfig {
+    ///
+    /// `#[cls]`-only semantics, so it lives HERE, not in `args.rs` (M2: the shared
+    /// grammar keeps no per-attribute behavior). The struct expression is TOTAL on
+    /// purpose: adding a `DecoratorConfig` field is a compile error here until a merge
+    /// rule is chosen. `explicit_name`/`webhook_*` are rejected by the parser for
+    /// [`HandlerKind::Cls`], so they are always inert (`None`/`false`) on both sides;
+    /// they still merge structurally rather than being silently dropped.
+    pub(crate) fn merge_over(&self, over: &DecoratorConfig) -> DecoratorConfig {
+        DecoratorConfig {
+            explicit_name: over
+                .explicit_name
+                .clone()
+                .or_else(|| self.explicit_name.clone()),
             gpu: over.gpu.clone().or_else(|| self.gpu.clone()),
             timeout_secs: over.timeout_secs.or(self.timeout_secs),
             cache: over.cache.or(self.cache),
@@ -79,147 +61,14 @@ impl ClsConfig {
             volumes: over.volumes.clone().or_else(|| self.volumes.clone()),
             image: over.image.clone().or_else(|| self.image.clone()),
             enable_memory_snapshot: over.enable_memory_snapshot.or(self.enable_memory_snapshot),
+            webhook_method: over
+                .webhook_method
+                .clone()
+                .or_else(|| self.webhook_method.clone()),
+            webhook_requires_proxy_auth: over.webhook_requires_proxy_auth
+                || self.webhook_requires_proxy_auth,
         }
     }
-}
-
-/// Parse a `(gpu = .., timeout = .., ..)` decorator argument list (the SAME grammar as
-/// `#[function]`, MINUS `name =` which a class/method does not accept) from a
-/// `proc_macro2::TokenStream` into a [`ClsConfig`]. Used for BOTH the outer
-/// `#[cls(..)]` attribute and each inner `#[method(..)]` marker, so they share the
-/// exact decorator vocabulary and diagnostics.
-pub(crate) fn parse_cls_config(tokens: proc_macro2::TokenStream) -> syn::Result<ClsConfig> {
-    let mut cfg = ClsConfig::default();
-    if tokens.is_empty() {
-        return Ok(cfg);
-    }
-    let parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("gpu") {
-            cfg.gpu = Some(meta.value()?.parse()?);
-            Ok(())
-        } else if meta.path.is_ident("timeout") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.timeout_secs = Some(lit.base10_parse()?);
-            Ok(())
-        } else if meta.path.is_ident("cache") {
-            let lit: LitBool = meta.value()?.parse()?;
-            cfg.cache = Some(lit.value);
-            Ok(())
-        } else if meta.path.is_ident("cpu") {
-            cfg.milli_cpu = Some(parse_cpu_to_milli(meta.value()?)?);
-            Ok(())
-        } else if meta.path.is_ident("memory") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.memory_mb = Some(lit.base10_parse()?);
-            Ok(())
-        } else if meta.path.is_ident("retries") {
-            // Bare int (fixed-interval shortcut) OR the `Retries(..)` struct form, same
-            // peek as `#[function]`.
-            let value = meta.value()?;
-            if value.peek(LitInt) {
-                let lit: LitInt = value.parse()?;
-                cfg.retries = Some(lit.base10_parse()?);
-            } else {
-                cfg.retries_spec = Some(parse_retries_to_spec(value)?);
-            }
-            Ok(())
-        } else if meta.path.is_ident("schedule") {
-            cfg.schedule = Some(parse_schedule_to_spec(meta.value()?)?);
-            Ok(())
-        } else if meta.path.is_ident("min_containers") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.min_containers = Some(lit.base10_parse()?);
-            Ok(())
-        } else if meta.path.is_ident("max_containers") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.max_containers = Some(lit.base10_parse()?);
-            Ok(())
-        } else if meta.path.is_ident("buffer_containers") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.buffer_containers = Some(lit.base10_parse()?);
-            Ok(())
-        } else if meta.path.is_ident("scaledown_window") {
-            let lit: LitInt = meta.value()?.parse()?;
-            cfg.scaledown_window = Some(lit.base10_parse()?);
-            Ok(())
-        } else if meta.path.is_ident("secrets") {
-            cfg.secrets = Some(
-                parse_str_list(meta.value()?)?
-                    .iter()
-                    .map(|s| s.value())
-                    .collect(),
-            );
-            Ok(())
-        } else if meta.path.is_ident("required_keys") {
-            cfg.required_keys = Some(
-                parse_str_list(meta.value()?)?
-                    .iter()
-                    .map(|s| s.value())
-                    .collect(),
-            );
-            Ok(())
-        } else if meta.path.is_ident("env") {
-            cfg.env = Some(
-                parse_str_map(meta.value()?)?
-                    .into_iter()
-                    .map(|(k, v)| (k.value(), v.value()))
-                    .collect(),
-            );
-            Ok(())
-        } else if meta.path.is_ident("volumes") {
-            let mut vols = Vec::new();
-            for s in parse_str_list(meta.value()?)? {
-                let raw = s.value();
-                let (mount, name) = raw.split_once('=').ok_or_else(|| {
-                    syn::Error::new_spanned(
-                        &s,
-                        format!(
-                            "`volumes` entries must be \"MOUNT_PATH=VOLUME_NAME\", got {raw:?}"
-                        ),
-                    )
-                })?;
-                let mount = mount.trim();
-                let name = name.trim();
-                if mount.is_empty() || name.is_empty() {
-                    return Err(syn::Error::new_spanned(
-                        &s,
-                        format!(
-                            "`volumes` entry {raw:?} must have a non-empty mount path AND name"
-                        ),
-                    ));
-                }
-                vols.push((mount.to_string(), name.to_string()));
-            }
-            cfg.volumes = Some(vols);
-            Ok(())
-        } else if meta.path.is_ident("image") {
-            cfg.image = Some(parse_image_to_spec(meta.value()?)?);
-            Ok(())
-        } else if meta.path.is_ident("enable_memory_snapshot") {
-            // enable_memory_snapshot = <bool> — a bare bool opting this `#[cls]` into
-            // Modal memory snapshot (same shape/precedent as `cache`). When true, the
-            // class's `#[enter]` load is captured into the deploy-time snapshot via the
-            // serve loop's `prime` frame (deploy-only effect). Default unset ⇒ inert.
-            let lit: LitBool = meta.value()?.parse()?;
-            cfg.enable_memory_snapshot = Some(lit.value);
-            Ok(())
-        } else if meta.path.is_ident("name") {
-            Err(meta.error(
-                "`name` is not valid on `#[cls]`/`#[method]`: the entrypoint name is \
-                 derived as \"<Class>.<method>\". Rename the method instead.",
-            ))
-        } else {
-            Err(meta.error(
-                "unsupported `#[cls]`/`#[method]` argument; recognized: `gpu`, \
-                 `timeout`, `cache`, `cpu`, `memory`, `retries`, `schedule`, \
-                 `min_containers`, `max_containers`, `buffer_containers`, \
-                 `scaledown_window`, `secrets`, `required_keys`, `env`, `volumes`, \
-                 `image`, `enable_memory_snapshot`",
-            ))
-        }
-    });
-    syn::parse::Parser::parse2(parser, tokens)?;
-    Ok(cfg)
 }
 
 /// One method collected from the `#[cls]` impl block: its `#[method(..)]` override
@@ -228,7 +77,7 @@ pub(crate) struct ClsMethod {
     /// The method ident (`embed`); the entrypoint name is `"<Class>.<embed>"`.
     pub(crate) ident: syn::Ident,
     /// Effective per-method config (class default merged with the method override).
-    pub(crate) config: ClsConfig,
+    pub(crate) config: DecoratorConfig,
     /// `(ident, type)` for each non-receiver param, in declaration order.
     pub(crate) params: Vec<(syn::Ident, Type)>,
     /// The method's return type (`-> anyhow::Result<Vec<f32>>`), copied verbatim for
@@ -241,8 +90,10 @@ pub(crate) struct ClsMethod {
 pub(crate) fn expand_cls(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut item_impl = parse_macro_input!(item as ItemImpl);
 
-    // Parse the CLASS-level decorator config (the default inherited by each method).
-    let class_config = match parse_cls_config(attr.into()) {
+    // Parse the CLASS-level decorator config (the default inherited by each method)
+    // through the SHARED grammar; `HandlerKind::Cls` is the allow-set (rejects `name`
+    // and the endpoint-only keys, accepts `enable_memory_snapshot`).
+    let class_config = match parse_decorator_config(attr.into(), HandlerKind::Cls) {
         Ok(c) => c,
         Err(e) => return e.to_compile_error().into(),
     };
@@ -561,7 +412,7 @@ pub(crate) fn classify_enter_return(output: &ReturnType, class_ident: &syn::Iden
 /// the method override on top of the class config.
 pub(crate) fn build_cls_method(
     method: &syn::ImplItemFn,
-    class_config: &ClsConfig,
+    class_config: &DecoratorConfig,
     over_tokens: proc_macro2::TokenStream,
 ) -> syn::Result<ClsMethod> {
     let ident = method.sig.ident.clone();
@@ -630,7 +481,7 @@ pub(crate) fn build_cls_method(
         params.push((pat_ident, (*pt.ty).clone()));
     }
 
-    let method_over = parse_cls_config(over_tokens)?;
+    let method_over = parse_decorator_config(over_tokens, HandlerKind::Cls)?;
     let config = class_config.merge_over(&method_over);
 
     Ok(ClsMethod {
@@ -751,7 +602,11 @@ pub(crate) fn emit_cls(
         let output_ty = result_ok_type(&m.output);
         let orig_output = &m.output;
 
-        let config = cls_config_to_registration(&m.config, facade);
+        // The ONE shared `FunctionConfig` emitter (M2): the same tokens
+        // `build_registration` emits for `#[function]`/`#[endpoint]`, so a knob
+        // threaded there rides the cls registration too — per-attribute drift is
+        // structurally impossible.
+        let config = function_config_tokens(&m.config, facade);
 
         // This method's snapshot-prime: `Some(<class prime fn>)` iff this method opted
         // into memory snapshot (the prime fn is emitted once above when ANY method does),
@@ -864,115 +719,6 @@ pub(crate) fn emit_cls(
         #prime_fn
         #( #method_mods )*
         #handle
-    }
-}
-
-/// Build the `#facade::FunctionConfig { .. }` token stream for a resolved per-method
-/// [`ClsConfig`] (same shape `build_registration` emits for `#[function]`). An unset
-/// `secrets`/`volumes` (`None`) emits `&[]` — byte-identical to the bare default.
-pub(crate) fn cls_config_to_registration(
-    cfg: &ClsConfig,
-    facade: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let opt_u32 = |v: Option<u32>| match v {
-        Some(n) => quote! { ::core::option::Option::Some(#n) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let gpu_tok = match &cfg.gpu {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let timeout_tok = match cfg.timeout_secs {
-        Some(n) => {
-            let n = n as u32;
-            quote! { ::core::option::Option::Some(#n) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-    let cache_tok = match cfg.cache {
-        Some(b) => quote! { ::core::option::Option::Some(#b) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let milli_cpu_tok = opt_u32(cfg.milli_cpu);
-    let memory_mb_tok = opt_u32(cfg.memory_mb);
-    let retries_tok = opt_u32(cfg.retries);
-    let retries_spec_tok = match &cfg.retries_spec {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let schedule_tok = match &cfg.schedule {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let min_tok = opt_u32(cfg.min_containers);
-    let max_tok = opt_u32(cfg.max_containers);
-    let buffer_tok = opt_u32(cfg.buffer_containers);
-    let scaledown_tok = opt_u32(cfg.scaledown_window);
-    let secrets_tok = {
-        let items = cfg.secrets.clone().unwrap_or_default();
-        quote! { &[ #( #items ),* ] }
-    };
-    let required_keys_tok = {
-        let items = cfg.required_keys.clone().unwrap_or_default();
-        quote! { &[ #( #items ),* ] }
-    };
-    let env_tok = {
-        let items = cfg
-            .env
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| quote! { (#k, #v) })
-            .collect::<Vec<_>>();
-        quote! { &[ #( #items ),* ] }
-    };
-    let volumes_tok = {
-        let items = cfg
-            .volumes
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(mount, name)| quote! { (#mount, #name) })
-            .collect::<Vec<_>>();
-        quote! { &[ #( #items ),* ] }
-    };
-    let image_tok = match &cfg.image {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // Unset ⇒ `false` (inert default, byte-identical wire). A plain `bool` literal,
-    // const-valid in the `static` `inventory::submit!` initializer.
-    let snapshot_on = cfg.enable_memory_snapshot.unwrap_or(false);
-    let snapshot_tok = quote! { #snapshot_on };
-
-    quote! {
-        #facade::FunctionConfig {
-            gpu: #gpu_tok,
-            timeout_secs: #timeout_tok,
-            cache: #cache_tok,
-            milli_cpu: #milli_cpu_tok,
-            memory_mb: #memory_mb_tok,
-            retries: #retries_tok,
-            retries_spec: #retries_spec_tok,
-            schedule: #schedule_tok,
-            min_containers: #min_tok,
-            max_containers: #max_tok,
-            buffer_containers: #buffer_tok,
-            scaledown_window: #scaledown_tok,
-            secrets: #secrets_tok,
-            required_keys: #required_keys_tok,
-            env: #env_tok,
-            volumes: #volumes_tok,
-            image: #image_tok,
-            // The resolved `enable_memory_snapshot` opt-in (unset ⇒ `false`). `false` is
-            // const-valid in the `static` `inventory::submit!` initializer and keeps the
-            // wire byte-identical; `true` rides into the deploy-time `FunctionCreate`.
-            enable_memory_snapshot: #snapshot_tok,
-            // Web endpoints are free-fn-only in v0 (`#[endpoint]` on a `#[cls]` method
-            // is a compile_error), so the inert defaults keep the wire byte-identical.
-            webhook_method: ::core::option::Option::None,
-            webhook_requires_proxy_auth: false,
-        }
     }
 }
 

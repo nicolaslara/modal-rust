@@ -470,12 +470,12 @@ mod tests {
 
     #[test]
     fn cls_config_merge_overrides_field_by_field() {
-        let class = ClsConfig {
+        let class = DecoratorConfig {
             gpu: Some(syn::parse_str::<LitStr>(r#""T4""#).unwrap()),
             timeout_secs: Some(600),
             ..Default::default()
         };
-        let method = ClsConfig {
+        let method = DecoratorConfig {
             gpu: Some(syn::parse_str::<LitStr>(r#""A10G""#).unwrap()),
             ..Default::default()
         };
@@ -484,16 +484,16 @@ mod tests {
         assert_eq!(merged.gpu.as_ref().unwrap().value(), "A10G");
         assert_eq!(merged.timeout_secs, Some(600));
         // A bare #[method] (empty override) inherits the whole class config.
-        let inherited = class.merge_over(&ClsConfig::default());
+        let inherited = class.merge_over(&DecoratorConfig::default());
         assert_eq!(inherited.gpu.as_ref().unwrap().value(), "T4");
         assert_eq!(inherited.timeout_secs, Some(600));
     }
 
     #[test]
-    fn parse_cls_config_reads_the_decorator_vocabulary() {
+    fn cls_kind_reads_the_decorator_vocabulary() {
         let tokens: proc_macro2::TokenStream =
             syn::parse_str(r#"gpu = "T4", timeout = 600, secrets = ["a", "b"]"#).unwrap();
-        let cfg = parse_cls_config(tokens).expect("valid config");
+        let cfg = parse_decorator_config(tokens, HandlerKind::Cls).expect("valid config");
         assert_eq!(cfg.gpu.as_ref().unwrap().value(), "T4");
         assert_eq!(cfg.timeout_secs, Some(600));
         assert_eq!(
@@ -502,7 +502,28 @@ mod tests {
         );
         // `name =` is rejected on a class/method.
         let bad: proc_macro2::TokenStream = syn::parse_str(r#"name = "x""#).unwrap();
-        assert!(parse_cls_config(bad).is_err());
+        assert!(parse_decorator_config(bad, HandlerKind::Cls).is_err());
+    }
+
+    #[test]
+    fn cls_kind_rejects_endpoint_only_keys_via_the_shared_allow_set() {
+        // `#[cls]`/`#[method]` parse through the SHARED grammar (M2); the
+        // `HandlerKind::Cls` allow-set rejects the endpoint-only keys with a pointed
+        // diagnostic instead of silently accepting (and inert-emitting) them.
+        let err = parse_err(r#"method = "POST""#, HandlerKind::Cls);
+        assert!(
+            err.to_string().contains("`method` is `#[endpoint]`-only"),
+            "got: {err}"
+        );
+        let err = parse_err("requires_proxy_auth = true", HandlerKind::Cls);
+        assert!(
+            err.to_string()
+                .contains("`requires_proxy_auth` is `#[endpoint]`-only"),
+            "got: {err}"
+        );
+        // ...and the cls-only snapshot opt-in is rejected on a free `#[function]`.
+        let err = parse_err("enable_memory_snapshot = true", HandlerKind::Function);
+        assert!(err.to_string().contains("`#[cls]`-only"), "got: {err}");
     }
 
     #[test]
@@ -622,47 +643,51 @@ mod tests {
     }
 
     #[test]
-    fn parse_cls_config_reads_enable_memory_snapshot_bool() {
+    fn cls_kind_reads_enable_memory_snapshot_bool() {
         // The bare-bool opt-in parses on `#[cls]` (precedent: `cache`). Unset ⇒ `None`
         // (inherit / inert); `true`/`false` are recorded explicitly.
         let on: proc_macro2::TokenStream = syn::parse_str("enable_memory_snapshot = true").unwrap();
         assert_eq!(
-            parse_cls_config(on).unwrap().enable_memory_snapshot,
+            parse_decorator_config(on, HandlerKind::Cls)
+                .unwrap()
+                .enable_memory_snapshot,
             Some(true)
         );
         let off: proc_macro2::TokenStream =
             syn::parse_str("enable_memory_snapshot = false").unwrap();
         assert_eq!(
-            parse_cls_config(off).unwrap().enable_memory_snapshot,
+            parse_decorator_config(off, HandlerKind::Cls)
+                .unwrap()
+                .enable_memory_snapshot,
             Some(false)
         );
         // Unset on a bare `#[cls]` ⇒ `None` (inert default).
         assert_eq!(
-            parse_cls_config(proc_macro2::TokenStream::new())
+            parse_decorator_config(proc_macro2::TokenStream::new(), HandlerKind::Cls)
                 .unwrap()
                 .enable_memory_snapshot,
             None
         );
         // A non-bool value is rejected (mirrors `cache`).
         let bad: proc_macro2::TokenStream = syn::parse_str("enable_memory_snapshot = 1").unwrap();
-        assert!(parse_cls_config(bad).is_err());
+        assert!(parse_decorator_config(bad, HandlerKind::Cls).is_err());
     }
 
     #[test]
     fn cls_config_merge_threads_enable_memory_snapshot() {
         // A class-level opt-in is inherited by a bare `#[method]`; a method override
         // wins (field-by-field merge, same as the other config fields).
-        let class = ClsConfig {
+        let class = DecoratorConfig {
             enable_memory_snapshot: Some(true),
             ..Default::default()
         };
         assert_eq!(
             class
-                .merge_over(&ClsConfig::default())
+                .merge_over(&DecoratorConfig::default())
                 .enable_memory_snapshot,
             Some(true)
         );
-        let method_off = ClsConfig {
+        let method_off = DecoratorConfig {
             enable_memory_snapshot: Some(false),
             ..Default::default()
         };
@@ -676,17 +701,17 @@ mod tests {
     fn cls_config_registration_emits_resolved_snapshot_flag() {
         let facade = quote! { ::modal_rust };
         // Unset ⇒ inert `false` in the emitted `FunctionConfig`.
-        let off = cls_config_to_registration(&ClsConfig::default(), &facade).to_string();
+        let off = function_config_tokens(&DecoratorConfig::default(), &facade).to_string();
         assert!(
             off.contains("enable_memory_snapshot : false"),
             "unset opt-in must emit the inert `false`, got: {off}"
         );
         // Set ⇒ `true` rides into the emitted `FunctionConfig`.
-        let cfg = ClsConfig {
+        let cfg = DecoratorConfig {
             enable_memory_snapshot: Some(true),
             ..Default::default()
         };
-        let on = cls_config_to_registration(&cfg, &facade).to_string();
+        let on = function_config_tokens(&cfg, &facade).to_string();
         assert!(
             on.contains("enable_memory_snapshot : true"),
             "opt-in must emit `true`, got: {on}"
@@ -699,7 +724,7 @@ mod tests {
             syn::parse_str(&format!("fn {name}(&self) -> anyhow::Result<usize>")).unwrap();
         ClsMethod {
             ident: syn::parse_str(name).unwrap(),
-            config: ClsConfig {
+            config: DecoratorConfig {
                 enable_memory_snapshot: snapshot,
                 ..Default::default()
             },
@@ -958,118 +983,5 @@ mod tests {
             take_cls_marker(&mut ok),
             Ok(Some(ClsMarker::Method(_)))
         ));
-    }
-}
-
-#[cfg(test)]
-mod m2_baseline {
-    // TEMPORARY M2 byte-identity capture: dumps the emitted token streams for a
-    // representative config matrix to /tmp/m2-tokens.txt; diffed before/after the
-    // grammar unification. Deleted before commit.
-    use super::tests_m2_support::*;
-
-    #[test]
-    fn dump_tokens() {
-        std::fs::write("/tmp/m2-tokens.txt", capture()).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod tests_m2_support {
-    use crate::args::*;
-    use crate::cls::*;
-    use crate::emit::*;
-    use quote::quote;
-
-    const FULL: &str = r#"gpu = "T4", timeout = 600, cache = false, cpu = 2.0, memory = 4096, retries = Retries(max_retries = 3), schedule = Cron("0 9 * * 1"), min_containers = 1, max_containers = 5, buffer_containers = 2, scaledown_window = 120, secrets = ["a", "b"], required_keys = ["K"], env = {"E" = "V"}, volumes = ["/d=v", "/m=w"], image = Image(base = "b")"#;
-
-    pub(crate) fn capture() -> String {
-        let facade = quote! { ::modal_rust };
-        let mut out = String::new();
-        let mut fun = |src: &str, kind: HandlerKind| {
-            let toks: proc_macro2::TokenStream = syn::parse_str(src).unwrap();
-            let args = parse_decorator_config(toks, kind).unwrap();
-            out.push_str(
-                &build_registration("f", quote! { H }, quote! { C }, &facade, &args).to_string(),
-            );
-            out.push('\n');
-        };
-        fun("", HandlerKind::Function);
-        fun(r#"name = "n", retries = 3"#, HandlerKind::Function);
-        fun(FULL, HandlerKind::Function);
-        fun(
-            &format!(r#"method = "POST", requires_proxy_auth = true, {FULL}"#),
-            HandlerKind::Endpoint,
-        );
-        fun(r#"method = "GET""#, HandlerKind::Endpoint);
-        let out = &mut out;
-
-        // cls: the config emitter alone, bare + full + snapshot-on.
-        for src in ["", FULL, "enable_memory_snapshot = true, retries = 2"] {
-            let toks: proc_macro2::TokenStream = syn::parse_str(src).unwrap();
-            let cfg = parse_cls_config(toks).unwrap();
-            out.push_str(&cls_config_to_registration(&cfg, &facade).to_string());
-            out.push('\n');
-        }
-
-        // cls: the full emit (singleton + shims + registrations + handle), with a
-        // class config merged under a method override, one method WITH params,
-        // snapshot on and off, fallible and infallible enter.
-        let class: syn::Ident = syn::parse_str("Embedder").unwrap();
-        let enter: syn::Ident = syn::parse_str("load").unwrap();
-        let class_cfg = {
-            let toks: proc_macro2::TokenStream = syn::parse_str(FULL).unwrap();
-            parse_cls_config(toks).unwrap()
-        };
-        let method_over = {
-            let toks: proc_macro2::TokenStream =
-                syn::parse_str(r#"gpu = "A10G", enable_memory_snapshot = true"#).unwrap();
-            parse_cls_config(toks).unwrap()
-        };
-        let sig: syn::Signature =
-            syn::parse_str("fn embed(&self, text: String, n: u32) -> anyhow::Result<Vec<f32>>")
-                .unwrap();
-        let m1 = ClsMethod {
-            ident: syn::parse_str("embed").unwrap(),
-            config: class_cfg.merge_over(&method_over),
-            params: vec![
-                (
-                    syn::parse_str("text").unwrap(),
-                    syn::parse_str("String").unwrap(),
-                ),
-                (syn::parse_str("n").unwrap(), syn::parse_str("u32").unwrap()),
-            ],
-            output: sig.output.clone(),
-        };
-        let m2 = ClsMethod {
-            ident: syn::parse_str("dim").unwrap(),
-            config: class_cfg
-                .merge_over(&parse_cls_config(proc_macro2::TokenStream::new()).unwrap()),
-            params: Vec::new(),
-            output: sig.output,
-        };
-        for fallible in [true, false] {
-            out.push_str(
-                &emit_cls(
-                    &class,
-                    &enter,
-                    fallible,
-                    &[m1_clone(&m1), m1_clone(&m2)],
-                    &facade,
-                )
-                .to_string(),
-            );
-            out.push('\n');
-        }
-        std::mem::take(out)
-    }
-
-    fn m1_clone(m: &ClsMethod) -> ClsMethod {
-        ClsMethod {
-            ident: m.ident.clone(),
-            config: m.config.clone(),
-            params: m.params.clone(),
-            output: m.output.clone(),
-        }
     }
 }
