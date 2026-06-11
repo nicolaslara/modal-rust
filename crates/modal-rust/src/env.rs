@@ -37,9 +37,11 @@ pub const INSTALL_RUST: &str = "MODAL_RUST_INSTALL_RUST";
 /// `RemoteConfig::default()`.
 pub const NO_CACHE: &str = "MODAL_RUST_NO_CACHE";
 
-/// Truthy ⇒ ALSO archive `target/` (not just `CARGO_HOME`) in the build cache.
-/// Read locally by `discover_cache_target` and, because the local env does not
-/// cross to Modal, baked into the run image `ENV` for the container wrapper.
+/// `target/` archiving in the build cache — DEFAULT ON; set `0`/`false`/`no`/
+/// `off` to opt OUT (without `target/`, every fresh container recompiles the
+/// whole dep graph). Read locally by `discover_cache_target`; an opt-out is
+/// baked as `=0` into the run image `ENV` so the container wrapper (also
+/// default-ON) honors it.
 pub const CACHE_TARGET: &str = "MODAL_RUST_CACHE_TARGET";
 
 /// Stable deploy app name override (default `DEFAULT_DEPLOY_APP`). Read by

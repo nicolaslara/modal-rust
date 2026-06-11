@@ -507,12 +507,21 @@ fn discover_cache() -> bool {
 }
 
 /// Discover whether to ALSO archive `target/` (not just CARGO_HOME) in the cache:
-/// `MODAL_RUST_CACHE_TARGET` truthy (`1`/`true`/`yes`/`on`, case-insensitive) ⇒
-/// `true`. Default OFF. When ON (and caching is on) the facade bakes the same var
-/// into the image ENV so the remote wrapper packs/unpacks `target/` too — the local
-/// process env does NOT otherwise reach the Modal container.
+/// DEFAULT ON — without `target/` every fresh container recompiles the whole
+/// dependency graph from source (the `cargo/` registry only saves the downloads),
+/// which for a `client`-feature crate is minutes of tonic per run; packing costs
+/// seconds. `MODAL_RUST_CACHE_TARGET=0`/`false`/`no`/`off` opts OUT (the facade
+/// then bakes `=0` into the image ENV so the container wrapper — whose own default
+/// is also ON — honors the opt-out; the local process env does not otherwise reach
+/// the Modal container). MUST mirror the wrapper's `_cache_target_on()`.
 pub(crate) fn discover_cache_target() -> bool {
-    crate::env::env_bool(crate::env::CACHE_TARGET)
+    match std::env::var(crate::env::CACHE_TARGET) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Ensure the run function for `entrypoint` exists on Modal and return its invokable
@@ -858,22 +867,26 @@ mod tests {
     }
 
     #[test]
-    fn discover_cache_target_default_off_env_flips_on() {
+    fn discover_cache_target_default_on_env_opts_out() {
         // Serialized against other env-mutating tests (see `crate::ENV_TEST_LOCK`).
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("MODAL_RUST_CACHE_TARGET");
-        assert!(!discover_cache_target(), "target caching defaults OFF");
-        for truthy in ["1", "true", "YES", "On"] {
-            std::env::set_var("MODAL_RUST_CACHE_TARGET", truthy);
+        assert!(
+            discover_cache_target(),
+            "target caching defaults ON (a fresh container must not recompile the world)"
+        );
+        for falsy in ["0", "false", "NO", "Off"] {
+            std::env::set_var("MODAL_RUST_CACHE_TARGET", falsy);
             assert!(
-                discover_cache_target(),
-                "MODAL_RUST_CACHE_TARGET={truthy:?} must turn target caching ON"
+                !discover_cache_target(),
+                "MODAL_RUST_CACHE_TARGET={falsy:?} must opt target caching OUT"
             );
         }
-        std::env::set_var("MODAL_RUST_CACHE_TARGET", "no");
-        assert!(!discover_cache_target(), "non-truthy value keeps it OFF");
+        // Truthy values (and anything non-falsy) keep it ON — mirrors the wrapper.
+        std::env::set_var("MODAL_RUST_CACHE_TARGET", "1");
+        assert!(discover_cache_target());
         std::env::remove_var("MODAL_RUST_CACHE_TARGET");
     }
 

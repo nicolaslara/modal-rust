@@ -836,7 +836,7 @@ so they never get renamed.
 | `MODAL_RUST_BASE_IMAGE` | Base image for the remote build (default `rust:<ver>-slim`); pair with `MODAL_RUST_INSTALL_RUST` for CUDA bases | local process (run/deploy config) | public |
 | `MODAL_RUST_INSTALL_RUST` | Truthy ⇒ install the Rust toolchain into the image (for bases without one) | local process (run/deploy config) | public |
 | `MODAL_RUST_NO_CACHE` | Truthy ⇒ disable the run-path build cache (default ON; see [Build cache](#build-cache)) | local process (run config) | public |
-| `MODAL_RUST_CACHE_TARGET` | Truthy ⇒ also archive `target/` (not just `CARGO_HOME`) in the build cache | local process; baked into the run image `ENV` for the container wrapper | public |
+| `MODAL_RUST_CACHE_TARGET` | `target/` archiving in the build cache — default ON (fresh containers reuse compiled deps); `0` opts out | local process; an opt-out is baked into the run image `ENV` for the container wrapper | public |
 | `MODAL_RUST_DEPLOY_APP` | Stable deploy app name override | local process (deploy config) | public |
 | `MODAL_RUST_SNAPSHOT_BEST_EFFORT` | Truthy ⇒ a failed snapshot prime degrades to lazy `#[enter]` instead of failing container init | local process at deploy; baked into the image `ENV` for the deploy wrapper | public |
 | `MODAL_RUST_SERVE` | Container-side escape hatch: falsy ⇒ wrappers print build/exec commands instead of running them | container (Python wrappers) | internal |

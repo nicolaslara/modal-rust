@@ -89,12 +89,16 @@ _ARCHIVE_ZSTD, _ARCHIVE_GZIP = _archive_paths(
 
 
 def _cache_target_on():
-    # Optionally archive target/ too. Gated by env, default OFF in v0.
-    return os.environ.get("MODAL_RUST_CACHE_TARGET", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    # Archive target/ too — DEFAULT ON: without it every fresh container recompiles
+    # the whole dependency graph from source (the cargo/ registry only saves the
+    # DOWNLOADs), which for a client-feature crate is ~150 crates of tonic — minutes
+    # per run. The archive grows (zstd keeps it manageable) and pack/unpack costs
+    # seconds; recompiling costs minutes. MODAL_RUST_CACHE_TARGET=0 opts out.
+    return os.environ.get("MODAL_RUST_CACHE_TARGET", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 

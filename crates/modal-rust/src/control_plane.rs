@@ -279,12 +279,12 @@ pub(crate) fn build_image_spec(
                     inputs.source.remote_src,
                 ))
                 .with_command("ENV RUST_BACKTRACE=1");
-            // P6: target/ caching is opt-in via MODAL_RUST_CACHE_TARGET (default OFF).
-            // The wrapper reads this from the CONTAINER env, but the local process env
-            // does not cross to Modal, so when caching is on AND the var is set
-            // locally we BAKE it into the image ENV. Default path renders identically.
-            if inputs.cache && crate::remote::discover_cache_target() {
-                spec = spec.with_command(format!("ENV {}=1", crate::env::CACHE_TARGET));
+            // target/ caching is DEFAULT ON (both here and in the wrapper — see
+            // `discover_cache_target`); only an explicit local OPT-OUT must cross to
+            // the container, so we bake `=0` then. The default path bakes nothing —
+            // rendered image byte-identical to before the default flip.
+            if inputs.cache && !crate::remote::discover_cache_target() {
+                spec = spec.with_command(format!("ENV {}=0", crate::env::CACHE_TARGET));
             }
             spec.with_command("ENTRYPOINT []")
         }
