@@ -26,9 +26,10 @@
 //!
 //! The whole sequence is identical across run/deploy EXCEPT the four inputs captured
 //! by [`Boundary`] (app state, source delivery, build timing, publish state). The
-//! divergence is isolated to that value plus the pure [`build_image_spec`] /
-//! [`build_function_spec`] functions — there is NO scattered `if run {…} else {…}`
-//! in [`provision`].
+//! divergence is isolated to that value, the [`ProvisionPlan`] it constructs (the
+//! entrypoint arity + publish cadence [`provision`] consults), the pure
+//! [`build_image_spec`] / [`build_function_spec`] functions, and the deploy-only
+//! [`deploy_gates`] — there is NO scattered `if run {…} else {…}` in [`provision`].
 //!
 //! | aspect          | run                              | deploy                                   |
 //! | --------------- | -------------------------------- | ---------------------------------------- |
@@ -109,6 +110,71 @@ pub(crate) const DEPLOY_BOUNDARY: Boundary = Boundary {
     app_state: AppState::Deployed,
     source_delivery: SourceDelivery::DeployContext,
 };
+
+/// The entrypoint ARITY + publish cadence each boundary owns — the run/deploy shape
+/// difference [`provision`] CONSULTS instead of re-deriving `if run {…}` booleans
+/// inline (the module-doc "no scattered branches" contract). Constructed ONCE per
+/// call by [`Boundary::plan`], so the RUN single-entrypoint contract lives with the
+/// boundary owner rather than as ad-hoc checks scattered through the sequence.
+#[derive(Clone, Copy)]
+enum ProvisionPlan<'a> {
+    /// RUN: exactly ONE entrypoint per [`provision`] call (the caller memoizes per
+    /// entrypoint and threads the cumulative publish union across calls). The app is
+    /// resolved FIRST (it was created at connect time) along with the run-level
+    /// cache/secrets/volumes, and the cumulative union is RE-PUBLISHED after EACH
+    /// create.
+    Single(&'a Entrypoint),
+    /// DEPLOY: every entrypoint in one call. The app is resolved AFTER the mounts,
+    /// per-entrypoint resources are resolved inside the create loop, and ONE
+    /// persistent publish carries the union after the loop.
+    Many,
+}
+
+impl Boundary {
+    /// Construct the [`ProvisionPlan`] this boundary owns. The RUN path provisions
+    /// exactly ONE entrypoint per call, enforced HERE (once, up front) instead of
+    /// mid-sequence.
+    fn plan<'a>(&self, entrypoints: &'a [Entrypoint]) -> Result<ProvisionPlan<'a>> {
+        match self.source_delivery {
+            SourceDelivery::RunMount => {
+                entrypoints
+                    .first()
+                    .map(ProvisionPlan::Single)
+                    .ok_or_else(|| {
+                        Error::config("RUN provision requires exactly one entrypoint".to_string())
+                    })
+            }
+            SourceDelivery::DeployContext => Ok(ProvisionPlan::Many),
+        }
+    }
+}
+
+/// The DEPLOY-only IMAGE gates, computed PURELY from the entrypoints. Kept next to
+/// [`DEPLOY_BOUNDARY`] so each new deploy-only feature lands its gate HERE — not as
+/// another inline block inside [`provision`]'s image arm. Both gates are opt-in, so
+/// an undecorated deploy renders byte-identically (the off-path guarantee).
+struct DeployGates<'a> {
+    /// Bake `ENV MODAL_RUST_SNAPSHOT_PRIME=1` into the top layer: `true` only when
+    /// ANY deployed entrypoint opted into `enable_memory_snapshot` (§9).
+    bake_snapshot_prime: bool,
+    /// Web endpoints §4: every deployed entrypoint that declared `webhook_method`
+    /// gets a generated `web_<sanitized>` adapter line in the baked wrapper (the
+    /// endpoint function's `implementation_name`). Empty ⇒ the plain static wrapper.
+    endpoint_entrypoints: Vec<&'a str>,
+}
+
+fn deploy_gates(entrypoints: &[Entrypoint]) -> DeployGates<'_> {
+    DeployGates {
+        bake_snapshot_prime: entrypoints
+            .iter()
+            .any(|ep| ep.options.enable_memory_snapshot),
+        endpoint_entrypoints: entrypoints
+            .iter()
+            .filter(|ep| ep.options.webhook_method.is_some())
+            .map(|ep| ep.name.as_str())
+            .collect(),
+    }
+}
 
 /// One entrypoint to provision: its NAME (the Modal object TAG) plus its effective
 /// per-entrypoint [`FunctionOptions`] (gpu/timeout/cache/secrets/volumes). The shared
@@ -596,10 +662,11 @@ pub(crate) async fn provision<C: ControlPlane>(
     // The RUN path resolves the app FIRST (it was created at connect time), then the
     // cargo cache + run-scoped secrets/user-volumes, then the mounts. The DEPLOY path
     // resolves the mounts first, then the app, then resolves secrets/user-volumes
-    // PER ENTRYPOINT inside the create loop. That ordering difference is the only
-    // place the Boundary reorders steps; it is expressed as the two arms below, each
-    // delegating to the SAME `ControlPlane` methods — no duplicated request building.
-    let run = matches!(boundary.source_delivery, SourceDelivery::RunMount);
+    // PER ENTRYPOINT inside the create loop. That ordering difference (plus the
+    // publish cadence) is the [`ProvisionPlan`] the boundary owns; the sequence below
+    // consults the plan, each arm delegating to the SAME `ControlPlane` methods — no
+    // duplicated request building.
+    let plan = boundary.plan(inputs.entrypoints)?;
 
     // Per-run resources resolved once before the create loop (RUN only): the cargo
     // cache + the single RUN entrypoint's secrets/user-volumes, in the live wire order.
@@ -608,8 +675,8 @@ pub(crate) async fn provision<C: ControlPlane>(
     let mut run_user_volume_mounts: Vec<(String, String)> = Vec::new();
 
     // App (RUN: ephemeral, resolved from the connect-time id; DEPLOY: persistent
-    // get-or-create AFTER the mounts — so the RUN arm resolves it here, DEPLOY later).
-    let app_id = if run {
+    // get-or-create AFTER the mounts — so the Single arm resolves it here, Many later).
+    let app_id = if let ProvisionPlan::Single(ep) = plan {
         let app_id = cp
             .ensure_app(inputs.app_name, inputs.app_id, boundary.app_state)
             .await?;
@@ -619,7 +686,6 @@ pub(crate) async fn provision<C: ControlPlane>(
         }
         // Run-level secrets + user volumes (the single RUN entrypoint's config). Named
         // secrets carry `required_keys`; a non-empty inline `env` adds one more id.
-        let ep = single_entrypoint(inputs)?;
         let object_tag = crate::remote::sanitize_object_tag(&ep.name);
         run_secret_ids =
             resolve_entrypoint_secrets(cp, inputs.app_name, &object_tag, &ep.options).await?;
@@ -659,31 +725,18 @@ pub(crate) async fn provision<C: ControlPlane>(
         SourceDelivery::RunMount => cp.ensure_image(&app_id, &base_spec, 0).await?,
         SourceDelivery::DeployContext => {
             let base_image_id = cp.ensure_image(&app_id, &base_spec, 0).await?;
-            // Bake the snapshot-prime ENV when ANY deployed entrypoint opted into memory
-            // snapshot. Reached only on the DEPLOY boundary, so the deploy app_state is
-            // implied; off ⇒ byte-identical image (the §9 off-path guarantee).
-            let bake_snapshot_prime = inputs
-                .entrypoints
-                .iter()
-                .any(|ep| ep.options.enable_memory_snapshot);
-            // Web endpoints §4: every deployed entrypoint that declared
-            // `webhook_method` gets a generated `web_<sanitized>` adapter line in the
-            // baked wrapper (the endpoint function's `implementation_name`). Reached
-            // only on the DEPLOY boundary (like the snapshot-prime gate above); none
-            // ⇒ the plain static wrapper, byte-identical.
-            let endpoint_entrypoints: Vec<&str> = inputs
-                .entrypoints
-                .iter()
-                .filter(|ep| ep.options.webhook_method.is_some())
-                .map(|ep| ep.name.as_str())
-                .collect();
+            // The deploy-only image gates (snapshot prime ENV, endpoint adapter
+            // lines), computed purely by [`deploy_gates`] next to [`DEPLOY_BOUNDARY`].
+            // Reached only on the DEPLOY boundary, so the deploy app_state is implied;
+            // both gates off ⇒ byte-identical image (the off-path guarantee).
+            let gates = deploy_gates(inputs.entrypoints);
             let top_spec = build_deploy_top_layer_spec(
                 &base_image_id,
                 &source_mount_id,
                 inputs.source.package,
-                bake_snapshot_prime,
+                gates.bake_snapshot_prime,
                 inputs.snapshot_best_effort,
-                &endpoint_entrypoints,
+                &gates.endpoint_entrypoints,
             );
             cp.ensure_image(&app_id, &top_spec, 1).await?
         }
@@ -698,24 +751,26 @@ pub(crate) async fn provision<C: ControlPlane>(
 
         // DEPLOY resolves secrets + user volumes PER ENTRYPOINT, here in the loop.
         // RUN reuses the run-level resources resolved above (its single entrypoint).
-        let (cache_for_ep, secret_ids, user_volume_mounts) = if run {
-            (
+        let (cache_for_ep, secret_ids, user_volume_mounts) = match plan {
+            ProvisionPlan::Single(_) => (
                 cache_vol_id.clone(),
                 run_secret_ids.clone(),
                 run_user_volume_mounts.clone(),
-            )
-        } else {
-            // Named secrets (with `required_keys`) + the inline `env` secret, resolved
-            // PER ENTRYPOINT here in the loop (the inline name keys on this object tag).
-            let secret_ids =
-                resolve_entrypoint_secrets(cp, inputs.app_name, &object_tag, &ep.options).await?;
-            let mut user_volume_mounts: Vec<(String, String)> =
-                Vec::with_capacity(ep.options.volumes.len());
-            for (mount_path, name) in &ep.options.volumes {
-                let vid = cp.ensure_volume(name, false).await?;
-                user_volume_mounts.push((vid, mount_path.clone()));
+            ),
+            ProvisionPlan::Many => {
+                // Named secrets (with `required_keys`) + the inline `env` secret, resolved
+                // PER ENTRYPOINT here in the loop (the inline name keys on this object tag).
+                let secret_ids =
+                    resolve_entrypoint_secrets(cp, inputs.app_name, &object_tag, &ep.options)
+                        .await?;
+                let mut user_volume_mounts: Vec<(String, String)> =
+                    Vec::with_capacity(ep.options.volumes.len());
+                for (mount_path, name) in &ep.options.volumes {
+                    let vid = cp.ensure_volume(name, false).await?;
+                    user_volume_mounts.push((vid, mount_path.clone()));
+                }
+                (None, secret_ids, user_volume_mounts)
             }
-            (None, secret_ids, user_volume_mounts)
         };
 
         let res = AttachedResources {
@@ -729,11 +784,11 @@ pub(crate) async fn provision<C: ControlPlane>(
         let created = cp.create(&app_id, &precreate_id, &fn_spec).await?;
         published.record(&object_tag, &created);
 
-        // RUN re-publishes the CUMULATIVE union after EACH create — `AppPublish`
-        // REPLACES the function set, so a per-entrypoint create must re-publish every
-        // prior one too (across calls, via the threaded `published`) or it would
-        // de-invoke them. DEPLOY publishes ONCE after the whole loop.
-        if run {
+        // RUN (Single) re-publishes the CUMULATIVE union after EACH create —
+        // `AppPublish` REPLACES the function set, so a per-entrypoint create must
+        // re-publish every prior one too (across calls, via the threaded `published`)
+        // or it would de-invoke them. DEPLOY (Many) publishes ONCE after the loop.
+        if matches!(plan, ProvisionPlan::Single(_)) {
             publish_url = cp
                 .publish(
                     &app_id,
@@ -746,8 +801,8 @@ pub(crate) async fn provision<C: ControlPlane>(
         }
     }
 
-    // DEPLOY: one persistent publish carrying the UNION of every per-entrypoint fn.
-    if !run {
+    // DEPLOY (Many): one persistent publish carrying the UNION of every entrypoint fn.
+    if matches!(plan, ProvisionPlan::Many) {
         publish_url = cp
             .publish(
                 &app_id,
@@ -805,15 +860,6 @@ fn reject_cache_collision(cache: bool, mount_path: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// The RUN path provisions exactly ONE entrypoint per [`provision`] call (the caller
-/// memoizes per entrypoint and maintains the cumulative publish union). Return it.
-fn single_entrypoint<'a>(inputs: &'a ProvisionInputs<'a>) -> Result<&'a Entrypoint> {
-    inputs
-        .entrypoints
-        .first()
-        .ok_or_else(|| Error::config("RUN provision requires exactly one entrypoint".to_string()))
 }
 
 /// The LIVE control plane: the real [`ModalClient`]. Encapsulates ALL live-only
