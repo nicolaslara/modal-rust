@@ -36,6 +36,10 @@ pub type ModalClientStub = ModalClientClient<InterceptedService<Channel, AuthInt
 /// # Ok(())
 /// # }
 /// ```
+/// `Clone` is cheap and shares the underlying HTTP/2 channel (tonic multiplexes
+/// concurrent requests over one connection) — used by the mount upload to probe
+/// many files concurrently.
+#[derive(Clone)]
 pub struct ModalClient {
     inner: ModalClientStub,
     config: ModalConfig,

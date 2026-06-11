@@ -284,10 +284,19 @@ impl ModalClient {
 
     /// Hash, dedup, and upload each [`LocalFile`], returning the assembled
     /// [`MountFile`] descriptors sorted by filename (deterministic mount build).
+    ///
+    /// Uploads run with BOUNDED CONCURRENCY (16-way, matching the Python client):
+    /// for an unchanged source tree every file resolves as a sha256 probe hit
+    /// ("server already has it"), so the cost is pure round-trip latency — done
+    /// sequentially that was ~N×RTT (5-10s for a typical crate), concurrently it
+    /// is ~N/16×RTT. Clones of [`ModalClient`] share one multiplexed h2 channel.
     async fn upload_files(&mut self, files: Vec<LocalFile>) -> Result<Vec<MountFile>> {
+        const UPLOAD_CONCURRENCY: usize = 16;
+
         let mut accounted_sha: HashSet<String> = HashSet::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
         let mut mount_files: Vec<MountFile> = Vec::with_capacity(files.len());
+        let mut to_upload: Vec<(String, Vec<u8>)> = Vec::new();
 
         for file in files {
             if !seen_paths.insert(file.mount_filename.clone()) {
@@ -301,7 +310,7 @@ impl ModalClient {
             // Skip RPCs for identical content already accounted for this run
             // (in-run dedup); the server also dedups by sha across runs/users.
             if accounted_sha.insert(sha256_hex.clone()) {
-                self.ensure_file_uploaded(&sha256_hex, &file.data).await?;
+                to_upload.push((sha256_hex.clone(), file.data.clone()));
             }
 
             mount_files.push(MountFile {
@@ -310,6 +319,23 @@ impl ModalClient {
                 size: Some(file.data.len() as u64),
                 mode: file.mode,
             });
+        }
+
+        let mut join = tokio::task::JoinSet::new();
+        let mut queue = to_upload.into_iter();
+        let mut spawn_next = |join: &mut tokio::task::JoinSet<Result<()>>,
+                              item: (String, Vec<u8>)| {
+            let mut client = self.clone();
+            join.spawn(async move { client.ensure_file_uploaded(&item.0, &item.1).await });
+        };
+        for item in queue.by_ref().take(UPLOAD_CONCURRENCY) {
+            spawn_next(&mut join, item);
+        }
+        while let Some(res) = join.join_next().await {
+            res.map_err(|e| Error::build(format!("mount upload task panicked: {e}")))??;
+            if let Some(item) = queue.next() {
+                spawn_next(&mut join, item);
+            }
         }
 
         mount_files.sort_by(|a, b| a.filename.cmp(&b.filename));
