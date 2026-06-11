@@ -73,6 +73,7 @@ pub(crate) async fn mock_client(server_url: String) -> Result<sdk::ModalClient> 
         token_secret: "as-mock".into(),
         environment: Some("main".into()),
         image_builder_version: None,
+        is_container: false,
     };
     Ok(sdk::ModalClient::from_config(config).await?)
 }

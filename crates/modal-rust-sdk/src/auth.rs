@@ -23,12 +23,19 @@ pub const CLIENT_VERSION: &str = "1.3.2";
 /// replicate the Python FILE-mode path, not the libmodal JS/Go identities.
 pub const CLIENT_TYPE_CLIENT: &str = "1";
 
+/// `ClientType::CLIENT_TYPE_CONTAINER` (api.proto:86) — the identity a client
+/// INSIDE a Modal container presents. Containers carry NO token pair (the
+/// Python client explicitly ignores tokens in-container, `client.py:224-231`);
+/// the worker-provided `MODAL_SERVER_URL` connection itself is the credential.
+pub const CLIENT_TYPE_CONTAINER: &str = "3";
+
 /// Authentication interceptor that injects the required Modal metadata headers
 /// into every gRPC request. Cheap to clone (all values are pre-parsed).
 #[derive(Clone)]
 pub struct AuthInterceptor {
-    token_id: MetadataValue<Ascii>,
-    token_secret: MetadataValue<Ascii>,
+    /// `None` in container mode: the Python client sends NO token headers with
+    /// `CLIENT_TYPE_CONTAINER` (`client.py:55-56` is conditional on credentials).
+    tokens: Option<(MetadataValue<Ascii>, MetadataValue<Ascii>)>,
     client_version: MetadataValue<Ascii>,
     client_type: MetadataValue<Ascii>,
     platform: MetadataValue<Ascii>,
@@ -40,10 +47,27 @@ impl AuthInterceptor {
     /// `"unknown"` if it ever fails to parse as an ASCII header.
     pub fn new(token_id: &str, token_secret: &str) -> Result<Self> {
         Ok(Self {
-            token_id: token_id.parse().map_err(Error::invalid_metadata)?,
-            token_secret: token_secret.parse().map_err(Error::invalid_metadata)?,
+            tokens: Some((
+                token_id.parse().map_err(Error::invalid_metadata)?,
+                token_secret.parse().map_err(Error::invalid_metadata)?,
+            )),
             client_version: CLIENT_VERSION.parse().map_err(Error::invalid_metadata)?,
             client_type: CLIENT_TYPE_CLIENT
+                .parse()
+                .map_err(Error::invalid_metadata)?,
+            platform: platform_string()
+                .parse()
+                .unwrap_or_else(|_| ascii_literal("unknown")),
+        })
+    }
+
+    /// Build the IN-CONTAINER interceptor: `CLIENT_TYPE_CONTAINER`, no token
+    /// headers (mirrors `client.py:230-231` — `credentials = None`).
+    pub fn container() -> Result<Self> {
+        Ok(Self {
+            tokens: None,
+            client_version: CLIENT_VERSION.parse().map_err(Error::invalid_metadata)?,
+            client_type: CLIENT_TYPE_CONTAINER
                 .parse()
                 .map_err(Error::invalid_metadata)?,
             platform: platform_string()
@@ -56,8 +80,10 @@ impl AuthInterceptor {
 impl Interceptor for AuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> std::result::Result<Request<()>, Status> {
         let md = req.metadata_mut();
-        md.insert("x-modal-token-id", self.token_id.clone());
-        md.insert("x-modal-token-secret", self.token_secret.clone());
+        if let Some((token_id, token_secret)) = &self.tokens {
+            md.insert("x-modal-token-id", token_id.clone());
+            md.insert("x-modal-token-secret", token_secret.clone());
+        }
         md.insert("x-modal-client-type", self.client_type.clone());
         md.insert("x-modal-client-version", self.client_version.clone());
         md.insert("x-modal-platform", self.platform.clone());
@@ -134,6 +160,21 @@ mod tests {
         assert_eq!(md.get("x-modal-client-version").unwrap(), CLIENT_VERSION);
         assert!(md.get("x-modal-platform").is_some());
         assert!(md.get("x-modal-timestamp").is_some());
+    }
+
+    #[test]
+    fn container_interceptor_sends_no_tokens_and_container_type() {
+        let mut interceptor = AuthInterceptor::container().unwrap();
+        let req = interceptor.call(Request::new(())).unwrap();
+        let md = req.metadata();
+        // Python parity (client.py:230-231): NO token headers in-container.
+        assert!(md.get("x-modal-token-id").is_none());
+        assert!(md.get("x-modal-token-secret").is_none());
+        assert_eq!(
+            md.get("x-modal-client-type").unwrap(),
+            CLIENT_TYPE_CONTAINER
+        );
+        assert!(md.get("x-modal-client-version").is_some());
     }
 
     #[test]

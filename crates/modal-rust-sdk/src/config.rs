@@ -35,6 +35,12 @@ pub struct ModalConfig {
     pub environment: Option<String>,
     /// Image builder version (if present in config/env).
     pub image_builder_version: Option<String>,
+    /// IN-CONTAINER mode (`MODAL_IS_REMOTE=1`, set by Modal's worker): identity
+    /// comes from the worker-provided connection (`MODAL_SERVER_URL`) and the
+    /// `CLIENT_TYPE_CONTAINER` client type — NO token credentials exist or are
+    /// sent (mirrors the Python client's `_is_remote()` branch, `client.py:224`:
+    /// tokens are explicitly IGNORED inside containers).
+    pub is_container: bool,
 }
 
 impl ModalConfig {
@@ -48,6 +54,7 @@ impl ModalConfig {
             token_secret: token_secret.trim().to_string(),
             environment: None,
             image_builder_version: None,
+            is_container: false,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -102,6 +109,30 @@ pub struct ModalProfile {
 /// the file is absent but `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` are both set,
 /// the file is treated as optional.
 pub fn read_modal_config() -> Result<ModalConfig> {
+    // IN-CONTAINER short-circuit (mirrors Python `_is_remote()`, config.py:117 +
+    // client.py:224): Modal's worker sets MODAL_IS_REMOTE=1 and MODAL_SERVER_URL
+    // in every container. There is NO ~/.modal.toml and NO token pair in there —
+    // identity rides the worker-provided connection with CLIENT_TYPE_CONTAINER —
+    // so the file/token resolution below must not run (it would fail exactly the
+    // way a Dict/Queue handle inside a `#[function]` body did before this branch).
+    if env_string("MODAL_IS_REMOTE").as_deref() == Some("1") {
+        let server_url = env_string("MODAL_SERVER_URL").ok_or_else(|| {
+            Error::config(
+                "MODAL_IS_REMOTE=1 but MODAL_SERVER_URL is unset — cannot reach the \
+                 control plane from inside this container",
+            )
+        })?;
+        return Ok(ModalConfig {
+            profile: "container".to_string(),
+            server_url,
+            token_id: String::new(),
+            token_secret: String::new(),
+            environment: env_string("MODAL_ENVIRONMENT"),
+            image_builder_version: env_string("MODAL_IMAGE_BUILDER_VERSION"),
+            is_container: true,
+        });
+    }
+
     let path = resolve_config_path();
 
     // Start from the file when present; otherwise an empty profile that env vars
@@ -146,6 +177,7 @@ pub fn read_modal_config() -> Result<ModalConfig> {
         token_secret: trimmed(profile.token_secret.as_deref()).unwrap_or_default(),
         environment: trimmed(profile.environment.as_deref()),
         image_builder_version: trimmed(profile.image_builder_version.as_deref()),
+        is_container: false,
     };
 
     apply_env_overrides(&mut resolved);
@@ -317,6 +349,7 @@ serverUrl = \"https://example.test\"
             token_secret: "secret".into(),
             environment: None,
             image_builder_version: None,
+            is_container: false,
         };
         assert!(cfg.validate().is_err());
     }

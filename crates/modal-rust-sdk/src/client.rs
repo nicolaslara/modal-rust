@@ -62,7 +62,14 @@ impl ModalClient {
     /// interceptor, then issues `ClientHello` to surface auth failures early.
     pub async fn from_config(config: ModalConfig) -> Result<Self> {
         let channel = build_channel(&config.server_url).await?;
-        let interceptor = AuthInterceptor::new(&config.token_id, &config.token_secret)?;
+        // IN-CONTAINER (MODAL_IS_REMOTE=1): CLIENT_TYPE_CONTAINER with NO token
+        // headers — the worker-provided connection is the credential (Python
+        // parity, client.py:230-231). Everywhere else: token-authenticated CLIENT.
+        let interceptor = if config.is_container {
+            AuthInterceptor::container()?
+        } else {
+            AuthInterceptor::new(&config.token_id, &config.token_secret)?
+        };
         let inner = ModalClientClient::with_interceptor(channel, interceptor);
         let mut client = Self {
             inner,

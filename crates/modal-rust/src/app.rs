@@ -339,6 +339,7 @@ impl App {
             token_secret: "as-mock".into(),
             environment: Some("main".into()),
             image_builder_version: None,
+            is_container: false,
         };
         let client = modal_rust_sdk::ModalClient::from_config(config).await?;
         Self::connect_inner_with_client(

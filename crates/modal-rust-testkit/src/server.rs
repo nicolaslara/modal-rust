@@ -86,6 +86,7 @@ impl MockModal {
             token_secret: "as-mock".into(),
             environment: Some("main".into()),
             image_builder_version: None,
+            is_container: false,
         }
     }
 
