@@ -93,7 +93,7 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   load-once-serve-many across the cold-start path. DEPLOY-ONLY (the flag rides into
   `Function.checkpointing_enabled`/`is_checkpointing_function` only at the deploy boundary;
   RUN stays wire-identical), built on a typed `prime` lifecycle frame on the `--serve` loop
-  (degrades to lazy `#[enter]` if the prime fails). `examples/snapshot-class`. Named
+  (a FAILED prime fails container init loudly by default; `MODAL_RUST_SNAPSHOT_BEST_EFFORT=1` opts into degrading to lazy `#[enter]`). `examples/snapshot-class`. Named
   follow-ups:
   - **GPU snap/restore split** — a CPU snapshot blocks GPU access in the snap window, so a
     GPU `#[cls]` must load on CPU inside the snapshot window and move to the GPU *after*
@@ -120,7 +120,7 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
 - Large files: the M1 mechanical splits landed — sdk `ops/function/{parse,spec,rpc}.rs`,
   `ops/image/{render,build}.rs`, macros `src/{args,cls,emit,specs}.rs` (all public paths
   preserved via re-exports). Remaining: `runtime/lib.rs` ~1620, `control_plane.rs` ~1420
-  (deliberately unsplit — one cohesive provision pipeline, pending review items M12/M13),
+  (deliberately unsplit — one cohesive provision pipeline; M13 landed `ProvisionPlan`/`deploy_gates()`, M12 shared-config-core still open),
   `remote.rs` ~1110. Both wrappers are real `.py` files (`remote/wrapper.py`,
   `deploy/wrapper.py` via `include_str!`).
 - The testkit duplicates the 4129-line proto + a 201-RPC server (its own `build_server`) —
