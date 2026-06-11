@@ -765,9 +765,9 @@ mod tests {
     // =======================================================================
 
     /// Parse a decorator argument list through the SHARED grammar as the given kind.
-    fn parse_args(src: &str, kind: HandlerKind) -> syn::Result<FunctionArgs> {
+    fn parse_args(src: &str, kind: HandlerKind) -> syn::Result<DecoratorConfig> {
         let tokens: proc_macro2::TokenStream = syn::parse_str(src).expect("tokenizable args");
-        parse_function_args(tokens, kind)
+        parse_decorator_config(tokens, kind)
     }
 
     /// Unwrap the parse ERROR (syn types are not `Debug` without `extra-traits`, so
@@ -958,5 +958,118 @@ mod tests {
             take_cls_marker(&mut ok),
             Ok(Some(ClsMarker::Method(_)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod m2_baseline {
+    // TEMPORARY M2 byte-identity capture: dumps the emitted token streams for a
+    // representative config matrix to /tmp/m2-tokens.txt; diffed before/after the
+    // grammar unification. Deleted before commit.
+    use super::tests_m2_support::*;
+
+    #[test]
+    fn dump_tokens() {
+        std::fs::write("/tmp/m2-tokens.txt", capture()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests_m2_support {
+    use crate::args::*;
+    use crate::cls::*;
+    use crate::emit::*;
+    use quote::quote;
+
+    const FULL: &str = r#"gpu = "T4", timeout = 600, cache = false, cpu = 2.0, memory = 4096, retries = Retries(max_retries = 3), schedule = Cron("0 9 * * 1"), min_containers = 1, max_containers = 5, buffer_containers = 2, scaledown_window = 120, secrets = ["a", "b"], required_keys = ["K"], env = {"E" = "V"}, volumes = ["/d=v", "/m=w"], image = Image(base = "b")"#;
+
+    pub(crate) fn capture() -> String {
+        let facade = quote! { ::modal_rust };
+        let mut out = String::new();
+        let mut fun = |src: &str, kind: HandlerKind| {
+            let toks: proc_macro2::TokenStream = syn::parse_str(src).unwrap();
+            let args = parse_decorator_config(toks, kind).unwrap();
+            out.push_str(
+                &build_registration("f", quote! { H }, quote! { C }, &facade, &args).to_string(),
+            );
+            out.push('\n');
+        };
+        fun("", HandlerKind::Function);
+        fun(r#"name = "n", retries = 3"#, HandlerKind::Function);
+        fun(FULL, HandlerKind::Function);
+        fun(
+            &format!(r#"method = "POST", requires_proxy_auth = true, {FULL}"#),
+            HandlerKind::Endpoint,
+        );
+        fun(r#"method = "GET""#, HandlerKind::Endpoint);
+        let out = &mut out;
+
+        // cls: the config emitter alone, bare + full + snapshot-on.
+        for src in ["", FULL, "enable_memory_snapshot = true, retries = 2"] {
+            let toks: proc_macro2::TokenStream = syn::parse_str(src).unwrap();
+            let cfg = parse_cls_config(toks).unwrap();
+            out.push_str(&cls_config_to_registration(&cfg, &facade).to_string());
+            out.push('\n');
+        }
+
+        // cls: the full emit (singleton + shims + registrations + handle), with a
+        // class config merged under a method override, one method WITH params,
+        // snapshot on and off, fallible and infallible enter.
+        let class: syn::Ident = syn::parse_str("Embedder").unwrap();
+        let enter: syn::Ident = syn::parse_str("load").unwrap();
+        let class_cfg = {
+            let toks: proc_macro2::TokenStream = syn::parse_str(FULL).unwrap();
+            parse_cls_config(toks).unwrap()
+        };
+        let method_over = {
+            let toks: proc_macro2::TokenStream =
+                syn::parse_str(r#"gpu = "A10G", enable_memory_snapshot = true"#).unwrap();
+            parse_cls_config(toks).unwrap()
+        };
+        let sig: syn::Signature =
+            syn::parse_str("fn embed(&self, text: String, n: u32) -> anyhow::Result<Vec<f32>>")
+                .unwrap();
+        let m1 = ClsMethod {
+            ident: syn::parse_str("embed").unwrap(),
+            config: class_cfg.merge_over(&method_over),
+            params: vec![
+                (
+                    syn::parse_str("text").unwrap(),
+                    syn::parse_str("String").unwrap(),
+                ),
+                (syn::parse_str("n").unwrap(), syn::parse_str("u32").unwrap()),
+            ],
+            output: sig.output.clone(),
+        };
+        let m2 = ClsMethod {
+            ident: syn::parse_str("dim").unwrap(),
+            config: class_cfg
+                .merge_over(&parse_cls_config(proc_macro2::TokenStream::new()).unwrap()),
+            params: Vec::new(),
+            output: sig.output,
+        };
+        for fallible in [true, false] {
+            out.push_str(
+                &emit_cls(
+                    &class,
+                    &enter,
+                    fallible,
+                    &[m1_clone(&m1), m1_clone(&m2)],
+                    &facade,
+                )
+                .to_string(),
+            );
+            out.push('\n');
+        }
+        std::mem::take(out)
+    }
+
+    fn m1_clone(m: &ClsMethod) -> ClsMethod {
+        ClsMethod {
+            ident: m.ident.clone(),
+            config: m.config.clone(),
+            params: m.params.clone(),
+            output: m.output.clone(),
+        }
     }
 }

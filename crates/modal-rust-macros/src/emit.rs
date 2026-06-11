@@ -9,7 +9,7 @@ use syn::{
     parse_macro_input, FnArg, GenericArgument, ItemFn, PatType, PathArguments, ReturnType, Type,
 };
 
-use crate::args::{parse_function_args, FunctionArgs, HandlerKind};
+use crate::args::{function_config_tokens, parse_decorator_config, DecoratorConfig, HandlerKind};
 use crate::facade_path;
 
 /// The ONE shared expansion path behind `#[function]` and `#[endpoint]`
@@ -27,7 +27,7 @@ pub(crate) fn expand_handler(
     // Parse the decorator arguments through the SHARED grammar. On a parse error,
     // keep the original fn (so the rest of the user's crate still type-checks) and
     // surface the diagnostic.
-    let args = match parse_function_args(attr.into(), kind) {
+    let args = match parse_decorator_config(attr.into(), kind) {
         Ok(args) => args,
         Err(e) => {
             let err = e.to_compile_error();
@@ -253,7 +253,7 @@ pub(crate) fn emit_registration(
     handler_expr: proc_macro2::TokenStream,
     check_expr: proc_macro2::TokenStream,
     facade: &proc_macro2::TokenStream,
-    args: &FunctionArgs,
+    args: &DecoratorConfig,
 ) -> TokenStream {
     let registration = build_registration(entry_name, handler_expr, check_expr, facade, args);
     quote! {
@@ -275,10 +275,9 @@ pub(crate) fn emit_registration(
 /// `HandlerFn` pointer — a const-evaluable expression valid in the `static`
 /// initializer `inventory::submit!` generates.
 ///
-/// The decorator config flows into the facade registration as a `FunctionConfig`. The
-/// `gpu` literal is a `&'static str` (so the `static` `inventory::submit!`
-/// initializer stays `const`-valid, matching `name: &'static str`); `timeout` is
-/// narrowed `u64 -> u32` here. The bare form sets all three to `None` =>
+/// The decorator config flows into the facade registration as a `FunctionConfig`
+/// through the ONE shared emitter ([`function_config_tokens`]) — the same tokens a
+/// `#[cls]` method registration carries (M2). The bare form emits
 /// `FunctionConfig::default()`, which runtime dispatch ignores (so behavior is
 /// byte-identical; only the facade reads `config` for control-plane work).
 pub(crate) fn build_registration(
@@ -286,112 +285,9 @@ pub(crate) fn build_registration(
     handler_expr: proc_macro2::TokenStream,
     check_expr: proc_macro2::TokenStream,
     facade: &proc_macro2::TokenStream,
-    args: &FunctionArgs,
+    args: &DecoratorConfig,
 ) -> proc_macro2::TokenStream {
-    let gpu_tok = match &args.gpu {
-        Some(s) => quote! { ::core::option::Option::Some(#s) }, // &'static str literal
-        None => quote! { ::core::option::Option::None },
-    };
-    let timeout_tok = match args.timeout_secs {
-        Some(n) => {
-            let n = n as u32;
-            quote! { ::core::option::Option::Some(#n) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-    let cache_tok = match args.cache {
-        Some(b) => quote! { ::core::option::Option::Some(#b) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // `cpu`/`memory` are resolved to wire units (milli-cores / MiB) at parse time, so
-    // each is a plain `Option<u32>` const-valid in the `static` initializer (exactly
-    // like `timeout`). `None` emits `None` => byte-identical to a bare decorator.
-    let milli_cpu_tok = match args.milli_cpu {
-        Some(n) => quote! { ::core::option::Option::Some(#n) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let memory_mb_tok = match args.memory_mb {
-        Some(n) => quote! { ::core::option::Option::Some(#n) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // `retries` is a plain `Option<u32>` const-valid in the `static` initializer
-    // (exactly like `timeout`). `None` emits `None` => byte-identical to a bare
-    // decorator (no retry policy on the wire).
-    let retries_tok = match args.retries {
-        Some(n) => quote! { ::core::option::Option::Some(#n) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // `retries_spec` is the canonicalized `Retries(..)` STRUCT form as a `&'static str`
-    // SPEC (the facade hands it to the SDK's `parse_retries_spec`), const-valid in the
-    // `static` initializer exactly like `gpu`/`schedule`. `None` emits `None` =>
-    // byte-identical to a bare decorator (the int form / no retries stays unchanged).
-    let retries_spec_tok = match &args.retries_spec {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // Each autoscaler knob is a plain `Option<u32>` const-valid in the `static`
-    // initializer (exactly like `timeout`/`retries`). `None` emits `None` =>
-    // byte-identical to a bare decorator (no autoscaler_settings on the wire).
-    let opt_u32_tok = |v: Option<u32>| match v {
-        Some(n) => quote! { ::core::option::Option::Some(#n) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let min_containers_tok = opt_u32_tok(args.min_containers);
-    let max_containers_tok = opt_u32_tok(args.max_containers);
-    let buffer_containers_tok = opt_u32_tok(args.buffer_containers);
-    let scaledown_window_tok = opt_u32_tok(args.scaledown_window);
-    // `schedule` is canonicalized to a `&'static str` SPEC string (the facade hands it
-    // to the SDK's `parse_schedule`), so it stays const-valid in the `static`
-    // initializer exactly like `gpu`. `None` emits `None` => byte-identical to a bare
-    // decorator (no schedule on the wire).
-    let schedule_tok = match &args.schedule {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // `secrets`/`volumes` are `&'static` slices on `FunctionConfig` (const-valid in
-    // the `static` `inventory::submit!` initializer, exactly like `gpu`/`name`). An
-    // empty list emits `&[]`, byte-identical to the bare default.
-    let secrets_tok = {
-        let items = args.secrets.iter();
-        quote! { &[ #( #items ),* ] }
-    };
-    // `required_keys` (asserted on the named secrets) + `env` (inline-secret key/values)
-    // are `&'static` slices on `FunctionConfig`, const-valid in the `static` initializer
-    // exactly like `secrets`/`volumes`. Empty lists emit `&[]`, byte-identical to the
-    // bare default.
-    let required_keys_tok = {
-        let items = args.required_keys.iter();
-        quote! { &[ #( #items ),* ] }
-    };
-    let env_tok = {
-        let items = args.env.iter().map(|(k, v)| quote! { (#k, #v) });
-        quote! { &[ #( #items ),* ] }
-    };
-    let volumes_tok = {
-        let items = args
-            .volumes
-            .iter()
-            .map(|(mount, name)| quote! { (#mount, #name) });
-        quote! { &[ #( #items ),* ] }
-    };
-    // `image` is the canonicalized per-function `Image(..)` SPEC string as a
-    // `&'static str` (the facade parses it via `remote::parse_image_spec`), const-valid
-    // in the `static` initializer exactly like `schedule`/`gpu`. `None` emits `None` =>
-    // byte-identical to a bare decorator (the env-only base image stays in effect).
-    let image_tok = match &args.image {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    // Web-endpoint marker: `#[endpoint]` threads the VALIDATED `method` (+ the
-    // proxy-auth opt-in); a plain `#[function]` keeps the inert `None`/`false`
-    // defaults ⇒ byte-identical wire. A `&'static str` literal / plain `bool`,
-    // const-valid in the `static` initializer exactly like `gpu`/
-    // `enable_memory_snapshot`.
-    let webhook_method_tok = match &args.webhook_method {
-        Some(s) => quote! { ::core::option::Option::Some(#s) },
-        None => quote! { ::core::option::Option::None },
-    };
-    let webhook_requires_proxy_auth = args.webhook_requires_proxy_auth;
+    let config = function_config_tokens(args, facade);
 
     quote! {
         #facade::__private::inventory::submit! {
@@ -407,34 +303,7 @@ pub(crate) fn build_registration(
                 // `#[function]` is never snapshot-enabled (memory snapshot is
                 // `#[cls]`-only in v0), so the prime hook is always `None` here ⇒ inert.
                 snapshot_prime: ::core::option::Option::None,
-                config: #facade::FunctionConfig {
-                    gpu: #gpu_tok,
-                    timeout_secs: #timeout_tok,
-                    cache: #cache_tok,
-                    milli_cpu: #milli_cpu_tok,
-                    memory_mb: #memory_mb_tok,
-                    retries: #retries_tok,
-                    retries_spec: #retries_spec_tok,
-                    schedule: #schedule_tok,
-                    min_containers: #min_containers_tok,
-                    max_containers: #max_containers_tok,
-                    buffer_containers: #buffer_containers_tok,
-                    scaledown_window: #scaledown_window_tok,
-                    secrets: #secrets_tok,
-                    required_keys: #required_keys_tok,
-                    env: #env_tok,
-                    volumes: #volumes_tok,
-                    image: #image_tok,
-                    // Memory snapshot is `#[cls]`-only in v0 (the shared parser rejects
-                    // the arg here), so the inert `false` keeps the wire byte-identical.
-                    enable_memory_snapshot: false,
-                    // Web-endpoint config: `#[endpoint]` threads its validated
-                    // `method`/`requires_proxy_auth`; `#[function]` keeps the inert
-                    // `None`/`false` ⇒ byte-identical wire. Const-valid in the `static`
-                    // initializer.
-                    webhook_method: #webhook_method_tok,
-                    webhook_requires_proxy_auth: #webhook_requires_proxy_auth,
-                },
+                config: #config,
                 // Capture the USER crate's cargo package name HERE — this macro
                 // expands in the user's crate, so `env!("CARGO_PKG_NAME")` is the
                 // user's package, not the facade's. The RUN/DEPLOY path threads it
