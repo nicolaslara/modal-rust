@@ -89,6 +89,11 @@ Every task needs evidence before completion. Match depth to scope:
 | `deploy` milestone | `cargo build` appears in deploy/build logs and is **absent** from call logs; deployed result is stable until redeploy |
 | GPU milestone | `nvidia-smi`/CUDA evidence; verified compute result; cost noted |
 
+**CI gate:** `scripts/ci-gate.sh` is the canonical pre-push command — it mirrors
+`.github/workflows/ci.yml` command-for-command (fmt, both clippy lints, tests,
+whitespace), so a green local gate means a green CI. The `.githooks/pre-push`
+hook (enable: `git config core.hooksPath .githooks`) runs the fast half.
+
 Record skipped verification in the task or `knowledge.md` with a reason.
 
 ## README Currency

@@ -886,6 +886,17 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+        // Linux ETXTBSY guard: a concurrent test's `Command::output()` fork can inherit
+        // our just-closed write fd across its fork→exec window, making a direct exec of
+        // this script transiently fail with ETXTBSY. `validate_input_locally` degrades
+        // spawn failures to Ok (by design), which would flip the reject-path assertion.
+        // Probe-spawn until the script execs cleanly so the test is deterministic.
+        for _ in 0..50 {
+            if std::process::Command::new(&path).output().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         path
     }
 

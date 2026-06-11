@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# pre-push — fast half of the CI gate (fmt + both clippy invocations).
+#
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# This runs only the FAST checks. The full suite (incl. `cargo test` and the
+# whitespace check) is scripts/ci-gate.sh — run it before pushing anything
+# non-trivial; it mirrors .github/workflows/ci.yml command-for-command.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+RUST_TOOLCHAIN="1.96.0" # keep in lockstep with ci.yml + rust-toolchain.toml
+
+echo "pre-push: fmt --check"
+cargo +"$RUST_TOOLCHAIN" fmt --check
+
+echo "pre-push: clippy --all-targets -D warnings"
+cargo +"$RUST_TOOLCHAIN" clippy --all-targets -- -D warnings
+
+echo "pre-push: light facade lint (clippy -p modal-rust -p modal-rust-macros)"
+cargo +"$RUST_TOOLCHAIN" clippy -p modal-rust -p modal-rust-macros -- -D warnings
+
+echo "pre-push: fast gate green. Note: scripts/ci-gate.sh runs the FULL CI suite (tests + whitespace)."
