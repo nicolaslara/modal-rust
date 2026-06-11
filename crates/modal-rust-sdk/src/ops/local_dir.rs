@@ -323,8 +323,7 @@ impl ModalClient {
 
         let mut join = tokio::task::JoinSet::new();
         let mut queue = to_upload.into_iter();
-        let mut spawn_next = |join: &mut tokio::task::JoinSet<Result<()>>,
-                              item: (String, Vec<u8>)| {
+        let spawn_next = |join: &mut tokio::task::JoinSet<Result<()>>, item: (String, Vec<u8>)| {
             let mut client = self.clone();
             join.spawn(async move { client.ensure_file_uploaded(&item.0, &item.1).await });
         };
