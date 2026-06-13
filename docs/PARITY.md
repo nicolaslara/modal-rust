@@ -1,7 +1,6 @@
 # modal-rust ↔ Modal Python parity
 
-An honest, code-verified inventory of what `modal-rust` (facade + `modal-rust-sdk`
-+ `#[modal_rust::function]` macro + `modal-rust` CLI) covers versus the official
+An honest, code-verified inventory of what `modal-rust` (facade + `modal-rust-sdk` + `#[modal_rust::function]` macro + `modal-rust` CLI) covers versus the official
 Modal Python client, so the maintainer can prioritise. Status legend:
 
 - ✅ **Have** — implemented end-to-end and live-proven.
