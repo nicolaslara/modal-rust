@@ -15,6 +15,13 @@ path = "src/lib.rs"
 name = "queue_pipeline"
 path = "src/bin/queue_pipeline.rs"
 
+[[bin]]
+# The standalone producer: `put_many`s the batch into the named Queue and exits,
+# leaving it populated so `modal-rust run drain_jobs` can drain it separately.
+# Live-only (Queue handles open a gRPC client); needs Modal credentials.
+name = "produce"
+path = "src/bin/produce.rs"
+
 [dependencies]
 # Queue handles ARE orchestration (they open a gRPC client), so unlike the pure
 # decorator examples this lib needs the `client` feature in [dependencies] — the

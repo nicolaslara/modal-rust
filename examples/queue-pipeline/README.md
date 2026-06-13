@@ -24,25 +24,31 @@ Queue handles are orchestration (they open a gRPC client), so this lib carries
 
 ## Run it
 
-Invoke the consumer with the `modal-rust` CLI — `drain_jobs` blocking-`get`s
-from the named Queue until it stays empty for `idle_ms`, returning the summary:
+The consumer (`drain_jobs`) and the producer (`put_many`) are two halves: the
+consumer is the `#[function]`, the producer is caller-side code. So running
+`drain_jobs` against an **empty** queue is well-defined but returns zeros
+(`{"jobs":0,...}`) — it blocks `idle_ms`, finds nothing, and exits. Populate the
+queue first, then drain it:
 
 ```bash
 cd examples/queue-pipeline
-modal-rust run drain_jobs --input '{"idle_ms":2000}'
+cargo run -p example-queue-pipeline --bin produce       # 1. enqueue [27, 6, 97, 9]
+modal-rust run drain_jobs --input '{"idle_ms":2000}'    # 2. drain the named Queue
 ```
 
-Expected output (against an already-populated queue):
+Expected output from step 2 (the consumer drains the four jobs FIFO):
 
 ```json
 {"ok":true,"value":{"jobs":4,"total_steps":256,"max_steps":118}}
 ```
 
-The consumer needs a **producer** to have `put_many`d jobs into
-`Queue::from_name("queue-pipeline-jobs")` first (any process by name — a Python
-`q.put(27)` works, see the interop note). To see the **full producer + consumer
-pipeline in one process** (produce here, drain in a container, then delete the
-demo Queue), use the driver:
+The producer shares **nothing** with the consumer but the name
+`queue-pipeline-jobs`, so any process can populate it — a Python `q.put_many([27,
+6, 97, 9])` works too (see the interop note). Drain within the idle window: a
+populated queue drains immediately.
+
+To see the **full producer + consumer pipeline in one process** (produce here,
+drain in a container, then delete the demo Queue), use the driver instead:
 
 ```bash
 RUN_REMOTE=1 cargo run -p example-queue-pipeline --bin queue_pipeline   # live pipeline
