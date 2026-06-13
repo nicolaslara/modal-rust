@@ -7,29 +7,9 @@ checksums an input value so you can confirm the body ran on your chosen image.
 
 ## Run it
 
-### Offline driver (no credentials needed)
-
-The primary lesson is the IMAGE the facade renders. The offline driver builds a
-`RemoteConfig` pointed at a CUDA-devel base with `install_rust = true`, calls
-`App::dry_run`, and prints the rendered Dockerfile lines — no Modal, no network.
-
-```bash
-cd examples/custom-base
-cargo run -p example-custom-base --bin custom_base
-```
-
-Expected output:
-
-```
-base:   FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
-rustup: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable ...
-```
-
-### Live run (Modal credentials required)
-
-`probe` is a plain CPU function — it runs with any base image that has a Rust
-toolchain. To run it on Modal you must set the base-image env vars (otherwise the
-default `rust:*-slim` base is used and the knobs are not exercised):
+`probe` is a plain CPU function — it runs on any base image that carries a Rust
+toolchain. Set the base-image env vars so the chosen base (not the default
+`rust:*-slim`) actually runs the body:
 
 ```bash
 cd examples/custom-base
@@ -45,6 +25,16 @@ Expected output (`checksum` is a deterministic FNV-1a of `value`):
 
 Note: `probe` requires `--input` with a `value` field. The CLI validates the input
 shape locally and fails fast (without calling Modal) if it does not match.
+
+Inspect the rendered image offline (no credentials): the driver builds a
+`RemoteConfig` pointed at a CUDA-devel base with `install_rust = true`, calls
+`App::dry_run`, and prints the rendered Dockerfile lines — no Modal, no network.
+
+```bash
+cargo run -p example-custom-base --bin custom_base
+# base:   FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
+# rustup: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable ...
+```
 
 ## Prereqs
 

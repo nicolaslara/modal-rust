@@ -17,16 +17,34 @@ Dict handles are orchestration (they open a gRPC client), so this lib carries
 
 ## Run it
 
-```bash
-# Offline (default): the honest computation — score each word locally and show
-# the entries the live path would write. No Modal, no credentials.
-cargo run -p example-dict-kv --bin dict_kv
+Invoke the writer with the `modal-rust` CLI — `record_scores` scores each word
+and `put`s `word -> score` into the named Dict, returning the entry count:
 
-# The offline write→read round-trip against the in-process mock backend:
-cargo test -p example-dict-kv
+```bash
+cd examples/dict-kv
+modal-rust run record_scores --input '{"words":["jazz","quartz","modal","rust"]}'
 ```
 
-Expected offline output:
+Expected output (four entries written, now live in `Dict::from_name("dict-kv-scores")`):
+
+```json
+{"ok":true,"value":4}
+```
+
+A Python (or any) reader can then open the same Dict by name and read the scores
+back (see the interop note below) — that is the shared-state point.
+
+To see the **full writer + reader round-trip in one process** (function writes
+in a container, this process reads back, then deletes the demo Dict), use the
+driver:
+
+```bash
+RUN_REMOTE=1 cargo run -p example-dict-kv --bin dict_kv   # live round-trip
+cargo run -p example-dict-kv --bin dict_kv                # offline: local scores only
+cargo test -p example-dict-kv                             # offline write→read vs mock backend
+```
+
+Offline driver output:
 
 ```
 local scores (what record_scores writes to the Dict):
@@ -35,13 +53,6 @@ local scores (what record_scores writes to the Dict):
   local: modal -> 8
   local: rust -> 4
 (skipping live function-writes/caller-reads — set RUN_REMOTE=1 with Modal credentials to run it)
-```
-
-With Modal credentials, run the real shared-state round-trip — the function
-writes in a container, this process reads back, then deletes the demo Dict:
-
-```bash
-RUN_REMOTE=1 cargo run -p example-dict-kv --bin dict_kv
 ```
 
 ## The Python interop boundary (by design)

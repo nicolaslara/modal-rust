@@ -24,17 +24,33 @@ Queue handles are orchestration (they open a gRPC client), so this lib carries
 
 ## Run it
 
-```bash
-# Offline (default): the honest computation — each job's Collatz stopping time,
-# locally. No Modal, no credentials.
-cargo run -p example-queue-pipeline --bin queue_pipeline
+Invoke the consumer with the `modal-rust` CLI — `drain_jobs` blocking-`get`s
+from the named Queue until it stays empty for `idle_ms`, returning the summary:
 
-# The offline produce→drain round-trip (FIFO + idle timeout) against the
-# in-process mock backend:
-cargo test -p example-queue-pipeline
+```bash
+cd examples/queue-pipeline
+modal-rust run drain_jobs --input '{"idle_ms":2000}'
 ```
 
-Expected offline output:
+Expected output (against an already-populated queue):
+
+```json
+{"ok":true,"value":{"jobs":4,"total_steps":256,"max_steps":118}}
+```
+
+The consumer needs a **producer** to have `put_many`d jobs into
+`Queue::from_name("queue-pipeline-jobs")` first (any process by name — a Python
+`q.put(27)` works, see the interop note). To see the **full producer + consumer
+pipeline in one process** (produce here, drain in a container, then delete the
+demo Queue), use the driver:
+
+```bash
+RUN_REMOTE=1 cargo run -p example-queue-pipeline --bin queue_pipeline   # live pipeline
+cargo run -p example-queue-pipeline --bin queue_pipeline                # offline: local stopping times
+cargo test -p example-queue-pipeline                                    # offline FIFO + idle timeout vs mock
+```
+
+Offline driver output:
 
 ```
 local stopping times (what drain_jobs computes per job):
@@ -44,13 +60,6 @@ local stopping times (what drain_jobs computes per job):
   local: 9 -> 19 steps
 local: 4 jobs, 256 total steps
 (skipping live produce + remote drain — set RUN_REMOTE=1 with Modal credentials to run it)
-```
-
-With Modal credentials, run the real pipeline — produce here, drain in a
-container, then delete the demo Queue:
-
-```bash
-RUN_REMOTE=1 cargo run -p example-queue-pipeline --bin queue_pipeline
 ```
 
 ## The Python interop boundary (by design)
