@@ -42,15 +42,21 @@
   <div class="grid">
     <a class="card" href="PARITY.md"><div class="t">Feature parity <span class="tag md">md</span></div><div class="d">Have / Partial / Missing vs the Modal Python client, with a prioritized gap list.</div></a>
     <a class="card" href="ROADMAP.md"><div class="t">Roadmap &amp; tech debt <span class="tag md">md</span></div><div class="d">Next steps (cheap + big parity features), and the real vs cosmetic tech-debt backlog.</div></a>
-    <a class="card" href="architecture-review.md"><div class="t">Architecture review <span class="tag md">md</span></div><div class="d">Good / weak / improve across readability, abstractions, domain separation, APIs, comments, file sizes; prioritized cleanups.</div></a>
+    <a class="card local" href="local/architecture-review-2026-06-10.html"><div class="t">Architecture review (2026-06-10) <span class="tag html">html</span></div><div class="d">The current full review: new issues + recommendations since the 2026-06-05 pass. Older reviews (issues now fixed) live in <code>local/archive/</code>.</div></a>
     <a class="card" href="https://github.com/nicolaslara/modal-rust/blob/main/crates/modal-rust-sdk/README.md"><div class="t">SDK gRPC coverage ↗</div><div class="d">The lean first-party Modal gRPC client: which of the ~200 RPCs are implemented, with a coverage matrix.</div></a>
     <a class="card" href="https://github.com/nicolaslara/modal-rust/blob/main/benchmarks/README.md"><div class="t">Benchmarks plan ↗</div><div class="d">The A/B-vs-Python benchmark scenarios (plan-only for now).</div></a>
+  </div>
+
+  <h2>Design proposals <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.8rem;color:var(--muted)">— forward-looking plans, not yet built</span></h2>
+  <div class="grid">
+    <a class="card" href="local-build-coupling.html"><div class="t">The local-build coupling problem <span class="tag html">html</span></div><div class="d">Why <code>modal-rust run</code> compiles the user's crate locally to read the entrypoint manifest, every way that coupling can hurt (F1: linux-only/<code>-sys</code> crates that won't build on the laptop), and the menu of fixes.</div></a>
+    <a class="card" href="precompile-builder-review.html"><div class="t">Precompile-on-builder vs inline-compile <span class="tag html">html</span></div><div class="d">Head-to-head design review of lifting the Rust build into a dedicated, reusable Modal builder container that emits a fingerprinted binary <code>run</code>/<code>deploy</code> fetch + exec. Recommendation: spike it, GPU + run first.</div></a>
   </div>
 
   <h2>Deep dives <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.8rem;color:var(--muted)">— local-only, not committed to the repo (<code>docs/local/</code> &amp; uncommitted)</span></h2>
   <div class="grid">
     <a class="card local" href="local/data-user-flows.html"><div class="t">Data &amp; user flows <span class="tag html">html</span></div><div class="d">Step-by-step run / deploy / call flows with SVG diagrams. (Anchor: <code>#deploy-flow</code>.)</div></a>
-    <a class="card local" href="local/architecture-issues.html"><div class="t">Architecture issues <span class="tag html">html</span></div><div class="d">Ranked issues + root-cause clusters. #1 (per-entrypoint config) is now marked RESOLVED; #2/#4/#6 (owned <code>FunctionOptions</code>) remain.</div></a>
+    <a class="card local" href="local/archive/architecture-issues-2026-06-06.html"><div class="t">Architecture issues (archived) <span class="tag html">html</span></div><div class="d">Ranked issues + root-cause clusters from 2026-06-06 — all 12 now resolved; kept in <code>local/archive/</code> with the 2026-06-05 review.</div></a>
     <a class="card local" href="local/examples-catalogue.md"><div class="t">Examples catalogue <span class="tag md">md</span></div><div class="d">The intended example set and what each demonstrates.</div></a>
     <a class="card local" href="local/testing-strategy.md"><div class="t">Testing strategy <span class="tag md">md</span></div><div class="d">Offline-testing design: pure request builders, the in-process mock backend, snapshots; why we built our own vs reusing the Python mock.</div></a>
     <a class="card local" href="local/ergonomics-and-docs-review.md"><div class="t">Ergonomics &amp; docs review <span class="tag md">md</span></div><div class="d">Prioritized API-friction + newcomer-docs findings (the source of the ergonomics-hardening work).</div></a>

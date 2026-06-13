@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>modal-rust — The local-build coupling problem</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1e21; --muted:#5c6470; --rule:#e3e5e8;
+    --accent:#7a3cff; --accent2:#0a7d52; --warn:#b5640a; --bad:#c23b3b;
+    --code-bg:#f4f5f7; --code-fg:#2b2f36; --box-rule:#d6dae0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  main{max-width:980px; margin:0 auto; padding:42px 36px 120px}
+  h1{font-size:28px; letter-spacing:-.4px; margin:0 0 4px}
+  .tagline{color:var(--muted); margin:0 0 28px}
+  h2{font-size:22px; margin:48px 0 12px; padding-top:12px; border-top:2px solid var(--rule)}
+  h3{font-size:17px; margin:26px 0 8px}
+  p{margin:10px 0}
+  code{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; font-size:13px;
+    background:var(--code-bg); color:var(--code-fg); padding:1.5px 5px; border-radius:4px}
+  pre{background:var(--code-bg); border:1px solid var(--box-rule); border-radius:8px;
+    padding:13px 15px; overflow-x:auto; line-height:1.5}
+  pre code{background:none; padding:0; font-size:12.5px}
+  table{border-collapse:collapse; width:100%; margin:14px 0; font-size:13.5px}
+  th,td{border:1px solid var(--box-rule); padding:7px 10px; text-align:left; vertical-align:top}
+  th{background:var(--code-bg); font-weight:600}
+  .card{border:1px solid var(--box-rule); border-left-width:4px; border-radius:8px;
+    background:#fff; padding:14px 18px; margin:14px 0}
+  .card h3{margin:0 0 6px}
+  .card .meta{font-size:12.5px; color:var(--muted); margin-bottom:8px}
+  .fm{border-left-color:var(--bad)}
+  .fm.silent{border-left-color:#8e24aa}
+  .sol{border-left-color:var(--accent2)}
+  .pill{display:inline-block; font-size:11px; font-weight:700; padding:1px 8px;
+    border-radius:20px; vertical-align:middle; margin-left:6px}
+  .pill.block{background:#fdebeb; color:var(--bad)}
+  .pill.silent{background:#f3e5f5; color:#8e24aa}
+  .pill.perf{background:#fff8ed; color:var(--warn)}
+  .pill.now{background:#eefcf4; color:var(--accent2)}
+  .pill.later{background:#e8f0ff; color:#1f5fd0}
+  .pill.no{background:#f4f5f7; color:var(--muted)}
+  .note{background:#fff8ed; border:1px solid #f0dcb8; border-left:4px solid var(--warn);
+    padding:11px 15px; border-radius:8px; margin:14px 0; font-size:14px}
+  .rec{background:#f6f2ff; border:1px solid #e2d6ff; border-left:4px solid var(--accent);
+    padding:14px 18px; border-radius:8px; margin:16px 0}
+  .flow{display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin:18px 0}
+  .lane{border:1px solid var(--box-rule); border-radius:8px; background:#fff; padding:12px 14px}
+  .lane h4{margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted)}
+  .lane li{font-size:13.5px; margin:6px 0}
+  .ok{color:var(--accent2); font-weight:600}
+  .no2{color:var(--bad); font-weight:600}
+  .small{font-size:13.5px; color:#3a4049}
+  td.y{background:#eefcf4; text-align:center} td.n{background:#fdf2f2; text-align:center}
+  td.p{background:#fff8ed; text-align:center}
+</style>
+</head>
+<body>
+<main>
+  <h1>The local-build coupling problem</h1>
+  <p class="tagline">`modal-rust run` obtains <b>arch-independent information</b> (the entrypoint manifest) by an <b>arch-dependent means</b> (compiling and executing the user's crate locally). This page maps every way that coupling can hurt, and every way out. <span class="small">Written 2026-06-11, from the dict/queue live-debugging session.</span></p>
+
+  <!-- ============================================================ -->
+  <h2>1. The system as it stands — who runs cargo, where</h2>
+  <div class="flow">
+    <div class="lane">
+      <h4>Laptop (any OS/arch)</h4>
+      <ul>
+        <li><b>Describe build</b>: <code>cargo build -p &lt;pkg&gt; --bin modal_runner</code>, DEBUG, shares the dev <code>target/</code>; output exec'd as <code>runner --describe</code> → manifest (entrypoints + decorator config).</li>
+        <li>Skipped on a <b>describe-cache hit</b> (source + <code>Cargo.lock</code> hash).</li>
+        <li><b>Input validation</b>: <code>runner --check-input</code>, degrades to the remote check if unavailable.</li>
+        <li class="ok">Nothing built here is ever uploaded.</li>
+      </ul>
+    </div>
+    <div class="lane">
+      <h4>Modal container — RUN <span class="small">(linux)</span></h4>
+      <ul>
+        <li>Wrapper checks the <b>runner-binary cache</b> (volume, keyed on source hash + package): hit ⇒ <span class="ok">no cargo at all</span>.</li>
+        <li>Miss ⇒ unpack cache archive (registry + RELEASE <code>target/</code>), <code>cargo build --release</code> incrementally, store the new binary, re-pack only if something compiled.</li>
+        <li class="ok">Cache archive is container-built; never leaves Modal.</li>
+      </ul>
+    </div>
+    <div class="lane">
+      <h4>Modal image builder — DEPLOY</h4>
+      <ul>
+        <li><code>RUN cargo build --release</code> at image-build time; binary baked to <code>/app/modal_runner</code>.</li>
+        <li class="ok">Deployed runtime never runs cargo.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="small"><b>What crosses the wire</b>: pruned source only (~1.4&nbsp;MB for this workspace, sha-deduped, <code>target/</code> ignore-pruned). Local DEBUG artifacts and the container's RELEASE cache are disjoint worlds; the only thing they share is resolving the same <code>Cargo.lock</code>.</p>
+
+  <div class="note"><b>Why the local build exists at all.</b> The CLI cannot link the user's crate, and the manifest lives in the compiled binary (the <code>#[function]</code> macro registers entrypoints + config via <code>inventory</code>, collected at runtime by <code>--describe</code>). Compiling locally is the cheapest <em>general</em> way to evaluate that registration exactly as rustc sees it — including <code>cfg</code>s, feature resolution, and macro expansion. Every alternative below trades away some of that fidelity or pays for it elsewhere.</div>
+
+  <!-- ============================================================ -->
+  <h2>2. Failure modes</h2>
+  <p>Severity classes: <span class="pill block">BLOCKS</span> the run with an error; <span class="pill silent">SILENT</span> — produces a <em>wrong manifest</em> without an error (worse); <span class="pill perf">COST</span> — correctness fine, time/resources wasted.</p>
+
+  <div class="card fm">
+    <h3>F1 — Compile-time platform dependencies <span class="pill block">BLOCKS</span></h3>
+    <p class="meta">Likelihood: the headline case. Affects: linux-only <code>-sys</code> crates, bindgen against system headers, proprietary SDKs, crates with <code>compile_error!</code> on non-linux.</p>
+    <p>The crate compiles for the container (linux) but not on the laptop (macOS/Windows). The local describe build fails with a cargo error before any Modal interaction, even though the remote build would succeed. <b>Mitigating reality:</b> Rust GPU crates mostly follow the cudarc pattern — compile everywhere, link/JIT CUDA at <em>runtime</em> — so <code>burn-add</code> and <code>cuda-vector-add</code> build on a CUDA-less Mac. The blocked class is compile-time coupling, not GPU per se.</p>
+  </div>
+
+  <div class="card fm silent">
+    <h3>F2 — <code>cfg</code>-divergent registries <span class="pill silent">SILENT</span></h3>
+    <p class="meta">Likelihood: low but insidious. Affects: <code>#[cfg(target_os = "linux")]</code>-gated <code>#[function]</code>s (or feature-gated ones with locally-different feature resolution).</p>
+    <p>The crate compiles on both sides but registers <em>different entrypoint sets</em>. A linux-only <code>#[function]</code> is absent from the locally-built manifest → the CLI reports "unknown entrypoint" for a function that exists remotely. Inverse: a mac-visible entrypoint validates locally, then the container's runner rejects it. No error points at the real cause. <b>Today's partial guards:</b> input validation already degrades on <code>unknown_entrypoint</code> (treats the local runner as non-authoritative), but manifest <em>lookup</em> does not.</p>
+  </div>
+
+  <div class="card fm silent">
+    <h3>F3 — Host-environment-dependent build scripts &amp; macro inputs <span class="pill silent">SILENT</span></h3>
+    <p class="meta">Likelihood: rare. Affects: <code>build.rs</code> probing the host (paths, installed tools, <code>env!</code> at compile time) feeding entrypoint names or config.</p>
+    <p>Manifest content baked from host state differs from what the container build would produce. Same class as F2, reached through build scripts instead of <code>cfg</code>.</p>
+  </div>
+
+  <div class="card fm">
+    <h3>F4 — Local toolchain mismatch <span class="pill block">BLOCKS</span></h3>
+    <p class="meta">Likelihood: common for newcomers. Affects: missing/old rustc, missing targets/components, rustup not installed.</p>
+    <p>The container installs its own pinned toolchain; the laptop might not satisfy the crate's MSRV or <code>rust-toolchain.toml</code>. Local failure, remote fine. Distinct from F1 because the fix ("install/update rust") is reasonable to demand — <code>doctor --rust</code> already diagnoses it — but it is still the same structural coupling.</p>
+  </div>
+
+  <div class="card fm">
+    <h3>F5 — Env-dependent describe output <span class="pill silent">SILENT</span></h3>
+    <p class="meta">Likelihood: low. Affects: config influenced by env vars at describe time.</p>
+    <p>The manifest is read on the laptop under the laptop's env. Decorator config is static today (macro literals), so this is currently theoretical — but any future "config from env/file at registration time" feature would make local-vs-container env divergence a silent manifest skew. Worth a standing design rule: <b>registration must stay a pure function of source + features.</b></p>
+  </div>
+
+  <div class="card fm">
+    <h3>F6 — First-build cost on weak machines <span class="pill perf">COST</span></h3>
+    <p class="meta">Likelihood: every new user, once. </p>
+    <p>The first describe build compiles the user's crate + the light facade (~9 crates) in DEBUG. Small for function-only crates (the light feature split exists for exactly this), but a heavy user crate pays its own compile locally even when only running remotely. Repeats only on source change (describe cache).</p>
+  </div>
+
+  <div class="card fm">
+    <h3>F7 — Broken sibling code in the workspace <span class="pill block">BLOCKS</span> <span class="small">(partially solved)</span></h3>
+    <p class="meta">Likelihood: medium in monorepos.</p>
+    <p><code>-p &lt;pkg&gt;</code> scoping plus the cargo-metadata closure means an unrelated broken sibling does <em>not</em> block — only the target package's dependency closure must compile. A broken crate <em>inside</em> the closure blocks both sides equally (not a coupling failure; the remote build would fail too). Listed for completeness because users perceive it as "the CLI is building too much".</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>3. Alternative solutions</h2>
+
+  <div class="card sol">
+    <h3>S1 — Manifest override: <code>--no-local-build</code> + flags or <code>--manifest file.json</code> <span class="pill now">recommended first</span></h3>
+    <p class="meta">Effort: small (CLI-only). Covers: F1, F4, F6 (opt-in), F7.</p>
+    <p>Skip the describe build entirely; take the entrypoint name from the command and the config from inline flags (<code>--gpu T4 --timeout 600 …</code>) or a user-written manifest file (the <code>modal-rust/describe@1</code> schema already exists and is documented). Input validation uses its existing degrade path (remote decode check).</p>
+    <table>
+      <tr><th>Pros</th><th>Cons</th></tr>
+      <tr><td>Tiny, reuses existing schema + degrade paths; unblocks any crate immediately; also the natural CI/scripting interface.</td><td>Manual: user re-states config that the decorator already declares (drift risk between decorator and flags); doesn't help F2/F3 (the silent class) — the user's hand-written manifest is just another locally-produced claim.</td></tr>
+    </table>
+  </div>
+
+  <div class="card sol">
+    <h3>S2 — Remote describe bootstrap <span class="pill later">recommended second</span></h3>
+    <p class="meta">Effort: medium. Covers: F1, F2, F3, F4, F5, F6 — the whole class, including SILENT.</p>
+    <p>When the local build fails (or on <code>--remote-describe</code>): provision a <em>default-config</em> function once, run <code>--describe</code> inside the container, cache the returned manifest locally keyed on the source hash. The chicken-and-egg (config is needed to create the function) is broken by using defaults for the bootstrap function only — <code>--describe</code> needs no GPU, no special timeout. Subsequent runs hit the cached manifest like any describe-cache hit.</p>
+    <table>
+      <tr><th>Pros</th><th>Cons</th></tr>
+      <tr><td>The container's own answer is <b>ground truth</b> — kills the silent failures (F2/F3/F5) that nothing else catches; fully automatic; piggybacks on the runner-binary cache (the bootstrap build is reused by the real run).</td><td>First run pays a remote build before config discovery (~minutes cold); costs money; needs care that the bootstrap function's default resources can build the crate (big crates may need more memory — bootstrap should use a generous CPU/memory default).</td></tr>
+    </table>
+  </div>
+
+  <div class="card sol">
+    <h3>S3 — Static source scanning (no compile) <span class="pill no">rejected</span></h3>
+    <p class="meta">Effort: medium-high, permanent maintenance. Covers: F1, F4, F6 — but introduces its own silent class.</p>
+    <p>Parse the source with <code>syn</code> for <code>#[modal_rust::function]</code> attributes and extract names + config without compiling. <b>Why rejected:</b> it re-implements rustc's view of the crate — <code>cfg</code> evaluation, feature resolution, <code>include!</code>, macro-generated functions, renamed imports of the macro — and every divergence is a new silent failure mode of exactly the kind S2 eliminates. A scanner that is "usually right" is worse than a build that is honestly wrong.</p>
+  </div>
+
+  <div class="card sol">
+    <h3>S4 — Local linux container for describe (docker) <span class="pill no">parked</span></h3>
+    <p class="meta">Effort: medium. Covers: F1, F2, F3, F4 — when docker exists.</p>
+    <p>Run the describe build inside a local linux container matching the remote target. Faithful (same OS) and offline-capable, but adds a docker dependency to a tool whose pitch is "no extra runtime deps", costs a cold container toolchain, and macOS docker is qemu/VM-slow for compiles. Strictly dominated by S2 for correctness and by S1 for convenience; worth revisiting only if remote-describe cost proves painful.</p>
+  </div>
+
+  <div class="card sol">
+    <h3>S5 — Cross-compiling locally for the container target <span class="pill no">rejected for this problem</span></h3>
+    <p class="meta">Effort: high (zig/cross toolchains). </p>
+    <p>Solves a <em>different</em> problem (shipping a locally-built binary, skipping the remote build). For manifest discovery it inherits F1 in reverse (now the laptop must cross-compile linux-only deps) and adds toolchain burden. Tracked separately as the "precompile/builder" exploration — see <code>precompile-builder-review.html</code>.</p>
+  </div>
+
+  <div class="card sol">
+    <h3>S6 — Authoring guidance: the cudarc pattern <span class="pill now">documentation duty</span></h3>
+    <p class="meta">Effort: docs only. Prevents: most real-world F1.</p>
+    <p>Recommend compile-everywhere/link-at-runtime crates (cudarc, NVRTC JIT) and <code>#[cfg]</code>-free entrypoint registration in the getting-started guide. Best dev loop regardless of which escape hatch exists, because it keeps <code>.local()</code> and the describe build working everywhere.</p>
+  </div>
+
+  <div class="card sol">
+    <h3>S7 — Manifest verification mode <span class="pill later">cheap adjunct to S2</span></h3>
+    <p class="meta">Effort: small once S2 exists. Covers: F2/F3/F5 detection (vs. S2's correction).</p>
+    <p><code>modal-rust run --verify-manifest</code> (or a live-tier test): compare the locally-derived manifest against the container's <code>--describe</code> answer and fail loudly on divergence. Turns the silent class into a diagnosable error for users who keep the fast local path.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>4. Coverage matrix</h2>
+  <table>
+    <tr><th>Failure mode</th><th>S1 override</th><th>S2 remote describe</th><th>S3 static scan</th><th>S4 docker</th><th>S6 docs</th><th>S7 verify</th></tr>
+    <tr><td>F1 platform deps <span class="pill block">B</span></td><td class="y">✓</td><td class="y">✓</td><td class="y">✓*</td><td class="y">✓</td><td class="p">prevents most</td><td class="n">—</td></tr>
+    <tr><td>F2 cfg-divergent registry <span class="pill silent">S</span></td><td class="n">—</td><td class="y">✓</td><td class="n">worsens</td><td class="y">✓</td><td class="p">prevents</td><td class="y">detects</td></tr>
+    <tr><td>F3 host-dependent build.rs <span class="pill silent">S</span></td><td class="n">—</td><td class="y">✓</td><td class="n">worsens</td><td class="y">✓</td><td class="p">prevents</td><td class="y">detects</td></tr>
+    <tr><td>F4 toolchain mismatch <span class="pill block">B</span></td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td></tr>
+    <tr><td>F5 env-dependent manifest <span class="pill silent">S</span></td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="p">partial</td><td class="p">design rule</td><td class="y">detects</td></tr>
+    <tr><td>F6 first-build cost <span class="pill perf">C</span></td><td class="y">✓ (opt-in)</td><td class="p">moves cost remote</td><td class="y">✓</td><td class="n">worsens</td><td class="n">—</td><td class="n">—</td></tr>
+  </table>
+  <p class="small">* S3 "covers" F1 only by not compiling at all — at the price of inventing new silent modes; that asterisk is why it's rejected.</p>
+
+  <!-- ============================================================ -->
+  <h2>5. Recommendation</h2>
+  <div class="rec">
+    <p><b>Policy ladder, in order:</b></p>
+    <ol>
+      <li><b>Default</b>: local describe build (fast, faithful for the overwhelmingly common compile-everywhere crate), with the describe cache as today.</li>
+      <li><b>On local build failure</b>: print a diagnosis that names this exact coupling ("your crate may compile on Modal but not locally") and offer both ladders explicitly: <code>--manifest/--gpu…</code> (S1, immediate) or <code>--remote-describe</code> (S2, automatic).</li>
+      <li><b>S2 as the truth machine</b>: remote describe also backs <code>--verify-manifest</code> (S7) so the silent F2/F3/F5 class is detectable even for users who never need the escape hatch.</li>
+      <li><b>S6 in the docs now</b> — costs nothing, prevents most F1 from existing.</li>
+    </ol>
+    <p class="small">Build order: S1 + the failure-message diagnosis are a small CLI change worth doing near-term; S2/S7 are one design (the bootstrap function + manifest cache) and slot naturally after the current parity work. S3/S4/S5 stay rejected/parked with reasoning recorded above.</p>
+  </div>
+
+  <h2>6. Standing design rules this implies</h2>
+  <ul>
+    <li><b>Registration purity</b>: <code>#[function]</code>/<code>#[cls]</code>/<code>#[endpoint]</code> registration must remain a pure function of source + resolved features — never of host env, build-script probes, or wall-clock (guards F5 by construction).</li>
+    <li><b>The manifest is a claim, not a fact</b>: any consumer of a locally-built manifest must keep a degrade path for "the remote disagrees" (the input-validation degrade on <code>unknown_entrypoint</code> is the template).</li>
+    <li><b>Arch-independent data should have an arch-independent acquisition path</b> available, even if the arch-dependent one stays the fast default — that is the whole page in one sentence.</li>
+  </ul>
+</main>
+</body>
+</html>

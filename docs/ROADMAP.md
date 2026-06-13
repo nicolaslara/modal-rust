@@ -132,8 +132,8 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   describe build fails before any Modal interaction. Other modes: SILENT (a wrong
   manifest from cfg/feature skew between laptop and container) and COST (redundant
   local builds). Full problem map + the menu of fixes:
-  `workpads/architecture/local-build-coupling.html` (written 2026-06-11 from the
-  dict/queue live-debugging session).
+  [`docs/local-build-coupling.html`](local-build-coupling.html) (written 2026-06-11
+  from the dict/queue live-debugging session).
 - **Precompile-on-builder spike** — lift the Rust build out of the run-function-body
   and the deploy-image-layer into a dedicated, long-lived Modal **builder** container
   that emits a binary keyed by a content fingerprint; both `run` and `deploy` then
@@ -143,7 +143,7 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   size/rebuild-cascade. New costs: cross-arch correctness, artifact-identity
   discipline, a second cold-path hop. Recommendation: **spike it, scoped to GPU + run
   first.** Head-to-head design review:
-  `workpads/architecture/precompile-builder-review.html`.
+  [`docs/precompile-builder-review.html`](precompile-builder-review.html).
 
 ### Infra / quality
 - **Benchmarks runnable** — wire the plan-only A/B-vs-Python harness (cold/warm build, deploy,

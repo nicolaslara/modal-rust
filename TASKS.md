@@ -29,11 +29,11 @@ mid-phase.
 > - **Local-build coupling** — `modal-rust run` extracts the entrypoint manifest by
 >   compiling the user's crate *locally*, which breaks for linux-only / `-sys` crates
 >   that won't compile on the laptop. Problem map:
->   `workpads/architecture/local-build-coupling.html`.
+>   `docs/local-build-coupling.html`.
 > - **Precompile-on-builder spike** — lift the Rust build into a dedicated, reusable
 >   Modal *builder* container that emits a fingerprinted binary which `run`/`deploy`
 >   fetch + exec (wins on the GPU path and the run dev-loop). Design review:
->   `workpads/architecture/precompile-builder-review.html`; recommendation is to spike
+>   `docs/precompile-builder-review.html`; recommendation is to spike
 >   it scoped to GPU + run first.
 > - **Largest remaining parity gap:** Sandboxes (PARITY §8). Plus the deferred
 >   follow-ups tracked in ROADMAP (Cls Shape B `#[exit]` / class params,

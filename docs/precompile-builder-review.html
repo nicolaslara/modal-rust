@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design Review — Precompile-on-Builder vs Inline-Compile</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d2129; --ink:#e7eaf0; --muted:#9aa4b2;
+    --line:#2a2f3a; --accent:#6ea8fe; --good:#56d68b; --warn:#f1c40f; --bad:#ff6b6b;
+    --run:#7aa2f7; --deploy:#bb9af7; --build:#e0af68;
+    --code:#c5cad6;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 120px}
+  header.head{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:8px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.4px}
+  h2{font-size:22px;margin:46px 0 14px;padding-top:10px;letter-spacing:-.3px}
+  h3{font-size:17px;margin:26px 0 8px;color:#cfd6e4}
+  .sub{color:var(--muted);font-size:15px;margin:0}
+  .meta{color:var(--muted);font-size:13px;margin-top:14px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.4px;
+    text-transform:uppercase;padding:2px 8px;border-radius:99px;border:1px solid var(--line)}
+  .tag.run{color:var(--run);border-color:#33406b}
+  .tag.deploy{color:var(--deploy);border-color:#4b3d6b}
+  .tag.build{color:var(--build);border-color:#5c4a25}
+  p{margin:10px 0}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{background:#0b0d12;border:1px solid var(--line);border-radius:5px;
+    padding:1px 5px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--code)}
+  pre{background:#0b0d12;border:1px solid var(--line);border-radius:10px;padding:14px 16px;
+    overflow:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--code)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .panel.tight{padding:14px 16px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  @media(max-width:820px){.grid2,.grid3{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cdd5e4;font-weight:600}
+  td.k{color:var(--muted);white-space:nowrap;font-weight:600}
+  .yes{color:var(--good);font-weight:600}
+  .no{color:var(--bad);font-weight:600}
+  .mid{color:var(--warn);font-weight:600}
+  .lede{font-size:16px;color:#d7dde9}
+  .callout{border-left:3px solid var(--accent);background:var(--panel2);
+    border-radius:0 10px 10px 0;padding:12px 16px;margin:16px 0}
+  .callout.good{border-color:var(--good)}
+  .callout.warn{border-color:var(--warn)}
+  .callout.bad{border-color:var(--bad)}
+  .callout .lbl{font-weight:700;font-size:12px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+  ul{margin:8px 0 8px 0;padding-left:22px}
+  li{margin:5px 0}
+  .toc{columns:2;column-gap:30px;font-size:14px}
+  .toc a{display:block;padding:2px 0;color:#bcc6d6}
+  @media(max-width:820px){.toc{columns:1}}
+  .flow{font:12px/1.5 ui-monospace,Menlo,monospace;white-space:pre;color:#aeb7c7;
+    background:#0b0d12;border:1px solid var(--line);border-radius:10px;padding:16px;overflow:auto}
+  .pill{display:inline-block;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600}
+  .pill.run{background:#1a2342;color:#9bb4ff}
+  .pill.deploy{background:#241a3f;color:#c4abff}
+  .pill.build{background:#2c2410;color:#e8c478}
+  .scorecard td:first-child{width:42%}
+  .verdict{font-size:13px}
+  footer{margin-top:60px;border-top:1px solid var(--line);padding-top:18px;color:var(--muted);font-size:13px}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin:8px 0}
+  .legend span b{font-weight:700}
+  .num{display:inline-block;width:22px;height:22px;border-radius:99px;background:var(--panel2);
+    border:1px solid var(--line);text-align:center;line-height:21px;font-size:12px;font-weight:700;color:var(--accent);margin-right:6px}
+  .q{font-weight:600;color:#dfe5f0}
+  hr.soft{border:0;border-top:1px solid var(--line);margin:30px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="head">
+  <div style="display:flex;gap:8px;margin-bottom:12px">
+    <span class="tag build">Architecture Proposal</span>
+    <span class="tag run">Affects RUN</span>
+    <span class="tag deploy">Affects DEPLOY</span>
+  </div>
+  <h1>Precompile on a Modal Builder vs. Inline Compile</h1>
+  <p class="sub">Decoupling the Rust build into a dedicated, reusable Modal container that emits a
+  fingerprinted binary — which <code>run</code> and <code>deploy</code> then fetch and exec.</p>
+  <p class="meta">modal-rust · architecture review · grounded in
+  <code>workpads/architecture/boundaries.md</code> §2/§4/§5/§7 and the implemented
+  <code>control_plane.rs</code> <code>Boundary</code> / <code>SourceDelivery</code> model ·
+  decision owner: project lead</p>
+</header>
+
+<div class="callout">
+  <div class="lbl">TL;DR for the reviewer</div>
+  The proposal does <b>not</b> change <i>whether</i> we compile on Modal (we already do). It changes
+  <b>where</b>: it lifts the build out of the run-function-body and the deploy-image-layer into a
+  separate, long-lived <span class="pill build">builder</span> container, producing a binary keyed by a
+  content fingerprint. Both <span class="pill run">run</span> and <span class="pill deploy">deploy</span>
+  become "fetch the prebuilt binary, exec it." <b>Both hard design stances survive.</b> The win is
+  concentrated on the <b>GPU path</b> (compile on cheap CPU, not GPU minutes), the <b>run dev-loop</b>
+  (the P7 cache becomes a first-class warm builder), and <b>deploy image size/rebuild-cascade</b>. The
+  new costs are <b>cross-arch correctness</b>, <b>artifact identity discipline</b>, and a
+  <b>second cold-path hop</b>. Recommendation: <b>spike it, scoped to GPU + run first</b> — see §9.
+</div>
+
+<h2 id="toc">Contents</h2>
+<div class="toc panel tight">
+  <a href="#frame">1 · The decision being asked</a>
+  <a href="#current">2 · How the design works today</a>
+  <a href="#proposed">3 · The proposed builder model</a>
+  <a href="#sidebyside">4 · Side-by-side mechanics</a>
+  <a href="#invariants">5 · Do the frozen invariants survive?</a>
+  <a href="#cost">6 · Latency &amp; cost analysis</a>
+  <a href="#risks">7 · New failure modes</a>
+  <a href="#fork">8 · The key fork: builder == runner?</a>
+  <a href="#reco">9 · Recommendation &amp; spike plan</a>
+  <a href="#scorecard">10 · Scorecard</a>
+</div>
+
+<h2 id="frame">1 · The decision being asked</h2>
+<p class="lede">Today, the Rust compile is <i>coupled</i> to the operation that needs it. The proposal
+is to make compilation its own phase whose only output is a binary, addressable by fingerprint, that any
+later operation reuses.</p>
+<p>The original idea, verbatim in spirit: <i>"compile on Modal as a separate step in the same type of
+machine that we will run, then send the binary on run/deploy, and reuse the compilation container for
+future compilation."</i> The reviewer is being asked to decide whether this is worth a research spike,
+and if so, scoped to what. This document compares it head-to-head with the implemented design so that
+decision can be made on mechanics, not vibes.</p>
+
+<h2 id="current">2 · How the design works today</h2>
+<p>The build boundary is <b>the product</b> (boundaries.md, hard stance #2). It is implemented — not just
+documented — as a single <code>Boundary</code> value in <code>control_plane.rs</code> with no scattered
+<code>if run {…} else {…}</code>. Two axes diverge:</p>
+
+<table>
+  <tr><th>Axis</th><th><span class="pill run">RUN</span> (dev loop)</th><th><span class="pill deploy">DEPLOY</span> (prod)</th></tr>
+  <tr><td class="k">Source delivery<br><code>SourceDelivery</code></td>
+      <td><code>Mount</code> — source mounted at container <b>startup</b> via <code>mount_ids</code></td>
+      <td><code>Copy</code> — source rides the image <b>build context</b> (<code>context_mount_id</code> + a <code>COPY</code> step)</td></tr>
+  <tr><td class="k">Where <code>cargo build</code> runs</td>
+      <td><b>In the function body</b>, at invoke time</td>
+      <td><b>In a Dockerfile <code>RUN</code> layer</b>, at image-build time</td></tr>
+  <tr><td class="k">Runtime executes</td>
+      <td>freshly built <code>modal_runner</code></td>
+      <td><b>only</b> the baked <code>/app/modal_runner</code></td></tr>
+  <tr><td class="k"><code>cargo</code> at call time</td>
+      <td class="mid">yes — that's the point</td>
+      <td class="no">never</td></tr>
+  <tr><td class="k">Build cache</td>
+      <td>P6 cargo cache Volume (run-path only, best-effort)</td>
+      <td class="no">none — image layers are the cache</td></tr>
+  <tr><td class="k">Cold cost driver</td>
+      <td>cold start + full first compile + crate downloads (timeout 1800s)</td>
+      <td>image build (cascading rebuild on any source change)</td></tr>
+</table>
+
+<div class="flow">RUN today          DEPLOY today
+─────────          ───────────
+mount /src   ┐     COPY src → image build ctx  ┐
+cargo build  ├ in   cargo build --release      ├ at image-BUILD time
+exec runner  ┘ body bake /app/modal_runner     ┘
+                   ─────────────
+                   call: exec /app/modal_runner   (NO cargo, NO mount)</div>
+
+<div class="callout">
+  <div class="lbl">The two hard stances this must not break</div>
+  <b>(1) Direct-execution-first</b> — try the normal <code>@app.function</code> path before reaching for a
+  Sandbox. <b>(2) The build boundary is the product</b> — <code>run</code> builds late (dev), <code>deploy</code>
+  bakes an immutable binary and the deployed runtime <b>never</b> invokes <code>cargo</code>. The M8 proof
+  obligation: <code>cargo build</code> appears in build logs and is <b>absent</b> from call logs.
+</div>
+
+<h2 id="proposed">3 · The proposed builder model</h2>
+<p>Introduce a third phase, <span class="pill build">BUILD</span>, owned by a dedicated Modal Function
+(or Sandbox) that lives across invocations. It holds a warm <code>target/</code> on local SSD (fast
+incremental) backed by a Volume snapshot for durability across container recycles. It is the single
+writer of the artifact store, keyed by the existing P7 fingerprint:</p>
+
+<pre>fingerprint = H(source after ignore rules
+              + Cargo.lock + toolchain/image + profile
+              + target-triple + features + runner/generator version)</pre>
+
+<p><span class="pill run">RUN</span> and <span class="pill deploy">DEPLOY</span> stop compiling. They
+resolve the fingerprint, ask the builder for (or wait on) the matching binary, and consume it:</p>
+
+<div class="flow">BUILDER (warm, single writer)          consumers
+──────────────────────────            ─────────
+fingerprint?──hit──→ return path      RUN:    fetch binary from Volume → exec   (mutable, fresh per change)
+            └─miss─→ incremental      DEPLOY: BAKE that exact binary into a thin
+                     cargo build →             COPY-only image layer → exec       (immutable, no Volume at call time)
+                     publish binary
+                     keyed by fp</div>
+
+<p>The run-vs-deploy distinction collapses from "<i>body-cargo vs image-cargo</i>" to a single, cleaner
+axis — <b>artifact durability</b>:</p>
+<div class="grid2">
+  <div class="panel tight"><b><span class="pill run">RUN</span></b> pulls a <i>mutable</i>, fresh
+  fingerprinted binary from the builder Volume. Always reflects current source.</div>
+  <div class="panel tight"><b><span class="pill deploy">DEPLOY</span></b> <i>bakes</i> the exact
+  fingerprinted binary into an immutable image layer. Self-contained; no call-time Volume dependency.</div>
+</div>
+
+<h2 id="sidebyside">4 · Side-by-side mechanics</h2>
+<table>
+  <tr><th>Concern</th><th>Today (inline compile)</th><th>Proposed (builder)</th></tr>
+  <tr><td class="k">Build location</td><td>run: function body · deploy: image layer</td><td>both: dedicated builder container</td></tr>
+  <tr><td class="k">Build env == run env</td><td class="yes">guaranteed (same container/arch)</td><td class="mid">must be <b>pinned</b> (separate scheduler placement)</td></tr>
+  <tr><td class="k">Incremental reuse</td><td>P6 volume cache (best-effort, lock hazards)</td><td class="yes">warm local <code>target/</code>, single writer</td></tr>
+  <tr><td class="k">GPU compile cost</td><td class="bad">compiles on the GPU container</td><td class="yes">compiles on cheap CPU; GPU only runs</td></tr>
+  <tr><td class="k">Deploy image</td><td>toolchain + full source + cargo layer</td><td class="yes">thin <code>COPY binary</code> layer</td></tr>
+  <tr><td class="k">Deploy rebuild cascade</td><td class="bad">any source touch → image rebuild</td><td class="yes">incremental in builder; image is COPY-only</td></tr>
+  <tr><td class="k">Cold first-run latency</td><td>one hop: build-and-exec in place</td><td class="mid">two hops if builder≠runner (build → fetch → exec)</td></tr>
+  <tr><td class="k">Concurrency / cache races</td><td class="mid">P7 warns: &gt;5 concurrent commits, last-write-wins</td><td class="yes">single long-lived writer serializes builds</td></tr>
+  <tr><td class="k">Runner protocol (§2/§3)</td><td colspan="2" class="yes" style="text-align:center">UNCHANGED — build location is orthogonal to the wire seam</td></tr>
+  <tr><td class="k">New correctness burden</td><td>— </td><td class="bad">cross-arch parity + fingerprint-is-load-bearing</td></tr>
+</table>
+
+<h2 id="invariants">5 · Do the frozen invariants survive?</h2>
+<p>This is the crux for the reviewer. The proposal is an <b>implementation refactor of "where build
+runs,"</b> not a contract change.</p>
+
+<table>
+  <tr><th>Invariant (source)</th><th>Survives?</th><th>Why</th></tr>
+  <tr><td class="k">Deployed runtime never invokes <code>cargo</code> (§2, §4)</td>
+      <td class="yes">YES</td>
+      <td>Deploy still execs only a prebuilt binary. Build moves from the image <code>RUN</code> layer to the builder; the call path is untouched.</td></tr>
+  <tr><td class="k">run builds late / deploy bakes immutable (§2 stance 2)</td>
+      <td class="yes">YES — sharper</td>
+      <td>Run gets a fresh fingerprinted binary per source change; deploy bakes an immutable one. The boundary becomes a clean durability axis.</td></tr>
+  <tr><td class="k">Direct-execution-first; Sandbox is fallback (§stance 1)</td>
+      <td class="yes">YES</td>
+      <td>The builder is a normal <code>@app.function</code>. Only escalate to a Sandbox if a Function body genuinely can't build (same rule as today).</td></tr>
+  <tr><td class="k">Frozen runner CLI seam (§2) + registry/<code>typed!</code> (§3)</td>
+      <td class="yes">YES</td>
+      <td>These govern what the binary <i>does</i>, not where it's built. Zero changes.</td></tr>
+  <tr><td class="k">M8 proof: <code>cargo</code> in build logs, absent from call logs</td>
+      <td class="mid">RELOCATES</td>
+      <td>cargo now appears in <b>builder</b> logs, not image-build logs. Spirit preserved (no cargo at call time); the acceptance assertion must be re-pointed at the builder. Doc change, not a violation.</td></tr>
+  <tr><td class="k">P7 "cache is advisory; hit only on exact fingerprint" (§7)</td>
+      <td class="bad">PROMOTED to primary</td>
+      <td>Today a bad cache hit costs only time. In the builder model a wrong fingerprint means you <b>exec the wrong binary</b>. The exact-match rule becomes a load-bearing correctness invariant, not a side optimization.</td></tr>
+</table>
+
+<div class="callout good">
+  <div class="lbl">Reviewer takeaway</div>
+  Nothing in the frozen contract forbids this. The two items that move — M8's log location and P7's cache
+  rule — are exactly the two places to focus review effort, because they shift from "convenience" to
+  "correctness."
+</div>
+
+<h2 id="cost">6 · Latency &amp; cost analysis</h2>
+<div class="grid3">
+  <div class="panel tight"><h3 style="margin-top:0">Run dev-loop</h3>
+    <p><b>Warm hit:</b> <span class="yes">faster</span> — skip cargo entirely, fetch + exec.</p>
+    <p><b>Cold/changed:</b> <span class="mid">~same or slightly worse</span> if builder≠runner (extra
+    fetch hop), but the builder's warm local <code>target/</code> beats P6's volume-backed incremental.</p></div>
+  <div class="panel tight"><h3 style="margin-top:0">GPU path</h3>
+    <p><b>Big win.</b> Per §9, the binary is mostly CPU code that <code>dlopen</code>s CUDA at runtime
+    (cudarc dynamic-loading). Tier 0/1 binaries need <b>no GPU to compile</b>. Compile on a cheap CPU
+    builder; spend GPU minutes only on the actual run. Only Tier 2 (<code>nvcc</code>) needs CUDA
+    headers — still no GPU.</p></div>
+  <div class="panel tight"><h3 style="margin-top:0">Deploy</h3>
+    <p><b>Win.</b> Image becomes a thin <code>COPY binary</code> layer instead of toolchain + source +
+    cargo. Smaller, faster to build, and the §12 cascading-rebuild risk largely evaporates — incremental
+    rebuilds live in the builder, not in opaque image layers.</p></div>
+</div>
+
+<h2 id="risks">7 · New failure modes the reviewer must weigh</h2>
+<div class="grid2">
+  <div class="callout bad" style="margin:6px 0"><div class="lbl">Cross-arch SIGILL</div>
+    The one safety inline-build gives for free is build-CPU == run-CPU. A separate builder must pin
+    arch/CPU-feature parity (and avoid <code>-C target-cpu=native</code> unless builder==runner class),
+    or ship a binary that <code>SIGILL</code>s at exec. <b>Mitigation:</b> a startup self-check that
+    verifies the binary's target triple/arch vs the host before exec — analogous to the §9 CUDA dlopen
+    self-check.</div>
+  <div class="callout bad" style="margin:6px 0"><div class="lbl">Fingerprint is load-bearing</div>
+    Reuse is correct only on an exact match of the full P7 input set. A stale binary = wrong code, not a
+    slow rebuild. <b>Mitigation:</b> conservative fingerprint (include toolchain, profile, features,
+    triple, runner/generator version), and make a fingerprint miss always cheap-and-correct.</div>
+  <div class="callout warn" style="margin:6px 0"><div class="lbl">Extra cold-path hop</div>
+    If builder≠runner, a cold first run pays builder cold-start + build + artifact sync + runner fetch.
+    See the fork in §8 — the answer is to default builder==runner on the CPU run path and only split for
+    GPU/deploy.</div>
+  <div class="callout warn" style="margin:6px 0"><div class="lbl">"Warm container" is best-effort</div>
+    Modal containers are ephemeral; local <code>target/</code> is not guaranteed across recycle. "Warm
+    builder" realistically = warm container (<code>min_containers≥1</code> / long scaledown) for speed
+    <i>while alive</i> + a Volume snapshot for durability. Don't assume warm disk persists.</div>
+  <div class="callout warn" style="margin:6px 0"><div class="lbl">Deploy immutability tension</div>
+    A deployed app must not depend on a mutable Volume at call time (breaks self-containment + reload
+    semantics). The builder Volume is the <i>source</i> of the bake, never a call-time dependency. Deploy
+    must COPY the binary into the image at deploy time.</div>
+  <div class="callout" style="margin:6px 0"><div class="lbl">Artifact store surface</div>
+    A new component (Volume layout, GC, fingerprint index, single-writer lock) to design, test, and
+    operate. Real engineering cost that the current "image layers are the cache" model avoids entirely.</div>
+</div>
+
+<h2 id="fork">8 · The key fork: is the builder the same container as the runner?</h2>
+<table>
+  <tr><th></th><th>builder == runner</th><th>builder separate</th></tr>
+  <tr><td class="k">Cold path</td><td class="yes">fastest — build then exec in place</td><td class="mid">extra hop (build → artifact → fetch)</td></tr>
+  <tr><td class="k">CPU-builds-GPU-binary</td><td class="no">no — wastes GPU minutes compiling</td><td class="yes">yes — the headline GPU win</td></tr>
+  <tr><td class="k">Env coupling</td><td class="mid">build env baked into run env</td><td class="yes">clean separation</td></tr>
+  <tr><td class="k">Cross-arch risk</td><td class="yes">none (same container)</td><td class="bad">must pin + self-check</td></tr>
+  <tr><td class="k">Complexity</td><td class="yes">low — basically P7 made real</td><td class="mid">artifact transport + identity</td></tr>
+</table>
+<p>These are not mutually exclusive — the same fingerprint/artifact contract supports both. The
+recommendation picks each per path.</p>
+
+<h2 id="reco">9 · Recommendation &amp; spike plan</h2>
+<div class="callout good">
+  <div class="lbl">Recommendation</div>
+  <b>Approve a scoped research spike, not a wholesale rewrite.</b> Adopt <b>builder == runner on the CPU
+  run path</b> first (it's P7 made real — lowest risk, immediate dev-loop win), and prototype the
+  <b>separate CPU builder specifically for the GPU + deploy paths</b>, where the hop cost is dwarfed by
+  the GPU-minute and image-size savings. Keep the inline path as the fallback until the spike clears the
+  three gates below.
+</div>
+
+<h3>Phased adoption</h3>
+<div class="grid3">
+  <div class="panel tight"><b>Phase A — Run, builder==runner</b><br>Formalize "build once, keep warm, skip
+  on fingerprint hit." Smallest delta from today. Validates the fingerprint + artifact contract with zero
+  cross-arch risk.</div>
+  <div class="panel tight"><b>Phase B — GPU, builder≠runner</b><br>Cheap CPU builder emits the
+  GPU-run binary. This is where the model earns its keep. Requires the cross-arch self-check.</div>
+  <div class="panel tight"><b>Phase C — Deploy bakes builder output</b><br>Thin COPY-only deploy image
+  sourced from the builder Volume. Re-point the M8 proof at builder logs.</div>
+</div>
+
+<h3>Gates the spike must clear before ratifying</h3>
+<p><span class="num">1</span><span class="q">Warm-disk reality:</span> does a warm Modal container
+actually retain <code>target/</code> long enough to matter, or is the Volume snapshot the real
+mechanism? Measure incremental-rebuild latency warm vs cold-recycle.</p>
+<p><span class="num">2</span><span class="q">Cross-arch parity:</span> what does Modal actually schedule
+the builder on, and can we pin it to the run target's arch/CPU class? Prove the startup self-check
+catches a deliberate mismatch instead of <code>SIGILL</code>.</p>
+<p><span class="num">3</span><span class="q">Fingerprint round-trip correctness:</span> a non-trivial
+source change must miss the cache and produce a correct new binary; an identical re-run must hit. No
+false hits under feature/profile/toolchain perturbation.</p>
+
+<div class="callout">
+  <div class="lbl">Where this slots in</div>
+  There is already a <code>precompile-research</code> skill and a <code>runner-approach-research</code>
+  lineage. This belongs as a new architecture workpad alongside
+  <code>workpads/architecture/boundaries.md</code>, gated empirically the same way runtime-compile and
+  mount-writability were (the project's established method).
+</div>
+
+<h2 id="scorecard">10 · Scorecard</h2>
+<table class="scorecard">
+  <tr><th>Dimension</th><th>Verdict</th><th class="verdict">Note</th></tr>
+  <tr><td>Preserves both hard stances</td><td class="yes">PASS</td><td class="verdict">Implementation refactor, not a contract change</td></tr>
+  <tr><td>Run dev-loop latency</td><td class="yes">BETTER</td><td class="verdict">P7 cache becomes a first-class warm builder; single writer</td></tr>
+  <tr><td>GPU compile cost</td><td class="yes">MUCH BETTER</td><td class="verdict">Compile on CPU, not GPU minutes</td></tr>
+  <tr><td>Deploy image size / rebuild cascade</td><td class="yes">BETTER</td><td class="verdict">Thin COPY-only layer</td></tr>
+  <tr><td>Cold first-run latency</td><td class="mid">NEUTRAL/WORSE</td><td class="verdict">Extra hop if builder≠runner; mitigated by builder==runner on run</td></tr>
+  <tr><td>Correctness surface</td><td class="mid">RISK</td><td class="verdict">Cross-arch + fingerprint become load-bearing; need self-check</td></tr>
+  <tr><td>Engineering cost</td><td class="mid">MODERATE</td><td class="verdict">New artifact store + single-writer + fingerprint index</td></tr>
+  <tr><td>Runner protocol impact</td><td class="yes">NONE</td><td class="verdict">Wire seam untouched</td></tr>
+</table>
+
+<div class="callout good">
+  <div class="lbl">Bottom line</div>
+  Net positive and contract-compatible, with the value concentrated on the GPU and deploy paths and the
+  risk concentrated in two well-understood places (cross-arch parity, fingerprint identity). The right
+  call is a scoped spike, run==builder first, then split for GPU/deploy — not a rewrite, and not a no.
+</div>
+
+<footer>
+  Generated as a decision aid for modal-rust. Sources: <code>workpads/architecture/boundaries.md</code>
+  (§2 stances, §4 build boundary, §5 shims, §7 smart cache, §9 GPU tiering, §12 risks),
+  <code>crates/modal-rust/src/control_plane.rs</code> (<code>Boundary</code>/<code>SourceDelivery</code>),
+  <code>crates/modal-rust/src/deploy.rs</code> (image-build-time cargo). No code was modified to produce
+  this review.
+</footer>
+
+</div>
+</body>
+</html>
