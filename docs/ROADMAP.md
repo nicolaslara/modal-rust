@@ -123,6 +123,28 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   - **`#[function(enable_memory_snapshot)]`** — `#[function]`-level snapshot support (v0 is
     `#[cls]`-only; the macro currently `compile_error`s the function form).
 
+### Build path / architecture (design done, not built)
+- **Local-build coupling** — `modal-rust run` extracts the arch-independent entrypoint
+  manifest by an arch-dependent means: it compiles + execs the user's crate *locally*
+  (`cargo build --bin modal_runner` → `--describe`). The headline failure mode (F1):
+  a crate with linux-only / `-sys` / bindgen / `compile_error!`-on-non-linux deps
+  compiles for the container but **not** on a macOS/Windows laptop, so the local
+  describe build fails before any Modal interaction. Other modes: SILENT (a wrong
+  manifest from cfg/feature skew between laptop and container) and COST (redundant
+  local builds). Full problem map + the menu of fixes:
+  `workpads/architecture/local-build-coupling.html` (written 2026-06-11 from the
+  dict/queue live-debugging session).
+- **Precompile-on-builder spike** — lift the Rust build out of the run-function-body
+  and the deploy-image-layer into a dedicated, long-lived Modal **builder** container
+  that emits a binary keyed by a content fingerprint; both `run` and `deploy` then
+  become "fetch the prebuilt binary, exec it." Keeps both hard design stances. Wins
+  concentrate on the GPU path (compile on cheap CPU, not GPU minutes), the run dev-loop
+  (the build cache becomes a first-class warm builder), and deploy image
+  size/rebuild-cascade. New costs: cross-arch correctness, artifact-identity
+  discipline, a second cold-path hop. Recommendation: **spike it, scoped to GPU + run
+  first.** Head-to-head design review:
+  `workpads/architecture/precompile-builder-review.html`.
+
 ### Infra / quality
 - **Benchmarks runnable** — wire the plan-only A/B-vs-Python harness (cold/warm build, deploy,
   invoke latency, `.map` at N, spawn, GPU cold-start). Currently `workpads/benchmarks` is plan-only.

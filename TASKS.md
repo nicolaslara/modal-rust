@@ -9,6 +9,39 @@ mid-phase.
 
 ## Active Now
 
+> **STATUS — updated 2026-06-13.** The core product and a broad parity surface are
+> DONE and live-proven. `modal-rust` authors plain Rust `#[function]` / `#[cls]` /
+> `#[endpoint]`s and runs them on Modal through a first-party Rust gRPC client — no
+> `modal` CLI, no per-project Python, no `modal-rs` dependency. Live-proven:
+> `.local()` / `.remote()` / `.spawn()` / `.map()` (+ `starmap` / `for_each` /
+> `spawn_map`), `deploy` + `call`, the run-vs-deploy build boundary, GPU (cudarc +
+> Burn/CubeCL on a T4), the full decorator config surface (gpu / cpu / memory /
+> timeout / retries / schedule / autoscaling / secrets / volumes / env / per-fn
+> image), `#[cls]` load-once-serve-many + `enable_memory_snapshot`, `#[endpoint]`
+> web endpoints (deploy-only), and `Dict` / `Queue` v0.
+>
+> **The live per-feature trackers are now `docs/PARITY.md` (code-verified
+> Have/Partial/Missing + the §10 priority list) and `docs/ROADMAP.md` (next features
+> + tech debt).** This file is the workpad queue only — feature status lives there,
+> not in the milestone log below.
+>
+> **Current frontier / open design questions** (designed, not yet built):
+> - **Local-build coupling** — `modal-rust run` extracts the entrypoint manifest by
+>   compiling the user's crate *locally*, which breaks for linux-only / `-sys` crates
+>   that won't compile on the laptop. Problem map:
+>   `workpads/architecture/local-build-coupling.html`.
+> - **Precompile-on-builder spike** — lift the Rust build into a dedicated, reusable
+>   Modal *builder* container that emits a fingerprinted binary which `run`/`deploy`
+>   fetch + exec (wins on the GPU path and the run dev-loop). Design review:
+>   `workpads/architecture/precompile-builder-review.html`; recommendation is to spike
+>   it scoped to GPU + run first.
+> - **Largest remaining parity gap:** Sandboxes (PARITY §8). Plus the deferred
+>   follow-ups tracked in ROADMAP (Cls Shape B `#[exit]` / class params,
+>   `#[web_server]` / ASGI shapes, Dict/Queue iteration + ephemeral + partitions, GPU
+>   memory-snapshot split, live `update_autoscaler`).
+
+<details><summary>Historical milestone log — 2026-06-03 → 2026-06-04 AFK run (superseded by docs/PARITY.md + docs/ROADMAP.md; kept as the durable build record)</summary>
+
 > **AFK AUTONOMOUS RUN — round 2 (2026-06-04 night).** User is asleep and authorized
 > finishing the project WITHOUT check-ins: work through the remaining optional items,
 > commit each milestone, keep `README.md` current after any change that affects it,
@@ -222,6 +255,8 @@ autonomous overnight run paused here rather than churn fragile work:
 > method. If you'd rather confirm runtime-compile empirically *before* ratifying the
 > architecture, re-open `research` and run the R2 live spike first (it's recorded in
 > `workpads/research/tasks.md` R2).
+
+</details>
 
 ## Workpad Queue
 

@@ -5,8 +5,12 @@ calling API.
 
 > [!WARNING]
 > **Work in progress.** `modal-rust` is early and the public API is still moving.
-> The CPU `add` path is proven for local execution, remote Modal execution, and
-> deploy/call, but this is not ready to treat as stable infrastructure yet.
+> A broad surface is implemented and live-proven — `.local()` / `.remote()` /
+> `.spawn()` / `.map()`, `deploy` + `call`, GPU (cudarc + Burn on a T4), the full
+> decorator config, `#[cls]` (load-once-serve-many + memory snapshot),
+> `#[endpoint]` web endpoints, and `Dict` / `Queue` — but this is not ready to treat
+> as stable infrastructure yet. See [`docs/PARITY.md`](docs/PARITY.md) for an honest,
+> code-verified Have/Partial/Missing inventory vs the Modal Python client.
 
 `modal-rust` lets you write normal Rust functions, register them as Modal
 entrypoints, and call them three ways:
