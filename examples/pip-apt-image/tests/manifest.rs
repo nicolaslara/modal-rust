@@ -112,9 +112,16 @@ fn no_image_steps_render_no_extra_lines() {
         ..RemoteConfig::default()
     };
     let cmds = run_image_dockerfile(&cfg);
+    // The run image always bakes a single `zstd` apt step (the build-cache archive
+    // codec) into its baseline — that is NOT a user image step. Ignore it and assert
+    // the empty knob adds no ADDITIONAL (user) apt step.
+    let user_apt: Vec<_> = cmds
+        .iter()
+        .filter(|c| c.contains("apt-get install") && !c.contains("zstd"))
+        .collect();
     assert!(
-        !cmds.iter().any(|c| c.contains("apt-get install")),
-        "no apt step without image_steps (got {cmds:?})"
+        user_apt.is_empty(),
+        "no user apt step without image_steps (got {user_apt:?})"
     );
     assert!(
         !cmds.iter().any(|c| c.contains("pip install")),
