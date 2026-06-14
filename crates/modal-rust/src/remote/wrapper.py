@@ -392,9 +392,46 @@ def _run_one_shot(entrypoint, input_json, env):
     return out
 
 
+# Reserved RESERVED describe sentinel (S2): when the facade invokes the wrapper with
+# this entrypoint name, run the runner ONE-SHOT in `--describe` mode and return its
+# manifest JSON line verbatim instead of executing a real entrypoint. Lowercase
+# (NOT a `MODAL_RUST_` literal) so it never trips the env drift-guard. Real
+# entrypoints never carry this name, so the sentinel is purely additive.
+_DESCRIBE_SENTINEL = "__modal_rust_describe__"
+
+
+def _run_describe(env):
+    # One-shot describe: `_build(env)` already compiled the runner + populated the
+    # runner-binary cache, so this just reads the manifest off the frozen `--describe`
+    # mode (NOT the serve loop — describe is intentionally one-shot). Returns the
+    # manifest JSON line verbatim (the same bytes the local `--describe` would emit).
+    proc = subprocess.run(
+        [_RUNNER, "--describe"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
+    print(f"[describe] modal_runner exit={proc.returncode}", file=sys.stderr)
+    out = proc.stdout.strip()
+    if not out:
+        raise RuntimeError(
+            f"modal_runner --describe produced no manifest; exit={proc.returncode}; "
+            f"stderr tail: {proc.stderr[-500:]!r}"
+        )
+    return out
+
+
 def handler(entrypoint, input_json):
     env = _env()
     _build(env)
+    # S2 describe sentinel: after the normal build (which populates the runner-binary
+    # cache), return the runner's `--describe` manifest verbatim. Off the serve child
+    # by design (one-shot). The (entrypoint, input) -> envelope contract for REAL
+    # calls below is unchanged.
+    if entrypoint == _DESCRIBE_SENTINEL:
+        return _run_describe(env)
     if _serve_enabled():
         return _run_serve(entrypoint, input_json, env)
     return _run_one_shot(entrypoint, input_json, env)

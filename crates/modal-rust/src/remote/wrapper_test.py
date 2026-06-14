@@ -175,6 +175,48 @@ class WrapperTests(unittest.TestCase):
 
         self.assertEqual(out, '{"ok":true,"value":1}')
 
+    def test_handler_describe_sentinel_runs_one_shot_describe(self):
+        # S2: the reserved describe sentinel builds (populating the runner cache) then
+        # runs `modal_runner --describe` ONE-SHOT and returns its manifest verbatim —
+        # never spawning the serve child, never exec'ing a real --entrypoint.
+        module = load_wrapper()
+        build_envs = []
+
+        def fake_build(env):
+            build_envs.append(env)
+
+        manifest_line = '{"schema":"modal-rust/describe@1","entrypoints":[]}'
+
+        class Proc:
+            returncode = 0
+            stderr = ""
+            stdout = manifest_line + "\n"
+
+        def fake_run(args, capture_output, text, env):
+            self.assertEqual(args, [module._RUNNER, "--describe"])
+            self.assertTrue(capture_output)
+            self.assertTrue(text)
+            return Proc()
+
+        module._build = fake_build
+
+        def boom_popen(*a, **k):
+            raise AssertionError("describe must not spawn the serve child")
+
+        with mock.patch.object(module.subprocess, "run", fake_run):
+            with mock.patch.object(module.subprocess, "Popen", boom_popen):
+                out = module.handler(module._DESCRIBE_SENTINEL, "")
+
+        self.assertEqual(out, manifest_line)
+        self.assertEqual(len(build_envs), 1, "describe still builds (populates runner cache)")
+
+    def test_describe_sentinel_is_lowercase_not_a_modal_rust_literal(self):
+        # The sentinel must stay lowercase so it never trips the MODAL_RUST_ env
+        # drift-guard (it is a reserved entrypoint NAME, not an env var).
+        module = load_wrapper()
+        self.assertEqual(module._DESCRIBE_SENTINEL, "__modal_rust_describe__")
+        self.assertNotIn("MODAL_RUST_", module._DESCRIBE_SENTINEL)
+
     def test_cache_target_default_on_mirrors_rust(self):
         # CROSS-LANGUAGE DRIFT GUARD: the Rust `discover_cache_target()` and this
         # wrapper's `_cache_target_on()` must agree — default ON, the falsy set

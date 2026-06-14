@@ -509,6 +509,150 @@ fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
     })
 }
 
+/// REMOTE DESCRIBE (S2): produce the describe manifest by building + running
+/// `--describe` ON MODAL instead of locally — the explicit `--remote-describe` escape
+/// hatch for a crate that compiles on Modal (Linux) but not on the user's laptop.
+///
+/// Mirrors [`build_and_describe`]'s shape so the two paths cannot drift:
+/// 1. Resolve `(root, package)` via cargo metadata and compute the SAME
+///    `describe_cache` key (including `is_generatable` via `resolve_runner_target`).
+/// 2. Consult the manifest CACHE FIRST — a hit returns exactly like `build_and_describe`
+///    (NO Modal round-trip), so a warm `--remote-describe` re-run is 0s.
+/// 3. On a miss, connect a DEFAULT-config ephemeral `App` with a REAL `RemoteConfig`
+///    (so the bootstrap function uploads + builds the user's actual crate), call
+///    [`App::remote_describe_manifest`], parse + schema-check the returned bytes, store
+///    them under the cache key, and return.
+///
+/// `runner_bin` is `None` (no local binary exists on this path), so local input
+/// validation degrades to the remote decode check — the existing
+/// [`validate_input_locally`] precedent for a build-less manifest.
+async fn remote_describe_outcome(project: &Path, _entrypoint: &str) -> Result<DescribeOutcome> {
+    let root = workspace::workspace_root(project)?;
+    let package = workspace::package_name(project)?;
+
+    // Compute the cache key the SAME way `build_and_describe` does: the generatable
+    // flag rides the key (a crate that flips between own-bin and generated runner gets
+    // a distinct entry), so a remote-describe and a local-describe of the same source
+    // state share one cache.
+    let target = modal_rust::resolve_runner_target(&root, &package);
+    let generate = target.as_ref().map(|t| t.is_generatable()).unwrap_or(false);
+    let shared_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    let cache_key = describe_cache::key(&root, &package, generate);
+
+    // CACHE consult first (hit ⇒ no Modal round-trip), re-validated through the SAME
+    // parse + schema check the live path uses.
+    if let Some(key) = &cache_key {
+        if let Some(bytes) = describe_cache::load(&shared_target, key) {
+            if let Ok(manifest) = parse_and_check(&bytes) {
+                if manifest.entrypoints.is_empty() {
+                    bail!("{}", no_entrypoints_error(&package));
+                }
+                eprintln!("modal-rust: describe cache hit ({package}); skipping remote describe");
+                return Ok(DescribeOutcome {
+                    manifest,
+                    root,
+                    package,
+                    runner_bin: None,
+                });
+            }
+        }
+    }
+
+    // MISS: bootstrap on Modal. A REAL RemoteConfig (workspace root + package) so the
+    // bootstrap function uploads and builds the user's actual crate, then runs
+    // `--describe` in-body via the wrapper describe sentinel.
+    eprintln!("modal-rust: building {package} modal_runner ON MODAL for --describe …");
+    let run_config = RemoteConfig {
+        local_root: root.clone(),
+        package: package.clone(),
+        ..RemoteConfig::default()
+    };
+    let app = App::connect_from_manifest(
+        "modal-rust-cli-describe",
+        std::iter::empty::<(String, FunctionOptions)>(),
+        run_config,
+    )
+    .await
+    .context("failed to connect to Modal for the remote-describe path")?;
+    let manifest_json = app
+        .remote_describe_manifest()
+        .await
+        .context("remote describe failed")?;
+    let manifest = parse_and_check(manifest_json.as_bytes())?;
+    if manifest.entrypoints.is_empty() {
+        bail!("{}", no_entrypoints_error(&package));
+    }
+    // Store the verbatim manifest bytes so the next invocation hits the cache (0s).
+    if let Some(key) = &cache_key {
+        describe_cache::store(&shared_target, key, manifest_json.as_bytes());
+    }
+    Ok(DescribeOutcome {
+        manifest,
+        root,
+        package,
+        runner_bin: None,
+    })
+}
+
+/// S7: diff a LOCAL describe manifest against a REMOTE one per entrypoint, bailing with
+/// a clear report on any divergence. Returns `Ok(())` when the two agree (same set of
+/// entrypoints, same per-entrypoint `FunctionOptions`), so the caller can proceed with
+/// the local manifest. The comparison is by serialized `ManifestEntry` (config +
+/// name), so any decorator field divergence (gpu/timeout/cpu/memory/…) is caught.
+fn diff_manifests(local: &Manifest, remote: &Manifest) -> Result<()> {
+    use std::collections::BTreeMap;
+    let index = |m: &Manifest| -> BTreeMap<String, String> {
+        m.entrypoints
+            .iter()
+            .map(|e| {
+                let cfg = serde_json::to_string(&e.config).unwrap_or_default();
+                (e.name.clone(), cfg)
+            })
+            .collect()
+    };
+    let l = index(local);
+    let r = index(remote);
+    let mut diffs: Vec<String> = Vec::new();
+    for (name, lcfg) in &l {
+        match r.get(name) {
+            None => diffs.push(format!("  {name:?}: present locally, ABSENT on Modal")),
+            Some(rcfg) if rcfg != lcfg => diffs.push(format!(
+                "  {name:?}: config differs\n      local : {lcfg}\n      remote: {rcfg}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for name in r.keys() {
+        if !l.contains_key(name) {
+            diffs.push(format!("  {name:?}: present on Modal, ABSENT locally"));
+        }
+    }
+    if !diffs.is_empty() {
+        bail!(
+            "--verify-manifest: local and remote describe manifests DIVERGE:\n{}\n\n\
+             The manifest your laptop produced does not match what Modal produces. Investigate \
+             platform-dependent #[function] config (e.g. a #[cfg(target_os)] entrypoint or a \
+             build.rs that changes config by platform).",
+            diffs.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// S7: run BOTH the local `build_and_describe` AND the remote `remote_describe_manifest`,
+/// diff them per entrypoint (bail on divergence), and on agreement return the LOCAL
+/// outcome (it carries the local `runner_bin` for `--check-input`). The remote describe
+/// reuses the same connect/invoke path as `remote_describe_outcome`.
+async fn verify_manifest_outcome(project: &Path, entrypoint: &str) -> Result<DescribeOutcome> {
+    let local = build_and_describe(project)?;
+    let remote = remote_describe_outcome(project, entrypoint).await?;
+    diff_manifests(&local.manifest, &remote.manifest)?;
+    eprintln!("modal-rust: --verify-manifest: local and remote describe manifests AGREE.");
+    Ok(local)
+}
+
 /// Validate `input_json` LOCALLY against `entrypoint`'s declared input shape by running
 /// the already-built `runner_bin` in DECODE-ONLY `--check-input` mode — NO Modal call,
 /// NO handler body. Returns `Err` (fail fast) when the input cannot be decoded, with a
@@ -672,6 +816,53 @@ fn print_envelope_and_exit_code(envelope: &str) -> i32 {
     }
 }
 
+/// Choose the describe-manifest SOURCE by flag precedence, shared by run + deploy so
+/// the two paths cannot drift:
+///   `--manifest`/`--no-local-build` (`resolve_manifest_no_build`)
+///     > `--verify-manifest` (S7: BOTH, diff, proceed with local)
+///     > `--remote-describe` (`remote_describe_outcome`)
+///     > default (`build_and_describe`).
+/// Inline overrides (`apply_inline_to_entry`) are applied by the CALLER afterward on
+/// ALL paths, so they are not handled here.
+/// How `run`/`deploy` obtain (and override) the entrypoint manifest. Groups the
+/// mutually-related describe-source flags so the command fns stay readable (and under
+/// clippy's argument limit); the precedence between them lives in [`describe_outcome`].
+pub struct ManifestOpts<'a> {
+    /// Skip the local build; config comes from `--manifest`/inline flags.
+    pub no_local_build: bool,
+    /// A hand-written describe@1 manifest file (`--manifest`).
+    pub manifest_file: Option<PathBuf>,
+    /// Build + run `--describe` on Modal instead of locally (`--remote-describe`).
+    pub remote_describe: bool,
+    /// Build the manifest both locally and on Modal and diff them (`--verify-manifest`).
+    pub verify_manifest: bool,
+    /// Per-invocation config overrides (`--gpu`/`--timeout`/...).
+    pub inline_config: &'a InlineConfig,
+}
+
+async fn describe_outcome(
+    project: &Path,
+    entrypoint: &str,
+    opts: &ManifestOpts<'_>,
+) -> Result<DescribeOutcome> {
+    if opts.no_local_build {
+        // --manifest/--no-local-build win: the manifest/inline flags supply config,
+        // no build (local OR remote) happens.
+        resolve_manifest_no_build(
+            project,
+            entrypoint,
+            opts.manifest_file.as_deref(),
+            opts.inline_config,
+        )
+    } else if opts.verify_manifest {
+        verify_manifest_outcome(project, entrypoint).await
+    } else if opts.remote_describe {
+        remote_describe_outcome(project, entrypoint).await
+    } else {
+        build_and_describe(project)
+    }
+}
+
 /// DEFAULT `run`: build + describe, then drive an EPHEMERAL app via the facade's
 /// `App::connect_from_manifest` + `remote_envelope` (mirrors `.remote()`). NO
 /// generated `.py`, NO `modal` subprocess (P9 §C.4).
@@ -679,24 +870,18 @@ pub async fn cmd_run_programmatic(
     entrypoint: &str,
     project: &Path,
     input_json: String,
-    no_local_build: bool,
-    manifest_file: Option<PathBuf>,
-    inline_config: &InlineConfig,
+    opts: ManifestOpts<'_>,
 ) -> Result<i32> {
     let DescribeOutcome {
         mut manifest,
         root,
         package,
         runner_bin,
-    } = if no_local_build {
-        resolve_manifest_no_build(project, entrypoint, manifest_file.as_deref(), inline_config)?
-    } else {
-        build_and_describe(project)?
-    };
+    } = describe_outcome(project, entrypoint, &opts).await?;
     let _ = manifest.entry(entrypoint)?;
     // Inline --gpu/--timeout/... override the decorator config for this entrypoint, on
     // any path (normal build included). No-op when no flag was supplied.
-    apply_inline_to_entry(&mut manifest, entrypoint, inline_config);
+    apply_inline_to_entry(&mut manifest, entrypoint, opts.inline_config);
 
     // LOCAL input validation (fail fast, NO Modal call): decode `--input` against the
     // entrypoint's input shape via the already-built runner's `--check-input` mode. A
@@ -734,27 +919,21 @@ pub async fn cmd_deploy_programmatic(
     entrypoint: &str,
     project: &Path,
     app_name: &str,
-    no_local_build: bool,
-    manifest_file: Option<PathBuf>,
-    inline_config: &InlineConfig,
+    opts: ManifestOpts<'_>,
 ) -> Result<i32> {
     let DescribeOutcome {
         mut manifest,
         root,
         package,
         runner_bin: _,
-    } = if no_local_build {
-        resolve_manifest_no_build(project, entrypoint, manifest_file.as_deref(), inline_config)?
-    } else {
-        build_and_describe(project)?
-    };
+    } = describe_outcome(project, entrypoint, &opts).await?;
     // Deploy publishes every manifest entrypoint as its own Modal function over one
     // shared image. The selected `entrypoint` is still not the only deployed
     // function, but validate it exists so a typo fails fast — parity with run.
     let _ = manifest.entry(entrypoint)?;
     // Inline --gpu/--timeout/... override the decorator config for the SELECTED
     // entrypoint (other deployed entrypoints keep their decorator config).
-    apply_inline_to_entry(&mut manifest, entrypoint, inline_config);
+    apply_inline_to_entry(&mut manifest, entrypoint, opts.inline_config);
     eprintln!(
         "modal-rust: note: entrypoint {entrypoint:?} is bound at call time, not deploy time."
     );

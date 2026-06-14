@@ -76,6 +76,15 @@ enum Commands {
         /// --no-local-build. The entrypoint must be present in this file.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// Produce the describe manifest by building + running `--describe` ON MODAL
+        /// (Linux) instead of locally. Use when the crate compiles on Modal but not on
+        /// your laptop. Explicit only — a local build failure never falls back here.
+        #[arg(long)]
+        remote_describe: bool,
+        /// Build the describe manifest BOTH locally and on Modal, diff them per
+        /// entrypoint, and bail on divergence (else proceed with the local manifest).
+        #[arg(long)]
+        verify_manifest: bool,
         #[command(flatten)]
         inline_config: InlineConfig,
     },
@@ -99,6 +108,15 @@ enum Commands {
         /// --no-local-build. The entrypoint must be present in this file.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// Produce the describe manifest by building + running `--describe` ON MODAL
+        /// (Linux) instead of locally. Use when the crate compiles on Modal but not on
+        /// your laptop. Explicit only — a local build failure never falls back here.
+        #[arg(long)]
+        remote_describe: bool,
+        /// Build the describe manifest BOTH locally and on Modal, diff them per
+        /// entrypoint, and bail on divergence (else proceed with the local manifest).
+        #[arg(long)]
+        verify_manifest: bool,
         #[command(flatten)]
         inline_config: InlineConfig,
     },
@@ -196,6 +214,8 @@ fn run(cli: Cli) -> Result<i32> {
             input,
             mut no_local_build,
             manifest,
+            remote_describe,
+            verify_manifest,
             inline_config,
         } => {
             // --manifest implies --no-local-build (manifest supplies config; skip build).
@@ -208,9 +228,13 @@ fn run(cli: Cli) -> Result<i32> {
                 &entrypoint,
                 &project,
                 input_json,
-                no_local_build,
-                manifest,
-                &inline_config,
+                programmatic::ManifestOpts {
+                    no_local_build,
+                    manifest_file: manifest,
+                    remote_describe,
+                    verify_manifest,
+                    inline_config: &inline_config,
+                },
             ))
         }
         Commands::Deploy {
@@ -219,6 +243,8 @@ fn run(cli: Cli) -> Result<i32> {
             app,
             mut no_local_build,
             manifest,
+            remote_describe,
+            verify_manifest,
             inline_config,
         } => {
             if manifest.is_some() {
@@ -228,9 +254,13 @@ fn run(cli: Cli) -> Result<i32> {
                 &entrypoint,
                 &project,
                 &app,
-                no_local_build,
-                manifest,
-                &inline_config,
+                programmatic::ManifestOpts {
+                    no_local_build,
+                    manifest_file: manifest,
+                    remote_describe,
+                    verify_manifest,
+                    inline_config: &inline_config,
+                },
             ))
         }
         Commands::Call {

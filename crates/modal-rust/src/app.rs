@@ -573,6 +573,95 @@ impl App {
         self.remote_invoke(entrypoint, input_json).await
     }
 
+    /// REMOTE DESCRIBE (S2): provision a DEFAULT-config ephemeral bootstrap function,
+    /// invoke it with the reserved describe sentinel, and return the runner's
+    /// `--describe` manifest JSON string VERBATIM — WITHOUT a local `cargo build`.
+    ///
+    /// This is the explicit `--remote-describe`/`--verify-manifest` escape hatch for a
+    /// crate that compiles on Modal (Linux) but not on the user's laptop: the manifest
+    /// is produced by running the EXISTING frozen `runner --describe` ON MODAL (via the
+    /// additive wrapper describe sentinel `"__modal_rust_describe__"`), so the local
+    /// platform never has to compile.
+    ///
+    /// It reuses the SAME provision/invoke path as [`remote_envelope`]: a wrapper
+    /// function is created under a RESERVED object tag (`"__describe__"`, distinct from
+    /// any real entrypoint) with [`FunctionOptions::default()`] EXCEPT a generous
+    /// `memory_mb = 4096` so a heavy dep tree can compile in the function body, then
+    /// invoked with `("__modal_rust_describe__", "")` through
+    /// `invoke_cbor_with_deadline`, decoding the result as the manifest `String`. The
+    /// deadline covers a cold in-body build (the `effective_timeout + 120` the RUN path
+    /// uses), since the bootstrap pays the full first-container compile.
+    ///
+    /// Client-gated like the rest of the talk-to-Modal surface.
+    #[cfg(feature = "client")]
+    pub async fn remote_describe_manifest(&self) -> Result<String> {
+        let handle = self.remote.as_ref().ok_or_else(Error::not_connected)?;
+        // Reserved bootstrap tag — NOT a real entrypoint, so it gets its own Modal
+        // object tag and never collides with a user function. Default config except a
+        // generous memory ceiling so a heavy crate can compile in-body.
+        const DESCRIBE_TAG: &str = "__describe__";
+        const DESCRIBE_SENTINEL: &str = "__modal_rust_describe__";
+        let mut options = FunctionOptions {
+            memory_mb: Some(4096),
+            ..FunctionOptions::default()
+        };
+
+        // Single-flight the bootstrap-function create per (tag, options) exactly like
+        // `resolve_function`, but with our explicit reserved-tag options (we cannot go
+        // through `resolve_function`/`config_for`, which would resolve the real
+        // decorator config for the tag name).
+        let effective_cache = options.cache.unwrap_or(handle.config.cache);
+        let effective_timeout = options.timeout_secs.unwrap_or(handle.config.timeout_secs);
+        options.cache = Some(effective_cache);
+        options.timeout_secs = Some(effective_timeout);
+        let key = RunFunctionKey {
+            entrypoint: DESCRIBE_TAG.to_string(),
+            options: options.clone(),
+        };
+        let cell = {
+            let mut function_ids = handle.function_ids.lock().await;
+            function_ids
+                .entry(key)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let function_id = cell
+            .get_or_try_init(|| async {
+                let run_config = handle.config.clone();
+                let mut run_config =
+                    crate::remote::apply_function_image(run_config, options.image.as_deref())?;
+                run_config.options = options.clone();
+                let mut client = handle.client.lock().await;
+                let mut published = handle.published.lock().await;
+                remote::ensure_function(
+                    &mut client,
+                    &handle.app_id,
+                    &handle.app_name,
+                    DESCRIBE_TAG,
+                    &run_config,
+                    &mut published,
+                )
+                .await
+            })
+            .await?
+            .clone();
+
+        let deadline = std::time::Duration::from_secs(effective_timeout as u64 + 120);
+        // Invoke with the reserved describe sentinel; the wrapper returns the manifest
+        // JSON line verbatim. Same args/kwargs SHAPE as `remote_invoke`.
+        let empty_kwargs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        let mut client = handle.client.lock().await;
+        let manifest: String = client
+            .invoke_cbor_with_deadline(
+                &function_id,
+                &(DESCRIBE_SENTINEL, String::new()),
+                &empty_kwargs,
+                deadline,
+            )
+            .await?;
+        Ok(manifest)
+    }
+
     /// Call a DEPLOYED entrypoint by app name and return the runner's one-line JSON
     /// envelope VERBATIM (NO build, NO upload — the deploy-call invariant). Reuses
     /// [`deploy::call_function`] exactly as [`App::call`] does, but returns the raw
