@@ -351,6 +351,7 @@ mod tests {
             .with_webhook(Some(WebhookSpec {
                 method: "POST".to_string(),
                 requires_proxy_auth: true,
+                ..Default::default()
             }))
             .expect("valid webhook");
         let req = build_function_create_request("ap-1", "fu-pre-1", &spec);

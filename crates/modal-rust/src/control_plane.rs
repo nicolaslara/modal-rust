@@ -161,6 +161,10 @@ struct DeployGates<'a> {
     /// gets a generated `web_<sanitized>` adapter line in the baked wrapper (the
     /// endpoint function's `implementation_name`). Empty ⇒ the plain static wrapper.
     endpoint_entrypoints: Vec<&'a str>,
+    /// Web server §5: every deployed `#[web_server]` entrypoint as `(name, port)` gets a
+    /// generated `web_server_<sanitized> = _make_web_server_handler(<port>, "<name>")`
+    /// launcher line in the baked wrapper. Empty ⇒ the plain static wrapper.
+    web_server_entrypoints: Vec<(&'a str, u16)>,
 }
 
 fn deploy_gates(entrypoints: &[Entrypoint]) -> DeployGates<'_> {
@@ -170,8 +174,16 @@ fn deploy_gates(entrypoints: &[Entrypoint]) -> DeployGates<'_> {
             .any(|ep| ep.options.enable_memory_snapshot),
         endpoint_entrypoints: entrypoints
             .iter()
-            .filter(|ep| ep.options.webhook_method.is_some())
+            // A `#[web_server]` (web_server_port set) is NOT a FUNCTION endpoint, even
+            // though it shares the webhook path; only true `#[endpoint]`s list here.
+            .filter(|ep| {
+                ep.options.webhook_method.is_some() && ep.options.web_server_port.is_none()
+            })
             .map(|ep| ep.name.as_str())
+            .collect(),
+        web_server_entrypoints: entrypoints
+            .iter()
+            .filter_map(|ep| ep.options.web_server_port.map(|p| (ep.name.as_str(), p)))
             .collect(),
     }
 }
@@ -338,12 +350,13 @@ pub(crate) fn build_deploy_top_layer_spec(
     bake_snapshot_prime: bool,
     bake_snapshot_best_effort: bool,
     endpoint_entrypoints: &[&str],
+    web_server_entrypoints: &[(&str, u16)],
 ) -> ImageSpec {
     let mut spec = ImageSpec::from_registry(String::new()) // FROM replaced by `FROM base`.
         .with_base_image(base_image_id)
         .with_wrapper_module(
             DEPLOY_WRAPPER_MODULE,
-            baked_deploy_wrapper_src(endpoint_entrypoints),
+            baked_deploy_wrapper_src(endpoint_entrypoints, web_server_entrypoints),
         )
         .with_context_mount(source_mount_id)
         // Context root → /, so the /app/src-prefixed tree lands at /app/src.
@@ -404,17 +417,34 @@ fn build_function_spec(
     res: &AttachedResources,
 ) -> Result<FunctionSpec> {
     let object_tag = crate::remote::sanitize_object_tag(&ep.name);
-    // Web endpoint is DEPLOY-only in v0 (D5: the URL is deploy-only), so build the
-    // webhook spec ONLY when this is the DEPLOY boundary AND the entrypoint declared
-    // `#[endpoint(method = ..)]`. RUN stays wire-identical even when decorated —
-    // exactly like `enable_memory_snapshot` below.
-    let webhook = match (&ep.options.webhook_method, boundary.app_state) {
-        (Some(method), AppState::Deployed) => Some(WebhookSpec {
+    // Web endpoint AND web server are DEPLOY-only in v0 (D5: the URL is deploy-only), so
+    // build the webhook spec ONLY on the DEPLOY boundary. RUN stays wire-identical even
+    // when decorated — exactly like `enable_memory_snapshot` below.
+    //
+    // A `#[web_server]` (`web_server_port` set) takes precedence and produces a
+    // WEB_SERVER raw-port-proxy webhook (Modal's `WEBHOOK_TYPE_WEB_SERVER`); an
+    // `#[endpoint]` (`webhook_method` set) produces the FUNCTION request/response webhook.
+    let webhook = match (
+        ep.options.web_server_port,
+        &ep.options.webhook_method,
+        boundary.app_state,
+    ) {
+        (Some(port), _, AppState::Deployed) => Some(WebhookSpec {
+            method: String::new(), // a raw port proxy has no per-request HTTP method
+            requires_proxy_auth: ep.options.webhook_requires_proxy_auth,
+            web_server_port: Some(port),
+            web_server_startup_timeout: ep.options.web_server_startup_timeout,
+        }),
+        (None, Some(method), AppState::Deployed) => Some(WebhookSpec {
             method: method.clone(),
             requires_proxy_auth: ep.options.webhook_requires_proxy_auth,
+            ..Default::default()
         }),
         _ => None,
     };
+    let is_web_server = webhook
+        .as_ref()
+        .is_some_and(|w| w.web_server_port.is_some());
     let (module, callable, mount_ids) = match boundary.source_delivery {
         SourceDelivery::RunMount => (
             WRAPPER_MODULE,
@@ -423,14 +453,19 @@ fn build_function_spec(
         ),
         // DEPLOY attaches the CLIENT mount ONLY (no source mount).
         SourceDelivery::DeployContext => {
-            // An ENDPOINT's FILE-mode callable is its PER-ENDPOINT adapter
-            // (`web_<sanitized>`, generated into the baked deploy wrapper) instead of
-            // the shared `handler` dispatch — Modal's FUNCTION webhook introspects the
-            // callable's signature, so each endpoint needs its own `(request)` adapter.
+            // A web-exposed entrypoint's FILE-mode callable is its PER-ENTRYPOINT adapter
+            // (generated into the baked deploy wrapper) instead of the shared `handler`
+            // dispatch:
+            // - ENDPOINT (FUNCTION webhook): `web_<sanitized>` — Modal introspects the
+            //   callable's `(request)` signature, so each endpoint needs its own adapter.
+            // - WEB_SERVER (raw port proxy): `web_server_<sanitized>` — invoked ONCE at
+            //   container start to `Popen` the `--web-server --port` runner, then return.
             // The object TAG below stays the entrypoint name, so the typed
-            // FunctionGet-by-tag path resolves the SAME function (the D2 dual surface).
-            // Non-endpoints (webhook None) keep the shared dispatch — byte-identical.
-            let callable = if webhook.is_some() {
+            // FunctionGet-by-tag path resolves the SAME function. Non-web entrypoints
+            // (webhook None) keep the shared dispatch — byte-identical.
+            let callable = if is_web_server {
+                crate::remote::web_server_attr(&ep.name)
+            } else if webhook.is_some() {
                 crate::remote::web_endpoint_attr(&ep.name)
             } else {
                 DEPLOY_WRAPPER_CALLABLE.to_string()
@@ -746,6 +781,7 @@ pub(crate) async fn provision<C: ControlPlane>(
                 gates.bake_snapshot_prime,
                 inputs.snapshot_best_effort,
                 &gates.endpoint_entrypoints,
+                &gates.web_server_entrypoints,
             );
             cp.ensure_image(&app_id, &top_spec, 1).await?
         }
@@ -1136,6 +1172,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
         );
         assert_eq!(spec.base_image_id.as_deref(), Some("im-layer1"));
         assert_eq!(spec.context_mount_id.as_deref(), Some("mo-deploy-src"));
@@ -1173,6 +1210,7 @@ mod tests {
             true,
             false,
             &[],
+            &[],
         );
         assert!(
             spec.extra_commands
@@ -1208,6 +1246,7 @@ mod tests {
             true,
             true,
             &[],
+            &[],
         );
         assert!(spec
             .extra_commands
@@ -1224,6 +1263,7 @@ mod tests {
             "example-add",
             false,
             true,
+            &[],
             &[],
         );
         assert!(!spec
@@ -1243,6 +1283,7 @@ mod tests {
             "example-add",
             false,
             false,
+            &[],
             &[],
         );
         assert_eq!(spec.wrapper_modules.len(), 1);
@@ -1268,6 +1309,7 @@ mod tests {
             false,
             false,
             &["predict", "my-fn.v2"],
+            &[],
         );
         let (module, src) = &spec.wrapper_modules[0];
         assert_eq!(module, DEPLOY_WRAPPER_MODULE);
@@ -1428,6 +1470,94 @@ mod tests {
             "RUN keeps the shared dispatch callable (wire-identical to a plain fn)"
         );
         assert_eq!(spec.object_tag(), "add");
+    }
+
+    #[test]
+    fn deploy_web_server_sets_web_server_webhook_and_launcher_callable() {
+        // A `#[web_server(port = 3000, startup_timeout = 30)]` entrypoint on the DEPLOY
+        // boundary: the webhook spec rides the FunctionSpec carrying `web_server_port`
+        // (which the SDK maps to `WEBHOOK_TYPE_WEB_SERVER`) + the startup timeout, and the
+        // FILE-mode callable becomes the PER-ENTRYPOINT launcher `web_server_<tag>` while
+        // the object TAG stays the entrypoint name. NO HTTP method (a raw port proxy).
+        let ep = Entrypoint {
+            name: "serve".to_string(),
+            options: FunctionOptions {
+                web_server_port: Some(3000),
+                web_server_startup_timeout: Some(30),
+                ..FunctionOptions::default()
+            },
+            timeout_secs: 1800,
+        };
+        let spec = build_function_spec(
+            &DEPLOY_BOUNDARY,
+            &ep,
+            "im-1",
+            &AttachedResources {
+                client_mount_id: "mo-client".to_string(),
+                source_mount_id: "mo-source".to_string(),
+                cache_vol_id: None,
+                secret_ids: vec![],
+                user_volume_mounts: vec![],
+            },
+        )
+        .expect("deploy web_server fn spec");
+        let webhook = spec
+            .webhook
+            .as_ref()
+            .expect("DEPLOY web_server sets webhook");
+        assert_eq!(
+            webhook.web_server_port,
+            Some(3000),
+            "the bound port rides the webhook (SDK ⇒ WEBHOOK_TYPE_WEB_SERVER)"
+        );
+        assert_eq!(webhook.web_server_startup_timeout, Some(30));
+        assert!(
+            webhook.method.is_empty(),
+            "a raw port proxy has no per-request HTTP method"
+        );
+        // implementation callable = the per-entrypoint launcher; TAG = the entrypoint.
+        assert_eq!(spec.module_name, DEPLOY_WRAPPER_MODULE);
+        assert_eq!(spec.function_name, "web_server_serve");
+        assert_eq!(
+            spec.object_tag(),
+            "serve",
+            "object TAG stays the entrypoint"
+        );
+    }
+
+    #[test]
+    fn run_web_server_suppresses_webhook_and_stays_wire_identical() {
+        // D5: the URL is DEPLOY-only. A RUN of a `#[web_server]` entrypoint suppresses the
+        // webhook entirely — same module/callable/spec as a plain `#[function]` run
+        // (byte-identical wire).
+        let ep = Entrypoint {
+            name: "serve".to_string(),
+            options: FunctionOptions {
+                web_server_port: Some(3000),
+                web_server_startup_timeout: Some(30),
+                ..FunctionOptions::default()
+            },
+            timeout_secs: 1800,
+        };
+        let res = AttachedResources {
+            client_mount_id: "mo-client".to_string(),
+            source_mount_id: "mo-source".to_string(),
+            cache_vol_id: None,
+            secret_ids: vec![],
+            user_volume_mounts: vec![],
+        };
+        let spec =
+            build_function_spec(&RUN_BOUNDARY, &ep, "im-1", &res).expect("run web_server fn spec");
+        assert!(
+            spec.webhook.is_none(),
+            "RUN suppresses the web_server webhook even when decorated"
+        );
+        assert_eq!(spec.module_name, WRAPPER_MODULE);
+        assert_eq!(
+            spec.function_name, WRAPPER_CALLABLE,
+            "RUN keeps the shared dispatch callable (wire-identical to a plain fn)"
+        );
+        assert_eq!(spec.object_tag(), "serve");
     }
 
     #[test]

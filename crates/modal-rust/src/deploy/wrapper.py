@@ -106,6 +106,30 @@ def _make_web_handler(entrypoint):
     return _web
 
 
+def _make_web_server_handler(port, entrypoint):
+    # Web server §5: the PER-ENTRYPOINT WEB-SERVER launcher FACTORY. Modal's WEB_SERVER
+    # webhook (a RAW PORT PROXY) invokes this callable ONCE at container start; it must
+    # LAUNCH the server bound to `port` and RETURN so Modal's runtime can wait for the
+    # port and then forward all traffic. We Popen the prebuilt /app/modal_runner in
+    # `--web-server --port <port>` mode (the runner blocks, serving forever) and return.
+    # The deploy bake GENERATES one module-level
+    # `web_server_<sanitized> = _make_web_server_handler(<port>, "<ep>")` line per
+    # web-server entrypoint after the static source. NO fastapi (a raw port proxy, unlike
+    # the FUNCTION endpoints which need an ASGI adapter).
+    def _serve_web_server():
+        cmd = [_RUNNER, "--web-server", "--port", str(port), "--entrypoint", entrypoint]
+        if not _serve_enabled():
+            # Dry-run (wrapper_test.py): show the launch line instead of spawning.
+            print(f"[deploy] web_server DRY-RUN launch: {' '.join(cmd)}", file=sys.stderr)
+            return
+        print(f"[deploy] launching web_server: {' '.join(cmd)}", file=sys.stderr)
+        # Detached child; it OWNS the port and serves forever. We return so Modal's
+        # web_server proxy can wait for the port and forward traffic.
+        subprocess.Popen(cmd, stdout=sys.stderr, stderr=sys.stderr)
+
+    return _serve_web_server
+
+
 def _snapshot_prime_enabled():
     return os.environ.get("MODAL_RUST_SNAPSHOT_PRIME", "").strip().lower() in (
         "1", "true", "yes", "on",

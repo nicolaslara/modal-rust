@@ -58,7 +58,7 @@ pub use modal_rust_sdk as sdk;
 // (2) Runtime essentials that appear in the facade's public API / error paths.
 //     Selective — NOT a glob — so `__macro_support`/`codec` stay out of the
 //     facade's stable surface.
-pub use modal_rust_runtime::{HandlerFn, Registry, RunnerError};
+pub use modal_rust_runtime::{HandlerFn, Registry, RunnerError, WebServerFn};
 // `typed!` is #[macro_export] at the runtime crate root; re-export it for users who
 // build a Registry by hand through the facade.
 pub use modal_rust_runtime::typed;
@@ -71,7 +71,7 @@ pub use modal_rust_runtime::typed;
 //     expands to the runner `main()` (the whole `src/bin/modal_runner.rs` in one
 //     line, with NO `__private` in user code). There is NO `app` macro —
 //     `modal_rust::App` is a struct.
-pub use modal_rust_macros::{cls, endpoint, function, modal_runner};
+pub use modal_rust_macros::{cls, endpoint, function, modal_runner, web_server};
 
 /// Macro-support re-exports — NOT a stable public API (hidden from docs).
 ///
@@ -91,6 +91,10 @@ pub use modal_rust_macros::{cls, endpoint, function, modal_runner};
 pub mod __private {
     /// Run the facade-owned inventory path; used by `modal_runner!()`.
     pub use crate::registration::run_cli_from_inventory;
+    /// `#[web_server]` launcher support: the trait normalizing the user fn's return
+    /// (`()` / `Result<(), E>`) and the `async` driver. Used ONLY by macro-generated
+    /// web-server launchers — an internal macro↔facade contract.
+    pub use crate::registration::{web_server_block_on, IntoWebServerResult};
     /// `::inventory`, re-exported so the macro's `inventory::submit!{…}` resolves
     /// through the facade. `submit!` builds a `static` from a path to the facade
     /// [`crate::Registration`] type — both edition-2018+ macro-path resolution and
@@ -163,7 +167,7 @@ pub use queue::Queue;
 pub use registration::{
     from_inventory_with_configs, package_from_inventory, registry_from_inventory,
     run_cli_from_inventory, run_cli_with_args_and_configs, run_cli_with_args_from_inventory,
-    FunctionConfig, FunctionOptions, Registration,
+    FunctionConfig, FunctionOptions, Registration, WebServerRegistration,
 };
 #[cfg(feature = "client")]
 pub use volume::Volume;

@@ -50,6 +50,16 @@ pub(crate) fn expand_handler(
     // path is routed through it so a macro-using crate needs only `modal-rust`.
     let facade = facade_path();
 
+    // `#[web_server]` is its OWN shape: the handler LAUNCHES a server on a port and
+    // blocks (it is NOT a `fn(&[u8]) -> Vec<u8>` request/response handler), so it skips
+    // the Mode A/B classifier AND the async-reject below (an `async fn serve` is the
+    // common case). It emits the original fn + a `WebServerRegistration` whose port
+    // launcher wraps the user fn (block_on for `async`, `?`/unit for the return type),
+    // PLUS the decorator `FunctionConfig` (with the web_server port/timeout fields set).
+    if kind == HandlerKind::WebServer {
+        return expand_web_server(&func, &entry_name, &facade, &args);
+    }
+
     // async fn -> reserved `typed_async!` shape (boundaries.md §3) is not yet
     // implemented in the runtime. Reject clearly; keep the original fn so the rest
     // of the user's crate still type-checks, and do NOT touch the sync path.
@@ -240,6 +250,104 @@ pub(crate) fn expand_handler(
         #func
         #generated
         #registration
+    }
+    .into()
+}
+
+/// Expand a `#[modal_rust::web_server]` handler. The handler LAUNCHES an HTTP server
+/// bound to `port` and BLOCKS — it is NOT a `fn(&[u8]) -> Vec<u8>` request/response
+/// handler, so it does not register a [`HandlerFn`]/`typed!` wrapper into the normal
+/// dispatch [`Registry`]. Instead it submits a `WebServerRegistration` carrying:
+///
+/// - a LAUNCHER `fn(u16) -> Result<(), RunnerError>` that runs the user fn on a port
+///   (driving an `async fn` on a runtime-owned Tokio executor, and mapping the user
+///   return — `()` or `Result<(), E>` — through the facade's `IntoWebServerResult`
+///   so BOTH sync/async and BOTH return shapes compile), and
+/// - the decorator `FunctionConfig` (with `web_server_port`/`web_server_startup_timeout`
+///   set), so the config rides the `--describe` manifest and the deploy webhook.
+///
+/// The runner's `--web-server --port <p>` dispatch (registration.rs) looks up the
+/// single registered launcher and calls it (it blocks, serving forever).
+fn expand_web_server(
+    func: &ItemFn,
+    entry_name: &str,
+    facade: &proc_macro2::TokenStream,
+    args: &DecoratorConfig,
+) -> TokenStream {
+    let fn_ident = func.sig.ident.clone();
+
+    // Free fns only: a `self` receiver cannot be a launcher.
+    if let Some(FnArg::Receiver(recv)) = func.sig.inputs.first() {
+        let err = syn::Error::new_spanned(
+            recv,
+            "#[modal_rust::web_server] applies to free functions only; a `self` receiver \
+             cannot launch a web server",
+        )
+        .to_compile_error();
+        return quote! { #func #err }.into();
+    }
+
+    // The handler must take exactly one parameter (the port). We do NOT inspect its
+    // type beyond arity (a proc-macro can't resolve types); the launcher passes a `u16`,
+    // so a wrong param type is a clear type error at the call site below.
+    let param_count = func
+        .sig
+        .inputs
+        .iter()
+        .filter(|a| matches!(a, FnArg::Typed(_)))
+        .count();
+    if param_count != 1 {
+        let err = syn::Error::new_spanned(
+            &func.sig,
+            "#[modal_rust::web_server] handlers take exactly one parameter, the bound \
+             port: `fn serve(port: u16) -> anyhow::Result<()>` (sync or async)",
+        )
+        .to_compile_error();
+        return quote! { #func #err }.into();
+    }
+
+    let is_async = func.sig.asyncness.is_some();
+    let config = function_config_tokens(args, facade);
+
+    // The launcher CALLS the user fn with the runner-supplied port and normalizes its
+    // result through `IntoWebServerResult` (covers `()` and `Result<(), E>` for sync;
+    // an `async` body is `block_on`-driven first). The trait is in scope via the
+    // `use` import; the launcher is a const-valid `fn` pointer for the static
+    // `inventory::submit!` initializer.
+    let call_expr = if is_async {
+        quote! {
+            #facade::__private::web_server_block_on(#fn_ident(__modal_rust_port))
+        }
+    } else {
+        quote! { #fn_ident(__modal_rust_port) }
+    };
+
+    let launcher_ident = format_ident!("__modal_rust_web_server_{}", fn_ident);
+
+    quote! {
+        #func
+
+        /// Private LAUNCHER: runs the user `#[web_server]` handler on the runner-supplied
+        /// port and normalizes its result into the frozen `RunnerError` shape. Submitted
+        /// as a `WebServerRegistration` port launcher; called by `--web-server --port`.
+        #[doc(hidden)]
+        fn #launcher_ident(
+            __modal_rust_port: u16,
+        ) -> ::core::result::Result<(), #facade::__private::runtime::RunnerError> {
+            #[allow(unused_imports)]
+            use #facade::__private::IntoWebServerResult as _;
+            let __modal_rust_out = #call_expr;
+            #facade::__private::IntoWebServerResult::into_web_server_result(__modal_rust_out)
+        }
+
+        #facade::__private::inventory::submit! {
+            #facade::WebServerRegistration {
+                name: #entry_name,
+                launcher: #launcher_ident,
+                config: #config,
+                package: ::core::env!("CARGO_PKG_NAME"),
+            }
+        }
     }
     .into()
 }

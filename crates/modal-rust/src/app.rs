@@ -897,6 +897,8 @@ mod tests {
                 enable_memory_snapshot: false,
                 webhook_method: None,
                 webhook_requires_proxy_auth: false,
+                web_server_port: None,
+                web_server_startup_timeout: None,
             },
             package: "modal-rust",
         }
@@ -929,6 +931,8 @@ mod tests {
                 enable_memory_snapshot: false,
                 webhook_method: None,
                 webhook_requires_proxy_auth: false,
+                web_server_port: None,
+                web_server_startup_timeout: None,
             },
             package: "modal-rust",
         }

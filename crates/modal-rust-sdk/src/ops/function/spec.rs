@@ -143,17 +143,29 @@ impl FunctionAutoscaler {
 /// advertise `supported_input_formats = [ASGI]` and `supported_output_formats =
 /// [ASGI, GENERATOR_DONE]`, else modal-http rejects the response as "unexpected data
 /// format: Pickle").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WebhookSpec {
     /// HTTP method for the single-function endpoint (`"GET"`/`"POST"`/`"PUT"`/
     /// `"DELETE"`/`"PATCH"`) → `WebhookConfig.method` (proto field 2). Validated
     /// upstream by the `#[endpoint(method = ..)]` macro; the SDK passes it verbatim.
+    /// EMPTY for a WEB-SERVER webhook (a raw port proxy has no per-request method).
     pub method: String,
     /// Modal proxy-auth opt-in → `WebhookConfig.requires_proxy_auth` (proto field
     /// 10). `false` (Modal's default) = public URL; `true` = Modal rejects requests
     /// lacking the `Modal-Key`/`Modal-Secret` proxy-auth header pair BEFORE they
     /// reach the container.
     pub requires_proxy_auth: bool,
+    /// Web-server bound TCP port (`#[web_server(port = ..)]`) → `WebhookConfig.type =
+    /// WEBHOOK_TYPE_WEB_SERVER` + `WebhookConfig.web_server_port` (proto field 7).
+    /// `None` (the default) ⇒ a FUNCTION webhook (the `#[endpoint]` request/response
+    /// shape, formats swapped to ASGI); `Some(port)` ⇒ a WEB-SERVER raw-port proxy
+    /// (Modal forwards all traffic to `port`; the data formats stay `[PICKLE, CBOR]`
+    /// since the function is invoked once at container start, not per request).
+    pub web_server_port: Option<u16>,
+    /// Web-server startup timeout in seconds (`#[web_server(.., startup_timeout = ..)]`)
+    /// → `WebhookConfig.web_server_startup_timeout` (proto field 8, a float). `None` ⇒
+    /// Modal default (`0.0`). Inert unless `web_server_port` is set.
+    pub web_server_startup_timeout: Option<u32>,
 }
 
 /// Declarative spec for a FILE-mode function create.
@@ -491,12 +503,17 @@ impl FunctionSpec {
     /// same five methods, but the SDK is a public crate and must not trust upstream.
     pub fn with_webhook(mut self, webhook: Option<WebhookSpec>) -> Result<Self> {
         if let Some(w) = &webhook {
-            const METHODS: [&str; 5] = ["GET", "POST", "PUT", "DELETE", "PATCH"];
-            if !METHODS.contains(&w.method.as_str()) {
-                return Err(Error::invalid(format!(
-                    "invalid webhook method {:?}: expected one of GET, POST, PUT, DELETE, PATCH",
-                    w.method
-                )));
+            // A WEB-SERVER webhook (`web_server_port` set) is a raw port proxy with no
+            // per-request HTTP method, so its method is empty and the verb allowlist is
+            // skipped; a FUNCTION webhook (`#[endpoint]`) still validates the verb.
+            if w.web_server_port.is_none() {
+                const METHODS: [&str; 5] = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+                if !METHODS.contains(&w.method.as_str()) {
+                    return Err(Error::invalid(format!(
+                        "invalid webhook method {:?}: expected one of GET, POST, PUT, DELETE, PATCH",
+                        w.method
+                    )));
+                }
             }
         }
         self.webhook = webhook;

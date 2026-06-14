@@ -58,6 +58,15 @@ pub type CheckFn = fn(&[u8]) -> Result<(), RunnerError>;
 /// `#[enter]` (correctness floor) rather than re-running.
 pub type PrimeFn = fn() -> Result<(), RunnerError>;
 
+/// A WEB-SERVER launcher reduced to a bare `fn` pointer: given the bound TCP port, it
+/// LAUNCHES a long-running HTTP server and BLOCKS, serving forever (it returns only on
+/// error or shutdown). This is the `#[modal_rust::web_server]` shape — fundamentally
+/// different from [`HandlerFn`] (one request → one response): the launcher owns the
+/// socket. The runner's `--web-server --port <p>` mode looks up the single registered
+/// launcher and calls it; the facade-generated launcher drives an `async fn` on a Tokio
+/// runtime and normalizes the user return into this `Result`.
+pub type WebServerFn = fn(u16) -> Result<(), RunnerError>;
+
 /// The frozen failure taxonomy (boundaries.md §2). The runner models failure as a
 /// Rust enum that **wraps** the user's error rather than stringifying it early, so
 /// the monomorphized [`typed!`] wrapper can preserve structure.
@@ -362,6 +371,12 @@ pub struct Registry {
     /// any registry built without snapshot-enabled `#[cls]` methods, so a `prime` frame
     /// simply acks `{"primed":0}`.
     primes: Vec<PrimeFn>,
+    /// `#[web_server]` launchers keyed by entrypoint name. SEPARATE from `handlers`
+    /// because a web-server launcher is `fn(u16) -> Result<(), _>` (it OWNS the socket
+    /// and blocks), NOT the one-shot `fn(&[u8]) -> Vec<u8>` dispatch shape. The runner's
+    /// `--web-server --port` mode reads from here; the one-shot/serve dispatch never
+    /// touches it, so a registry with no web servers is byte-identical to before.
+    web_servers: BTreeMap<&'static str, WebServerFn>,
 }
 
 impl Registry {
@@ -371,6 +386,7 @@ impl Registry {
             handlers: BTreeMap::new(),
             checks: BTreeMap::new(),
             primes: Vec::new(),
+            web_servers: BTreeMap::new(),
         }
     }
 
@@ -445,6 +461,31 @@ impl Registry {
     pub fn snapshot_prime(mut self, prime: PrimeFn) -> Self {
         self.primes.push(prime);
         self
+    }
+
+    /// Register a `#[web_server]` launcher under `name` (the SEPARATE web-server
+    /// registry). Builder-style like [`Registry::function`].
+    ///
+    /// # Panics
+    /// Panics (the SAME hard startup error as [`Registry::function`]) if `name` is
+    /// already registered as a web server — duplicate names are rejected, never silently
+    /// last-write-wins.
+    pub fn web_server(mut self, name: &'static str, launcher: WebServerFn) -> Self {
+        if self.web_servers.insert(name, launcher).is_some() {
+            panic!("duplicate web_server entrypoint registered: {name:?}");
+        }
+        self
+    }
+
+    /// Look up a `#[web_server]` launcher by name.
+    pub fn get_web_server(&self, name: &str) -> Option<WebServerFn> {
+        self.web_servers.get(name).copied()
+    }
+
+    /// The registered web-server entrypoint names, sorted (for diagnostics + the
+    /// single-launcher `--web-server` lookup).
+    pub fn web_server_names(&self) -> impl Iterator<Item = &&'static str> {
+        self.web_servers.keys()
     }
 
     /// Look up a handler by name.
@@ -654,6 +695,13 @@ pub fn run_cli_with_args<W: std::io::Write>(
         return run_check_input(&registry, &argv[1..], out);
     }
 
+    // `--web-server --port <p>`: launch the registered `#[web_server]` launcher (it
+    // blocks, serving forever). ADDITIVE: reached only on the `--web-server` token; the
+    // one-shot `--entrypoint`/`--input-*` wire below is untouched.
+    if argv.first().map(String::as_str) == Some("--web-server") {
+        return run_web_server(registry, &argv[1..]);
+    }
+
     let args = match parse_args(argv) {
         Ok(a) => a,
         Err(ArgError(msg)) => {
@@ -710,6 +758,99 @@ pub fn run_cli_with_args<W: std::io::Write>(
             emit(out, &envelope, 0)
         }
         Err(err) => emit(out, &err.to_envelope(), 1),
+    }
+}
+
+/// The `--web-server --port <p> [--entrypoint <name>]` mode: look up the registered
+/// `#[web_server]` LAUNCHER and CALL it on `<p>` — it BLOCKS, serving forever (so this
+/// fn does not return on the happy path). ADDITIVE: this is reached ONLY when the first
+/// argument is `--web-server`; the one-shot `--entrypoint`/`--input-*` and
+/// `--describe`/`--serve` wires are untouched.
+///
+/// The launcher is selected by `--entrypoint <name>` when given; otherwise, when EXACTLY
+/// one web server is registered (the common case), it is selected implicitly. A missing
+/// `--port`, an unknown/ambiguous launcher, or a launcher error returns exit code `1`
+/// with a diagnostic on stderr (no stdout envelope — a web server has no JSON result).
+pub fn run_web_server(registry: Registry, argv: &[String]) -> i32 {
+    // Parse `--port <u16>` and an optional `--entrypoint <name>`; the leading
+    // `--web-server` token is already consumed by the caller's dispatch.
+    let mut port: Option<u16> = None;
+    let mut entrypoint: Option<String> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--port" => {
+                let Some(v) = argv.get(i + 1) else {
+                    eprintln!("modal_runner --web-server: --port requires a value");
+                    return 1;
+                };
+                match v.parse::<u16>() {
+                    Ok(p) => port = Some(p),
+                    Err(e) => {
+                        eprintln!("modal_runner --web-server: invalid --port {v:?}: {e}");
+                        return 1;
+                    }
+                }
+                i += 2;
+            }
+            "--entrypoint" => {
+                let Some(v) = argv.get(i + 1) else {
+                    eprintln!("modal_runner --web-server: --entrypoint requires a value");
+                    return 1;
+                };
+                entrypoint = Some(v.clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("modal_runner --web-server: unrecognized argument: {other}");
+                return 1;
+            }
+        }
+    }
+    let Some(port) = port else {
+        eprintln!("modal_runner --web-server: --port <u16> is required");
+        return 1;
+    };
+
+    // Select the launcher: explicit `--entrypoint`, else the single registered one.
+    let names: Vec<&&'static str> = registry.web_server_names().collect();
+    let launcher = match entrypoint.as_deref() {
+        Some(name) => match registry.get_web_server(name) {
+            Some(l) => l,
+            None => {
+                eprintln!(
+                    "modal_runner --web-server: unknown web_server entrypoint {name:?}; \
+                     registered: {names:?}"
+                );
+                return 1;
+            }
+        },
+        None => match names.as_slice() {
+            [only] => registry
+                .get_web_server(only)
+                .expect("listed launcher resolves"),
+            [] => {
+                eprintln!("modal_runner --web-server: no #[web_server] entrypoint is registered");
+                return 1;
+            }
+            _ => {
+                eprintln!(
+                    "modal_runner --web-server: multiple web_server entrypoints {names:?}; \
+                     pass --entrypoint <name> to choose one"
+                );
+                return 1;
+            }
+        },
+    };
+
+    eprintln!("modal_runner --web-server: launching on port {port}");
+    match launcher(port) {
+        // A web server that returns Ok has shut down cleanly.
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("modal_runner --web-server: server exited with error: {e}");
+            1
+        }
     }
 }
 

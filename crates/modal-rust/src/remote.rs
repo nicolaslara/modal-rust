@@ -77,6 +77,27 @@ pub(crate) fn web_endpoint_attr(entrypoint: &str) -> String {
         .collect();
     format!("web_{sanitized}")
 }
+
+/// The in-container callable (FILE-mode `getattr` target / `implementation_name`) for a
+/// `#[web_server]` entrypoint: `web_server_<sanitized>`. Mirrors [`web_endpoint_attr`]
+/// (a valid Python identifier — `-`/`.` mapped to `_`) but is the WEB-SERVER launcher,
+/// not the per-request adapter. The deploy bake generates a matching module-level
+/// `web_server_<sanitized> = _make_web_server_handler(<port>, "<entrypoint>")` line per
+/// web-server entrypoint, so the deployed function's `implementation_name` resolves the
+/// launcher in-container while the object TAG stays the entrypoint name.
+pub(crate) fn web_server_attr(entrypoint: &str) -> String {
+    let sanitized: String = entrypoint
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("web_server_{sanitized}")
+}
 /// Where the uploaded source mount lands inside the container.
 pub(crate) const REMOTE_SRC: &str = "/src";
 /// Rust base image major version tag (`rust:{ver}-slim`).

@@ -549,6 +549,7 @@ mod tests {
             .with_webhook(Some(WebhookSpec {
                 method: "GET".to_string(),
                 requires_proxy_auth: false,
+                ..Default::default()
             }))
             .expect("valid webhook");
 
@@ -847,6 +848,7 @@ mod tests {
             .with_webhook(Some(WebhookSpec {
                 method: "POST".to_string(),
                 requires_proxy_auth: false,
+                ..Default::default()
             }))
             .expect("POST is a valid method");
         let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
@@ -883,6 +885,7 @@ mod tests {
             .with_webhook(Some(WebhookSpec {
                 method: "GET".to_string(),
                 requires_proxy_auth: true,
+                ..Default::default()
             }))
             .expect("GET is a valid method");
         // And the set-time allowlist REJECTS a malformed method (in-flight fix #5).
@@ -890,6 +893,7 @@ mod tests {
             .with_webhook(Some(WebhookSpec {
                 method: "BREW".to_string(),
                 requires_proxy_auth: false,
+                ..Default::default()
             }))
             .is_err());
         let webhook = build_function_create_request("ap-1", "fu-pre-1", &spec)
@@ -902,6 +906,41 @@ mod tests {
             webhook.requires_proxy_auth,
             "proxy-auth opt-in rides WebhookConfig.requires_proxy_auth (field 10)"
         );
+    }
+
+    #[test]
+    fn with_webhook_web_server_sets_web_server_type_port_and_keeps_formats() {
+        // A `#[web_server]` WebhookSpec (`web_server_port` set) ⇒ a WEB_SERVER-type
+        // webhook_config: `type = WEBHOOK_TYPE_WEB_SERVER`, `web_server_port` set, the
+        // startup timeout mapped to the float field, and NO per-request method. Unlike a
+        // FUNCTION webhook it is a RAW PORT PROXY, so the data formats stay [PICKLE, CBOR]
+        // (no ASGI swap) — byte-identical to a plain function on the format axis. The verb
+        // allowlist is SKIPPED (an empty method is valid for a port proxy).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_webhook(Some(WebhookSpec {
+                method: String::new(),
+                requires_proxy_auth: false,
+                web_server_port: Some(3000),
+                web_server_startup_timeout: Some(30),
+            }))
+            .expect("web_server webhook needs no method allowlist");
+        let function = build_function_create_request("ap-1", "fu-pre-1", &spec)
+            .function
+            .expect("function set");
+        let webhook = function
+            .webhook_config
+            .expect("web_server ⇒ webhook_config present");
+        assert_eq!(webhook.r#type, WebhookType::WebServer as i32);
+        assert_eq!(webhook.web_server_port, 3000);
+        assert_eq!(webhook.web_server_startup_timeout, 30.0);
+        assert!(
+            webhook.method.is_empty(),
+            "a raw port proxy carries no per-request method"
+        );
+        // NO ASGI swap — the proxy ignores formats, so they stay the plain-function pair.
+        assert_eq!(function.supported_input_formats, supported_formats());
+        assert_eq!(function.supported_output_formats, supported_formats());
+        assert_eq!(function.function_type, FunctionType::Function as i32);
     }
 
     #[test]

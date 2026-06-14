@@ -85,18 +85,37 @@ pub(crate) fn web_adapter_suffix(endpoint_entrypoints: &[&str]) -> String {
         .collect()
 }
 
+/// Web server §5: the GENERATED per-web-server launcher suffix — one module-level
+/// `web_server_<sanitized> = _make_web_server_handler(<port>, "<entrypoint>")` line per
+/// `#[web_server]` entrypoint, so the deployed function's `implementation_name`
+/// ([`crate::remote::web_server_attr`]) resolves a REAL module attribute that LAUNCHES
+/// the server on container start. Pure (no I/O); empty input ⇒ empty suffix.
+pub(crate) fn web_server_adapter_suffix(web_servers: &[(&str, u16)]) -> String {
+    web_servers
+        .iter()
+        .map(|(ep, port)| {
+            let attr = crate::remote::web_server_attr(ep);
+            format!("{attr} = _make_web_server_handler({port}, \"{ep}\")\n")
+        })
+        .collect()
+}
+
 /// The deploy-wrapper source actually BAKED into the image
 /// ([`crate::control_plane::build_deploy_top_layer_spec`]): the static
-/// [`DEPLOY_WRAPPER_SRC`] plus the generated [`web_adapter_suffix`] when any deployed
-/// entrypoint is a web endpoint. NO endpoints ⇒ the plain [`DEPLOY_WRAPPER_SRC`],
-/// byte-identical (web endpoints forward-safety §6).
-pub(crate) fn baked_deploy_wrapper_src(endpoint_entrypoints: &[&str]) -> String {
-    if endpoint_entrypoints.is_empty() {
+/// [`DEPLOY_WRAPPER_SRC`] plus the generated [`web_adapter_suffix`] (FUNCTION endpoints)
+/// and [`web_server_adapter_suffix`] (WEB_SERVER entrypoints). NO web-exposed entrypoints
+/// ⇒ the plain [`DEPLOY_WRAPPER_SRC`], byte-identical (web endpoints forward-safety §6).
+pub(crate) fn baked_deploy_wrapper_src(
+    endpoint_entrypoints: &[&str],
+    web_servers: &[(&str, u16)],
+) -> String {
+    if endpoint_entrypoints.is_empty() && web_servers.is_empty() {
         return DEPLOY_WRAPPER_SRC.to_string();
     }
     format!(
-        "{DEPLOY_WRAPPER_SRC}\n{}",
-        web_adapter_suffix(endpoint_entrypoints)
+        "{DEPLOY_WRAPPER_SRC}\n{}{}",
+        web_adapter_suffix(endpoint_entrypoints),
+        web_server_adapter_suffix(web_servers),
     )
 }
 
@@ -612,9 +631,15 @@ mod tests {
             "the fastapi import must be INSIDE the factory, not module-level"
         );
         assert_eq!(
-            src.matches("fastapi").count(),
+            src.matches("from fastapi import").count(),
             1,
             "exactly one (local) fastapi import — module import must stay fastapi-free"
+        );
+        // And NO module-level `import fastapi` / `from fastapi` survives outside the
+        // factory: the ONLY fastapi import sits after the factory def (asserted above).
+        assert!(
+            !src[..def_at].contains("fastapi"),
+            "no fastapi reference may appear before the endpoint factory (module stays fastapi-free)"
         );
     }
 
@@ -637,15 +662,37 @@ mod tests {
     }
 
     #[test]
+    fn web_server_adapter_suffix_generates_one_launcher_line_per_web_server() {
+        // Web server §5: one module-level
+        // `web_server_<sanitized> = _make_web_server_handler(<port>, "<entrypoint>")`
+        // launcher line per `#[web_server]` entrypoint.
+        assert_eq!(
+            web_server_adapter_suffix(&[("serve", 3000)]),
+            "web_server_serve = _make_web_server_handler(3000, \"serve\")\n"
+        );
+        // The attr sanitizes dots/dashes to `_` (a valid Python identifier) while the
+        // factory arg keeps the RAW entrypoint name (the launcher dispatch key).
+        assert_eq!(
+            web_server_adapter_suffix(&[("api.v2", 8080)]),
+            "web_server_api_v2 = _make_web_server_handler(8080, \"api.v2\")\n"
+        );
+        assert_eq!(
+            web_server_adapter_suffix(&[]),
+            "",
+            "no web servers ⇒ empty suffix"
+        );
+    }
+
+    #[test]
     fn baked_deploy_wrapper_src_is_byte_identical_without_endpoints() {
-        // Off-path forward safety (web endpoints §6): no endpoints ⇒ the baked wrapper
-        // is the plain static source, BYTE-IDENTICAL.
-        assert_eq!(baked_deploy_wrapper_src(&[]), DEPLOY_WRAPPER_SRC);
+        // Off-path forward safety (web endpoints §6): no web-exposed entrypoints ⇒ the
+        // baked wrapper is the plain static source, BYTE-IDENTICAL.
+        assert_eq!(baked_deploy_wrapper_src(&[], &[]), DEPLOY_WRAPPER_SRC);
     }
 
     #[test]
     fn baked_deploy_wrapper_src_appends_the_adapter_suffix_after_the_static_source() {
-        let src = baked_deploy_wrapper_src(&["add"]);
+        let src = baked_deploy_wrapper_src(&["add"], &[]);
         assert!(
             src.starts_with(DEPLOY_WRAPPER_SRC),
             "the static wrapper source must lead, unmodified"
@@ -654,6 +701,22 @@ mod tests {
             &src[DEPLOY_WRAPPER_SRC.len()..],
             "\nweb_add = _make_web_handler(\"add\")\n",
             "the generated adapter lines ride after a separating newline"
+        );
+    }
+
+    #[test]
+    fn baked_deploy_wrapper_src_appends_web_server_launcher_after_the_static_source() {
+        // Web server §5: a `#[web_server]` entrypoint appends its launcher line after the
+        // static source (the FILE-mode `implementation_name` = `web_server_<sanitized>`).
+        let src = baked_deploy_wrapper_src(&[], &[("serve", 3000)]);
+        assert!(
+            src.starts_with(DEPLOY_WRAPPER_SRC),
+            "the static wrapper source must lead, unmodified"
+        );
+        assert_eq!(
+            &src[DEPLOY_WRAPPER_SRC.len()..],
+            "\nweb_server_serve = _make_web_server_handler(3000, \"serve\")\n",
+            "the generated web_server launcher line rides after a separating newline"
         );
     }
 

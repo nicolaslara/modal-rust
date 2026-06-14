@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::{HandlerFn, Registry};
-use modal_rust_runtime::{CheckFn, PrimeFn};
+use crate::{HandlerFn, Registry, RunnerError};
+use modal_rust_runtime::{CheckFn, PrimeFn, WebServerFn};
 
 /// Per-function deploy/run CONFIG sourced from
 /// `#[modal_rust::function(gpu=..., timeout=..., cache=...)]`.
@@ -115,6 +115,17 @@ pub struct FunctionConfig {
     /// BEFORE they reach the container. Inert unless `webhook_method` is set. A bare
     /// `bool`, const-valid in the `static` initializer (like `enable_memory_snapshot`).
     pub webhook_requires_proxy_auth: bool,
+    /// Web-server bound port (`#[web_server(port = 3000)]`). `None` (the default) ⇒ not a
+    /// web server ⇒ byte-identical to before web servers. The facade only lets it take
+    /// effect on the DEPLOY boundary (the URL is deploy-only in v0), setting Modal's
+    /// `WEBHOOK_TYPE_WEB_SERVER` + `web_server_port`; a RUN stays wire-identical even when
+    /// the decorator opts in — exactly like `webhook_method`. `Option<u16>`, const-valid
+    /// in the `static` `inventory::submit!` initializer.
+    pub web_server_port: Option<u16>,
+    /// Web-server startup timeout in seconds (`#[web_server(.., startup_timeout = 30)]`).
+    /// `None` ⇒ Modal default. Inert unless `web_server_port` is set. `Option<u32>`,
+    /// const-valid in the `static` initializer.
+    pub web_server_startup_timeout: Option<u32>,
 }
 
 impl FunctionConfig {
@@ -146,6 +157,8 @@ impl FunctionConfig {
             enable_memory_snapshot: false,
             webhook_method: None,
             webhook_requires_proxy_auth: false,
+            web_server_port: None,
+            web_server_startup_timeout: None,
         }
     }
 }
@@ -241,6 +254,16 @@ pub struct FunctionOptions {
     /// `webhook_method` is set. Rides the `--describe` manifest like the rest.
     #[serde(default)]
     pub webhook_requires_proxy_auth: bool,
+    /// Web-server bound port (`#[web_server(port = 3000)]`). `None` ⇒ not a web server.
+    /// The facade only lets it take effect on the DEPLOY boundary (the URL is deploy-only
+    /// in v0); RUN stays wire-identical. Rides the `--describe` manifest like the rest.
+    #[serde(default)]
+    pub web_server_port: Option<u16>,
+    /// Web-server startup timeout in seconds (`#[web_server(.., startup_timeout = 30)]`).
+    /// `None` ⇒ Modal default. Inert unless `web_server_port` is set. Rides the
+    /// `--describe` manifest like the rest.
+    #[serde(default)]
+    pub web_server_startup_timeout: Option<u32>,
 }
 
 impl FunctionOptions {
@@ -291,6 +314,8 @@ impl From<&FunctionConfig> for FunctionOptions {
             enable_memory_snapshot: config.enable_memory_snapshot,
             webhook_method: config.webhook_method.map(str::to_string),
             webhook_requires_proxy_auth: config.webhook_requires_proxy_auth,
+            web_server_port: config.web_server_port,
+            web_server_startup_timeout: config.web_server_startup_timeout,
         }
     }
 }
@@ -334,11 +359,35 @@ pub struct Registration {
 
 inventory::collect!(Registration);
 
+/// The macro-discovery record for a `#[modal_rust::web_server]` handler. SEPARATE from
+/// [`Registration`] because a web server is NOT a one-shot `fn(&[u8]) -> Vec<u8>`
+/// dispatch handler: it owns a port and BLOCKS, serving forever. The record pairs the
+/// `WebServerFn` launcher (which the runner's `--web-server --port` mode calls) with the
+/// control-plane [`FunctionConfig`] (carrying `web_server_port`/`startup_timeout`), so
+/// dispatch and metadata are registered atomically like a `#[function]`.
+pub struct WebServerRegistration {
+    /// The entrypoint name (the Modal object TAG + the web-server registry key).
+    pub name: &'static str,
+    /// The port LAUNCHER (`fn(u16) -> Result<(), RunnerError>`) the macro generated: it
+    /// runs the user's server (driving an `async fn` on a Tokio runtime) and blocks.
+    pub launcher: WebServerFn,
+    /// Per-function deploy/run config sourced from the decorator (with the web_server
+    /// port/timeout fields set).
+    pub config: FunctionConfig,
+    /// Cargo package captured at the user crate's macro expansion site.
+    pub package: &'static str,
+}
+
+inventory::collect!(WebServerRegistration);
+
 /// Assemble the runtime registry from facade-owned macro registrations.
 pub fn registry_from_inventory() -> Registry {
     let mut registry = Registry::new();
     for registration in inventory::iter::<Registration> {
         registry = register_one(registry, registration);
+    }
+    for ws in inventory::iter::<WebServerRegistration> {
+        registry = registry.web_server(ws.name, ws.launcher);
     }
     registry
 }
@@ -373,6 +422,13 @@ pub fn from_inventory_with_configs() -> (Registry, Vec<(&'static str, FunctionOp
             FunctionOptions::from(&registration.config),
         ));
     }
+    // `#[web_server]` launchers ride the SAME config map (so they appear in `--describe`
+    // and deploy as entrypoints carrying the web_server port/timeout) but register into
+    // the SEPARATE web-server registry.
+    for ws in inventory::iter::<WebServerRegistration> {
+        registry = registry.web_server(ws.name, ws.launcher);
+        configs.push((ws.name, FunctionOptions::from(&ws.config)));
+    }
     (registry, configs)
 }
 
@@ -382,6 +438,11 @@ pub fn package_from_inventory() -> Option<&'static str> {
     inventory::iter::<Registration>
         .into_iter()
         .map(|r| r.package)
+        .chain(
+            inventory::iter::<WebServerRegistration>
+                .into_iter()
+                .map(|r| r.package),
+        )
         .find(|p| !p.is_empty())
 }
 
@@ -422,6 +483,48 @@ pub fn run_cli_with_args_and_configs<W: std::io::Write>(
     modal_rust_runtime::run_cli_with_args(registry, argv, out)
 }
 
+/// Normalize a `#[web_server]` handler's return value into the launcher's
+/// `Result<(), RunnerError>`. The handler may return `()` (an infallible server that
+/// only exits by panic/abort) or `Result<(), E>` (the common case). Implemented for
+/// BOTH so the macro-generated launcher compiles regardless of the user's signature —
+/// the SAME "accept either return shape" trick the runner uses elsewhere. NOT a stable
+/// public API (used only by macro-generated launchers via `__private`).
+#[doc(hidden)]
+pub trait IntoWebServerResult {
+    fn into_web_server_result(self) -> std::result::Result<(), RunnerError>;
+}
+
+/// `()` — an infallible server body. Reaching here means it returned (a clean shutdown).
+impl IntoWebServerResult for () {
+    fn into_web_server_result(self) -> std::result::Result<(), RunnerError> {
+        Ok(())
+    }
+}
+
+/// `Result<(), E>` — the fallible server body. A server error is wrapped onto the frozen
+/// `function_error` kind (`details = null`; a web server error is surfaced via stderr +
+/// exit code, not a JSON envelope).
+impl<E: std::fmt::Display> IntoWebServerResult for std::result::Result<(), E> {
+    fn into_web_server_result(self) -> std::result::Result<(), RunnerError> {
+        self.map_err(RunnerError::function_opaque)
+    }
+}
+
+/// Drive a `#[web_server]` `async fn serve(port)` body to completion on a multi-thread
+/// Tokio runtime, BLOCKING the calling (runner) thread until the server returns. Used
+/// ONLY by macro-generated async launchers (via `__private`), so the in-container light
+/// build needs a real reactor — that is why the facade carries a small always-present
+/// `tokio` `rt-multi-thread` dep (see `Cargo.toml`). The returned value is the future's
+/// output (`()` or `Result<(), E>`), normalized by [`IntoWebServerResult`].
+#[doc(hidden)]
+pub fn web_server_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime for #[web_server] launcher")
+        .block_on(fut)
+}
+
 const DESCRIBE_SCHEMA: &str = "modal-rust/describe@1";
 
 #[derive(Serialize)]
@@ -442,8 +545,12 @@ fn emit_describe<W: std::io::Write>(
     out: &mut W,
 ) -> i32 {
     let default = FunctionOptions::default();
+    // Both dispatch handlers AND `#[web_server]` launchers are entrypoints in the
+    // manifest (a web server has no `HandlerFn`, so it is absent from `names()`); chain
+    // both name sources so every deployed entrypoint appears with its config.
     let entrypoints: Vec<DescribeEntry<'_>> = registry
         .names()
+        .chain(registry.web_server_names())
         .map(|&name| {
             let config = configs
                 .iter()
@@ -527,6 +634,8 @@ mod tests {
                 enable_memory_snapshot: false,
                 webhook_method: None,
                 webhook_requires_proxy_auth: false,
+                web_server_port: None,
+                web_server_startup_timeout: None,
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -618,6 +727,8 @@ mod tests {
             enable_memory_snapshot: true,
             webhook_method: Some("POST"),
             webhook_requires_proxy_auth: true,
+            web_server_port: Some(3000),
+            web_server_startup_timeout: Some(30),
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -643,6 +754,8 @@ mod tests {
         assert!(options.enable_memory_snapshot);
         assert_eq!(options.webhook_method.as_deref(), Some("POST"));
         assert!(options.webhook_requires_proxy_auth);
+        assert_eq!(options.web_server_port, Some(3000));
+        assert_eq!(options.web_server_startup_timeout, Some(30));
     }
 
     /// Round-trip test: every field of a fully-populated `FunctionConfig` must
@@ -677,6 +790,8 @@ mod tests {
             enable_memory_snapshot: true,
             webhook_method: Some("POST"),
             webhook_requires_proxy_auth: true,
+            web_server_port: Some(3000),
+            web_server_startup_timeout: Some(30),
         };
 
         let opts = FunctionOptions::from(&config);
@@ -705,6 +820,8 @@ mod tests {
             enable_memory_snapshot,
             webhook_method,
             webhook_requires_proxy_auth,
+            web_server_port,
+            web_server_startup_timeout,
         } = opts;
 
         assert_eq!(gpu.as_deref(), Some("H100"));
@@ -736,6 +853,8 @@ mod tests {
         assert!(enable_memory_snapshot);
         assert_eq!(webhook_method.as_deref(), Some("POST"));
         assert!(webhook_requires_proxy_auth);
+        assert_eq!(web_server_port, Some(3000));
+        assert_eq!(web_server_startup_timeout, Some(30));
     }
 
     #[test]

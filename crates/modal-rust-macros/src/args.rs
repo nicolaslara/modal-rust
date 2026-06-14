@@ -25,6 +25,7 @@ use crate::specs::{
 pub(crate) enum HandlerKind {
     Function,
     Endpoint,
+    WebServer,
     Cls,
 }
 
@@ -34,6 +35,7 @@ impl HandlerKind {
         match self {
             HandlerKind::Function => "#[modal_rust::function]",
             HandlerKind::Endpoint => "#[modal_rust::endpoint]",
+            HandlerKind::WebServer => "#[modal_rust::web_server]",
             HandlerKind::Cls => "#[modal_rust::cls]",
         }
     }
@@ -46,6 +48,11 @@ pub(crate) const ENDPOINT_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "
 /// The expected `#[endpoint]` syntax, embedded in the missing/invalid-`method`
 /// compile errors so the fix is copy-pasteable from the diagnostic.
 pub(crate) const ENDPOINT_EXPECTED_SYNTAX: &str = "#[modal_rust::endpoint(method = \"GET\"|\"POST\"|\"PUT\"|\"DELETE\"|\"PATCH\", <any #[function] config>)]";
+
+/// The expected `#[web_server]` syntax, embedded in the missing-`port` compile error
+/// so the fix is copy-pasteable from the diagnostic.
+pub(crate) const WEB_SERVER_EXPECTED_SYNTAX: &str =
+    "#[modal_rust::web_server(port = <u16>, startup_timeout = <secs, optional>, <any #[function] config>)]";
 
 /// Every argument the SHARED decorator grammar parses, in ONE record so the parse
 /// ([`parse_decorator_config`]) and emit ([`function_config_tokens`]) paths have a
@@ -89,6 +96,12 @@ pub(crate) struct DecoratorConfig {
     /// `requires_proxy_auth = true` — Modal proxy-auth opt-in (`#[endpoint]`-only;
     /// default `false` = PUBLIC, matching Modal).
     pub(crate) webhook_requires_proxy_auth: bool,
+    /// `port = 3000` — the TCP port a `#[web_server]` handler binds (`#[web_server]`-only;
+    /// REQUIRED there). `None` everywhere else ⇒ inert, byte-identical wire.
+    pub(crate) web_server_port: Option<u16>,
+    /// `startup_timeout = 30` — optional seconds Modal waits for the `#[web_server]`
+    /// port to come up (`#[web_server]`-only). `None` ⇒ Modal default.
+    pub(crate) web_server_startup_timeout: Option<u32>,
 }
 
 /// Parse a `#[function(..)]` / `#[endpoint(..)]` / `#[cls(..)]` / `#[method(..)]`
@@ -310,6 +323,34 @@ pub(crate) fn parse_decorator_config(
                 let lit: LitBool = meta.value()?.parse()?;
                 cfg.webhook_requires_proxy_auth = lit.value;
                 Ok(())
+            } else if meta.path.is_ident("port") {
+                // port = <u16> — the REQUIRED TCP port a `#[web_server]` handler binds
+                // (explicit, no silent default). `#[web_server]`-only: on any other
+                // attribute, reject with a pointer at `#[web_server]` (pointed
+                // diagnostic, like `method`/`enable_memory_snapshot`).
+                if kind != HandlerKind::WebServer {
+                    return Err(meta.error(
+                        "`port` is `#[web_server]`-only: it sets the TCP port a long-running \
+                         HTTP server binds. To launch a web server, decorate this handler \
+                         `#[modal_rust::web_server(port = 3000)]` instead.",
+                    ));
+                }
+                let lit: LitInt = meta.value()?.parse()?;
+                cfg.web_server_port = Some(lit.base10_parse()?); // bad/overflow u16 -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("startup_timeout") {
+                // startup_timeout = <secs> — OPTIONAL seconds Modal waits for the
+                // `#[web_server]` port to come up. `#[web_server]`-only.
+                if kind != HandlerKind::WebServer {
+                    return Err(meta.error(
+                        "`startup_timeout` is `#[web_server]`-only: it sets how long Modal \
+                         waits for the server port. Use \
+                         `#[modal_rust::web_server(port = .., startup_timeout = 30)]` instead.",
+                    ));
+                }
+                let lit: LitInt = meta.value()?.parse()?;
+                cfg.web_server_startup_timeout = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
             } else if meta.path.is_ident("enable_memory_snapshot") {
                 // enable_memory_snapshot = <bool> — a bare bool opting a `#[cls]` into
                 // Modal memory snapshot (same shape/precedent as `cache`). When true, the
@@ -348,6 +389,19 @@ pub(crate) fn parse_decorator_config(
         ));
     }
 
+    // A web server's bound PORT is REQUIRED — no silent default. (Only the `port =`
+    // branch above, web-server-gated, ever sets it.)
+    if kind == HandlerKind::WebServer && cfg.web_server_port.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "{} requires `port = ...` (the TCP port the server binds; no silent \
+                 default): {WEB_SERVER_EXPECTED_SYNTAX}",
+                kind.display(),
+            ),
+        ));
+    }
+
     Ok(cfg)
 }
 
@@ -362,12 +416,13 @@ fn unsupported_argument_message(kind: HandlerKind) -> String {
                 `image`, `enable_memory_snapshot`"
             .to_string();
     }
-    // An `#[endpoint]` additionally lists its two extra keys.
+    // An `#[endpoint]` / `#[web_server]` additionally lists its extra keys.
     let endpoint_extras = match kind {
         HandlerKind::Endpoint => {
             "`method = \"GET\"|\"POST\"|\"PUT\"|\"DELETE\"|\"PATCH\"` \
              (REQUIRED), `requires_proxy_auth = <bool>`, "
         }
+        HandlerKind::WebServer => "`port = <u16>` (REQUIRED), `startup_timeout = <secs>`, ",
         _ => "",
     };
     format!(
@@ -469,6 +524,13 @@ pub(crate) fn function_config_tokens(
     // keys), so everything else keeps the inert `None`/`false` ⇒ byte-identical wire.
     let webhook_method_tok = opt_litstr(&cfg.webhook_method);
     let webhook_requires_proxy_auth = cfg.webhook_requires_proxy_auth;
+    // Web-server marker: only `#[web_server]` can set these (the parser gates the keys),
+    // so everything else keeps the inert `None` ⇒ byte-identical wire.
+    let web_server_port_tok = match cfg.web_server_port {
+        Some(p) => quote::quote! { ::core::option::Option::Some(#p) },
+        None => quote::quote! { ::core::option::Option::None },
+    };
+    let web_server_startup_timeout_tok = opt_u32(cfg.web_server_startup_timeout);
 
     quote::quote! {
         #facade::FunctionConfig {
@@ -492,6 +554,8 @@ pub(crate) fn function_config_tokens(
             enable_memory_snapshot: #snapshot_on,
             webhook_method: #webhook_method_tok,
             webhook_requires_proxy_auth: #webhook_requires_proxy_auth,
+            web_server_port: #web_server_port_tok,
+            web_server_startup_timeout: #web_server_startup_timeout_tok,
         }
     }
 }

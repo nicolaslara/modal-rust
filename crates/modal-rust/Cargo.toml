@@ -22,7 +22,7 @@ default = []
 # `deploy`/`call`, `remote_envelope`/`call_envelope`, AND the offline
 # `dry_run`/`dump_deploy_manifest` dump (offline, but it compiles against SDK
 # spec/planning TYPES). The `modal-rust` CLI enables this for you.
-client = ["dep:modal-rust-sdk", "dep:tokio"]
+client = ["dep:modal-rust-sdk", "tokio/sync"]
 # Opt-in live Modal round-trip test for `.remote()`. Gated so the no-CUDA CI box
 # NEVER runs it; enable locally with `--features live`. Now REQUIRES `client` (the
 # live tests do real `.remote()`/`deploy`/`connect`).
@@ -57,12 +57,14 @@ serde_json = "1"
 # upload is a self-consistent workspace cargo can load. Format-preserving editor.
 # Used by the LIGHT scope.rs/runner_gen.rs, so it stays unconditional.
 toml_edit  = "0.22"
-# OPTIONAL under `client`: the ONLY tokio uses in the facade are the
-# `Mutex<ModalClient>` + `OnceCell<String>` in `RemoteHandle` and the async client
-# ops — all client-side. `Function::local`/`App::local` are sync, so the light build
-# drops tokio too. `sync` for the RemoteHandle Mutex/OnceCell; `rt`/`macros` so the
-# async `.remote()` surface is drivable.
-tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
+# NON-OPTIONAL (light) because `__private::web_server_block_on` — the `#[web_server]`
+# launcher's `async fn serve(port)` driver — must exist IN-CONTAINER, where the `client`
+# feature is OFF. So the facade always carries a small `rt-multi-thread` runtime (still
+# no tonic/hyper/prost/reqwest). The `client` feature ADDS `tokio/sync` for the
+# `RemoteHandle` `Mutex<ModalClient>`/`OnceCell<String>` + the async client ops; the base
+# `rt`/`rt-multi-thread`/`macros` already cover both the launcher and the async
+# `.remote()` surface.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 # Content-address the injected `modal_runner.rs` in the wire-delta mock test

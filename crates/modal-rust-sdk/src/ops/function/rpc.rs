@@ -103,20 +103,41 @@ pub(crate) fn build_function_create_request(
     // swap to the ASGI pair Modal's web layer requires (spike finding 3 — advertising
     // PICKLE on a webhook makes modal-http reject the ASGI response). `function_type`
     // stays FUNCTION either way (webhooks cannot be generators at the user level).
-    let webhook_config = spec.webhook.as_ref().map(|w| WebhookConfig {
-        r#type: WebhookType::Function as i32,
-        method: w.method.clone(),
-        requires_proxy_auth: w.requires_proxy_auth,
-        ..Default::default()
+    // Two webhook shapes ride field 15:
+    // - FUNCTION (`#[endpoint]`): `web_server_port` unset ⇒ a per-request webhook; the
+    //   advertised formats swap to the ASGI pair (advertising PICKLE breaks modal-http).
+    // - WEB_SERVER (`#[web_server]`): `web_server_port` set ⇒ a RAW PORT PROXY; Modal
+    //   forwards all traffic to `web_server_port` and the function is invoked once at
+    //   container start to launch the server. NO ASGI swap (the formats are irrelevant to
+    //   the proxy; keep `[PICKLE, CBOR]`, byte-identical to a plain function).
+    let is_web_server = spec
+        .webhook
+        .as_ref()
+        .is_some_and(|w| w.web_server_port.is_some());
+    let webhook_config = spec.webhook.as_ref().map(|w| match w.web_server_port {
+        Some(port) => WebhookConfig {
+            r#type: WebhookType::WebServer as i32,
+            web_server_port: port as u32,
+            web_server_startup_timeout: w.web_server_startup_timeout.unwrap_or(0) as f32,
+            requires_proxy_auth: w.requires_proxy_auth,
+            ..Default::default()
+        },
+        None => WebhookConfig {
+            r#type: WebhookType::Function as i32,
+            method: w.method.clone(),
+            requires_proxy_auth: w.requires_proxy_auth,
+            ..Default::default()
+        },
     });
-    let (supported_input_formats, supported_output_formats) = if spec.webhook.is_some() {
-        (
-            vec![DataFormat::Asgi as i32],
-            vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
-        )
-    } else {
-        (supported_formats(), supported_formats())
-    };
+    let (supported_input_formats, supported_output_formats) =
+        if spec.webhook.is_some() && !is_web_server {
+            (
+                vec![DataFormat::Asgi as i32],
+                vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
+            )
+        } else {
+            (supported_formats(), supported_formats())
+        };
     let function = Function {
         module_name: spec.module_name.clone(),
         function_name: object_tag,

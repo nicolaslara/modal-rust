@@ -237,6 +237,35 @@ pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
     emit::expand_handler(attr, item, HandlerKind::Endpoint)
 }
 
+/// Attribute macro that registers a LONG-RUNNING WEB SERVER handler: a function that
+/// LAUNCHES an HTTP server bound to `port` and BLOCKS, serving forever. Unlike
+/// [`macro@endpoint`] (a request/response `fn(In) -> Out` mapped onto a Modal FUNCTION
+/// webhook), `#[web_server]` is a RAW PORT PROXY (Modal `WEBHOOK_TYPE_WEB_SERVER`): on
+/// `modal-rust deploy` Modal assigns a URL and forwards ALL traffic to the bound port.
+///
+/// The handler signature is `(port: u16) -> ()` / `-> anyhow::Result<()>` (sync or
+/// `async`). It does NOT use the `fn(&[u8]) -> Vec<u8>` request/response shape — it owns
+/// the socket and serves until the container stops.
+///
+/// `port` is REQUIRED (the TCP port the server binds; no silent default).
+/// `startup_timeout = <secs>` is OPTIONAL (how long Modal waits for the port to come
+/// up). Every other argument is the shared `#[function]` vocabulary
+/// (`gpu`/`memory`/`timeout`/`image`/`secrets`/`volumes`/…).
+///
+/// ```ignore
+/// #[modal_rust::web_server(port = 3000, gpu = "T4")]
+/// async fn serve(port: u16) -> anyhow::Result<()> {
+///     burn_lm_http::App::new(port).serve().await.map_err(|e| anyhow::anyhow!(e))
+/// }
+/// // deploy ⇒ Modal prints the assigned URL and proxies traffic to port 3000.
+/// ```
+///
+/// v0 limits: DEPLOY-only (the URL is assigned by `modal-rust deploy`); free fns only.
+#[proc_macro_attribute]
+pub fn web_server(attr: TokenStream, item: TokenStream) -> TokenStream {
+    emit::expand_handler(attr, item, HandlerKind::WebServer)
+}
+
 /// `#[modal_rust::cls(<class config>)]` — the load-once stateful-class attribute.
 ///
 /// Applied to an `impl` block, it parses the inner `#[enter]` / `#[method]` / `#[exit]`

@@ -67,6 +67,13 @@ impl DecoratorConfig {
                 .or_else(|| self.webhook_method.clone()),
             webhook_requires_proxy_auth: over.webhook_requires_proxy_auth
                 || self.webhook_requires_proxy_auth,
+            // `web_server_*` are `#[web_server]`-only (the parser rejects them for
+            // `#[cls]`/`#[method]`), so both sides are always inert `None`; they still
+            // merge structurally rather than being silently dropped.
+            web_server_port: over.web_server_port.or(self.web_server_port),
+            web_server_startup_timeout: over
+                .web_server_startup_timeout
+                .or(self.web_server_startup_timeout),
         }
     }
 }
