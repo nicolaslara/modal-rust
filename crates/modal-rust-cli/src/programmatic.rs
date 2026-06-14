@@ -176,9 +176,8 @@ fn load_manifest_from_file(path: &Path) -> Result<Manifest> {
 }
 
 /// The multi-line build-failure diagnostic body (extracted so it is testable without
-/// spawning cargo). Names the local-build coupling explicitly, offers the two immediate
-/// escape hatches, mentions the planned S2 remote-describe path, and points at the S6
-/// docs guidance (the cudarc pattern).
+/// spawning cargo). Names the local-build coupling explicitly, offers the three
+/// escape hatches, and points at the S6 docs guidance (the cudarc pattern).
 fn build_failure_diagnostic(entrypoint_placeholder: &str) -> String {
     format!(
         "Your Rust crate may compile on Modal (Linux) but not on your laptop,\n\
@@ -186,16 +185,16 @@ fn build_failure_diagnostic(entrypoint_placeholder: &str) -> String {
          -sys crate, a build.rs script probing system headers, or a\n\
          #[cfg(target_os = \"linux\")] #[function] entrypoint).\n\
          \n\
-         Two escape hatches are available:\n\
+         Three escape hatches are available:\n\
          \n  \
-         1. Immediate: provide a hand-written describe@1 manifest:\n     \
+         1. Let Modal build + describe the crate for you (cached afterwards):\n     \
+         modal-rust run {entrypoint_placeholder} --project . --remote-describe --input '{{...}}'\n\
+         \n  \
+         2. Provide a hand-written describe@1 manifest:\n     \
          modal-rust run {entrypoint_placeholder} --project . --manifest manifest.json --input '{{...}}'\n\
          \n  \
-         2. Immediate: supply inline flags to skip the describe build:\n     \
+         3. Supply inline flags to skip the describe build:\n     \
          modal-rust run {entrypoint_placeholder} --project . --no-local-build --gpu T4 --timeout 600 --input '{{...}}'\n\
-         \n  \
-         3. Planned (Slice 2): --remote-describe will bootstrap on Modal:\n     \
-         modal-rust run {entrypoint_placeholder} --project . --remote-describe --input '{{...}}'\n\
          \n\
          For compile-everywhere crates (the cudarc pattern), see:\n  \
          docs/getting-started.md \u{a7} Troubleshooting: Platform-dependent dependencies"
