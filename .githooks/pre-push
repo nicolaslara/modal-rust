@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# pre-push — catch the regressions that matter before they reach CI, fast.
+# pre-push — FAST by default: catch the trivially-fixable stuff without paying a
+# cargo compile, and let CI (~4 min) be the real gate for clippy + tests.
 #
-# Runs the FULL fmt + clippy gate (cheap) plus `cargo test` on the FIVE CORE
-# crates only. The ~28 example test crates are deliberately skipped here: they
-# dominate the wall-clock (each links the facade and exercises the CLI/build
-# path) and make a full local `cargo test` take ~1h on a cold/contended machine,
-# while CI runs everything in ~4min. CI remains the complete gate.
+# This machine is slow at any cargo build, so the default hook runs ONLY the
+# no-compile checks (`cargo fmt --check` + `git diff --check`) — ~1-2s. Clippy and
+# the test suite run in CI on every push (.github/workflows/ci.yml).
 #
 # Enable once per clone with:
 #   git config core.hooksPath .githooks
 #
-# Tradeoff to know: a regression that lives ONLY in an example crate (e.g. a
-# stale example test asserting old image output) will NOT be caught here — CI
-# catches it. Before pushing something that touches examples or image/manifest
-# rendering, run the full mirror yourself: scripts/ci-gate.sh
-#
-# Fast path: set MODAL_RUST_FAST_PUSH=1 to run only fmt + clippy (no tests).
-#   MODAL_RUST_FAST_PUSH=1 git push
+# Want the heavier local gate before a risky push? Opt in:
+#   MODAL_RUST_FULL_PUSH=1 git push   # fmt + clippy + core-crate tests + whitespace
+# Or run the complete CI mirror by hand:  scripts/ci-gate.sh
+# Or skip the hook entirely:             git push --no-verify
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -28,17 +24,19 @@ run() {
   "$@"
 }
 
-# fmt + clippy (the full CI lint surface — cheap, always run).
+# Always: the no-compile checks (instant).
 run cargo +"$RUST_TOOLCHAIN" fmt --check
-run cargo +"$RUST_TOOLCHAIN" clippy --all-targets -- -D warnings
-run cargo +"$RUST_TOOLCHAIN" clippy -p modal-rust -p modal-rust-macros -- -D warnings
+run git diff --check
 
-if [[ "${MODAL_RUST_FAST_PUSH:-0}" == "1" ]]; then
-  echo "pre-push: FAST mode (MODAL_RUST_FAST_PUSH=1) — SKIPPING tests."
+if [[ "${MODAL_RUST_FULL_PUSH:-0}" != "1" ]]; then
+  echo "pre-push: fast checks green (fmt + whitespace). Clippy + tests run in CI; MODAL_RUST_FULL_PUSH=1 to run them locally."
   exit 0
 fi
 
-# Tests: the five core crates only (skip the slow example crates — CI runs them).
+# Opt-in heavy gate: clippy (full lint surface) + core-crate tests (skip the ~28
+# example crates — CI runs those; they make a local `cargo test` take ~1h here).
+run cargo +"$RUST_TOOLCHAIN" clippy --all-targets -- -D warnings
+run cargo +"$RUST_TOOLCHAIN" clippy -p modal-rust -p modal-rust-macros -- -D warnings
 run cargo +"$RUST_TOOLCHAIN" test \
   -p modal-rust \
   -p modal-rust-sdk \
@@ -46,7 +44,4 @@ run cargo +"$RUST_TOOLCHAIN" test \
   -p modal-rust-cli \
   -p modal-rust-macros
 
-# Whitespace (matches ci.yml's Check Whitespace step).
-run git diff --check
-
-echo "pre-push: core gate green. Example crates are NOT tested here — run scripts/ci-gate.sh for the full CI mirror."
+echo "pre-push: full local gate green. (Example crates still only run in CI / scripts/ci-gate.sh.)"
