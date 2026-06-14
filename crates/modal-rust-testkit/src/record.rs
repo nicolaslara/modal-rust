@@ -42,6 +42,7 @@ pub enum RecordedRequest {
     FunctionGetOutputs(gen::FunctionGetOutputsRequest),
     SecretGetOrCreate(gen::SecretGetOrCreateRequest),
     VolumeGetOrCreate(gen::VolumeGetOrCreateRequest),
+    VolumePutFiles2(gen::VolumePutFiles2Request),
     // Dict/Queue v0 (the stateful mock-store arms).
     DictGetOrCreate(gen::DictGetOrCreateRequest),
     DictGet(gen::DictGetRequest),
@@ -155,6 +156,7 @@ impl_from_recorded! {
     FunctionGetOutputsRequest    => FunctionGetOutputs,
     SecretGetOrCreateRequest     => SecretGetOrCreate,
     VolumeGetOrCreateRequest     => VolumeGetOrCreate,
+    VolumePutFiles2Request       => VolumePutFiles2,
     DictGetOrCreateRequest       => DictGetOrCreate,
     DictGetRequest               => DictGet,
     DictUpdateRequest            => DictUpdate,

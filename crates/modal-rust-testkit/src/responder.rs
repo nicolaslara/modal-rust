@@ -72,6 +72,8 @@ pub(crate) struct Responses {
         Option<OverrideFn<gen::SecretGetOrCreateRequest, gen::SecretGetOrCreateResponse>>,
     pub(crate) on_volume_get_or_create:
         Option<OverrideFn<gen::VolumeGetOrCreateRequest, gen::VolumeGetOrCreateResponse>>,
+    pub(crate) on_volume_put_files2:
+        Option<OverrideFn<gen::VolumePutFiles2Request, gen::VolumePutFiles2Response>>,
     /// Dict/Queue resolve hooks. When set they BYPASS the stateful mock store
     /// for that RPC (useful to force a specific id or a resolve-time error);
     /// the data-op arms always hit the real store.

@@ -30,7 +30,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use modal_rust::{App, DeployConfig, FunctionOptions, RemoteConfig};
+use modal_rust::{App, DeployConfig, FunctionOptions, RemoteConfig, Volume};
 
 use crate::describe_cache;
 use crate::workspace;
@@ -984,6 +984,51 @@ pub async fn cmd_call_programmatic(
         .await
         .context("call failed")?;
     Ok(print_envelope_and_exit_code(&envelope))
+}
+
+/// `volume put`: upload a local file or directory into a named Volume, creating
+/// the Volume if missing. Resolves via the `modal_rust::Volume` facade (V2
+/// block-based upload — multi-GB safe), prints a per-file plan + a final summary.
+///
+/// `force = false` errors if a remote file already exists (matching
+/// `modal volume put`); `force = true` overwrites.
+pub async fn cmd_volume_put_programmatic(
+    volume_name: &str,
+    local_path: &std::path::Path,
+    remote_path: &str,
+    force: bool,
+) -> Result<i32> {
+    // Plan up front (pure, offline) so we can show what will be uploaded and fail
+    // fast on a bad path BEFORE touching the network.
+    let plan = modal_rust::sdk::ops::volume::plan_upload(local_path, remote_path)
+        .with_context(|| format!("cannot plan upload of '{}'", local_path.display()))?;
+    let total_bytes: u64 = plan
+        .iter()
+        .filter_map(|f| std::fs::metadata(&f.local).ok().map(|m| m.len()))
+        .sum();
+    eprintln!(
+        "modal-rust: uploading {} file(s), {:.2} MiB to volume '{}'",
+        plan.len(),
+        total_bytes as f64 / (1024.0 * 1024.0),
+        volume_name,
+    );
+    for f in &plan {
+        eprintln!("modal-rust:   {} -> {}", f.local.display(), f.remote);
+    }
+
+    let volume = Volume::from_name(volume_name)
+        .await
+        .with_context(|| format!("failed to resolve volume '{volume_name}'"))?;
+    let stats = volume
+        .put(local_path, remote_path, force)
+        .await
+        .context("volume put failed")?;
+
+    println!(
+        "uploaded {} file(s), {} byte(s), {} block(s) sent to volume '{}'",
+        stats.files, stats.bytes, stats.blocks_uploaded, volume_name,
+    );
+    Ok(0)
 }
 
 #[cfg(test)]

@@ -416,6 +416,26 @@ impl ModalClient for MockServicer {
         }))
     }
 
+    /// Accept a V2 block-based volume upload. The default reports NO missing
+    /// blocks (every declared block is treated as already present), so the
+    /// client's `volume_put` converges in one round with zero object-storage
+    /// PUTs — exercising the whole request-building + commit path offline. An
+    /// `on_volume_put_files2` override can return `missing_blocks` to drive the
+    /// upload loop, or an error to test overwrite/force handling.
+    async fn volume_put_files2(
+        &self,
+        request: Request<gen::VolumePutFiles2Request>,
+    ) -> Result<Response<gen::VolumePutFiles2Response>, Status> {
+        let req = request.into_inner();
+        self.log.push(RecordedRequest::VolumePutFiles2(req.clone()));
+        if let Some(f) = &self.responses.on_volume_put_files2 {
+            return f(&req).map(Response::new);
+        }
+        Ok(Response::new(gen::VolumePutFiles2Response {
+            missing_blocks: Vec::new(),
+        }))
+    }
+
     // ---------- HAND-WRITTEN + STATEFUL: the Dict/Queue v0 RPCs ----------
     //
     // These arms back real state transitions against the shared [`ObjectStore`]
@@ -845,7 +865,6 @@ impl ModalClient for MockServicer {
     unary volume_heartbeat(gen::VolumeHeartbeatRequest) -> ();
     unary volume_list(gen::VolumeListRequest) -> gen::VolumeListResponse;
     unary volume_put_files(gen::VolumePutFilesRequest) -> ();
-    unary volume_put_files2(gen::VolumePutFiles2Request) -> gen::VolumePutFiles2Response;
     unary volume_reload(gen::VolumeReloadRequest) -> ();
     unary volume_remove_file(gen::VolumeRemoveFileRequest) -> ();
     unary volume_remove_file2(gen::VolumeRemoveFile2Request) -> ();

@@ -202,6 +202,20 @@ impl MockModalBuilder {
         self
     }
 
+    /// ESCAPE HATCH: steer `volume_put_files2` (e.g. force a `missing_blocks`
+    /// list to exercise the upload loop, or an overwrite error). The default
+    /// returns an EMPTY `missing_blocks` (the upload converges in one round).
+    pub fn on_volume_put_files2<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&gen::VolumePutFiles2Request) -> Result<gen::VolumePutFiles2Response, Status>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.responses.on_volume_put_files2 = Some(boxed(f));
+        self
+    }
+
     /// ESCAPE HATCH: steer `dict_get_or_create` (e.g. a specific `dict_id` or a
     /// resolve-time error `Status`). NOTE: an override BYPASSES the stateful
     /// mock store for this RPC, so the returned id won't be backed by store

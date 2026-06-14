@@ -130,6 +130,28 @@ enum Commands {
         #[command(flatten)]
         input: InputArg,
     },
+    /// Manage Volumes (named, server-side persistent storage).
+    #[command(subcommand)]
+    Volume(VolumeCommands),
+}
+
+#[derive(Subcommand)]
+enum VolumeCommands {
+    /// Upload a local file or directory into a Volume (creates the Volume if
+    /// missing). Errors if the remote path already exists unless `--force`.
+    Put {
+        /// Volume name (created if missing).
+        volume_name: String,
+        /// Local file or directory to upload.
+        local_path: PathBuf,
+        /// Destination path inside the Volume. Defaults to the local basename.
+        /// For a file, a trailing `/` means "into this dir"; for a directory it
+        /// is the destination prefix.
+        remote_path: Option<String>,
+        /// Overwrite remote files that already exist (default: error on conflict).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Inline entrypoint configuration flags. When set, each overrides the matching
@@ -275,6 +297,34 @@ fn run(cli: Cli) -> Result<i32> {
                 input_json,
             ))
         }
+        Commands::Volume(cmd) => match cmd {
+            VolumeCommands::Put {
+                volume_name,
+                local_path,
+                remote_path,
+                force,
+            } => {
+                // Default the remote to "<basename>" for a file, or "" (root) for
+                // a directory; plan_upload resolves both per the documented rules.
+                let remote = remote_path.unwrap_or_else(|| {
+                    if local_path.is_dir() {
+                        String::new()
+                    } else {
+                        local_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| "uploaded".to_string())
+                    }
+                });
+                runtime()?.block_on(programmatic::cmd_volume_put_programmatic(
+                    &volume_name,
+                    &local_path,
+                    &remote,
+                    force,
+                ))
+            }
+        },
     }
 }
 

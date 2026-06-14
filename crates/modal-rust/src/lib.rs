@@ -138,6 +138,11 @@ mod registration;
 mod remote;
 mod runner_gen;
 mod scope;
+// Typed handle over modal.Volume (named, server-side persistent filesystem).
+// Client-gated like Dict/Queue — it owns a `ModalClient` and IS the control
+// plane; the LIGHT build is byte-identical without it.
+#[cfg(feature = "client")]
+pub(crate) mod volume;
 
 pub use app::App;
 #[cfg(feature = "client")]
@@ -154,11 +159,14 @@ pub use error::{Error, Result};
 pub use function::{Function, FunctionCall, TypedCall, TypedFunctionCall};
 #[cfg(feature = "client")]
 pub use queue::Queue;
+// Typed Volume handle (upload surface) — client-gated like Dict/Queue.
 pub use registration::{
     from_inventory_with_configs, package_from_inventory, registry_from_inventory,
     run_cli_from_inventory, run_cli_with_args_and_configs, run_cli_with_args_from_inventory,
     FunctionConfig, FunctionOptions, Registration,
 };
+#[cfg(feature = "client")]
+pub use volume::Volume;
 // The RUN-path config the `modal-rust` CLI builds from `--describe` + workspace root
 // (P9). `App::connect_from_manifest` takes it explicitly. Client-only (lives in the
 // gated `remote` module).
