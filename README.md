@@ -142,6 +142,8 @@ The CLI drives the first-party SDK directly — it builds your crate, generates 
 `modal_runner` binary for it (or uses one you ship), reads its `--describe`
 manifest, and creates/invokes the function over gRPC. There is no generated Python
 and no dependency on the `modal` CLI; just configure Modal credentials.
+(For platform-dependent dependencies, see §11 Troubleshooting in the getting-started
+guide — the cudarc pattern keeps the describe build working everywhere.)
 
 Your crate stays a **pure library** — a single `modal-rust` dependency and your
 `#[function]`s, no runner binary. The examples below drive

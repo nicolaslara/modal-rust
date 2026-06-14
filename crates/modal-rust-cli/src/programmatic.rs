@@ -28,12 +28,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use modal_rust::{App, DeployConfig, FunctionOptions, RemoteConfig};
 
 use crate::describe_cache;
 use crate::workspace;
+use crate::InlineConfig;
 
 /// The `--describe` manifest schema this CLI understands. The CLI warns-and-proceeds
 /// on an unknown MINOR; HARD-errors on an unknown MAJOR (P9 §A.3 / §C.3).
@@ -41,14 +42,14 @@ const DESCRIBE_SCHEMA_FAMILY: &str = "modal-rust/describe@";
 const DESCRIBE_SCHEMA_MAJOR: u32 = 1;
 
 /// One entrypoint in the parsed manifest.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     name: String,
     config: FunctionOptions,
 }
 
 /// The parsed `--describe` manifest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     schema: String,
     entrypoints: Vec<ManifestEntry>,
@@ -105,6 +106,119 @@ fn check_schema(schema: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Synthesize a single-entry `modal-rust/describe@1` manifest from the positional
+/// entrypoint + inline flags. Used on the `--no-local-build` path (no `--manifest`):
+/// the build is skipped entirely, so the inline flags ARE the config (P4 escape hatch).
+fn synthesize_manifest_from_flags(entrypoint: &str, inline: &InlineConfig) -> Manifest {
+    Manifest {
+        schema: format!("{DESCRIBE_SCHEMA_FAMILY}{DESCRIBE_SCHEMA_MAJOR}"),
+        entrypoints: vec![ManifestEntry {
+            name: entrypoint.to_string(),
+            config: function_options_from_inline(inline),
+        }],
+    }
+}
+
+/// Map the CLI inline flags onto `FunctionOptions` (other fields default). Shared by
+/// synthesis and by `--manifest` override (so the two paths cannot drift).
+fn function_options_from_inline(inline: &InlineConfig) -> FunctionOptions {
+    FunctionOptions {
+        gpu: inline.gpu.clone(),
+        timeout_secs: inline.timeout,
+        milli_cpu: inline.cpu,
+        memory_mb: inline.memory,
+        ..FunctionOptions::default()
+    }
+}
+
+/// Apply inline flag OVERRIDES onto an already-loaded manifest entry, in place. Only
+/// the supplied flags override; unset flags leave the manifest value intact (so
+/// `--manifest m.json --gpu A100` keeps m.json's timeout but forces A100).
+fn apply_inline_overrides(config: &mut FunctionOptions, inline: &InlineConfig) {
+    if inline.gpu.is_some() {
+        config.gpu = inline.gpu.clone();
+    }
+    if inline.timeout.is_some() {
+        config.timeout_secs = inline.timeout;
+    }
+    if inline.cpu.is_some() {
+        config.milli_cpu = inline.cpu;
+    }
+    if inline.memory.is_some() {
+        config.memory_mb = inline.memory;
+    }
+}
+
+/// Load a `--manifest <file>` describe@1 manifest from disk and validate its schema
+/// through the SAME `parse_and_check` the live describe path uses (so a corrupt or
+/// schema-incompatible file is rejected identically).
+fn load_manifest_from_file(path: &Path) -> Result<Manifest> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read manifest file: {}", path.display()))?;
+    parse_and_check(&bytes).with_context(|| format!("invalid manifest file: {}", path.display()))
+}
+
+/// The multi-line build-failure diagnostic body (extracted so it is testable without
+/// spawning cargo). Names the local-build coupling explicitly, offers the two immediate
+/// escape hatches, mentions the planned S2 remote-describe path, and points at the S6
+/// docs guidance (the cudarc pattern).
+fn build_failure_diagnostic(entrypoint_placeholder: &str) -> String {
+    format!(
+        "Your Rust crate may compile on Modal (Linux) but not on your laptop,\n\
+         usually because of platform-specific compile-time dependencies (e.g. a\n\
+         -sys crate, a build.rs script probing system headers, or a\n\
+         #[cfg(target_os = \"linux\")] #[function] entrypoint).\n\
+         \n\
+         Two escape hatches are available:\n\
+         \n  \
+         1. Immediate: provide a hand-written describe@1 manifest:\n     \
+         modal-rust run {entrypoint_placeholder} --project . --manifest manifest.json --input '{{...}}'\n\
+         \n  \
+         2. Immediate: supply inline flags to skip the describe build:\n     \
+         modal-rust run {entrypoint_placeholder} --project . --no-local-build --gpu T4 --timeout 600 --input '{{...}}'\n\
+         \n  \
+         3. Planned (Slice 2): --remote-describe will bootstrap on Modal:\n     \
+         modal-rust run {entrypoint_placeholder} --project . --remote-describe --input '{{...}}'\n\
+         \n\
+         For compile-everywhere crates (the cudarc pattern), see:\n  \
+         docs/getting-started.md \u{a7} Troubleshooting: Platform-dependent dependencies"
+    )
+}
+
+/// Resolve the manifest WITHOUT building: either from a `--manifest <file>` (loaded +
+/// schema-checked, with inline overrides applied) or synthesized from inline flags.
+/// Always resolves `(workspace_root, package)` via cargo metadata (cheap; macOS-safe) so
+/// `RemoteConfig`/`DeployConfig` are complete — only the COMPILE is skipped (constraint 4).
+fn resolve_manifest_no_build(
+    project: &Path,
+    entrypoint: &str,
+    manifest_file: Option<&Path>,
+    inline: &InlineConfig,
+) -> Result<DescribeOutcome> {
+    let root = workspace::workspace_root(project)?;
+    let package = workspace::package_name(project)?;
+    let mut manifest = match manifest_file {
+        Some(path) => load_manifest_from_file(path)?,
+        None => synthesize_manifest_from_flags(entrypoint, inline),
+    };
+    // Inline flags override the matching manifest entry's config (synthesis already
+    // carries them; for a loaded file this lets `--manifest m.json --gpu A100` win).
+    if let Some(entry) = manifest
+        .entrypoints
+        .iter_mut()
+        .find(|e| e.name == entrypoint)
+    {
+        apply_inline_overrides(&mut entry.config, inline);
+    }
+    Ok(DescribeOutcome {
+        manifest,
+        root,
+        package,
+        // No build ⇒ no local runner binary ⇒ local input validation degrades to remote.
+        runner_bin: None,
+    })
 }
 
 /// Build the user crate's `modal_runner` and read its `--describe` manifest (P9 §C.3).
@@ -323,6 +437,11 @@ fn build_and_describe(project: &Path) -> Result<DescribeOutcome> {
     }
     let status = child.wait().context("failed to wait for `cargo build`")?;
     if !status.success() {
+        eprintln!();
+        eprintln!("modal-rust: cargo build failed for `{package}` modal_runner");
+        eprintln!();
+        eprintln!("{}", build_failure_diagnostic("<entrypoint>"));
+        eprintln!();
         bail!(
             "cargo build of `{package}` modal_runner failed (exit {})",
             status.code().unwrap_or(-1)
@@ -552,14 +671,20 @@ pub async fn cmd_run_programmatic(
     entrypoint: &str,
     project: &Path,
     input_json: String,
-    timeout: Option<u64>,
+    no_local_build: bool,
+    manifest_file: Option<PathBuf>,
+    inline_config: &InlineConfig,
 ) -> Result<i32> {
     let DescribeOutcome {
         manifest,
         root,
         package,
         runner_bin,
-    } = build_and_describe(project)?;
+    } = if no_local_build {
+        resolve_manifest_no_build(project, entrypoint, manifest_file.as_deref(), inline_config)?
+    } else {
+        build_and_describe(project)?
+    };
     let _ = manifest.entry(entrypoint)?;
 
     // LOCAL input validation (fail fast, NO Modal call): decode `--input` against the
@@ -570,13 +695,6 @@ pub async fn cmd_run_programmatic(
     // runner binary is unavailable (a cache hit after `cargo clean`).
     if let Some(runner_bin) = &runner_bin {
         validate_input_locally(runner_bin, entrypoint, &input_json)?;
-    }
-
-    if let Some(t) = timeout {
-        eprintln!(
-            "modal-rust: note: --timeout {t}s is informational; the entrypoint's decorator \
-             timeout (or the run-path default) applies."
-        );
     }
 
     // Build the EXPLICIT RemoteConfig from the real workspace root + package + the
@@ -605,13 +723,20 @@ pub async fn cmd_deploy_programmatic(
     entrypoint: &str,
     project: &Path,
     app_name: &str,
+    no_local_build: bool,
+    manifest_file: Option<PathBuf>,
+    inline_config: &InlineConfig,
 ) -> Result<i32> {
     let DescribeOutcome {
         manifest,
         root,
         package,
         runner_bin: _,
-    } = build_and_describe(project)?;
+    } = if no_local_build {
+        resolve_manifest_no_build(project, entrypoint, manifest_file.as_deref(), inline_config)?
+    } else {
+        build_and_describe(project)?
+    };
     // Deploy publishes every manifest entrypoint as its own Modal function over one
     // shared image. The selected `entrypoint` is still not the only deployed
     // function, but validate it exists so a typo fails fast — parity with run.
@@ -968,5 +1093,122 @@ mod tests {
             "unknown_entrypoint from a stale shared runner must degrade, not fail fast"
         );
         let _ = std::fs::remove_file(&runner);
+    }
+
+    // ---- Slice 1: --no-local-build / --manifest manifest synthesis + loading ----
+
+    fn inline(
+        gpu: Option<&str>,
+        timeout: Option<u32>,
+        cpu: Option<u32>,
+        memory: Option<u32>,
+    ) -> InlineConfig {
+        InlineConfig {
+            gpu: gpu.map(str::to_string),
+            timeout,
+            cpu,
+            memory,
+        }
+    }
+
+    #[test]
+    fn synthesize_manifest_from_flags_full() {
+        let cfg = inline(Some("T4"), Some(600), Some(1000), Some(2048));
+        let m = synthesize_manifest_from_flags("add", &cfg);
+        assert_eq!(m.schema, "modal-rust/describe@1");
+        assert_eq!(m.entrypoints.len(), 1);
+        assert_eq!(m.entrypoints[0].name, "add");
+        let c = &m.entrypoints[0].config;
+        assert_eq!(c.gpu.as_deref(), Some("T4"));
+        assert_eq!(c.timeout_secs, Some(600));
+        assert_eq!(c.milli_cpu, Some(1000));
+        assert_eq!(c.memory_mb, Some(2048));
+        // The synthesized manifest must round-trip the SAME schema check the live path uses.
+        check_schema(&m.schema).unwrap();
+    }
+
+    #[test]
+    fn synthesize_manifest_from_flags_partial() {
+        let cfg = inline(None, Some(1200), None, None);
+        let m = synthesize_manifest_from_flags("myfunction", &cfg);
+        let c = &m.entrypoints[0].config;
+        assert_eq!(c.timeout_secs, Some(1200));
+        assert_eq!(c.gpu, None);
+        assert_eq!(c.milli_cpu, None);
+        assert_eq!(c.memory_mb, None);
+    }
+
+    #[test]
+    fn load_manifest_from_file_valid() {
+        let json = r#"{
+            "schema": "modal-rust/describe@1",
+            "entrypoints": [
+                {"name": "add", "config": {"gpu": "T4", "timeout_secs": 600}}
+            ]
+        }"#;
+        let f = std::env::temp_dir().join(format!(
+            "mr-manifest-ok-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&f, json).unwrap();
+        let result = load_manifest_from_file(&f);
+        let _ = std::fs::remove_file(&f);
+
+        let m = result.expect("valid manifest should load");
+        assert_eq!(m.entrypoints[0].name, "add");
+        assert_eq!(m.entrypoints[0].config.gpu.as_deref(), Some("T4"));
+    }
+
+    #[test]
+    fn load_manifest_from_file_invalid_schema() {
+        let bad = r#"{"schema": "modal-rust/describe@999", "entrypoints": []}"#;
+        let f = std::env::temp_dir().join(format!(
+            "mr-manifest-bad-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&f, bad).unwrap();
+        let result = load_manifest_from_file(&f);
+        let _ = std::fs::remove_file(&f);
+
+        let err = result.expect_err("incompatible major must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest file") || msg.contains("incompatible"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn apply_inline_overrides_only_sets_supplied() {
+        // A loaded entry with T4 + 300s; --gpu A100 overrides gpu, leaves timeout intact.
+        let mut config = FunctionOptions {
+            gpu: Some("T4".to_string()),
+            timeout_secs: Some(300),
+            ..FunctionOptions::default()
+        };
+        apply_inline_overrides(&mut config, &inline(Some("A100"), None, None, None));
+        assert_eq!(config.gpu.as_deref(), Some("A100"));
+        assert_eq!(config.timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn build_failure_diagnostic_names_coupling_and_hatches() {
+        let msg = build_failure_diagnostic("<entrypoint>");
+        assert!(
+            msg.contains("platform-specific compile-time dependencies"),
+            "{msg}"
+        );
+        assert!(msg.contains("--manifest"), "{msg}");
+        assert!(msg.contains("--no-local-build"), "{msg}");
+        assert!(msg.contains("--remote-describe"), "{msg}");
+        assert!(msg.contains("cudarc pattern"), "{msg}");
     }
 }

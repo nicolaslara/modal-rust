@@ -274,6 +274,21 @@ open.
 
 ## 11. Troubleshooting
 
+**Platform-dependent dependencies and the cudarc pattern**
+
+The local describe build compiles your crate on your laptop (macOS, Windows, Linux)
+to extract the entrypoint manifest. This can fail on any OS where a *compile-time*
+dependency (a `-sys` crate, a `build.rs` script probing system headers, or a
+`#[cfg(target_os = ...)]` gate on an entrypoint) is unavailable — even though the
+remote Modal build on Linux would succeed. **The recommended pattern:** use
+compile-everywhere, link-at-runtime crates (the [cudarc](https://github.com/coreylowman/cudarc)
+pattern for CUDA — it compiles on any OS and JIT-links CUDA at runtime). This keeps
+`.local()` working on all platforms and the describe build offline-capable. Avoid
+`#[cfg]`-gating `#[function]` registrations across OS boundaries; if you must, either
+embrace the tooling's escape hatches (`--no-local-build`, `--manifest`) or prepare to
+use them once. The examples [`cuda-vector-add`](../examples/cuda-vector-add) and
+[`burn-add`](../examples/burn-add) follow this pattern.
+
 - **`no method named 'add' found for struct App`** — the typed method needs the
   generated trait in scope. Add `use my_app::AddCall;` (named after the function) or
   `use my_app::*;` at the call site.
