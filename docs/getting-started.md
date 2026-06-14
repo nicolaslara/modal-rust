@@ -301,7 +301,16 @@ modal-rust run <entrypoint> --project . \
 # Or hand-write a describe@1 manifest and pass it:
 echo '{"schema":"modal-rust/describe@1","entrypoints":[{"name":"<entrypoint>","config":{"gpu":"T4","timeout_secs":600}}]}' > manifest.json
 modal-rust run <entrypoint> --project . --manifest manifest.json --input '{...}'
+
+# Or let Modal build + describe the crate for you (cached locally afterwards):
+modal-rust run <entrypoint> --project . --remote-describe --input '{...}'
 ```
+
+A bare local build failure never auto-runs the remote path — it prints the
+diagnostic (which names `--remote-describe`) and exits, so there's no surprise
+remote build. `--verify-manifest` builds the manifest both locally and on Modal and
+fails if they disagree (catches a `#[cfg]`-gated entrypoint that's invisible to the
+local build).
 
 - **`no method named 'add' found for struct App`** — the typed method needs the
   generated trait in scope. Add `use my_app::AddCall;` (named after the function) or

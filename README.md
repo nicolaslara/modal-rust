@@ -229,10 +229,28 @@ JSON
 modal-rust run summarize --project examples/cli-workflow \
   --manifest manifest.json \
   --input '{"text":"the quick brown fox"}'
+
+# 3. Let Modal produce the manifest: build + run `--describe` ON MODAL (Linux),
+#    cached locally so repeat runs are instant. No manual config to write.
+modal-rust run summarize --project examples/cli-workflow \
+  --remote-describe \
+  --input '{"text":"the quick brown fox"}'
 ```
 
-Both also work on `modal-rust deploy`. The best fix, though, is to keep your crate
-compile-everywhere in the first place — see the cudarc pattern in the
+A bare local build failure never auto-escalates — it prints the diagnostic (which
+names `--remote-describe`) and exits, so you never pay a surprise remote build. To
+catch the subtler case where a crate compiles on *both* sides but registers a
+*different* set of entrypoints (e.g. a `#[cfg(target_os = "linux")]`-gated
+function), `--verify-manifest` builds the manifest both locally and on Modal and
+fails on any divergence:
+
+```bash
+modal-rust run summarize --project examples/cli-workflow --verify-manifest \
+  --input '{"text":"the quick brown fox"}'
+```
+
+All of these also work on `modal-rust deploy`. The best fix, though, is to keep
+your crate compile-everywhere in the first place — see the cudarc pattern in the
 [Getting Started troubleshooting](docs/getting-started.md#11-troubleshooting).
 
 ## Library API
