@@ -22,7 +22,7 @@ mod workspace;
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 /// The default persistent deploy app name (boundaries.md / tasks.md M7).
@@ -114,27 +114,26 @@ enum Commands {
     },
 }
 
-/// Inline entrypoint configuration flags (override decorator config when
-/// --no-local-build or --manifest is used).
+/// Inline entrypoint configuration flags. When set, each overrides the matching
+/// decorator field for the selected entrypoint — on any path (a normal local build,
+/// `--no-local-build`, or `--manifest`). The decorator stays the source of truth;
+/// these are explicit, per-invocation overrides.
 #[derive(Args)]
 struct InlineConfig {
     /// GPU type (Modal format: "T4", "A100", "A100-80GB", "H100:4", etc.).
-    /// Overrides the decorator's setting. Only valid with --no-local-build/--manifest.
+    /// Overrides the decorator's gpu for this entrypoint, on any path.
     #[arg(long)]
     gpu: Option<String>,
 
-    /// Function timeout in seconds. Overrides the decorator's setting.
-    /// Only valid with --no-local-build/--manifest.
+    /// Function timeout in seconds. Overrides the decorator's timeout.
     #[arg(long)]
     timeout: Option<u32>,
 
-    /// Requested CPU in millicores. Overrides the decorator's setting.
-    /// Only valid with --no-local-build/--manifest.
+    /// Requested CPU in millicores. Overrides the decorator's cpu.
     #[arg(long)]
     cpu: Option<u32>,
 
-    /// Requested memory in mebibytes. Overrides the decorator's setting.
-    /// Only valid with --no-local-build/--manifest.
+    /// Requested memory in mebibytes. Overrides the decorator's memory.
     #[arg(long)]
     memory: Option<u32>,
 }
@@ -146,31 +145,6 @@ struct InputArg {
     /// Inline JSON (`'{"a":40,"b":2}'`) or `@file` to read JSON from.
     #[arg(long)]
     input: Option<String>,
-}
-
-impl InlineConfig {
-    /// True when ANY inline config flag was supplied.
-    fn any_set(&self) -> bool {
-        self.gpu.is_some() || self.timeout.is_some() || self.cpu.is_some() || self.memory.is_some()
-    }
-}
-
-/// P4 doctrine: inline config flags are an ESCAPE HATCH, only valid together with
-/// --no-local-build or --manifest. On the normal build path the decorator is the
-/// source of truth, so reject inline flags with a clear, actionable error.
-fn reject_inline_without_escape_hatch(inline: &InlineConfig, no_local_build: bool) -> Result<()> {
-    if inline.any_set() && !no_local_build {
-        bail!(
-            "inline config flags (--gpu, --timeout, --cpu, --memory) are only valid with \
-             --no-local-build or --manifest.\n\n\
-             P4 doctrine: decorator settings are the source of truth. To override them:\n  \
-             1. Use --manifest <file> with a custom describe@1 manifest, OR\n  \
-             2. Use --no-local-build --gpu <T4> --timeout 600 ... (inline flags only skip the build)\n\n\
-             For per-entrypoint config, edit the decorator: \
-             #[modal_rust::function(gpu = \"T4\", timeout = 600)]"
-        );
-    }
-    Ok(())
 }
 
 impl InputArg {
@@ -225,11 +199,10 @@ fn run(cli: Cli) -> Result<i32> {
             inline_config,
         } => {
             // --manifest implies --no-local-build (manifest supplies config; skip build).
+            // Inline flags (--gpu/...) are an override that applies on ANY path.
             if manifest.is_some() {
                 no_local_build = true;
             }
-            // P4: inline flags only with the escape hatch.
-            reject_inline_without_escape_hatch(&inline_config, no_local_build)?;
             let input_json = input.resolve()?;
             runtime()?.block_on(programmatic::cmd_run_programmatic(
                 &entrypoint,
@@ -251,7 +224,6 @@ fn run(cli: Cli) -> Result<i32> {
             if manifest.is_some() {
                 no_local_build = true;
             }
-            reject_inline_without_escape_hatch(&inline_config, no_local_build)?;
             runtime()?.block_on(programmatic::cmd_deploy_programmatic(
                 &entrypoint,
                 &project,

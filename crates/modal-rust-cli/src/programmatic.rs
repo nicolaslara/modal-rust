@@ -151,6 +151,21 @@ fn apply_inline_overrides(config: &mut FunctionOptions, inline: &InlineConfig) {
     }
 }
 
+/// Apply inline flag overrides onto the SELECTED entrypoint's config in `manifest`,
+/// in place. A no-op when no flags are set. Called on EVERY path (normal build,
+/// `--no-local-build`, `--manifest`) so `--gpu A100` overrides the decorator's gpu for
+/// this invocation regardless of how the manifest was obtained. The decorator stays the
+/// source of truth; this is an explicit per-invocation override.
+fn apply_inline_to_entry(manifest: &mut Manifest, entrypoint: &str, inline: &InlineConfig) {
+    if let Some(entry) = manifest
+        .entrypoints
+        .iter_mut()
+        .find(|e| e.name == entrypoint)
+    {
+        apply_inline_overrides(&mut entry.config, inline);
+    }
+}
+
 /// Load a `--manifest <file>` describe@1 manifest from disk and validate its schema
 /// through the SAME `parse_and_check` the live describe path uses (so a corrupt or
 /// schema-incompatible file is rejected identically).
@@ -199,19 +214,12 @@ fn resolve_manifest_no_build(
 ) -> Result<DescribeOutcome> {
     let root = workspace::workspace_root(project)?;
     let package = workspace::package_name(project)?;
-    let mut manifest = match manifest_file {
+    let manifest = match manifest_file {
         Some(path) => load_manifest_from_file(path)?,
         None => synthesize_manifest_from_flags(entrypoint, inline),
     };
-    // Inline flags override the matching manifest entry's config (synthesis already
-    // carries them; for a loaded file this lets `--manifest m.json --gpu A100` win).
-    if let Some(entry) = manifest
-        .entrypoints
-        .iter_mut()
-        .find(|e| e.name == entrypoint)
-    {
-        apply_inline_overrides(&mut entry.config, inline);
-    }
+    // Inline overrides are applied centrally by the caller (apply_inline_to_entry), so
+    // a loaded `--manifest m.json --gpu A100` and a normal build are handled the same way.
     Ok(DescribeOutcome {
         manifest,
         root,
@@ -676,7 +684,7 @@ pub async fn cmd_run_programmatic(
     inline_config: &InlineConfig,
 ) -> Result<i32> {
     let DescribeOutcome {
-        manifest,
+        mut manifest,
         root,
         package,
         runner_bin,
@@ -686,6 +694,9 @@ pub async fn cmd_run_programmatic(
         build_and_describe(project)?
     };
     let _ = manifest.entry(entrypoint)?;
+    // Inline --gpu/--timeout/... override the decorator config for this entrypoint, on
+    // any path (normal build included). No-op when no flag was supplied.
+    apply_inline_to_entry(&mut manifest, entrypoint, inline_config);
 
     // LOCAL input validation (fail fast, NO Modal call): decode `--input` against the
     // entrypoint's input shape via the already-built runner's `--check-input` mode. A
@@ -728,7 +739,7 @@ pub async fn cmd_deploy_programmatic(
     inline_config: &InlineConfig,
 ) -> Result<i32> {
     let DescribeOutcome {
-        manifest,
+        mut manifest,
         root,
         package,
         runner_bin: _,
@@ -741,6 +752,9 @@ pub async fn cmd_deploy_programmatic(
     // shared image. The selected `entrypoint` is still not the only deployed
     // function, but validate it exists so a typo fails fast — parity with run.
     let _ = manifest.entry(entrypoint)?;
+    // Inline --gpu/--timeout/... override the decorator config for the SELECTED
+    // entrypoint (other deployed entrypoints keep their decorator config).
+    apply_inline_to_entry(&mut manifest, entrypoint, inline_config);
     eprintln!(
         "modal-rust: note: entrypoint {entrypoint:?} is bound at call time, not deploy time."
     );
@@ -1210,5 +1224,27 @@ mod tests {
         assert!(msg.contains("--no-local-build"), "{msg}");
         assert!(msg.contains("--remote-describe"), "{msg}");
         assert!(msg.contains("cudarc pattern"), "{msg}");
+    }
+
+    #[test]
+    fn apply_inline_to_entry_overrides_only_the_named_entry() {
+        let entry = |name: &str| ManifestEntry {
+            name: name.to_string(),
+            config: FunctionOptions {
+                gpu: Some("T4".to_string()),
+                ..FunctionOptions::default()
+            },
+        };
+        let mut m = Manifest {
+            schema: "modal-rust/describe@1".to_string(),
+            entrypoints: vec![entry("a"), entry("b")],
+        };
+        // Override gpu on "a" only — mirrors `--gpu A100` on a normal (built) manifest.
+        apply_inline_to_entry(&mut m, "a", &inline(Some("A100"), None, None, None));
+        assert_eq!(m.entrypoints[0].config.gpu.as_deref(), Some("A100"));
+        assert_eq!(m.entrypoints[1].config.gpu.as_deref(), Some("T4"));
+        // No flags ⇒ no change.
+        apply_inline_to_entry(&mut m, "b", &inline(None, None, None, None));
+        assert_eq!(m.entrypoints[1].config.gpu.as_deref(), Some("T4"));
     }
 }

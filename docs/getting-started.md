@@ -289,9 +289,9 @@ embrace the tooling's escape hatches (`--no-local-build`, `--manifest`) or prepa
 use them once. The examples [`cuda-vector-add`](../examples/cuda-vector-add) and
 [`burn-add`](../examples/burn-add) follow this pattern.
 
-If the local build does fail, skip it with one of the two escape hatches (config
-flags are only accepted alongside these, since the decorator is normally the source
-of truth):
+If the local build does fail, skip it with one of the two escape hatches (with
+`--no-local-build` the decorator can't be read, so the inline `--gpu/--timeout/...`
+flags supply the config; on a normal build those same flags just override it):
 
 ```bash
 # Supply config inline and skip the local build:
