@@ -289,6 +289,20 @@ embrace the tooling's escape hatches (`--no-local-build`, `--manifest`) or prepa
 use them once. The examples [`cuda-vector-add`](../examples/cuda-vector-add) and
 [`burn-add`](../examples/burn-add) follow this pattern.
 
+If the local build does fail, skip it with one of the two escape hatches (config
+flags are only accepted alongside these, since the decorator is normally the source
+of truth):
+
+```bash
+# Supply config inline and skip the local build:
+modal-rust run <entrypoint> --project . \
+  --no-local-build --gpu T4 --timeout 600 --input '{...}'
+
+# Or hand-write a describe@1 manifest and pass it:
+echo '{"schema":"modal-rust/describe@1","entrypoints":[{"name":"<entrypoint>","config":{"gpu":"T4","timeout_secs":600}}]}' > manifest.json
+modal-rust run <entrypoint> --project . --manifest manifest.json --input '{...}'
+```
+
 - **`no method named 'add' found for struct App`** — the typed method needs the
   generated trait in scope. Add `use my_app::AddCall;` (named after the function) or
   `use my_app::*;` at the call site.

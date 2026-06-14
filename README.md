@@ -191,6 +191,39 @@ fast with the expected shape (a `decode_error`) instead of building and running 
 Modal only to fail there. A typo in the entrypoint name or a missing runner
 degrades gracefully to the normal remote check rather than a false rejection.
 
+### When the local build can't run (`--no-local-build` / `--manifest`)
+
+By default the CLI compiles your crate **locally** (a quick debug build) to read
+its entrypoint manifest before talking to Modal. That local build can fail on a
+machine where a *compile-time* dependency is unavailable — e.g. a linux-only
+`-sys` crate on macOS — even though the remote Modal build (on Linux) would
+succeed. When that happens the CLI prints a diagnostic naming the cause and points
+you at two escape hatches:
+
+```bash
+# 1. Skip the local build; supply config inline (the decorator can't be read, so
+#    you state what it would have declared). Config flags are ONLY valid here.
+modal-rust run summarize --project examples/cli-workflow \
+  --no-local-build --gpu T4 --timeout 600 \
+  --input '{"text":"the quick brown fox"}'
+
+# 2. Skip the local build; supply a hand-written describe@1 manifest file.
+cat > manifest.json <<'JSON'
+{"schema":"modal-rust/describe@1",
+ "entrypoints":[{"name":"summarize","config":{"gpu":"T4","timeout_secs":600}}]}
+JSON
+modal-rust run summarize --project examples/cli-workflow \
+  --manifest manifest.json \
+  --input '{"text":"the quick brown fox"}'
+```
+
+Both also work on `modal-rust deploy`. The inline `--gpu/--timeout/--cpu/--memory`
+flags are an **escape hatch**: on the normal build path they are rejected (the
+`#[function]` decorator is the source of truth), so they only apply alongside
+`--no-local-build` or `--manifest`. The best fix is to keep your crate
+compile-everywhere in the first place — see the cudarc pattern in the
+[Getting Started troubleshooting](docs/getting-started.md#11-troubleshooting).
+
 ## Library API
 
 There are two ways to register a function: the `#[modal_rust::function]`
