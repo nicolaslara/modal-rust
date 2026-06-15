@@ -909,13 +909,14 @@ mod tests {
     }
 
     #[test]
-    fn with_webhook_web_server_sets_web_server_type_port_and_keeps_formats() {
+    fn with_webhook_web_server_sets_web_server_type_port_and_swaps_formats() {
         // A `#[web_server]` WebhookSpec (`web_server_port` set) ⇒ a WEB_SERVER-type
         // webhook_config: `type = WEBHOOK_TYPE_WEB_SERVER`, `web_server_port` set, the
-        // startup timeout mapped to the float field, and NO per-request method. Unlike a
-        // FUNCTION webhook it is a RAW PORT PROXY, so the data formats stay [PICKLE, CBOR]
-        // (no ASGI swap) — byte-identical to a plain function on the format axis. The verb
-        // allowlist is SKIPPED (an empty method is valid for a port proxy).
+        // startup timeout mapped to the float field, and NO per-request method. Like every
+        // webhook it advertises the ASGI formats: Modal's `modal-http` frontend treats any
+        // webhook with a non-UNSPECIFIED type as a web endpoint and rejects a PICKLE
+        // advertisement with `unexpected data format: Pickle` (even for a raw port proxy).
+        // The verb allowlist is SKIPPED (an empty method is valid for a port proxy).
         let spec = FunctionSpec::new("m", "handler", "im-1")
             .with_webhook(Some(WebhookSpec {
                 method: String::new(),
@@ -937,9 +938,18 @@ mod tests {
             webhook.method.is_empty(),
             "a raw port proxy carries no per-request method"
         );
-        // NO ASGI swap — the proxy ignores formats, so they stay the plain-function pair.
-        assert_eq!(function.supported_input_formats, supported_formats());
-        assert_eq!(function.supported_output_formats, supported_formats());
+        // ASGI swap — a web_server is a web endpoint; advertising PICKLE makes Modal's
+        // modal-http frontend reject every request with "unexpected data format: Pickle".
+        assert_eq!(
+            function.supported_input_formats,
+            vec![DataFormat::Asgi as i32],
+            "web_server ⇒ input formats [ASGI]"
+        );
+        assert_eq!(
+            function.supported_output_formats,
+            vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
+            "web_server ⇒ output formats [ASGI, GENERATOR_DONE]"
+        );
         assert_eq!(function.function_type, FunctionType::Function as i32);
     }
 

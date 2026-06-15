@@ -108,12 +108,9 @@ pub(crate) fn build_function_create_request(
     //   advertised formats swap to the ASGI pair (advertising PICKLE breaks modal-http).
     // - WEB_SERVER (`#[web_server]`): `web_server_port` set ⇒ a RAW PORT PROXY; Modal
     //   forwards all traffic to `web_server_port` and the function is invoked once at
-    //   container start to launch the server. NO ASGI swap (the formats are irrelevant to
-    //   the proxy; keep `[PICKLE, CBOR]`, byte-identical to a plain function).
-    let is_web_server = spec
-        .webhook
-        .as_ref()
-        .is_some_and(|w| w.web_server_port.is_some());
+    //   container start to launch the server. Like every webhook it still advertises the
+    //   ASGI formats — Modal's `modal-http` frontend rejects a webhook that advertises
+    //   PICKLE with `unexpected data format: Pickle`, even for a raw port proxy.
     let webhook_config = spec.webhook.as_ref().map(|w| match w.web_server_port {
         Some(port) => WebhookConfig {
             r#type: WebhookType::WebServer as i32,
@@ -129,15 +126,14 @@ pub(crate) fn build_function_create_request(
             ..Default::default()
         },
     });
-    let (supported_input_formats, supported_output_formats) =
-        if spec.webhook.is_some() && !is_web_server {
-            (
-                vec![DataFormat::Asgi as i32],
-                vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
-            )
-        } else {
-            (supported_formats(), supported_formats())
-        };
+    let (supported_input_formats, supported_output_formats) = if spec.webhook.is_some() {
+        (
+            vec![DataFormat::Asgi as i32],
+            vec![DataFormat::Asgi as i32, DataFormat::GeneratorDone as i32],
+        )
+    } else {
+        (supported_formats(), supported_formats())
+    };
     let function = Function {
         module_name: spec.module_name.clone(),
         function_name: object_tag,
