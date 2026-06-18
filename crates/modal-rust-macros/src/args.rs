@@ -102,6 +102,13 @@ pub(crate) struct DecoratorConfig {
     /// `startup_timeout = 30` — optional seconds Modal waits for the `#[web_server]`
     /// port to come up (`#[web_server]`-only). `None` ⇒ Modal default.
     pub(crate) web_server_startup_timeout: Option<u32>,
+    /// `max_concurrent_inputs = N` — per-container MAX input concurrency. Accepted
+    /// ungated on every kind (like `max_containers`). `None` ⇒ inert, byte-identical
+    /// wire.
+    pub(crate) max_concurrent_inputs: Option<u32>,
+    /// `target_concurrent_inputs = N` — per-container TARGET input concurrency. Accepted
+    /// ungated on every kind. `None` ⇒ inert, byte-identical wire.
+    pub(crate) target_concurrent_inputs: Option<u32>,
 }
 
 /// Parse a `#[function(..)]` / `#[endpoint(..)]` / `#[cls(..)]` / `#[method(..)]`
@@ -203,6 +210,19 @@ pub(crate) fn parse_decorator_config(
                 // Modal's `scaledown_window` (pka `container_idle_timeout`).
                 let lit: LitInt = meta.value()?.parse()?;
                 cfg.scaledown_window = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("max_concurrent_inputs") {
+                // max_concurrent_inputs = <N> — per-container MAX input concurrency
+                // (Function field 34). Ungated (valid on every kind, like
+                // max_containers); cross-field validation lives in the SDK.
+                let lit: LitInt = meta.value()?.parse()?;
+                cfg.max_concurrent_inputs = Some(lit.base10_parse()?); // bad int -> compile_error!
+                Ok(())
+            } else if meta.path.is_ident("target_concurrent_inputs") {
+                // target_concurrent_inputs = <N> — per-container TARGET input concurrency
+                // (Function field 64). Ungated; cross-field validation lives in the SDK.
+                let lit: LitInt = meta.value()?.parse()?;
+                cfg.target_concurrent_inputs = Some(lit.base10_parse()?); // bad int -> compile_error!
                 Ok(())
             } else if meta.path.is_ident("secrets") {
                 // secrets = ["my-secret", "other"] — a bracketed list of string
@@ -412,8 +432,9 @@ fn unsupported_argument_message(kind: HandlerKind) -> String {
         return "unsupported `#[cls]`/`#[method]` argument; recognized: `gpu`, \
                 `timeout`, `cache`, `cpu`, `memory`, `retries`, `schedule`, \
                 `min_containers`, `max_containers`, `buffer_containers`, \
-                `scaledown_window`, `secrets`, `required_keys`, `env`, `volumes`, \
-                `image`, `enable_memory_snapshot`"
+                `scaledown_window`, `max_concurrent_inputs`, \
+                `target_concurrent_inputs`, `secrets`, `required_keys`, `env`, \
+                `volumes`, `image`, `enable_memory_snapshot`"
             .to_string();
     }
     // An `#[endpoint]` / `#[web_server]` additionally lists its extra keys.
@@ -433,6 +454,7 @@ fn unsupported_argument_message(kind: HandlerKind) -> String {
          `schedule = Cron(\"..\")/Period(..)`, \
          `min_containers = <N>`, `max_containers = <N>`, \
          `buffer_containers = <N>`, `scaledown_window = <secs>`, \
+         `max_concurrent_inputs = <N>`, `target_concurrent_inputs = <N>`, \
          `secrets = [\"name\", ..]`, `required_keys = [\"KEY\", ..]`, \
          `env = {{\"K\" = \"V\", ..}}`, `volumes = [\"/mount=name\", ..]`, \
          `image = Image(base = \"..\", apt = [..], pip = [..], run = [..])`",
@@ -531,6 +553,10 @@ pub(crate) fn function_config_tokens(
         None => quote::quote! { ::core::option::Option::None },
     };
     let web_server_startup_timeout_tok = opt_u32(cfg.web_server_startup_timeout);
+    // Per-container input concurrency (Function fields 34/64). Unset ⇒ `None` ⇒
+    // byte-identical wire. Accepted ungated on every kind (like max_containers).
+    let max_concurrent_inputs_tok = opt_u32(cfg.max_concurrent_inputs);
+    let target_concurrent_inputs_tok = opt_u32(cfg.target_concurrent_inputs);
 
     quote::quote! {
         #facade::FunctionConfig {
@@ -556,6 +582,8 @@ pub(crate) fn function_config_tokens(
             webhook_requires_proxy_auth: #webhook_requires_proxy_auth,
             web_server_port: #web_server_port_tok,
             web_server_startup_timeout: #web_server_startup_timeout_tok,
+            max_concurrent_inputs: #max_concurrent_inputs_tok,
+            target_concurrent_inputs: #target_concurrent_inputs_tok,
         }
     }
 }

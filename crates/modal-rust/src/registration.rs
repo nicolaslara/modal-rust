@@ -126,6 +126,17 @@ pub struct FunctionConfig {
     /// `None` ⇒ Modal default. Inert unless `web_server_port` is set. `Option<u32>`,
     /// const-valid in the `static` initializer.
     pub web_server_startup_timeout: Option<u32>,
+    /// Per-container MAX input concurrency (`max_concurrent_inputs = N`). `None` (the
+    /// default) ⇒ field stays unset ⇒ byte-identical to before. The MAX number of inputs
+    /// a single replica processes at once (distinct from `max_containers` scale-OUT, and
+    /// NOT part of Modal's `AutoscalerSettings`). Accepted ungated on every kind, like
+    /// `max_containers`. `Option<u32>`, const-valid in the `static` initializer.
+    pub max_concurrent_inputs: Option<u32>,
+    /// Per-container TARGET input concurrency (`target_concurrent_inputs = N`). `None`
+    /// (the default) ⇒ field stays unset ⇒ byte-identical to before. Must be <=
+    /// `max_concurrent_inputs` when both set. `Option<u32>`, const-valid in the `static`
+    /// initializer.
+    pub target_concurrent_inputs: Option<u32>,
 }
 
 impl FunctionConfig {
@@ -159,6 +170,8 @@ impl FunctionConfig {
             webhook_requires_proxy_auth: false,
             web_server_port: None,
             web_server_startup_timeout: None,
+            max_concurrent_inputs: None,
+            target_concurrent_inputs: None,
         }
     }
 }
@@ -264,6 +277,19 @@ pub struct FunctionOptions {
     /// `--describe` manifest like the rest.
     #[serde(default)]
     pub web_server_startup_timeout: Option<u32>,
+    /// Per-container MAX input concurrency (`max_concurrent_inputs = N`). `None` ⇒ unset
+    /// ⇒ byte-identical to before. The per-replica fan-in MAX, distinct from
+    /// `max_containers` scale-OUT and NOT part of `AutoscalerSettings`. Rides the
+    /// `--describe` manifest like the rest. `#[serde(default)]` for forward-compat with
+    /// old manifests that predate the key.
+    #[serde(default)]
+    pub max_concurrent_inputs: Option<u32>,
+    /// Per-container TARGET input concurrency (`target_concurrent_inputs = N`). `None` ⇒
+    /// unset ⇒ byte-identical to before. Must be <= `max_concurrent_inputs` when both
+    /// set. Rides the `--describe` manifest like the rest. `#[serde(default)]` for
+    /// forward-compat with old manifests.
+    #[serde(default)]
+    pub target_concurrent_inputs: Option<u32>,
 }
 
 impl FunctionOptions {
@@ -316,6 +342,8 @@ impl From<&FunctionConfig> for FunctionOptions {
             webhook_requires_proxy_auth: config.webhook_requires_proxy_auth,
             web_server_port: config.web_server_port,
             web_server_startup_timeout: config.web_server_startup_timeout,
+            max_concurrent_inputs: config.max_concurrent_inputs,
+            target_concurrent_inputs: config.target_concurrent_inputs,
         }
     }
 }
@@ -636,6 +664,8 @@ mod tests {
                 webhook_requires_proxy_auth: false,
                 web_server_port: None,
                 web_server_startup_timeout: None,
+                max_concurrent_inputs: Some(32),
+                target_concurrent_inputs: Some(8),
             },
         )];
         let argv = vec!["--describe".to_string()];
@@ -673,6 +703,8 @@ mod tests {
         assert_eq!(eps[0]["config"]["max_containers"], 5);
         assert_eq!(eps[0]["config"]["buffer_containers"], 2);
         assert_eq!(eps[0]["config"]["scaledown_window"], 120);
+        assert_eq!(eps[0]["config"]["max_concurrent_inputs"], 32);
+        assert_eq!(eps[0]["config"]["target_concurrent_inputs"], 8);
         assert_eq!(
             eps[0]["config"]["image"],
             r#"{"base":"nvidia/cuda:12.6.3-devel","install_rust":true}"#
@@ -729,6 +761,8 @@ mod tests {
             webhook_requires_proxy_auth: true,
             web_server_port: Some(3000),
             web_server_startup_timeout: Some(30),
+            max_concurrent_inputs: Some(8),
+            target_concurrent_inputs: Some(4),
         };
         let options = FunctionOptions::from(&config);
         assert_eq!(options.gpu.as_deref(), Some("T4"));
@@ -756,6 +790,8 @@ mod tests {
         assert!(options.webhook_requires_proxy_auth);
         assert_eq!(options.web_server_port, Some(3000));
         assert_eq!(options.web_server_startup_timeout, Some(30));
+        assert_eq!(options.max_concurrent_inputs, Some(8));
+        assert_eq!(options.target_concurrent_inputs, Some(4));
     }
 
     /// Round-trip test: every field of a fully-populated `FunctionConfig` must
@@ -792,6 +828,8 @@ mod tests {
             webhook_requires_proxy_auth: true,
             web_server_port: Some(3000),
             web_server_startup_timeout: Some(30),
+            max_concurrent_inputs: Some(8),
+            target_concurrent_inputs: Some(4),
         };
 
         let opts = FunctionOptions::from(&config);
@@ -822,6 +860,8 @@ mod tests {
             webhook_requires_proxy_auth,
             web_server_port,
             web_server_startup_timeout,
+            max_concurrent_inputs,
+            target_concurrent_inputs,
         } = opts;
 
         assert_eq!(gpu.as_deref(), Some("H100"));
@@ -855,6 +895,8 @@ mod tests {
         assert!(webhook_requires_proxy_auth);
         assert_eq!(web_server_port, Some(3000));
         assert_eq!(web_server_startup_timeout, Some(30));
+        assert_eq!(max_concurrent_inputs, Some(8));
+        assert_eq!(target_concurrent_inputs, Some(4));
     }
 
     #[test]

@@ -272,6 +272,20 @@ pub struct FunctionSpec {
     /// [`with_webhook`](FunctionSpec::with_webhook); RUN stays wire-identical even
     /// when the decorator opts in — exactly like `checkpointing_enabled`.
     pub webhook: Option<WebhookSpec>,
+    /// Per-container input concurrency → `Function.max_concurrent_inputs` (proto field
+    /// 34). DEFAULT `None`: the scalar stays 0 ⇒ prost omits field 34 ⇒ byte-identical
+    /// to before for every function that does not opt in. This is the MAX number of
+    /// inputs a single replica processes at once (distinct from the `max_containers`
+    /// scale-OUT count, and NOT part of `AutoscalerSettings`). Set via
+    /// [`with_concurrency`](FunctionSpec::with_concurrency).
+    pub max_concurrent_inputs: Option<u32>,
+    /// Target per-container input concurrency → `Function.target_concurrent_inputs`
+    /// (proto field 64). DEFAULT `None`: the scalar stays 0 ⇒ prost omits field 64 ⇒
+    /// byte-identical to before. The TARGET concurrency the autoscaler aims for per
+    /// replica; when unset Modal's worker falls back to `max_concurrent_inputs`. NOT
+    /// part of `AutoscalerSettings`. Set via
+    /// [`with_concurrency`](FunctionSpec::with_concurrency).
+    pub target_concurrent_inputs: Option<u32>,
 }
 
 impl FunctionSpec {
@@ -298,6 +312,8 @@ impl FunctionSpec {
             autoscaler: FunctionAutoscaler::default(),
             checkpointing_enabled: false,
             webhook: None,
+            max_concurrent_inputs: None,
+            target_concurrent_inputs: None,
         }
     }
 
@@ -477,6 +493,55 @@ impl FunctionSpec {
             }
         }
         self.autoscaler = autoscaler;
+        Ok(self)
+    }
+
+    /// Set per-container input concurrency (`#[function(max_concurrent_inputs = ..,
+    /// target_concurrent_inputs = ..)]`) → `Function.max_concurrent_inputs` (proto
+    /// field 34) + `Function.target_concurrent_inputs` (proto field 64). These are the
+    /// per-replica input-fan-in knobs, distinct from the `max_containers` scale-OUT
+    /// count and NOT part of `AutoscalerSettings`. All-`None` (the default) leaves the
+    /// wire byte-identical to before (both scalars stay 0 ⇒ prost omits fields 34 + 64).
+    ///
+    /// Mirrors Modal's client-side validation (`_partial_function.py:755-756`):
+    /// both values must be >= 1 (a `Some(0)` is the ambiguous unset sentinel — proto3
+    /// `u32` 0 serializes identically to omitted — and is rejected for each);
+    /// `target_concurrent_inputs` requires `max_concurrent_inputs` to be set (Modal's
+    /// client raises `missing required argument: max_inputs` when a target is given
+    /// without a max); and `target_concurrent_inputs` must be <= `max_concurrent_inputs`
+    /// when both are set (`max == target` is allowed). `target_concurrent_inputs` is left
+    /// unset on the wire (0) when not given — Modal's worker applies its own `target or
+    /// max` default rather than us guessing. A violation returns [`Error::invalid`] — fix
+    /// the decorator value.
+    pub fn with_concurrency(
+        mut self,
+        max_concurrent_inputs: Option<u32>,
+        target_concurrent_inputs: Option<u32>,
+    ) -> Result<Self> {
+        if let Some(0) = max_concurrent_inputs {
+            return Err(Error::invalid(
+                "`max_concurrent_inputs` must be >= 1".to_string(),
+            ));
+        }
+        if let Some(0) = target_concurrent_inputs {
+            return Err(Error::invalid(
+                "`target_concurrent_inputs` must be >= 1".to_string(),
+            ));
+        }
+        if target_concurrent_inputs.is_some() && max_concurrent_inputs.is_none() {
+            return Err(Error::invalid(
+                "`target_concurrent_inputs` requires `max_concurrent_inputs` to be set".to_string(),
+            ));
+        }
+        if let (Some(max), Some(target)) = (max_concurrent_inputs, target_concurrent_inputs) {
+            if target > max {
+                return Err(Error::invalid(format!(
+                    "`target_concurrent_inputs` ({target}) cannot be greater than `max_concurrent_inputs` ({max})"
+                )));
+            }
+        }
+        self.max_concurrent_inputs = max_concurrent_inputs;
+        self.target_concurrent_inputs = target_concurrent_inputs;
         Ok(self)
     }
 

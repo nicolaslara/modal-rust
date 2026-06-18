@@ -74,6 +74,10 @@ impl DecoratorConfig {
             web_server_startup_timeout: over
                 .web_server_startup_timeout
                 .or(self.web_server_startup_timeout),
+            max_concurrent_inputs: over.max_concurrent_inputs.or(self.max_concurrent_inputs),
+            target_concurrent_inputs: over
+                .target_concurrent_inputs
+                .or(self.target_concurrent_inputs),
         }
     }
 }

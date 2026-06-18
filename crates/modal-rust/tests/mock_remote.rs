@@ -655,6 +655,90 @@ async fn run_with_autoscaling_rides_into_function_create() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// Per-container input concurrency rides into the TOP-LEVEL Function scalars
+/// (`max_concurrent_inputs` = field 34, `target_concurrent_inputs` = field 64), NOT
+/// `AutoscalerSettings` (which has no such field). ADDITIVE: an unset decorator leaves
+/// both at 0 (negative test below).
+#[tokio::test]
+async fn run_with_concurrency_rides_into_function_create() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-conc-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false;
+    let app = App::connect_at_with_configs(
+        "conc-app",
+        modal_registry(),
+        configs_for_add(FunctionConfig {
+            cache: Some(false),
+            max_concurrent_inputs: Some(8),
+            target_concurrent_inputs: Some(4),
+            ..FunctionConfig::default()
+        }),
+        mock.url(),
+        rc,
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+
+    // Top-level Function u32 scalars — AutoscalerSettings has no such field.
+    assert_eq!(function.max_concurrent_inputs, 8, "field 34 rode in");
+    assert_eq!(function.target_concurrent_inputs, 4, "field 64 rode in");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// concurrency NEGATIVE — an unset decorator leaves both fields at 0, so the
+/// FunctionCreate is wire-identical to before the feature for non-setting callers.
+#[tokio::test]
+async fn run_without_concurrency_is_wire_identical() {
+    let mock = MockModal::start().await.expect("mock up");
+    let tmp = std::env::temp_dir().join(format!("modal-rust-mock-noconc-{}", std::process::id()));
+    let mut rc = tiny_source_config(&tmp);
+    rc.cache = false;
+    let app = App::connect_at_with_configs(
+        "noconc-app",
+        modal_registry(),
+        configs_for_add(FunctionConfig {
+            cache: Some(false),
+            ..FunctionConfig::default()
+        }),
+        mock.url(),
+        rc,
+    )
+    .await
+    .expect("connect");
+
+    let _: serde_json::Value = app
+        .function("add")
+        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+        .await
+        .expect("remote");
+
+    let function = mock
+        .last::<FunctionCreateRequest>()
+        .and_then(|fc| fc.function)
+        .expect("function");
+
+    assert_eq!(function.max_concurrent_inputs, 0, "unset ⇒ field 34 at 0");
+    assert_eq!(
+        function.target_concurrent_inputs, 0,
+        "unset ⇒ field 64 at 0"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// autoscaling NEGATIVE — an unset decorator leaves `autoscaler_settings` unset AND
 /// every legacy mirror at 0, so the FunctionCreate is wire-identical to before the
 /// feature. Pins the additive guarantee.

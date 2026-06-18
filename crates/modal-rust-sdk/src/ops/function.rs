@@ -295,6 +295,47 @@ mod tests {
     }
 
     #[test]
+    fn with_concurrency_maps_onto_top_level_function_fields() {
+        // The two knobs ride the FLAT Function scalars (proto fields 34 + 64), NOT
+        // AutoscalerSettings (which has no such field).
+        let spec = FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(Some(8), Some(4))
+            .expect("valid concurrency");
+        let req = build_function_create_request("ap-1", "fu-pre-1", &spec);
+        let function = req.function.expect("function set");
+        assert_eq!(function.max_concurrent_inputs, 8);
+        assert_eq!(function.target_concurrent_inputs, 4);
+    }
+
+    #[test]
+    fn with_concurrency_rejects_invalid_values() {
+        // target > max is rejected up front.
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(Some(2), Some(5))
+            .is_err());
+        // max == 0 (the ambiguous unset sentinel) is rejected.
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(Some(0), None)
+            .is_err());
+        // target == 0 (the same ambiguous sentinel) is rejected for symmetry.
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(Some(4), Some(0))
+            .is_err());
+        // target set without max is rejected (Modal requires max_inputs when a target is given).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(None, Some(4))
+            .is_err());
+        // max == target is allowed.
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(Some(4), Some(4))
+            .is_ok());
+        // neither set is a no-op (byte-identical wire).
+        assert!(FunctionSpec::new("m", "handler", "im-1")
+            .with_concurrency(None, None)
+            .is_ok());
+    }
+
+    #[test]
     fn with_autoscaler_partial_leaves_unset_knobs_none() {
         // Only `min_containers` set: the modern settings carries Some(2) for min and
         // None for the rest; the unset legacy mirrors stay 0.
@@ -691,6 +732,14 @@ mod tests {
         assert_eq!(
             function.concurrency_limit, 0,
             "no autoscaling ⇒ legacy max 0"
+        );
+        assert_eq!(
+            function.max_concurrent_inputs, 0,
+            "no input concurrency ⇒ field 34 unset (wire-identical)"
+        );
+        assert_eq!(
+            function.target_concurrent_inputs, 0,
+            "no input concurrency ⇒ field 64 unset (wire-identical)"
         );
         assert!(req.function_data.is_none(), "XOR holds for CPU too");
     }

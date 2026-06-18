@@ -487,6 +487,14 @@ fn build_function_spec(
         // the server default (0), so an unset decorator stays wire-identical.
         .with_milli_cpu(ep.options.milli_cpu)
         .with_memory_mb(ep.options.memory_mb)
+        // Per-container input concurrency rides into the top-level Function scalars
+        // (proto fields 34 + 64), NOT AutoscalerSettings. All-`None` leaves both at 0,
+        // so an unset decorator is byte-identical; target > max / max == 0 are rejected
+        // up front (mirrors `with_autoscaler`).
+        .with_concurrency(
+            ep.options.max_concurrent_inputs,
+            ep.options.target_concurrent_inputs,
+        )?
         // schedule rides into Function.schedule (Cron/Period). `None` leaves the field
         // unset, so an unset decorator is byte-identical; a malformed spec is rejected
         // up front (mirrors `with_gpu`).

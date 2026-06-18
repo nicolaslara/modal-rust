@@ -97,6 +97,12 @@ pub(crate) fn build_function_create_request(
     let concurrency_limit = spec.autoscaler.max_containers.unwrap_or(0);
     let experimental_buffer_containers = spec.autoscaler.buffer_containers.unwrap_or(0);
     let task_idle_timeout_secs = spec.autoscaler.scaledown_window.unwrap_or(0);
+    // Per-container input concurrency (proto fields 34 + 64). `None` ⇒ 0 ⇒ prost omits
+    // the field ⇒ byte-identical for callers that don't set input concurrency. These are
+    // per-REPLICA fan-in knobs, NOT the container-count autoscaler mirror above and NOT
+    // part of `AutoscalerSettings` (which has no such field).
+    let max_concurrent_inputs = spec.max_concurrent_inputs.unwrap_or(0);
+    let target_concurrent_inputs = spec.target_concurrent_inputs.unwrap_or(0);
     // Web endpoint: `None` ⇒ no `webhook_config` (prost omits field 15) AND the
     // advertised formats stay `[PICKLE, CBOR]` ⇒ byte-identical to before web
     // endpoints. `Some` ⇒ a FUNCTION-type webhook rides field 15 AND the formats
@@ -185,6 +191,11 @@ pub(crate) fn build_function_create_request(
         // function. The facade only sets `spec.webhook` on the DEPLOY boundary,
         // so RUN stays wire-identical.
         webhook_config,
+        // Per-container input concurrency (proto fields 34 + 64). `0` ⇒ prost omits ⇒
+        // byte-identical for callers that don't set input concurrency. These are the
+        // per-replica fan-in knobs, NOT the container-count autoscaler mirror.
+        max_concurrent_inputs,
+        target_concurrent_inputs,
         ..Default::default()
     };
 

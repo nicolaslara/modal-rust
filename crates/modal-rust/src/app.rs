@@ -899,6 +899,8 @@ mod tests {
                 webhook_requires_proxy_auth: false,
                 web_server_port: None,
                 web_server_startup_timeout: None,
+                max_concurrent_inputs: None,
+                target_concurrent_inputs: None,
             },
             package: "modal-rust",
         }
@@ -933,6 +935,8 @@ mod tests {
                 webhook_requires_proxy_auth: false,
                 web_server_port: None,
                 web_server_startup_timeout: None,
+                max_concurrent_inputs: None,
+                target_concurrent_inputs: None,
             },
             package: "modal-rust",
         }
