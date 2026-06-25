@@ -753,9 +753,36 @@ Three things to know:
   `#[function]` for compute plus a thin `#[endpoint]` fn that calls it.
 
 v0 is one method + one request/response per free fn. Routing, multiple methods,
-streaming, and websockets are the `#[web_server]` follow-up, and `#[endpoint]` on a
-`#[cls]` method is a compile error for now — see [`docs/ROADMAP.md`](docs/ROADMAP.md)
-and [`docs/PARITY.md`](docs/PARITY.md) §8.
+streaming, and websockets are the `#[web_server]` follow-up (below), and
+`#[endpoint]` on a `#[cls]` method is a compile error for now — see
+[`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/PARITY.md`](docs/PARITY.md) §8.
+
+### Full HTTP apps — `#[web_server]`: own the port, serve forever
+
+Where `#[endpoint]` maps ONE request/response onto a Modal function webhook,
+`#[modal_rust::web_server(port = ..)]` is a **raw port proxy** (Modal
+`WEBHOOK_TYPE_WEB_SERVER`). The annotated fn is `(port: u16) -> anyhow::Result<()>`
+(sync or `async`) that LAUNCHES your own HTTP server bound to `port` and BLOCKS,
+serving forever. On `modal-rust deploy` Modal assigns a public URL and forwards ALL
+traffic to that port — so **multi-route apps, SSE streaming, and websockets work
+as-is** (it is your server, not a per-request adapter). DEPLOY-only in v0.
+
+```rust
+use modal_rust::web_server;
+
+#[web_server(port = 3000, gpu = "T4", memory = 16384,
+    image = Image(base = "nvidia/cuda:12.4.1-devel-ubuntu22.04", install_rust = true))]
+async fn serve(port: u16) -> anyhow::Result<()> {
+    burn_lm_http::App::new(port).serve().await.map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+```
+
+Every other argument is the shared `#[function]` vocabulary
+(`gpu`/`memory`/`timeout`/`image`/`secrets`/`volumes`), plus `startup_timeout = <secs>`
+for how long Modal waits for the port to come up. The live dogfood —
+wrapping the burn-lm-http GPU inference server and load-testing it — is
+[`examples/burn-lm-bench`](examples/burn-lm-bench) (GPU/CUDA-only, excluded from
+`default-members`).
 
 ## How It Works
 

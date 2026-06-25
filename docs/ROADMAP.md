@@ -72,9 +72,12 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   validated at compile time. DUAL surface: the fn keeps its typed
   `.local()`/`.remote()` path alongside the URL. `examples/web-endpoint`. Named
   follow-ups:
-  - **`#[web_server]`** — the full-app shape (a Rust `Router`/real HTTP server behind
-    `WEBHOOK_TYPE_WEB_SERVER`): routing, multiple methods, streaming, websockets.
-    Reuses v0's `webhook_config` plumbing; needs the new `--web` runtime mode.
+  - ~~**`#[web_server]`**~~ — DONE (v0, deploy-only): the full-app shape (a real Rust
+    HTTP server behind `WEBHOOK_TYPE_WEB_SERVER`) — routing, multiple methods,
+    streaming, websockets all work because Modal proxies the raw port. The annotated
+    `(port: u16) -> anyhow::Result<()>` fn launches the server and blocks; reuses v0's
+    `webhook_config` plumbing. Dogfood: `examples/burn-lm-bench` (burn-lm-http on GPU).
+    Remaining: the ephemeral `modal serve`-style RUN URL.
     (`#[asgi_app]` stays reserved-only — a Rust fn cannot return a Python ASGI app.)
   - **Custom domains / `requested_suffix` / `web_endpoint_docs`** — the remaining
     `WebhookConfig` knobs (v0 takes Modal's default URL label, no OpenAPI docs page).
