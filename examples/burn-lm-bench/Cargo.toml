@@ -1,0 +1,56 @@
+[package]
+name = "example-burn-lm-bench"
+version = "0.0.0"
+edition = "2021"
+description = "Live dogfood of `#[modal_rust::web_server]` and a real server-GPU benchmark of burn-lm continuous batching (tracel-ai/burn-lm#57): wrap the burn-lm-http inference server (an OpenAI-compatible /v1/chat/completions API) as a long-running, GPU-backed Modal web server, then load-test it with the standalone `burn-lm-bench-client`. Standalone (own workspace); consumes modal-rust as a third-party git dependency."
+publish = false
+
+# STANDALONE workspace. This GPU/CUDA example is NOT a member of the modal-rust repo's
+# workspace: it depends on `modal-rust` as a third-party user would (a GIT dep, below). The
+# empty `[workspace]` table makes this crate its own root, so it builds and deploys on its
+# own and bare `cargo`/CI in the modal-rust repo never touch this CUDA-only crate.
+#
+# NO cubecl `[patch]`: the "Memory page N doesn't exist" stale-page race no longer reproduces
+# on the current Modal T4 stack (verified — even stock unfixed cubecl `ba103c7` runs the
+# deterministic micro-repro clean), and burn `2384148e` (pinned by burn-lm 79ea775) pulls a
+# stock cubecl that runs the batching workload cleanly. If the race ever resurfaces, the
+# fix/diagnostic branches live on the `nicolaslara/cubecl` fork (see git history).
+[workspace]
+
+# GPU/CUDA-ONLY. This crate pulls `burn-lm-inference` with the `cuda` feature, which
+# brings `burn/cuda` -> CubeCL/cudarc. cudarc uses DYNAMIC loading (dlopen libnvrtc/
+# libcudart at runtime), so the crate COMPILES with no CUDA toolkit on the build host
+# (a macOS box / the Modal Function body), but it only RUNS on a CUDA GPU (Modal T4+).
+
+[lib]
+name = "example_burn_lm_bench"
+path = "src/lib.rs"
+
+# The black-box HTTP load tester lives in the SEPARATE `burn-lm-bench-client` crate
+# (no burn/modal deps, so it builds in seconds). This crate is server-only.
+
+[dependencies]
+# SINGLE modal dependency: the `modal-rust` facade, consumed exactly as a third-party user
+# would — a GIT dep on the published repo (modal-rust is not on crates.io), NOT a path into
+# the monorepo. Track `main` to match the CLI you install with
+#   cargo install --git https://github.com/nicolaslara/modal-rust --package modal-rust-cli
+# (pin `rev = "<sha>"` instead for a reproducible build). `#[web_server]` is an AUTHORING
+# macro, so this stays LIGHT — NO `features = ["client"]`.
+modal-rust = { git = "https://github.com/nicolaslara/modal-rust", branch = "main" }
+
+# The inference server we wrap. burn-lm-http exposes `App::new_with_config(host, port, cfg)`.
+# The rev is the head of the `nicolas/batching` branch (pins burn `2384148e`, carries the
+# AppConfig knobs + `batching` observability logs) — i.e. this example runs the exact
+# continuous-batching code under test. (burn-lm-http pulls the Llama servers via
+# burn-lm-registry, which already enables the `llama3` feature, so no direct burn-lm-llama
+# dep is needed here.) `profiling` exposes the `/debug/pprof` CPU profiler on the server port.
+burn-lm-http = { git = "https://github.com/nicolaslara/burn-lm", rev = "79ea775ab41ec8ca4f62922ce878c77726ddf3ec", features = ["profiling"] }
+# burn-lm-http has NO backend features of its own; the GPU backend is selected on
+# burn-lm-inference. `cuda` => burn/cuda (CubeCL/cudarc dynamic-loading); `f32` selects
+# the f32 element type. Same git+rev as burn-lm-http so the graph resolves one copy.
+burn-lm-inference = { git = "https://github.com/nicolaslara/burn-lm", rev = "79ea775ab41ec8ca4f62922ce878c77726ddf3ec", features = ["cuda", "f32"] }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

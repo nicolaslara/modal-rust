@@ -1,0 +1,29 @@
+[package]
+name = "burn-lm-bench-client"
+version = "0.0.0"
+edition = "2021"
+description = "Standalone black-box HTTP load tester + plotter for a deployed burn-lm-http inference server. Pure HTTP client — NO burn/modal deps — so it compiles and runs in seconds locally (unlike the server crate `example-burn-lm-bench`, which pulls the full burn/CUDA stack). Drives the deployed `#[modal_rust::web_server]` URL, sweeps concurrency levels per model, keeps partial results (resumable), and renders interactive throughput/speedup/latency HTML charts with `plotly`."
+publish = false
+
+# STANDALONE workspace (NOT a member of the modal-rust repo's workspace) — the load-test
+# CLIENT for `example-burn-lm-bench`. Pure HTTP: no burn/cubecl/modal deps, so it needs no
+# `[patch]`; the empty `[workspace]` table just lets it build on its own next to the
+# (standalone) server example. Builds in ~2s and runs anywhere.
+[workspace]
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+# `plotly_embed_js` inlines plotly.js into each HTML file so the charts are fully
+# self-contained (open offline; no CDN). It is pure-Rust (bundles the JS as a
+# string at build time) — NOT kaleido/static-image export, so no system deps.
+plotly = { version = "0.14", features = ["plotly_embed_js"] }
