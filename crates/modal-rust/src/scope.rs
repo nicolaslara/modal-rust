@@ -67,7 +67,9 @@ pub(crate) struct Package {
 }
 
 /// A single `cargo metadata` build target (`targets[]` per package): the `kind`s
-/// (`["lib"]`, `["bin"]`, `["cdylib"]`, …) and the target `name`.
+/// (`["lib"]`, `["bin"]`, `["cdylib"]`, …), the target `name`, and the target's
+/// `src_path` (used by the dependency-prebuild stub synthesis to place an empty stub
+/// source at the SAME relative path the real source lives at).
 #[derive(Debug, Deserialize)]
 pub(crate) struct Target {
     /// Target kinds (e.g. `["bin"]`, `["lib"]`). Auto-detect matches a kind that
@@ -76,6 +78,13 @@ pub(crate) struct Target {
     pub kind: Vec<String>,
     /// Target name (e.g. `"modal_runner"`, the crate's lib name).
     pub name: String,
+    /// Absolute path to this target's root source file (cargo-metadata emits
+    /// `targets[].src_path` absolute, e.g. `/ws/crates/foo/src/lib.rs`). Used ONLY by
+    /// the dependency-prebuild stub synthesis ([`stub_inline_files`]); defaults to
+    /// empty when cargo omits it (older cargo) — such a target is skipped by the stub
+    /// builder.
+    #[serde(default)]
+    pub src_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +325,191 @@ fn build_closure_upload(
         extra_files,
         inline_files,
     })
+}
+
+/// The dependency-prebuild STUB upload set: manifests (rewritten workspace
+/// `Cargo.toml` plus dev-dep-stripped member manifests), verbatim `Cargo.lock`, and ONE
+/// synthesized empty stub source per closure-crate build target, but NO real `.rs`
+/// source. Fed to an
+/// inline-only mount (`crate_dirs: &[]`) so the dependency-prebuild image layer compiles
+/// the heavy git/registry dep closure ONCE against stable, edit-invariant content.
+///
+/// Returned by [`workspace_closure_stub`]. The `extra_files` (Cargo.lock) ride from disk
+/// verbatim; `inline_files` carries the manifests + stub sources, all as
+/// `(workspace-relative POSIX path, bytes)`.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+pub(crate) struct StubUpload {
+    /// On-disk files uploaded verbatim (the workspace `Cargo.lock`).
+    pub extra_files: Vec<PathBuf>,
+    /// In-memory `(workspace-relative POSIX path, bytes)`: the rewritten workspace
+    /// manifest, the dev-dep-stripped member manifests, and the synthesized empty stub
+    /// sources (one per closure-crate target). Deterministically sorted.
+    pub inline_files: Vec<(String, Vec<u8>)>,
+}
+
+/// Compute the dependency-prebuild [`StubUpload`] for `package` rooted at
+/// `workspace_root`: the SAME manifests + `Cargo.lock` that [`workspace_closure`]
+/// produces, PLUS one synthesized minimal stub source per build target of every closure
+/// crate (empty `lib.rs`; empty-`fn main(){}` per `[[bin]]` at its declared path; an
+/// empty `build.rs` if a build script is declared) — but NONE of the real `.rs` source.
+///
+/// The stub's content is INVARIANT to real source edits (empty bodies), so Modal's
+/// content-addressed layer cache hits the prebuild layer on every warm redeploy; a
+/// dependency change (which DOES alter the manifests/`Cargo.lock`) correctly invalidates
+/// it. Output is fully deterministic: no HashMap iteration order, no mtimes, no absolute
+/// paths — the inline list is sorted by mount path.
+///
+/// Returns `Ok(Some(_))` on success, `Ok(None)` on the soft-fallback conditions
+/// (metadata unavailable, package not a workspace member, un-rewritable manifest), and
+/// `Err(msg)` on the hard out-of-workspace path-dep error (same contract as
+/// [`workspace_closure`]). Used only by the client control plane + tests.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+pub(crate) fn workspace_closure_stub(
+    workspace_root: &Path,
+    package: &str,
+) -> Result<Option<StubUpload>, String> {
+    let manifest = workspace_root.join("Cargo.toml");
+    if !manifest.is_file() {
+        return Ok(None);
+    }
+    let Some(metadata) = run_cargo_metadata(&manifest) else {
+        return Ok(None);
+    };
+    let Some(ClosureResult {
+        dirs,
+        out_of_workspace,
+    }) = closure_from_metadata(&metadata, package)
+    else {
+        return Ok(None);
+    };
+    if !out_of_workspace.is_empty() {
+        return Err(out_of_workspace_error(package, &out_of_workspace));
+    }
+    // Reuse the FULL closure upload (rewritten ws manifest + stripped member manifests +
+    // Cargo.lock + injected runner). We keep its manifests + Cargo.lock verbatim and
+    // REPLACE its real-source `dirs` walk with synthesized stub sources.
+    let Some(closure) = build_closure_upload(&metadata, package, dirs) else {
+        return Ok(None);
+    };
+    Some(stub_upload_from_closure(&metadata, package, closure)).transpose()
+}
+
+/// Assemble a [`StubUpload`] from an already-built [`ClosureUpload`] (its manifests +
+/// `Cargo.lock` are reused verbatim) plus the synthesized stub sources for `package`'s
+/// closure crates. Split out (taking parsed `metadata`) so it is unit-testable on
+/// fixtures without a cargo invocation.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+fn stub_upload_from_closure(
+    metadata: &Metadata,
+    _package: &str,
+    closure: ClosureUpload,
+) -> Result<StubUpload, String> {
+    let ws_root = &metadata.workspace_root;
+    let member_ids: HashSet<&str> = metadata
+        .workspace_members
+        .iter()
+        .map(String::as_str)
+        .collect();
+    // The closure crate dirs (already resolved + sorted by `closure_from_metadata`).
+    let closure_dirs: HashSet<&Path> = closure.dirs.iter().map(PathBuf::as_path).collect();
+
+    // The injected `modal_runner.rs` (if any) is among `closure.inline_files`; the stub
+    // reuses the SAME manifests + Cargo.lock + injected runner, then ADDS stub sources.
+    let mut inline_files = closure.inline_files;
+
+    // Synthesize one stub source per build target of every closure-crate package. Iterate
+    // packages in a STABLE order (sort by id) so emission is deterministic regardless of
+    // cargo's package ordering.
+    let mut pkgs: Vec<&Package> = metadata
+        .packages
+        .iter()
+        .filter(|p| member_ids.contains(p.id.as_str()))
+        .filter(|p| {
+            p.manifest_path
+                .parent()
+                .is_some_and(|d| closure_dirs.contains(d))
+        })
+        .collect();
+    pkgs.sort_by(|a, b| a.id.cmp(&b.id));
+
+    for pkg in pkgs {
+        let crate_dir = match pkg.manifest_path.parent() {
+            Some(d) => d,
+            None => continue,
+        };
+        for target in &pkg.targets {
+            if target.src_path.as_os_str().is_empty() {
+                continue; // older cargo without src_path — cannot place a stub
+            }
+            // Place the stub at the target's src_path RELATIVE to the workspace root, so
+            // the uploaded layout matches the real source tree (path-dep .rlibs land at
+            // the SAME path the top layer's COPY-over rewrites).
+            let Ok(rel) = target.src_path.strip_prefix(ws_root) else {
+                continue; // a src_path outside the ws root cannot be emitted inline
+            };
+            let rel_posix = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            let body = stub_source_body(&target.kind, &target.name);
+            // The injected `modal_runner.rs` (a closure inline file) must NOT be
+            // overwritten by a stub — but the stub for the bin target whose name is
+            // `modal_runner` would collide. The injected runner is at
+            // `<crate_rel>/src/bin/modal_runner.rs`; a generated bin target's src_path is
+            // the SAME path, so prefer the injected (real) runner when present.
+            if inline_files.iter().any(|(p, _)| p == &rel_posix) {
+                continue;
+            }
+            inline_files.push((rel_posix, body.into_bytes()));
+        }
+        // Defensive: ensure each closure crate has at LEAST a lib.rs stub so an empty
+        // `targets` (older cargo) still yields a compilable crate. Keyed off the crate
+        // dir relative to ws root.
+        if pkg.targets.is_empty() {
+            if let Ok(rel) = crate_dir.strip_prefix(ws_root) {
+                let rel_posix = rel
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let lib = if rel_posix.is_empty() {
+                    "src/lib.rs".to_string()
+                } else {
+                    format!("{rel_posix}/src/lib.rs")
+                };
+                if !inline_files.iter().any(|(p, _)| p == &lib) {
+                    inline_files.push((lib, Vec::new()));
+                }
+            }
+        }
+    }
+
+    // Determinism: sort the whole inline set by mount path (the manifests + injected
+    // runner + stub sources together) so two runs differing only in leaf source bytes
+    // produce byte-identical stub uploads.
+    inline_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(StubUpload {
+        extra_files: closure.extra_files,
+        inline_files,
+    })
+}
+
+/// The minimal stub source body for a target of the given `kind`s. Empty for a
+/// library/proc-macro/cdylib (an empty lib compiles, even as a proc-macro); an empty
+/// `fn main() {}` for a `bin` or a `custom-build` (build script). The body is invariant
+/// to the real source, which is what makes the prebuild layer cache stable.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+fn stub_source_body(kind: &[String], _name: &str) -> String {
+    let is_bin = kind.iter().any(|k| k == "bin");
+    let is_build = kind.iter().any(|k| k == "custom-build");
+    if is_bin || is_build {
+        "fn main() {}\n".to_string()
+    } else {
+        // lib / proc-macro / cdylib / staticlib: an empty body compiles for all.
+        String::new()
+    }
 }
 
 /// Build the actionable upload-time error for one or more normal path-deps that escape
@@ -934,5 +1128,209 @@ nix = \"0.27\"
             .expect("target dev-deps removed");
         assert!(!out.contains("dev-dependencies"));
         assert!(!out.contains("nix"));
+    }
+
+    /// A `Metadata` fixture with real `targets[]` (kind + name + src_path) so the stub
+    /// synthesizer has something to place. Two members: a lib crate `lib-a` with a build
+    /// script, and a bin crate `app` (lib + bin + custom-build), all under `/ws`.
+    fn stub_fixture() -> Metadata {
+        Metadata {
+            workspace_root: PathBuf::from("/ws"),
+            workspace_members: vec!["a-id".into(), "app-id".into()],
+            packages: vec![
+                Package {
+                    id: "a-id".into(),
+                    name: "lib-a".into(),
+                    manifest_path: "/ws/crates/a/Cargo.toml".into(),
+                    dependencies: vec![],
+                    targets: vec![
+                        Target {
+                            kind: vec!["lib".into()],
+                            name: "lib_a".into(),
+                            src_path: "/ws/crates/a/src/lib.rs".into(),
+                        },
+                        Target {
+                            kind: vec!["custom-build".into()],
+                            name: "build-script-build".into(),
+                            src_path: "/ws/crates/a/build.rs".into(),
+                        },
+                    ],
+                },
+                Package {
+                    id: "app-id".into(),
+                    name: "app".into(),
+                    manifest_path: "/ws/crates/app/Cargo.toml".into(),
+                    dependencies: vec![Dependency {
+                        name: "lib-a".into(),
+                        kind: None,
+                        path: Some("/ws/crates/a".into()),
+                    }],
+                    targets: vec![
+                        Target {
+                            kind: vec!["lib".into()],
+                            name: "app".into(),
+                            src_path: "/ws/crates/app/src/lib.rs".into(),
+                        },
+                        Target {
+                            kind: vec!["bin".into()],
+                            name: "app".into(),
+                            src_path: "/ws/crates/app/src/main.rs".into(),
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// A minimal `ClosureUpload` carrying just the manifests + Cargo.lock that
+    /// `build_closure_upload` would emit (no disk reads), so `stub_upload_from_closure`
+    /// is unit-testable on the fixture. `dirs` are the closure crate dirs.
+    fn closure_for(dirs: &[&str]) -> ClosureUpload {
+        ClosureUpload {
+            dirs: dirs.iter().map(PathBuf::from).collect(),
+            extra_files: vec![PathBuf::from("/ws/Cargo.lock")],
+            inline_files: vec![
+                ("Cargo.toml".to_string(), b"[workspace]\n".to_vec()),
+                ("crates/app/Cargo.toml".to_string(), b"[package]\n".to_vec()),
+                ("crates/a/Cargo.toml".to_string(), b"[package]\n".to_vec()),
+            ],
+        }
+    }
+
+    #[test]
+    fn stub_source_body_per_kind() {
+        // lib / proc-macro / cdylib → empty; bin / custom-build → `fn main(){}`.
+        assert_eq!(stub_source_body(&["lib".into()], "x"), "");
+        assert_eq!(stub_source_body(&["proc-macro".into()], "x"), "");
+        assert_eq!(stub_source_body(&["cdylib".into()], "x"), "");
+        assert_eq!(stub_source_body(&["bin".into()], "x"), "fn main() {}\n");
+        assert_eq!(
+            stub_source_body(&["custom-build".into()], "build-script-build"),
+            "fn main() {}\n"
+        );
+    }
+
+    #[test]
+    fn stub_upload_synthesizes_one_stub_per_target_sorted() {
+        let m = stub_fixture();
+        let closure = closure_for(&["/ws/crates/a", "/ws/crates/app"]);
+        let stub = stub_upload_from_closure(&m, "app", closure).unwrap();
+
+        // Cargo.lock rides verbatim from disk.
+        assert_eq!(stub.extra_files, vec![PathBuf::from("/ws/Cargo.lock")]);
+
+        let paths: Vec<&str> = stub.inline_files.iter().map(|(p, _)| p.as_str()).collect();
+        // Manifests (reused from the closure) + one stub source per target, all SORTED.
+        assert_eq!(
+            paths,
+            vec![
+                "Cargo.toml",
+                "crates/a/Cargo.toml",
+                "crates/a/build.rs",
+                "crates/a/src/lib.rs",
+                "crates/app/Cargo.toml",
+                "crates/app/src/lib.rs",
+                "crates/app/src/main.rs",
+            ],
+            "manifests + one stub per target, deterministically sorted"
+        );
+
+        let body =
+            |p: &str| -> &[u8] { &stub.inline_files.iter().find(|(x, _)| x == p).unwrap().1 };
+        // lib stub is empty; bin + build-script stubs are `fn main(){}`.
+        assert!(body("crates/a/src/lib.rs").is_empty());
+        assert!(body("crates/app/src/lib.rs").is_empty());
+        assert_eq!(body("crates/app/src/main.rs"), b"fn main() {}\n");
+        assert_eq!(body("crates/a/build.rs"), b"fn main() {}\n");
+    }
+
+    #[test]
+    fn stub_upload_is_deterministic_across_runs() {
+        // Two independent runs over the SAME inputs produce byte-identical uploads (no
+        // HashMap iteration order leaking in; the inline list is fully sorted).
+        let one = stub_upload_from_closure(
+            &stub_fixture(),
+            "app",
+            closure_for(&["/ws/crates/a", "/ws/crates/app"]),
+        )
+        .unwrap();
+        let two = stub_upload_from_closure(
+            &stub_fixture(),
+            "app",
+            closure_for(&["/ws/crates/a", "/ws/crates/app"]),
+        )
+        .unwrap();
+        assert_eq!(one.inline_files, two.inline_files);
+        assert_eq!(one.extra_files, two.extra_files);
+    }
+
+    #[test]
+    fn stub_upload_invariant_to_leaf_source_edits() {
+        // The stub's content key is INVARIANT to real source bytes: the synthesized
+        // bodies are empty/`fn main(){}` regardless of what the leaf crate's real source
+        // says. (The fixture carries no real source, so the invariance is structural —
+        // the synthesizer NEVER reads target src_path contents, only its kind+path.) We
+        // model a "leaf edit" by changing nothing the stub depends on and asserting the
+        // output is identical to the baseline.
+        let baseline = stub_upload_from_closure(
+            &stub_fixture(),
+            "app",
+            closure_for(&["/ws/crates/a", "/ws/crates/app"]),
+        )
+        .unwrap();
+        // A second fixture identical in manifests/targets (a leaf-source edit would NOT
+        // change targets[] kind/name/src_path) yields the same stub bytes.
+        let after_edit = stub_upload_from_closure(
+            &stub_fixture(),
+            "app",
+            closure_for(&["/ws/crates/a", "/ws/crates/app"]),
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.inline_files, after_edit.inline_files,
+            "stub bytes invariant to leaf source edits (cache-key stability)"
+        );
+    }
+
+    #[test]
+    fn stub_upload_keeps_injected_runner_over_bin_stub() {
+        // If the closure already carries an injected real `modal_runner.rs` at the bin's
+        // src_path, the stub must NOT overwrite it (the real runner wins).
+        let m = Metadata {
+            workspace_root: PathBuf::from("/ws"),
+            workspace_members: vec!["app-id".into()],
+            packages: vec![Package {
+                id: "app-id".into(),
+                name: "app".into(),
+                manifest_path: "/ws/crates/app/Cargo.toml".into(),
+                dependencies: vec![],
+                targets: vec![Target {
+                    kind: vec!["bin".into()],
+                    name: "modal_runner".into(),
+                    src_path: "/ws/crates/app/src/bin/modal_runner.rs".into(),
+                }],
+            }],
+        };
+        let mut closure = ClosureUpload {
+            dirs: vec![PathBuf::from("/ws/crates/app")],
+            extra_files: vec![],
+            inline_files: vec![(
+                "crates/app/src/bin/modal_runner.rs".to_string(),
+                b"// REAL injected runner\n".to_vec(),
+            )],
+        };
+        closure
+            .inline_files
+            .push(("crates/app/Cargo.toml".to_string(), b"[package]\n".to_vec()));
+        let stub = stub_upload_from_closure(&m, "app", closure).unwrap();
+        let runner = stub
+            .inline_files
+            .iter()
+            .find(|(p, _)| p == "crates/app/src/bin/modal_runner.rs")
+            .unwrap();
+        assert_eq!(
+            runner.1, b"// REAL injected runner\n",
+            "the injected real runner is preserved, not stubbed over"
+        );
     }
 }

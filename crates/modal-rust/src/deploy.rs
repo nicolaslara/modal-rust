@@ -176,6 +176,14 @@ pub struct DeployConfig {
     /// lazy `#[enter]` path instead. Only meaningful when an entrypoint sets
     /// `enable_memory_snapshot`.
     pub snapshot_best_effort: bool,
+    /// DEFAULT ON: insert a dependency-PREBUILD image layer between the deploy BASE and
+    /// TOP layers that compiles the heavy git/registry dependency closure ONCE against a
+    /// synthesized stub source tree, so warm redeploys hit Modal's content-addressed
+    /// layer cache and the TOP layer only recompiles the changed leaf crate. Opt OUT via
+    /// `MODAL_RUST_DEP_PREBUILD=0`/`false`. When OFF (or when cargo scoping is disabled /
+    /// metadata is unavailable, so no stub can be synthesized), deploy renders the EXACT
+    /// historical two-layer proto. Orthogonal to the P6 RUN cargo cache.
+    pub dep_prebuild: bool,
     /// Owned per-function Modal options used by the manual/no-decorator fallback
     /// function. Decorated entrypoints carry their own [`FunctionOptions`] in
     /// [`DeployEntrypoint`].
@@ -186,6 +194,20 @@ pub struct DeployConfig {
 /// (`MODAL_RUST_SNAPSHOT_BEST_EFFORT` truthy ⇒ opt into degrade-to-lazy).
 fn discover_snapshot_best_effort() -> bool {
     crate::env::env_bool(crate::env::SNAPSHOT_BEST_EFFORT)
+}
+
+/// Deploy-time env discovery for [`DeployConfig::dep_prebuild`]: DEFAULT ON; only an
+/// explicit falsy `MODAL_RUST_DEP_PREBUILD=0`/`false`/`no`/`off` opts OUT (unset ⇒ ON).
+/// Mirrors `crate::remote::discover_cache_target`'s default-ON-with-falsy-opt-out idiom
+/// (NOT `env_bool`, which would treat unset as false).
+fn discover_dep_prebuild() -> bool {
+    match std::env::var(crate::env::DEP_PREBUILD) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 impl DeployConfig {
@@ -205,6 +227,7 @@ impl DeployConfig {
             install_rust: base.install_rust,
             image_steps: base.image_steps,
             snapshot_best_effort: discover_snapshot_best_effort(),
+            dep_prebuild: discover_dep_prebuild(),
             options: FunctionOptions::default(),
         }
     }
@@ -418,6 +441,7 @@ pub(crate) async fn deploy_function(
         image_steps: &config.image_steps,
         cache: false, // DEPLOY builds at image-build time — no run-path cargo cache.
         snapshot_best_effort: config.snapshot_best_effort,
+        dep_prebuild: config.dep_prebuild,
         entrypoints: &plan,
     };
     let mut published = Published::default();
@@ -810,6 +834,7 @@ mod tests {
             image_steps: &steps,
             cache: false,
             snapshot_best_effort: false,
+            dep_prebuild: false,
             entrypoints: &plan,
         };
         let base = build_image_spec(&DEPLOY_BOUNDARY, &inputs, "mo-py-standalone");

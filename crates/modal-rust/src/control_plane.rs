@@ -235,6 +235,14 @@ pub(crate) struct ProvisionInputs<'a> {
     /// as a per-cold-start perf cliff. From [`crate::DeployConfig::snapshot_best_effort`]
     /// (env `MODAL_RUST_SNAPSHOT_BEST_EFFORT`).
     pub snapshot_best_effort: bool,
+    /// DEFAULT ON (DEPLOY path only): insert a dependency-PREBUILD image layer between
+    /// the BASE and TOP layers that COPYs a SYNTHESIZED stub source tree and `cargo
+    /// build`s the dependency closure ONCE, so warm redeploys hit Modal's
+    /// content-addressed layer cache. When `false` — or when no stub mount can be built
+    /// (cargo scoping off / metadata unavailable) — [`provision`] renders the EXACT
+    /// historical two-layer proto. The RUN path never reads it. From
+    /// [`crate::DeployConfig::dep_prebuild`] (env `MODAL_RUST_DEP_PREBUILD`).
+    pub dep_prebuild: bool,
     /// The entrypoints to create (one DISTINCT Modal function per entrypoint).
     pub entrypoints: &'a [Entrypoint],
 }
@@ -327,6 +335,16 @@ pub(crate) fn build_image_spec(
     }
 }
 
+/// The image-build-time `cargo build` of the runner binary, shared VERBATIM by the
+/// DEPLOY top layer and the dependency-prebuild layer so the two cannot drift (a drift
+/// would break dep-`.rlib` reuse — the top layer must run the same build over the
+/// prebuilt `target/`). `-p` disambiguates the shared `modal_runner` bin in a
+/// multi-crate closure. The RUN-path in-body build (`remote/wrapper.py`) issues the
+/// SAME command in Python; keep them in sync (cross-language, can't share the literal).
+fn deploy_runner_build_command(package: &str) -> String {
+    format!("RUN cd {DEPLOY_SRC} && cargo build --release -p {package} --bin modal_runner")
+}
+
 /// The DEPLOY TOP layer (layer 2): bases on the add_python base layer via `FROM
 /// base`, bakes the deploy wrapper, COPYs the SOURCE (this layer's build context),
 /// then runs `cargo build --release` + `cp`/bake of `/app/modal_runner`. cargo runs
@@ -361,10 +379,8 @@ pub(crate) fn build_deploy_top_layer_spec(
         .with_context_mount(source_mount_id)
         // Context root → /, so the /app/src-prefixed tree lands at /app/src.
         .with_command("COPY . /")
-        // cargo build AT IMAGE-BUILD time; -p disambiguates the shared modal_runner bin.
-        .with_command(format!(
-            "RUN cd {DEPLOY_SRC} && cargo build --release -p {package} --bin modal_runner"
-        ))
+        // cargo build AT IMAGE-BUILD time; shared verbatim with the dep-prebuild layer.
+        .with_command(deploy_runner_build_command(package))
         // Bake the freshly built binary to the fixed path the deployed body execs.
         .with_command(format!(
             "RUN cp {DEPLOY_SRC}/target/release/modal_runner {DEPLOY_RUNNER} \
@@ -383,6 +399,37 @@ pub(crate) fn build_deploy_top_layer_spec(
         }
     }
     spec.with_command("ENTRYPOINT []")
+}
+
+/// The DEPLOY dependency-PREBUILD layer (layer 1, inserted between BASE and TOP when
+/// `dep_prebuild` is ON): bases on the add_python base layer via `FROM base`, COPYs the
+/// SYNTHESIZED STUB source tree (this layer's build context — manifests + `Cargo.lock` +
+/// empty stub sources, NO real source), then runs `cargo build --release -p {package}
+/// --bin modal_runner` under [`DEPLOY_SRC`]. That compiles the entire heavy git/registry
+/// dependency closure ONCE; because the stub's content is invariant to real source edits,
+/// Modal's content-addressed layer cache hits this layer on every warm redeploy, so the
+/// dep closure is built once and skipped thereafter. The TOP layer then bases on THIS
+/// layer's image and COPYs the REAL source over the stub at the SAME `{DEPLOY_SRC}` path,
+/// so cargo reuses the prebuilt dep `.rlib`s in `{DEPLOY_SRC}/target/release/deps` and
+/// only recompiles the changed leaf crate.
+///
+/// The stub bin `modal_runner` exists (synthesized empty-`fn main(){}` or the injected
+/// runner), so `--bin modal_runner` resolves and the whole dep graph compiles. NO wrapper
+/// module is baked (this layer only compiles deps), NO snapshot/endpoint ENV (those ride
+/// the TOP layer). Pure (no I/O).
+pub(crate) fn build_deploy_dep_layer_spec(
+    base_image_id: &str,
+    stub_mount_id: &str,
+    package: &str,
+) -> ImageSpec {
+    ImageSpec::from_registry(String::new()) // FROM replaced by `FROM base`.
+        .with_base_image(base_image_id)
+        .with_context_mount(stub_mount_id)
+        // Context root → /, so the /app/src-prefixed stub tree lands at /app/src.
+        .with_command("COPY . /")
+        // Compile the dep closure ONCE against the stub sources at image-build time.
+        .with_command(deploy_runner_build_command(package))
+        .with_command("ENTRYPOINT []")
 }
 
 /// Build the FILE-mode [`FunctionSpec`] for one entrypoint — the ONLY function-create
@@ -599,6 +646,19 @@ pub(crate) trait ControlPlane {
         remote_path: &str,
     ) -> Result<String>;
 
+    /// Upload + finalize the dependency-PREBUILD STUB context as an ephemeral inline-only
+    /// mount → `Some(mount_id)`, or `None` when no stub can be synthesized (cargo scoping
+    /// off / metadata unavailable / target not a workspace member) so [`provision`] falls
+    /// back to the historical two-layer deploy. The stub carries manifests, `Cargo.lock`,
+    /// and synthesized empty stub sources ONLY (NO real source), at the SAME
+    /// workspace-relative layout + `remote_path` as the source mount so the prebuilt dep
+    /// `.rlib`s land where the TOP layer's COPY-over reuses them.
+    async fn ensure_prebuild_mount(
+        &mut self,
+        source: &SourceInputs<'_>,
+        remote_path: &str,
+    ) -> Result<Option<String>>;
+
     /// Resolve the hosted python-build-standalone mount for `series` → `mount_id`.
     async fn ensure_python_mount(&mut self, series: &str) -> Result<String>;
 
@@ -777,13 +837,41 @@ pub(crate) async fn provision<C: ControlPlane>(
         SourceDelivery::RunMount => cp.ensure_image(&app_id, &base_spec, 0).await?,
         SourceDelivery::DeployContext => {
             let base_image_id = cp.ensure_image(&app_id, &base_spec, 0).await?;
+            // Dependency-PREBUILD layer (default ON): compile the heavy dep closure ONCE
+            // against a synthesized stub so warm redeploys hit the content-addressed
+            // cache and the TOP layer only recompiles the changed leaf. The TOP layer
+            // then bases on THIS image. When the flag is OFF — or no stub can be built
+            // (cargo scoping off / metadata unavailable) — `top_base` stays the BASE
+            // image and the rendered proto is the EXACT historical two-layer sequence.
+            let top_base = if inputs.dep_prebuild {
+                match cp
+                    .ensure_prebuild_mount(&inputs.source, source_remote)
+                    .await?
+                {
+                    Some(stub_mount_id) => {
+                        let dep_spec = build_deploy_dep_layer_spec(
+                            &base_image_id,
+                            &stub_mount_id,
+                            inputs.source.package,
+                        );
+                        cp.ensure_image(&app_id, &dep_spec, 1).await?
+                    }
+                    None => base_image_id.clone(),
+                }
+            } else {
+                base_image_id.clone()
+            };
+            // The TOP layer's ordinal is 2 when the prebuild layer rode (dump projection
+            // only; the live impl ignores it), else 1 — preserving the historical
+            // off-path ordinal sequence.
+            let top_layer_ordinal = if top_base == base_image_id { 1 } else { 2 };
             // The deploy-only image gates (snapshot prime ENV, endpoint adapter
             // lines), computed purely by [`deploy_gates`] next to [`DEPLOY_BOUNDARY`].
             // Reached only on the DEPLOY boundary, so the deploy app_state is implied;
             // both gates off ⇒ byte-identical image (the off-path guarantee).
             let gates = deploy_gates(inputs.entrypoints);
             let top_spec = build_deploy_top_layer_spec(
-                &base_image_id,
+                &top_base,
                 &source_mount_id,
                 inputs.source.package,
                 gates.bake_snapshot_prime,
@@ -791,7 +879,8 @@ pub(crate) async fn provision<C: ControlPlane>(
                 &gates.endpoint_entrypoints,
                 &gates.web_server_entrypoints,
             );
-            cp.ensure_image(&app_id, &top_spec, 1).await?
+            cp.ensure_image(&app_id, &top_spec, top_layer_ordinal)
+                .await?
         }
     };
 
@@ -1037,6 +1126,41 @@ impl ControlPlane for LiveControlPlane<'_> {
         }
     }
 
+    async fn ensure_prebuild_mount(
+        &mut self,
+        source: &SourceInputs<'_>,
+        remote_path: &str,
+    ) -> Result<Option<String>> {
+        // The stub mount is built ONLY from cargo-metadata scoping (it needs the closure
+        // manifests + targets). Without scoping there is no stub → caller falls back to
+        // the historical two-layer deploy. A HARD out-of-workspace error is surfaced
+        // (same contract as `ensure_source_mount`), NOT swallowed.
+        if !source.use_cargo_scoping {
+            return Ok(None);
+        }
+        let stub = crate::scope::workspace_closure_stub(source.local_root, source.package)
+            .map_err(Error::config)?;
+        let Some(stub) = stub else {
+            return Ok(None);
+        };
+        // INLINE-ONLY mount: empty `crate_dirs` so the SDK walks NO on-disk source; all
+        // stub sources + manifests ride `extra_inline_files`, the verbatim Cargo.lock
+        // rides `extra_files`. Same workspace-relative layout + remote_path as the source
+        // mount (so the prebuilt deps land at the TOP layer's COPY-over path).
+        let spec = modal_rust_sdk::WorkspaceClosureSpec {
+            workspace_root: source.local_root,
+            crate_dirs: &[],
+            extra_files: &stub.extra_files,
+            extra_inline_files: &stub.inline_files,
+            modalignore_name: source.modalignore_name,
+        };
+        Ok(Some(
+            self.client
+                .mount_workspace_closure(&spec, remote_path, None)
+                .await?,
+        ))
+    }
+
     async fn ensure_python_mount(&mut self, series: &str) -> Result<String> {
         Ok(self.client.python_standalone_mount_id(series, None).await?)
     }
@@ -1115,6 +1239,7 @@ mod tests {
             image_steps: &[],
             cache: true,
             snapshot_best_effort: false,
+            dep_prebuild: false,
             entrypoints,
         }
     }

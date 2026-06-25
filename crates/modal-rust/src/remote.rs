@@ -626,6 +626,8 @@ pub(crate) async fn ensure_function(
         cache: config.options.cache.unwrap_or(config.cache),
         // RUN never snapshots (deploy-only feature), so the strictness knob is moot here.
         snapshot_best_effort: false,
+        // RUN never prebuilds deps (it builds in the function body); deploy-only.
+        dep_prebuild: false,
         entrypoints: &entrypoints,
     };
 

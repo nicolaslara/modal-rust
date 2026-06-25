@@ -602,6 +602,7 @@ mod tests {
         Target {
             kind: vec!["lib".to_string()],
             name: name.to_string(),
+            src_path: PathBuf::new(),
         }
     }
 
@@ -609,6 +610,7 @@ mod tests {
         Target {
             kind: vec!["bin".to_string()],
             name: name.to_string(),
+            src_path: PathBuf::new(),
         }
     }
 

@@ -44,6 +44,15 @@ pub const NO_CACHE: &str = "MODAL_RUST_NO_CACHE";
 /// default-ON) honors it.
 pub const CACHE_TARGET: &str = "MODAL_RUST_CACHE_TARGET";
 
+/// Deploy dependency-PREBUILD image layer — DEFAULT ON; set `0`/`false`/`no`/`off`
+/// to opt OUT. When ON, deploy inserts a cached image layer between the BASE and TOP
+/// layers that compiles the heavy git/registry dependency closure ONCE against a
+/// SYNTHESIZED stub source tree (empty lib/bin bodies), so warm redeploys hit Modal's
+/// content-addressed layer cache and the TOP layer only recompiles the changed leaf
+/// crate. Read locally by `discover_dep_prebuild` (deploy-only; the RUN path ignores
+/// it). With the flag OFF, deploy renders the EXACT historical two-layer proto.
+pub const DEP_PREBUILD: &str = "MODAL_RUST_DEP_PREBUILD";
+
 /// Stable deploy app name override (default `DEFAULT_DEPLOY_APP`). Read by
 /// `DeployConfig::default()`.
 pub const DEPLOY_APP: &str = "MODAL_RUST_DEPLOY_APP";
@@ -102,6 +111,7 @@ mod tests {
         super::INSTALL_RUST,
         super::NO_CACHE,
         super::CACHE_TARGET,
+        super::DEP_PREBUILD,
         super::DEPLOY_APP,
         super::SNAPSHOT_BEST_EFFORT,
         super::SERVE,

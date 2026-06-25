@@ -900,6 +900,60 @@ mod tests {
     }
 
     #[test]
+    fn collect_files_for_dirs_inline_only_walks_no_source() {
+        // The dependency-PREBUILD stub mount path: NO crate_dirs (so the walk emits
+        // nothing — the real `.rs` source is never read), only the verbatim Cargo.lock
+        // (extra_files) + the synthesized manifests/stub sources (extra_inline_files).
+        // Proves the inline-only mount works without on-disk crate dirs.
+        let dir = TempTree::new();
+        dir.write("Cargo.toml", "[workspace]\n");
+        dir.write("Cargo.lock", "# lock\n");
+        // A real crate with real source that MUST NOT be uploaded (no crate_dirs given).
+        dir.write("a/Cargo.toml", "[package]\nname = \"a\"\n");
+        dir.write("a/src/lib.rs", "fn real_body() { panic!() }\n");
+
+        let m = build_matcher(dir.path(), DEFAULT_MODALIGNORE_NAME).unwrap();
+        let extras = vec![dir.path().join("Cargo.lock")];
+        // Inline: the rewritten workspace manifest + a stub member manifest + an EMPTY
+        // stub lib.rs (the stub source — invariant to the real body above).
+        let inline = vec![
+            (
+                "Cargo.toml".to_string(),
+                b"[workspace]\nmembers=[]\n".to_vec(),
+            ),
+            (
+                "a/Cargo.toml".to_string(),
+                b"[package]\nname=\"a\"\n".to_vec(),
+            ),
+            ("a/src/lib.rs".to_string(), Vec::new()),
+        ];
+        let mut files =
+            collect_files_for_dirs(dir.path(), &[], &extras, &inline, "/app/src", &m).unwrap();
+        files.sort_by(|x, y| x.mount_filename.cmp(&y.mount_filename));
+        let names: Vec<&str> = files.iter().map(|f| f.mount_filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "/app/src/Cargo.lock",
+                "/app/src/Cargo.toml",
+                "/app/src/a/Cargo.toml",
+                "/app/src/a/src/lib.rs",
+            ],
+            "inline-only mount: Cargo.lock (extra) + inline manifests/stub, NO walked source"
+        );
+        // The stub lib.rs is the EMPTY inline body, not the real on-disk source.
+        let lib = files
+            .iter()
+            .find(|f| f.mount_filename == "/app/src/a/src/lib.rs")
+            .unwrap();
+        assert!(
+            lib.data.is_empty(),
+            "stub lib.rs is empty (real source was never walked): {:?}",
+            lib.data
+        );
+    }
+
+    #[test]
     fn collect_files_for_dirs_extras_exempt_from_ignore() {
         // Even if a .gitignore would match Cargo.lock, the explicit extra is kept.
         let dir = TempTree::new();

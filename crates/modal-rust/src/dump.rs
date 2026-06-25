@@ -48,6 +48,9 @@ pub enum MountRole {
     /// The uploaded source mount: a runtime mount at `/src` (RUN) or the image build
     /// CONTEXT (DEPLOY).
     Source,
+    /// The dependency-PREBUILD STUB context mount (DEPLOY, default-on prebuild layer):
+    /// synthesized manifests + empty stub sources, NO real source.
+    PrebuildStub,
     /// The hosted python-build-standalone mount (`add_python`).
     PythonStandalone,
 }
@@ -387,6 +390,25 @@ impl ControlPlane for RecordingControlPlane {
         Ok(format!("mo-{}", self.next_id()))
     }
 
+    async fn ensure_prebuild_mount(
+        &mut self,
+        source: &SourceInputs<'_>,
+        _remote_path: &str,
+    ) -> Result<Option<String>> {
+        // Mirror the live decision OFFLINE without a cargo invocation: the stub mount is
+        // built only when cargo scoping is on. The dump's deploy fixtures use
+        // `use_cargo_scoping: false`, so this records nothing and the manifest stays the
+        // historical two-layer sequence; an on-scoping deploy records the stub mount so
+        // the dumped 3-layer shape matches what `deploy` would send.
+        if !source.use_cargo_scoping {
+            return Ok(None);
+        }
+        self.requests.push(PlannedRequest::MountGetOrCreate {
+            role: MountRole::PrebuildStub,
+        });
+        Ok(Some(format!("mo-{}", self.next_id())))
+    }
+
     async fn ensure_python_mount(&mut self, _series: &str) -> Result<String> {
         self.requests.push(PlannedRequest::MountGetOrCreate {
             role: MountRole::PythonStandalone,
@@ -532,6 +554,8 @@ impl crate::App {
             cache: cfg.options.cache.unwrap_or(cfg.cache),
             // RUN never snapshots; the strictness knob is deploy-only.
             snapshot_best_effort: false,
+            // RUN never prebuilds deps (it builds in the function body); deploy-only.
+            dep_prebuild: false,
             entrypoints: &entrypoints,
         };
 
@@ -588,6 +612,7 @@ impl crate::App {
             image_steps: &config.image_steps,
             cache: false,
             snapshot_best_effort: config.snapshot_best_effort,
+            dep_prebuild: config.dep_prebuild,
             entrypoints: &entrypoints,
         };
 
@@ -1094,6 +1119,136 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["add".to_string()], "object tag = entrypoint");
+    }
+
+    #[test]
+    fn dump_deploy_dep_prebuild_off_renders_historical_two_layer_proto() {
+        // FLAG-OFF byte-identical guarantee: with `dep_prebuild: false`, deploy renders
+        // the EXACT historical two-layer sequence (base + top), even with cargo scoping
+        // ON — no prebuild stub mount, no third image layer. This is the disabled-path
+        // contract.
+        let app = App::from_manifest([("add".to_string(), FunctionConfig::default())]);
+        let dcfg = DeployConfig {
+            app_name: "off-deploy".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: true,
+            dep_prebuild: false,
+            ..DeployConfig::for_app("off-deploy")
+        };
+        let manifest = app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+        assert_eq!(
+            variants(&manifest.requests),
+            vec![
+                "MountGetOrCreate", // client
+                "MountGetOrCreate", // source (build context)
+                "MountGetOrCreate", // python-standalone
+                "AppGetOrCreate",   // persistent
+                "ImageGetOrCreate", // base layer (0)
+                "ImageGetOrCreate", // top layer (1, cargo build)
+                "FunctionPrecreate",
+                "FunctionCreate",
+                "AppPublish",
+            ],
+            "flag-off: exact historical two-layer proto (no PrebuildStub mount)"
+        );
+        // No prebuild stub mount recorded.
+        assert!(
+            !manifest.requests.iter().any(|r| matches!(
+                r,
+                PlannedRequest::MountGetOrCreate {
+                    role: MountRole::PrebuildStub
+                }
+            )),
+            "flag-off: no dependency-prebuild stub mount"
+        );
+        // The cargo build rides the TOP layer at ordinal 1 (historical).
+        let top = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::ImageGetOrCreate {
+                    dockerfile_commands,
+                    layer,
+                } if *layer == 1 => Some(dockerfile_commands.clone()),
+                _ => None,
+            })
+            .expect("top layer at ordinal 1");
+        assert!(top.iter().any(|c| c.contains("cargo build --release")));
+    }
+
+    #[test]
+    fn dump_deploy_dep_prebuild_on_inserts_third_stub_layer() {
+        // FLAG-ON (default): with cargo scoping ON, deploy inserts a PrebuildStub mount +
+        // a third image layer (ordinal 1) that cargo-builds the dep closure over the stub
+        // context, and the TOP layer moves to ordinal 2.
+        let app = App::from_manifest([("add".to_string(), FunctionConfig::default())]);
+        let dcfg = DeployConfig {
+            app_name: "on-deploy".to_string(),
+            package: "app".to_string(),
+            base_image: "rust:1-slim".to_string(),
+            use_cargo_scoping: true,
+            dep_prebuild: true,
+            ..DeployConfig::for_app("on-deploy")
+        };
+        let manifest = app.dump_deploy_manifest(&dcfg).expect("dump_deploy");
+        assert_eq!(
+            variants(&manifest.requests),
+            vec![
+                "MountGetOrCreate", // client
+                "MountGetOrCreate", // source (build context)
+                "MountGetOrCreate", // python-standalone
+                "AppGetOrCreate",   // persistent
+                "ImageGetOrCreate", // base layer (0)
+                "MountGetOrCreate", // prebuild stub context (built inside the deploy arm)
+                "ImageGetOrCreate", // dep-prebuild layer (1, stub cargo build)
+                "ImageGetOrCreate", // top layer (2, cargo build over real source)
+                "FunctionPrecreate",
+                "FunctionCreate",
+                "AppPublish",
+            ],
+            "flag-on: base / prebuild-stub / top three-layer proto"
+        );
+        // The PrebuildStub mount is recorded.
+        assert!(
+            manifest.requests.iter().any(|r| matches!(
+                r,
+                PlannedRequest::MountGetOrCreate {
+                    role: MountRole::PrebuildStub
+                }
+            )),
+            "flag-on: a dependency-prebuild stub mount is recorded"
+        );
+        // The PREBUILD layer (ordinal 1) cargo-builds over the stub context.
+        let prebuild = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::ImageGetOrCreate {
+                    dockerfile_commands,
+                    layer,
+                } if *layer == 1 => Some(dockerfile_commands.clone()),
+                _ => None,
+            })
+            .expect("prebuild layer at ordinal 1");
+        assert!(
+            prebuild.iter().any(|c| c.contains("cargo build --release")),
+            "the prebuild layer compiles the dep closure over the stub"
+        );
+        assert!(prebuild.iter().any(|c| c == "COPY . /"));
+        // The TOP layer moved to ordinal 2 and still cargo-builds the real source.
+        let top = manifest
+            .requests
+            .iter()
+            .find_map(|r| match r {
+                PlannedRequest::ImageGetOrCreate {
+                    dockerfile_commands,
+                    layer,
+                } if *layer == 2 => Some(dockerfile_commands.clone()),
+                _ => None,
+            })
+            .expect("top layer at ordinal 2");
+        assert!(top.iter().any(|c| c.contains("cargo build --release")));
     }
 
     #[test]

@@ -302,10 +302,36 @@ def call_entrypoint(entrypoint: str, input_json: str) -> str:
     # NO cargo, NO source mount, NO cache Volume
 ```
 
-Optional deploy hardening (documented, not v0-default): a dependency-prebuild
-layer (copy `Cargo.toml`/`Cargo.lock` + stub, build deps, then copy real src) to
-blunt cascading rebuilds; and a `--vendor` (`cargo vendor`) flag for hermetic
-builds if a target account restricts build-time egress `[spike: R-egress / M7]`.
+Deploy hardening — **dependency-prebuild layer (IMPLEMENTED, default-ON)**: deploy
+inserts a cached image layer BETWEEN the base and top layers whose build context is
+**manifests + synthesized stub sources only** (rewritten workspace `Cargo.toml` +
+dev-dep-stripped member manifests + verbatim `Cargo.lock` + one empty stub source
+per build target — empty `lib.rs`, empty `fn main(){}` per `[[bin]]`/build script,
+crate-type honored for cdylib/proc-macro). That layer `cargo build --release -p
+<pkg> --bin modal_runner`s the heavy git/registry dependency closure ONCE; because
+the stub's content is invariant to real source edits, Modal's content-addressed
+layer cache hits it on every warm redeploy, so the top layer only recompiles the
+changed leaf crate. The top layer then bases on the prebuild image and COPYs the
+real source over the stub at the SAME `/app/src` path, so cargo reuses the prebuilt
+dep `.rlib`s. Opt OUT with `MODAL_RUST_DEP_PREBUILD=0`/`false` (or when cargo
+scoping is off / metadata is unavailable), which renders the EXACT historical
+two-layer proto, byte-identical. Wiring: `scope::workspace_closure_stub`,
+`control_plane::build_deploy_dep_layer_spec` + `ensure_prebuild_mount`,
+`DeployConfig::dep_prebuild`.
+
+- **One-context-mount-per-layer constraint**: each image layer carries exactly ONE
+  context mount (proto field 15 `context_mount_id`), so the prebuild stub and the
+  real source ride as TWO distinct layers (two `COPY . /`s over two mounts), NOT two
+  COPYs in one layer.
+- **External-path-dep caveat**: a user with normal in-workspace path-deps gets a
+  stub for the path-dep crate too, so its real source is replaced during prebuild;
+  the top layer then COPYs the real path-dep source and cargo sees changed mtimes at
+  the same path and recompiles that ONE crate — a redundant-but-correct degrade. The
+  proven case (burn-lm-bench) has zero path-deps, so it does not occur there.
+
+Also documented (not yet implemented): a `--vendor` (`cargo vendor`) flag for
+hermetic builds if a target account restricts build-time egress `[spike: R-egress
+/ M7]`.
 
 **`call_app.py` (call):**
 
