@@ -1,9 +1,10 @@
 [package]
 name = "modal-rust-macros"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicolaslara/modal-rust"
 description = "Additive proc-macro sugar for modal-rust: #[modal_rust::function] expands to the SAME typed!() wrapper + an inventory::submit! registration the manual Registry path produces. Changes no runner protocol."
-publish = false
 
 [lib]
 proc-macro = true

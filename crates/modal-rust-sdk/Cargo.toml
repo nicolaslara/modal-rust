@@ -1,8 +1,9 @@
 [package]
 name = "modal-rust-sdk"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicolaslara/modal-rust"
 description = "First-party lean Rust gRPC client for Modal's control plane (modal_rust::sdk)"
 build = "build.rs"
 

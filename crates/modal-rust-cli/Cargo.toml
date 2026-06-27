@@ -1,9 +1,10 @@
 [package]
 name = "modal-rust-cli"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicolaslara/modal-rust"
 description = "The `modal-rust` binary: drives the programmatic SDK/facade (run/deploy/call via `modal_runner --describe` + crates/modal-rust) — no codegen, no `modal` CLI. clap lives here (CLI-only), never in the runtime."
-publish = false
 
 [[bin]]
 name = "modal-rust"
@@ -20,7 +21,7 @@ anyhow = "1"
 # (tonic/hyper/prost/reqwest). The async facade ops run under a tokio runtime. (The
 # LIGHT describe helpers — resolve_runner_target/materialize_shadow/
 # describe_cache_inputs — are available regardless of the feature.)
-modal-rust = { path = "../modal-rust", features = ["client"] }
+modal-rust = { path = "../modal-rust", version = "0.1.0-alpha.1", features = ["client"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Content-address the describe MANIFEST CACHE key (describe_cache.rs): a SHA-256 over the
 # closure source + Cargo.lock + the package/path decision keys the cached `--describe`

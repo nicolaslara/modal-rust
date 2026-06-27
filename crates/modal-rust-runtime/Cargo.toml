@@ -1,9 +1,10 @@
 [package]
 name = "modal-rust-runtime"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicolaslara/modal-rust"
 description = "modal-rust runtime: Registry, typed!() macro, JSON Codec, HandlerFn, and the runner CLI protocol. Zero Modal/network/Python deps."
-publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
