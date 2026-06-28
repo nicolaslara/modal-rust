@@ -81,14 +81,21 @@ Python→Rust cheat sheet, and troubleshooting.
 
 ## Install
 
-`modal-rust` is not published to crates.io yet. Add it from GitHub — one
-dependency covers both the macro and the manual authoring paths:
+`modal-rust` is on crates.io. It is currently a **pre-release**, so pin the
+version explicitly — `cargo add` / `cargo install` skip pre-releases by default.
+One dependency covers both the macro and the manual authoring paths:
 
 ```toml
 [dependencies]
-modal-rust = { git = "https://github.com/nicolaslara/modal-rust" }
+modal-rust = "0.1.0-alpha.1"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+```
+
+Or track the latest unreleased code from GitHub instead:
+
+```toml
+modal-rust = { git = "https://github.com/nicolaslara/modal-rust" }
 ```
 
 The `#[modal_rust::function]` macro routes its generated code through the
@@ -108,10 +115,10 @@ or the offline `dry_run`/`dump_deploy_manifest` dump:
 
 ```toml
 # Function-only crate (authoring + .local() + `modal-rust run`/`deploy`): nothing to add.
-modal-rust = { git = "..." }
+modal-rust = "0.1.0-alpha.1"
 
 # Orchestration code (your binary/tests call .remote()/deploy/connect): add the feature.
-modal-rust = { git = "...", features = ["client"] }
+modal-rust = { version = "0.1.0-alpha.1", features = ["client"] }
 ```
 
 If you forget the feature, the talk-to-Modal methods still compile — they return a
@@ -126,15 +133,19 @@ the `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` environment variables.
 
 ## CLI Usage
 
-Install the CLI from GitHub:
+The `modal-rust` binary ships in the **`modal-rust-cli`** crate — the `modal-rust`
+crate itself is the library, so `cargo install modal-rust` does **not** work (same
+split as `wasmtime` / `wasmtime-cli`). Install the CLI from crates.io (explicit
+version while it is a pre-release):
+
+```bash
+cargo install modal-rust-cli --version 0.1.0-alpha.1
+```
+
+Or from GitHub, or a local checkout you are editing:
 
 ```bash
 cargo install --git https://github.com/nicolaslara/modal-rust --package modal-rust-cli
-```
-
-From a local checkout, install the CLI you are editing with:
-
-```bash
 cargo install --path crates/modal-rust-cli
 ```
 
