@@ -1,9 +1,10 @@
 [package]
 name = "modal-rust"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nicolaslara/modal-rust"
+readme = "README.md"
 description = "Ergonomic user-facing facade for modal-rust: App/Function handles with in-process .local() (frozen Registry) and the locked .remote()/.spawn()/.map() async surface. Re-exports modal_rust_sdk as `sdk`."
 
 [lib]
@@ -39,10 +40,10 @@ testkit = ["client"]
 [dependencies]
 # OPTIONAL: pulled in only by the `client` feature (was unconditional). A crate that
 # only authors `#[function]`s + uses `.local()` never links tonic/hyper/prost/reqwest.
-modal-rust-sdk     = { path = "../modal-rust-sdk", version = "0.1.0-alpha.1", optional = true }
-modal-rust-runtime = { path = "../modal-rust-runtime", version = "0.1.0-alpha.1" }
+modal-rust-sdk     = { path = "../modal-rust-sdk", version = "0.1.0-alpha.2", optional = true }
+modal-rust-runtime = { path = "../modal-rust-runtime", version = "0.1.0-alpha.2" }
 # Re-exported so users can spell `#[modal_rust::function]` (see lib.rs caveat).
-modal-rust-macros  = { path = "../modal-rust-macros", version = "0.1.0-alpha.1" }
+modal-rust-macros  = { path = "../modal-rust-macros", version = "0.1.0-alpha.2" }
 # Re-exported under `__private::inventory` so the macro's single
 # `inventory::submit!{ Registration { handler, config, package } }` resolves THROUGH
 # the facade — a macro-using crate needs no direct `inventory` dep (serde_derive
