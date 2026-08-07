@@ -1,5 +1,5 @@
 //! `mock_unimplemented!` — emit a default `Status::unimplemented` impl for every
-//! `ModalClient` RPC the mock does NOT hand-write (the ~184 the SDK never calls).
+//! `ModalClient` RPC the mock does NOT hand-write (the ~200 the SDK never calls).
 //!
 //! KEY FINDING (proven in the spike): the generated server trait is
 //! `#[async_trait]` (boxed-future desugaring). An attribute macro on the impl

@@ -1,0 +1,26 @@
+# Provenance for the vendored `api.proto`.
+#
+# `proto/api.proto` is a byte-for-byte copy of Modal's public client proto.
+# `crates/modal-rust-testkit/proto/api.proto` is the same file with a one-line
+# "keep in sync" header prepended; both are compiled by their crate's build.rs.
+#
+# To re-vendor:
+#   curl -sL "$url" -o crates/modal-rust-sdk/proto/api.proto
+#   { echo '// copied verbatim from crates/modal-rust-sdk/proto/api.proto; keep in sync.'; \
+#     cat crates/modal-rust-sdk/proto/api.proto; } > crates/modal-rust-testkit/proto/api.proto
+#   cargo test   # new/changed RPCs surface as missing ModalClient trait methods
+#
+# Then update `commit` and `synced` below, and add a `mock_unimplemented!` arm in
+# crates/modal-rust-testkit/src/servicer.rs for every RPC the SDK does not call.
+
+repo = "https://github.com/modal-labs/modal-client"
+path = "modal_proto/api.proto"
+url = "https://raw.githubusercontent.com/modal-labs/modal-client/main/modal_proto/api.proto"
+
+# Upstream commit this copy was taken at.
+commit = "1d53eec296"
+commit_date = "2026-08-07"
+synced = "2026-08-07"
+
+# 236 RPCs on service ModalClient at this revision.
+rpc_count = 236

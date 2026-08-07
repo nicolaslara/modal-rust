@@ -1,10 +1,14 @@
 //! The mock servicer: `impl ModalClient` for [`MockServicer`].
 //!
-//! Hand-writes the ~18 RPCs the SDK actually calls on the deploy / call / remote
+//! Hand-writes the RPCs the SDK actually calls on the deploy / call / remote
 //! flow — each RECORDS its request into the shared [`RequestLog`], runs a per-test
 //! override closure if one is configured, else returns a DETERMINISTIC happy-path
-//! default. Every OTHER RPC (the ~183 the SDK never touches) is stubbed as
-//! `Status::unimplemented` via [`mock_unimplemented!`](crate::macros).
+//! default. Every OTHER RPC in the service (the ~200 the SDK never touches) is
+//! stubbed as `Status::unimplemented` via [`mock_unimplemented!`](crate::macros).
+//!
+//! The macro block below must cover every `ModalClient` RPC that is not
+//! hand-written above it, so re-vendoring `proto/api.proto` with new RPCs means
+//! adding matching arms (a missing arm is an unimplemented-trait-method error).
 //!
 //! Determinism: all ids are fixed (`ap-1`, `im-1`, `fu-1`, …) — no `Date`, no
 //! random. Mount/volume ids increment per call so a multi-mount manifest gets
@@ -728,7 +732,7 @@ impl ModalClient for MockServicer {
     unary app_heartbeat(gen::AppHeartbeatRequest) -> ();
     unary app_list(gen::AppListRequest) -> gen::AppListResponse;
     unary app_lookup(gen::AppLookupRequest) -> gen::AppLookupResponse;
-    unary app_rollback(gen::AppRollbackRequest) -> ();
+    unary app_rollback(gen::AppRollbackRequest) -> gen::AppRollbackResponse;
     unary app_rollover(gen::AppRolloverRequest) -> gen::AppRolloverResponse;
     unary app_set_objects(gen::AppSetObjectsRequest) -> ();
     unary app_set_tags(gen::AppSetTagsRequest) -> ();
@@ -751,7 +755,9 @@ impl ModalClient for MockServicer {
     unary container_hello(()) -> ();
     unary container_log(gen::ContainerLogRequest) -> ();
     unary container_reload_volumes(gen::ContainerReloadVolumesRequest) -> gen::ContainerReloadVolumesResponse;
+    unary container_server_lifecycle_ready(gen::ContainerServerLifecycleReadyRequest) -> ();
     unary container_stop(gen::ContainerStopRequest) -> gen::ContainerStopResponse;
+    unary curl_get_auth_token(gen::CurlAuthTokenRequest) -> gen::CurlAuthTokenResponse;
     unary dict_get_by_id(gen::DictGetByIdRequest) -> gen::DictGetByIdResponse;
     unary dict_heartbeat(gen::DictHeartbeatRequest) -> ();
     unary dict_list(gen::DictListRequest) -> gen::DictListResponse;
@@ -759,13 +765,20 @@ impl ModalClient for MockServicer {
     unary domain_create(gen::DomainCreateRequest) -> gen::DomainCreateResponse;
     unary domain_list(gen::DomainListRequest) -> gen::DomainListResponse;
     unary endpoint_create(gen::EndpointCreateRequest) -> gen::EndpointCreateResponse;
+    unary endpoint_get_by_name(gen::EndpointGetByNameRequest) -> gen::EndpointGetByNameResponse;
+    unary endpoint_get_lifecycle(gen::EndpointGetLifecycleRequest) -> gen::EndpointGetLifecycleResponse;
     unary endpoint_list(gen::EndpointListRequest) -> gen::EndpointListResponse;
     unary endpoint_stop(gen::EndpointStopRequest) -> gen::EndpointStopResponse;
+    unary environment_billing_summary(gen::EnvironmentBillingSummaryRequest) -> gen::EnvironmentBillingSummaryResponse;
     unary environment_create(gen::EnvironmentCreateRequest) -> ();
     unary environment_delete(gen::EnvironmentDeleteRequest) -> ();
+    unary environment_get_budget(gen::EnvironmentGetBudgetRequest) -> gen::EnvironmentGetBudgetResponse;
     unary environment_get_managed(gen::EnvironmentGetManagedRequest) -> gen::EnvironmentGetManagedResponse;
+    unary environment_get_roles(gen::EnvironmentGetRolesRequest) -> gen::EnvironmentGetRolesResponse;
     unary environment_list(()) -> gen::EnvironmentListResponse;
     unary environment_role_set(gen::EnvironmentRoleSetRequest) -> ();
+    unary environment_set_budget(gen::EnvironmentSetBudgetRequest) -> ();
+    unary environment_set_default_member_role(gen::EnvironmentSetDefaultMemberRoleRequest) -> ();
     unary environment_set_managed(gen::EnvironmentSetManagedRequest) -> ();
     unary environment_update(gen::EnvironmentUpdateRequest) -> gen::EnvironmentListItem;
     unary flash_container_deregister(gen::FlashContainerDeregisterRequest) -> ();
@@ -776,6 +789,7 @@ impl ModalClient for MockServicer {
     unary function_bind_params(gen::FunctionBindParamsRequest) -> gen::FunctionBindParamsResponse;
     unary function_call_cancel(gen::FunctionCallCancelRequest) -> ();
     unary function_call_from_id(gen::FunctionCallFromIdRequest) -> gen::FunctionCallFromIdResponse;
+    unary function_call_get_info(gen::FunctionCallGetInfoRequest) -> gen::FunctionCallGetInfoResponse;
     unary function_call_list(gen::FunctionCallListRequest) -> gen::FunctionCallListResponse;
     unary function_call_put_data_out(gen::FunctionCallPutDataRequest) -> ();
     unary function_finish_inputs(gen::FunctionFinishInputsRequest) -> ();
@@ -788,11 +802,17 @@ impl ModalClient for MockServicer {
     unary function_retry_inputs(gen::FunctionRetryInputsRequest) -> gen::FunctionRetryInputsResponse;
     unary function_start_pty_shell(()) -> ();
     unary function_update_scheduling_params(gen::FunctionUpdateSchedulingParamsRequest) -> gen::FunctionUpdateSchedulingParamsResponse;
+    unary image_build_chain_get(gen::ImageBuildChainGetRequest) -> gen::ImageBuildChainGetResponse;
     unary image_delete(gen::ImageDeleteRequest) -> ();
     unary image_from_id(gen::ImageFromIdRequest) -> gen::ImageFromIdResponse;
+    unary image_get_by_tag(gen::ImageGetByTagRequest) -> gen::ImageGetByTagResponse;
+    unary image_list_tags(gen::ImageListTagsRequest) -> gen::ImageListTagsResponse;
+    unary image_publish(gen::ImagePublishRequest) -> gen::ImagePublishResponse;
+    unary image_tag_revisions(gen::ImageTagRevisionsRequest) -> gen::ImageTagRevisionsResponse;
     unary map_await(gen::MapAwaitRequest) -> gen::MapAwaitResponse;
     unary map_check_inputs(gen::MapCheckInputsRequest) -> gen::MapCheckInputsResponse;
     unary map_start_or_continue(gen::MapStartOrContinueRequest) -> gen::MapStartOrContinueResponse;
+    unary mount_batched_check_existence(gen::MountBatchedCheckExistenceRequest) -> gen::MountBatchedCheckExistenceResponse;
     unary notebook_kernel_publish_results(gen::NotebookKernelPublishResultsRequest) -> ();
     unary proxy_add_ip(gen::ProxyAddIpRequest) -> gen::ProxyAddIpResponse;
     unary proxy_create(gen::ProxyCreateRequest) -> gen::ProxyCreateResponse;
@@ -807,16 +827,22 @@ impl ModalClient for MockServicer {
     unary queue_next_items(gen::QueueNextItemsRequest) -> gen::QueueNextItemsResponse;
     unary sandbox_create(gen::SandboxCreateRequest) -> gen::SandboxCreateResponse;
     unary sandbox_create_connect_token(gen::SandboxCreateConnectTokenRequest) -> gen::SandboxCreateConnectTokenResponse;
+    unary sandbox_create_connect_token_v2(gen::SandboxCreateConnectTokenRequest) -> gen::SandboxCreateConnectTokenResponse;
     unary sandbox_create_v2(gen::SandboxCreateV2Request) -> gen::SandboxCreateV2Response;
     unary sandbox_get_command_router_access(gen::SandboxGetCommandRouterAccessRequest) -> gen::SandboxGetCommandRouterAccessResponse;
+    unary sandbox_get_exit_snapshot(gen::SandboxGetExitSnapshotRequest) -> gen::SandboxGetExitSnapshotResponse;
     unary sandbox_get_from_name(gen::SandboxGetFromNameRequest) -> gen::SandboxGetFromNameResponse;
+    unary sandbox_get_from_name_v2(gen::SandboxGetFromNameRequest) -> gen::SandboxGetFromNameResponse;
     unary sandbox_get_resource_usage(gen::SandboxGetResourceUsageRequest) -> gen::SandboxGetResourceUsageResponse;
     unary sandbox_get_task_id(gen::SandboxGetTaskIdRequest) -> gen::SandboxGetTaskIdResponse;
     unary sandbox_get_task_id_v2(gen::SandboxGetTaskIdRequest) -> gen::SandboxGetTaskIdResponse;
     unary sandbox_get_tunnels(gen::SandboxGetTunnelsRequest) -> gen::SandboxGetTunnelsResponse;
     unary sandbox_get_tunnels_v2(gen::SandboxGetTunnelsRequest) -> gen::SandboxGetTunnelsResponse;
     unary sandbox_list(gen::SandboxListRequest) -> gen::SandboxListResponse;
+    unary sandbox_list_v2(gen::SandboxListRequest) -> gen::SandboxListResponse;
     unary sandbox_restore(gen::SandboxRestoreRequest) -> gen::SandboxRestoreResponse;
+    unary sandbox_restore_v2(gen::SandboxRestoreV2Request) -> gen::SandboxRestoreV2Response;
+    unary sandbox_set_name(gen::SandboxSetNameRequest) -> gen::SandboxSetNameResponse;
     unary sandbox_snapshot(gen::SandboxSnapshotRequest) -> gen::SandboxSnapshotResponse;
     unary sandbox_snapshot_fs(gen::SandboxSnapshotFsRequest) -> gen::SandboxSnapshotFsResponse;
     unary sandbox_snapshot_fs_async(gen::SandboxSnapshotFsAsyncRequest) -> gen::SandboxSnapshotFsAsyncResponse;
@@ -825,7 +851,9 @@ impl ModalClient for MockServicer {
     unary sandbox_snapshot_wait(gen::SandboxSnapshotWaitRequest) -> gen::SandboxSnapshotWaitResponse;
     unary sandbox_stdin_write(gen::SandboxStdinWriteRequest) -> gen::SandboxStdinWriteResponse;
     unary sandbox_tags_get(gen::SandboxTagsGetRequest) -> gen::SandboxTagsGetResponse;
+    unary sandbox_tags_get_v2(gen::SandboxTagsGetRequest) -> gen::SandboxTagsGetResponse;
     unary sandbox_tags_set(gen::SandboxTagsSetRequest) -> ();
+    unary sandbox_tags_set_v2(gen::SandboxTagsSetRequest) -> ();
     unary sandbox_terminate(gen::SandboxTerminateRequest) -> gen::SandboxTerminateResponse;
     unary sandbox_terminate_v2(gen::SandboxTerminateRequest) -> gen::SandboxTerminateResponse;
     unary sandbox_wait(gen::SandboxWaitRequest) -> gen::SandboxWaitResponse;
@@ -869,9 +897,20 @@ impl ModalClient for MockServicer {
     unary volume_remove_file(gen::VolumeRemoveFileRequest) -> ();
     unary volume_remove_file2(gen::VolumeRemoveFile2Request) -> ();
     unary volume_rename(gen::VolumeRenameRequest) -> ();
+    unary webhook_token_create(gen::WebhookTokenCreateRequest) -> gen::TokenCreateResponse;
+    unary webhook_token_delete(gen::TokenDeleteRequest) -> ();
+    unary webhook_token_environment_add(gen::WebhookTokenEnvironmentAddRequest) -> ();
+    unary webhook_token_environment_list(gen::WebhookTokenEnvironmentListRequest) -> gen::WebhookTokenEnvironmentListResponse;
+    unary webhook_token_environment_remove(gen::WebhookTokenEnvironmentRemoveRequest) -> ();
+    unary webhook_token_list(()) -> gen::WebhookTokenListResponse;
+    unary webhook_token_list_for_environment(gen::WebhookTokenListForEnvironmentRequest) -> gen::WebhookTokenListResponse;
+    unary workspace_billing_summary(gen::WorkspaceBillingSummaryRequest) -> gen::WorkspaceBillingSummaryResponse;
     unary workspace_dashboard_url_get(gen::WorkspaceDashboardUrlRequest) -> gen::WorkspaceDashboardUrlResponse;
     unary workspace_members_list(()) -> gen::WorkspaceMembersListResponse;
     unary workspace_name_lookup(()) -> gen::WorkspaceNameLookupResponse;
+    unary workspace_set_default_environment(gen::WorkspaceSetDefaultEnvironmentRequest) -> ();
+    unary workspace_set_image_builder_version(gen::WorkspaceSetImageBuilderVersionRequest) -> gen::WorkspaceSetImageBuilderVersionResponse;
+    unary workspace_settings(()) -> gen::WorkspaceSettingsResponse;
     // ---- server-streaming RPCs ----
     stream app_get_logs[AppGetLogsStream](gen::AppGetLogsRequest) -> gen::TaskLogsBatch;
     stream container_exec_get_output[ContainerExecGetOutputStream](gen::ContainerExecGetOutputRequest) -> gen::RuntimeOutputBatch;
