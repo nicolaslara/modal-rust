@@ -170,6 +170,7 @@ impl ModalClient for MockServicer {
                     image_builder_version: "2025.06".to_string(),
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
         }))
     }
