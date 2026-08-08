@@ -13,7 +13,9 @@ higher-level `modal-rust` facade (decorator, `.local()` / `.remote()`, deploy +
   features dropped) + `prost`, `serde` + `serde_cbor`, `toml`, `reqwest`
   (rustls only — no system OpenSSL), `sha2`, `walkdir`, `ignore`. The vendored
   proto (`proto/api.proto`) is copied verbatim from the official Modal Python
-  SDK; the auth/channel/codec *structure* follows the unofficial `modal-rs`, but
+  SDK — see [`proto/SOURCE.toml`](proto/SOURCE.toml) for the exact upstream
+  revision and the re-vendoring steps; the auth/channel/codec *structure*
+  follows the unofficial `modal-rs`, but
   **neither is a build- or run-time dependency** (both are read-only references;
   see `NOTICE`).
 - **Auth + channel.** Credentials/endpoint resolve from the environment or
@@ -47,7 +49,7 @@ higher-level `modal-rust` facade (decorator, `.local()` / `.remote()`, deploy +
 
 ## Coverage matrix (control plane)
 
-Scope: this crate currently calls **18 distinct RPCs** out of the ~200 in the
+Scope: this crate currently calls **18 distinct RPCs** out of the ~240 in the
 vendored `proto/api.proto`. The matrix below is grouped by object/area. Status:
 **Implemented** = we call this RPC in `ops/*` or `client.rs`; **Partial** = the
 RPC is called but only a subset of its semantics/fields is exercised;
