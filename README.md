@@ -1181,9 +1181,9 @@ RUN_REMOTE=1 cargo run -p example-orchestrate --bin orchestrate
 
 ```text
 local:  add(40, 2) -> {sum: 42}
-remote: add(40, 2) -> {sum: 42}
+remote: add(40, 2) -> 42
 deployed app 'modal-rust-orchestrate-demo' (...)
-call:   add(40, 2) -> {sum: 42}
+call:   add(40, 2) -> 42
 ```
 
 The GPU examples (`cuda-vector-add`, `burn-add`) need a real GPU and Modal

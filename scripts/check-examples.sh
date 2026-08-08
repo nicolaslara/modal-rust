@@ -34,8 +34,11 @@ fail=0
 # naming any example dir that falls through every tier without an entry.
 #
 # SKIP_COVERAGE: examples in NO tier at all. Add only with a documented reason.
-# (Currently empty — all examples are exercised in at least one tier above.)
-SKIP_COVERAGE=()
+# - burn-lm-bench / burn-lm-bench-client: the heavy GPU dogfood pair (a real Llama
+#   on an L4 via #[web_server] + its HTTP client). Deploys cost real GPU time and a
+#   multi-GB model build, so they are driven manually (see examples/burn-lm-bench/
+#   README.md), not by this harness.
+SKIP_COVERAGE=(burn-lm-bench burn-lm-bench-client)
 
 covered_examples=(
   add add-macro autoscaling background-jobs burn-add cli-workflow cpu-memory
@@ -372,8 +375,8 @@ else
   # LIVE (CPU): one orchestrate run drives .remote() + deploy + call.
   live "orchestrate: live .remote() + deploy + call (CPU)" \
     "RUN_REMOTE=1 cargo run -q -p example-orchestrate --bin orchestrate" \
-    'remote: add(40, 2) -> {sum: 42}' \
-    'call: add(40, 2) -> {sum: 42}'
+    'remote: add(40, 2) -> 42' \
+    'call: add(40, 2) -> 42'
 
   # LIVE (CPU): ways-to-call drives the three remote shapes (.remote/.spawn/.map).
   live "ways-to-call: live .remote() + .spawn() + .map() (CPU)" \

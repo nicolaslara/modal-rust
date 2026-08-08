@@ -215,7 +215,15 @@ impl DeployConfig {
     /// [`RemoteConfig`] defaults for `local_root` / `package` / scoping / ignore /
     /// `base_image` (so the deploy context upload matches the RUN-path upload).
     pub fn for_app(app_name: impl Into<String>) -> Self {
-        let base = RemoteConfig::default();
+        // PACKAGE AUTO-DETECT, exactly like `App::connect`'s RUN config: fill the
+        // package from the macro-captured inventory `CARGO_PKG_NAME` when the user
+        // has not set `MODAL_RUST_PACKAGE`. Without this, deploy inherits
+        // `discover_package`'s last-resort v0 default (`example-add`) and builds the
+        // WRONG crate for any inventory app that deploys without an explicit package.
+        let base = RemoteConfig::default().with_detected_package(
+            std::env::var(crate::env::PACKAGE).ok().as_deref(),
+            crate::package_from_inventory(),
+        );
         DeployConfig {
             app_name: app_name.into(),
             local_root: base.local_root,

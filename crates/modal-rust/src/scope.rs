@@ -172,6 +172,17 @@ pub(crate) fn workspace_closure(
         return Err(out_of_workspace_error(package, &out_of_workspace));
     }
 
+    // A package that CANNOT produce the frozen `modal_runner` bin — no own bin, no
+    // `modal-rust` facade dep to generate one from — is doomed remotely: the wrapper's
+    // `cargo build -p <pkg> --bin modal_runner` fails with cargo's cryptic "no bin
+    // target" AFTER the upload + container spin-up. Fail loudly HERE instead (parity
+    // with the CLI's offline preflight hint).
+    if let Some(target) = crate::runner_gen::resolve_from_metadata(&metadata, package) {
+        if !target.is_runnable() {
+            return Err(target.unrunnable_error());
+        }
+    }
+
     Ok(build_closure_upload(&metadata, package, dirs))
 }
 
@@ -414,8 +425,21 @@ fn stub_upload_from_closure(
     let closure_dirs: HashSet<&Path> = closure.dirs.iter().map(PathBuf::as_path).collect();
 
     // The injected `modal_runner.rs` (if any) is among `closure.inline_files`; the stub
-    // reuses the SAME manifests + Cargo.lock + injected runner, then ADDS stub sources.
+    // reuses the SAME manifests + Cargo.lock, then ADDS stub sources.
     let mut inline_files = closure.inline_files;
+
+    // NEUTER the injected runner: its real body invokes the facade's `modal_runner!`
+    // macro, which cannot compile against the STUB path-deps (empty `lib.rs`) — the
+    // prebuild layer died with "cannot find `modal_runner` in <facade>". The layer
+    // only exists to compile the registry/git DEP closure, so give the runner the
+    // same empty `fn main(){}` body a declared bin target gets. Its PATH must stay
+    // (cargo's `src/bin` auto-discovery still needs to see the bin target); the TOP
+    // layer COPYs the real runner back over and rebuilds it against real source.
+    for (path, bytes) in inline_files.iter_mut() {
+        if path == "src/bin/modal_runner.rs" || path.ends_with("/src/bin/modal_runner.rs") {
+            *bytes = b"fn main() {}\n".to_vec();
+        }
+    }
 
     // Synthesize one stub source per build target of every closure-crate package. Iterate
     // packages in a STABLE order (sort by id) so emission is deterministic regardless of
@@ -431,6 +455,37 @@ fn stub_upload_from_closure(
         })
         .collect();
     pkgs.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Every closure crate's `Cargo.toml` must ride the stub. The FULL upload carries a
+    // member manifest either as a dev-dep-stripped INLINE override or VERBATIM via the
+    // real-source dirs walk — and the stub DROPS the dirs walk, so a manifest with no
+    // dev-deps to strip (e.g. the proc-macro crate) would silently vanish and the
+    // prebuild layer's cargo dies with "failed to read .../Cargo.toml: No such file".
+    // Backfill those verbatim from disk (best-effort: an unreadable manifest falls
+    // through to the same missing-file build error as before, never a wrong upload).
+    for pkg in &pkgs {
+        let Some(crate_dir) = pkg.manifest_path.parent() else {
+            continue;
+        };
+        let Ok(rel) = crate_dir.strip_prefix(ws_root) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue; // the root manifest is the rewritten workspace Cargo.toml
+        }
+        let rel_posix = rel
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        let key = format!("{rel_posix}/Cargo.toml");
+        if inline_files.iter().any(|(p, _)| p == &key) {
+            continue; // already carried as a dev-dep-stripped override
+        }
+        if let Ok(bytes) = std::fs::read(&pkg.manifest_path) {
+            inline_files.push((key, bytes));
+        }
+    }
 
     for pkg in pkgs {
         let crate_dir = match pkg.manifest_path.parent() {
@@ -1245,6 +1300,54 @@ nix = \"0.27\"
     }
 
     #[test]
+    fn stub_upload_backfills_manifests_missing_an_inline_override() {
+        // The cold-deploy bug: a closure crate with NO dev-deps gets no inline
+        // manifest override (its `Cargo.toml` rides the dirs walk in the FULL
+        // upload), and the stub DROPS the dirs walk — so the prebuild layer's cargo
+        // died with "failed to read .../Cargo.toml". The stub must backfill such
+        // manifests verbatim from disk. Uses a real tempdir so the disk read resolves.
+        let root = std::env::temp_dir().join(format!("stub-backfill-{}", std::process::id()));
+        let a_dir = root.join("crates/a");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        let manifest_bytes = b"[package]\nname = \"lib-a\"\n".to_vec();
+        std::fs::write(a_dir.join("Cargo.toml"), &manifest_bytes).unwrap();
+
+        // Re-root the fixture at the tempdir so `manifest_path` points at real files.
+        let mut m = stub_fixture();
+        m.workspace_root = root.clone();
+        for pkg in &mut m.packages {
+            let rebased = root.join(pkg.manifest_path.strip_prefix("/ws").unwrap());
+            pkg.manifest_path = rebased;
+            for t in &mut pkg.targets {
+                t.src_path = root.join(t.src_path.strip_prefix("/ws").unwrap());
+            }
+            for d in &mut pkg.dependencies {
+                if let Some(p) = d.path.take() {
+                    d.path = Some(root.join(p.strip_prefix("/ws").unwrap()));
+                }
+            }
+        }
+
+        let closure = ClosureUpload {
+            dirs: vec![root.join("crates/a"), root.join("crates/app")],
+            extra_files: vec![],
+            // NO inline override for `crates/a` (the no-dev-deps case); `app` has one.
+            inline_files: vec![
+                ("Cargo.toml".to_string(), b"[workspace]\n".to_vec()),
+                ("crates/app/Cargo.toml".to_string(), b"[package]\n".to_vec()),
+            ],
+        };
+        let stub = stub_upload_from_closure(&m, "app", closure).unwrap();
+        let got = stub
+            .inline_files
+            .iter()
+            .find(|(p, _)| p == "crates/a/Cargo.toml")
+            .expect("the missing member manifest must be backfilled into the stub");
+        assert_eq!(got.1, manifest_bytes, "backfilled verbatim from disk");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn stub_upload_is_deterministic_across_runs() {
         // Two independent runs over the SAME inputs produce byte-identical uploads (no
         // HashMap iteration order leaking in; the inline list is fully sorted).
@@ -1293,9 +1396,12 @@ nix = \"0.27\"
     }
 
     #[test]
-    fn stub_upload_keeps_injected_runner_over_bin_stub() {
-        // If the closure already carries an injected real `modal_runner.rs` at the bin's
-        // src_path, the stub must NOT overwrite it (the real runner wins).
+    fn stub_upload_neuters_injected_runner_to_bin_stub() {
+        // The closure carries the injected REAL `modal_runner.rs`, whose body invokes
+        // the facade's `modal_runner!` macro — uncompilable against the stub's EMPTY
+        // path-dep sources. The stub must keep its PATH (the bin target must exist)
+        // but replace its body with the empty bin stub; the TOP layer restores the
+        // real runner.
         let m = Metadata {
             workspace_root: PathBuf::from("/ws"),
             workspace_members: vec!["app-id".into()],
@@ -1329,8 +1435,9 @@ nix = \"0.27\"
             .find(|(p, _)| p == "crates/app/src/bin/modal_runner.rs")
             .unwrap();
         assert_eq!(
-            runner.1, b"// REAL injected runner\n",
-            "the injected real runner is preserved, not stubbed over"
+            runner.1, b"fn main() {}\n",
+            "the injected runner is neutered to the empty bin stub (its real body \
+             cannot compile against stub deps)"
         );
     }
 }

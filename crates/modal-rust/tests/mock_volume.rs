@@ -17,13 +17,14 @@ use modal_rust::Volume;
 use modal_rust_testkit::prelude::*;
 
 fn tmpdir() -> std::path::PathBuf {
+    // A monotone per-process counter, NOT a timestamp: two tests calling this
+    // concurrently can tie on `SystemTime::now()` nanos and end up SHARING a
+    // directory (each then sees the other's files — a flaky count mismatch).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let d = std::env::temp_dir().join(format!(
         "mr-vol-facade-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&d).unwrap();
     d

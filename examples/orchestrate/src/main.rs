@@ -14,10 +14,15 @@
 //!    `#[modal_rust::function]` auto-I/O twin, where no input/output type is named.
 //! 2. **`.remote(..).await`** — the RUN path: the crate is uploaded and
 //!    `cargo build`-ed IN the Modal function body at invoke time, then the result
-//!    comes back typed. Requires Modal credentials.
+//!    comes back typed. Requires Modal credentials. The live legs drive the
+//!    MACRO/inventory registry (`example-add-macro`): the tooling can only generate
+//!    the frozen `modal_runner` for a `#[modal_rust::function]` crate — a
+//!    manual-registry crate like `example-add` must ship its own `modal_runner` bin
+//!    to run remotely (it deliberately doesn't; `.remote()` on it fails fast with
+//!    that hint).
 //! 3. **`App::deploy_with(..)` + `App::call(..)`** — the DEPLOY path: build once at
 //!    image-build time into a persistent app, then invoke with no rebuild. Requires
-//!    Modal credentials.
+//!    Modal credentials. Same macro registry as the RUN leg.
 //!
 //! Auth for the live paths reads `~/.modal.toml` or the `MODAL_TOKEN_ID` /
 //! `MODAL_TOKEN_SECRET` env vars directly — there is NO dependency on the `modal`
@@ -97,19 +102,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The RUN path: `App::connect(..)` then `function(..).remote(input).await`.
+/// The RUN path: `App::connect(..)` then the typed `app.add(40, 2).remote().await`.
 ///
-/// `connect_with_registry` builds a live control-plane client (reading
-/// `~/.modal.toml` / `MODAL_TOKEN_*`) and an ephemeral app. The first `.remote()`
-/// uploads the crate, builds it IN the function body, runs the real Rust `add`, and
-/// returns the typed `AddOutput` — same semantics as `.local()`.
+/// `App::connect("name").await` uses the `#[modal_rust::function]` INVENTORY
+/// registry (here: `example-add-macro`'s `add`) and builds a live control-plane
+/// client (reading `~/.modal.toml` / `MODAL_TOKEN_*`) plus an ephemeral app. The
+/// first `.remote()` uploads the crate (with a tooling-GENERATED `modal_runner`
+/// bin), builds it IN the function body, runs the real Rust `add`, and returns the
+/// typed result — same semantics as `.local()`.
 async fn run_remote() -> Result<(), Box<dyn std::error::Error>> {
-    // `App::connect("name").await` uses the inventory registry; here we pass an
-    // explicit one so the example is self-contained.
-    let app = App::connect_with_registry("modal-rust-orchestrate-run", modal_registry()).await?;
-    let out: AddOutput = app.function("add").remote(AddInput { a: 40, b: 2 }).await?;
-    println!("remote: add(40, 2) -> {{sum: {}}}", out.sum);
-    assert_eq!(out.sum, 42);
+    use example_add_macro::AddCall;
+    let app = App::connect("modal-rust-orchestrate-run").await?;
+    let sum: i64 = app.add(40, 2).remote().await?;
+    println!("remote: add(40, 2) -> {sum}");
+    assert_eq!(sum, 42);
     Ok(())
 }
 
@@ -118,8 +124,7 @@ async fn run_remote() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_deploy_and_call() -> Result<(), Box<dyn std::error::Error>> {
     // A connected App is required for both deploy and call. The connection's own app
     // name is throwaway; the deploy publishes persistently under DEPLOY_APP.
-    let app = App::connect_with_registry("modal-rust-orchestrate-deploy-driver", modal_registry())
-        .await?;
+    let app = App::connect("modal-rust-orchestrate-deploy-driver").await?;
 
     // DEPLOY: cargo build runs AT image-build time; the deployed runtime execs only
     // the prebuilt /app/modal_runner. Re-deploys REPLACE the named app.
@@ -129,12 +134,17 @@ async fn run_deploy_and_call() -> Result<(), Box<dyn std::error::Error>> {
         deployed.name, deployed.image_id
     );
 
-    // CALL: resolve by name + invoke — no upload, no build.
-    let out: AddOutput = app
-        .call(DEPLOY_APP, "add", AddInput { a: 40, b: 2 })
+    // CALL: resolve by name + invoke — no upload, no build. The wire input is the
+    // macro-generated `add::Input { a, b }`; the result decodes to the return type.
+    let sum: i64 = app
+        .call(
+            DEPLOY_APP,
+            "add",
+            example_add_macro::add::Input { a: 40, b: 2 },
+        )
         .await?;
-    println!("call: add(40, 2) -> {{sum: {}}}", out.sum);
-    assert_eq!(out.sum, 42);
+    println!("call: add(40, 2) -> {sum}");
+    assert_eq!(sum, 42);
     Ok(())
 }
 

@@ -82,6 +82,27 @@ impl RunnerTarget {
     pub fn is_runnable(&self) -> bool {
         self.is_generatable() || self.has_own_runner_bin
     }
+
+    /// The actionable message for the un-runnable case ([`Self::is_runnable`] false),
+    /// naming the crate's REAL bin(s) and both ways out. Used by the facade upload
+    /// path ([`crate::scope::workspace_closure`]) so `.remote()`/deploy fail BEFORE
+    /// uploading instead of dying remotely with cargo's confusing "no bin target
+    /// named `modal_runner`" help.
+    pub fn unrunnable_error(&self) -> String {
+        let bins = if self.bin_targets.is_empty() {
+            "none".to_string()
+        } else {
+            self.bin_targets.join(", ")
+        };
+        format!(
+            "package `{}` cannot run on Modal: it has no `modal_runner` bin and no \
+             `modal-rust` dependency to generate one from (it ships bin target(s): \
+             {bins}). Either register functions with `#[modal_rust::function]` (the \
+             tooling then generates the runner), or ship your own \
+             `src/bin/modal_runner.rs` (`modal_rust::modal_runner!(<your_crate>);`).",
+            self.package
+        )
+    }
 }
 
 // Public-API surface (re-exported by the facade `lib.rs`):
@@ -108,7 +129,10 @@ pub fn resolve_runner_target(workspace_root: &Path, package: &str) -> Option<Run
 
 /// Pure resolution over already-parsed metadata (no cargo invocation) — unit-testable.
 /// Reads the target manifest from disk ONLY for the facade-extern name.
-fn resolve_from_metadata(metadata: &scope::Metadata, package: &str) -> Option<RunnerTarget> {
+pub(crate) fn resolve_from_metadata(
+    metadata: &scope::Metadata,
+    package: &str,
+) -> Option<RunnerTarget> {
     let member_ids: std::collections::HashSet<&str> = metadata
         .workspace_members
         .iter()
