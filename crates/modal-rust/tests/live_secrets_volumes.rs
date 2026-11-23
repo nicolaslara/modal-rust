@@ -198,6 +198,25 @@ async fn probe(label: &str, app_name: &str, input: ProbeInput) -> ProbeOutput {
     );
 }
 
+/// How many fresh containers may look for the marker before the volume is judged
+/// not to have persisted it, and how long to wait between them.
+const READ_ATTEMPTS: u32 = 6;
+const READ_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// One read-only probe of the marker from a fresh container.
+async fn read_marker() -> ProbeOutput {
+    probe(
+        "READ",
+        APP_READ,
+        ProbeInput {
+            secret_key: SECRET_KEY.to_string(),
+            marker_path: MARKER_PATH.to_string(),
+            write_value: None,
+        },
+    )
+    .await
+}
+
 #[tokio::test]
 #[ignore = "live Modal secrets+volumes round-trip; run with --features live -- --ignored"]
 async fn secret_injected_and_user_volume_persists() {
@@ -251,16 +270,25 @@ async fn secret_injected_and_user_volume_persists() {
     // 2. READ call (a SEPARATE ephemeral app => a fresh container): write_value=None
     //    so it only READS the marker back. If the value persisted, the user volume is
     //    real persistent storage committed across calls (the persistence half of (b)).
-    let read_out = probe(
-        "READ",
-        APP_READ,
-        ProbeInput {
-            secret_key: SECRET_KEY.to_string(),
-            marker_path: MARKER_PATH.to_string(),
-            write_value: None,
-        },
-    )
-    .await;
+    //
+    //    A write reaches other containers once the writing container's changes are
+    //    committed, which happens in the background and at container exit, not at the
+    //    moment `.remote()` returns. Each attempt connects a new ephemeral app, so it
+    //    lands on a fresh container that mounts the latest committed state.
+    let mut read_out = read_marker().await;
+    for attempt in 2..=READ_ATTEMPTS {
+        if read_out.marker_read.as_deref() == Some(marker_value.as_str()) {
+            break;
+        }
+        eprintln!(
+            "[READ] marker not committed yet (read {:?}); attempt {attempt}/{READ_ATTEMPTS} \
+             in {}s",
+            read_out.marker_read,
+            READ_RETRY_DELAY.as_secs()
+        );
+        tokio::time::sleep(READ_RETRY_DELAY).await;
+        read_out = read_marker().await;
+    }
     assert!(
         !read_out.wrote,
         "the read call must NOT write (write_value=None)"
