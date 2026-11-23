@@ -10,7 +10,7 @@ description = "Additive proc-macro sugar for modal-rust: #[modal_rust::function]
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 # Resolve the import name of the `modal-rust` facade in the USER crate's Cargo.toml at

@@ -448,7 +448,7 @@ pub(crate) fn build_cls_method(
     // interior mutability inside the struct.
     match method.sig.inputs.first() {
         Some(FnArg::Receiver(recv)) => {
-            if recv.reference.is_none() || recv.mutability.is_some() {
+            if !matches!(recv.kind, syn::ReceiverKind::Reference(_, _, None)) {
                 return Err(syn::Error::new_spanned(
                     recv,
                     "#[method] must take `&self` in v0 (not `self` / `&mut self`): the \

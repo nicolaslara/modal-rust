@@ -19,11 +19,11 @@ name = "modal_rust_testkit"
 # decodes) and `ModalConfig` in the `modal_config()` helper.
 modal-rust-sdk = { path = "../modal-rust-sdk" }
 # Server-side tonic. `router` is REQUIRED for Server::add_service (GOTCHA 2).
-tonic       = { version = "0.14.3", default-features = false, features = ["server", "router", "transport", "codegen"] }
-tonic-prost = "0.14.3"
-prost       = "0.14.3"
-prost-types = "0.14.3"
-tokio       = { version = "1.49", features = ["full"] }
+tonic       = { version = "0.14.9", default-features = false, features = ["server", "router", "transport", "codegen"] }
+tonic-prost = "0.14.9"
+prost       = "0.14.6"
+prost-types = "0.14.6"
+tokio       = { version = "1.54", features = ["full"] }
 tokio-stream = "0.1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
@@ -32,5 +32,5 @@ serde_json  = "1"
 serde_cbor  = "0.11"
 
 [build-dependencies]
-tonic-prost-build = "0.14.3"
+tonic-prost-build = "0.14.9"
 protoc-bin-vendored = "3"

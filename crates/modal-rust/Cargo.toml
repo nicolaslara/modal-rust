@@ -23,7 +23,7 @@ default = []
 # `deploy`/`call`, `remote_envelope`/`call_envelope`, AND the offline
 # `dry_run`/`dump_deploy_manifest` dump (offline, but it compiles against SDK
 # spec/planning TYPES). The `modal-rust` CLI enables this for you.
-client = ["dep:modal-rust-sdk", "tokio/sync"]
+client = ["dep:modal-rust-sdk", "dep:base64", "tokio/sync"]
 # Opt-in live Modal round-trip test for `.remote()`. Gated so the no-CUDA CI box
 # NEVER runs it; enable locally with `--features live`. Now REQUIRES `client` (the
 # live tests do real `.remote()`/`deploy`/`connect`).
@@ -50,14 +50,15 @@ modal-rust-macros  = { path = "../modal-rust-macros", version = "0.1.0-alpha.3" 
 # pattern). The collected type is facade-owned so dispatch and control-plane metadata
 # are registered atomically.
 inventory  = "0.3"
-base64     = "0.22"
+# Encodes the run wrapper's config for the image; only the `client` paths use it.
+base64     = { version = "0.22", optional = true }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Rewrite the uploaded workspace Cargo.toml's `members`/`default-members` to the
 # cargo-metadata closure subset (preserving `[profile]` + comments) so the scoped
 # upload is a self-consistent workspace cargo can load. Format-preserving editor.
 # Used by the LIGHT scope.rs/runner_gen.rs, so it stays unconditional.
-toml_edit  = "0.22"
+toml_edit  = "0.25"
 # NON-OPTIONAL (light) because `__private::web_server_block_on` — the `#[web_server]`
 # launcher's `async fn serve(port)` driver — must exist IN-CONTAINER, where the `client`
 # feature is OFF. So the facade always carries a small `rt-multi-thread` runtime (still
@@ -73,7 +74,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 # returns `exists=true` after a PROBE, so the bytes are proven via the MountFile's
 # `sha256_hex` matching `sha256(render_runner_main(..))`. Already in the lockfile via
 # the SDK upload path; pulled in directly here only for the test.
-sha2 = "0.10"
+sha2 = "0.11"
 # The `#[cls]` macro-expansion test (tests/cls.rs) authors a `#[cls] impl` exactly as
 # a user would (`#[enter] fn load() -> anyhow::Result<Self>`), so the test target needs
 # `anyhow` directly — the SAME single-dep contract a real `#[cls]`/`#[function]` user

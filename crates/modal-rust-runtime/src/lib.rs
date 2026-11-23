@@ -2,7 +2,7 @@
 //!
 //! This crate is recompiled on **every** dev run and baked into **every** deploy
 //! image, so it keeps a minimal dependency surface (only `serde`, `serde_json`,
-//! `anyhow`, and a hand-rolled arg parser) — no Modal / network / Python deps
+//! `inventory`, and a hand-rolled arg parser) — no Modal / network / Python deps
 //! (boundaries.md §1).
 //!
 //! It provides:

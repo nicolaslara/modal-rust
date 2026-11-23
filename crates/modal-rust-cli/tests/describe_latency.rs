@@ -104,7 +104,10 @@ fn is_generatable_flip_changes_key_proof() {
         // (skip Cargo.lock + closure files — we only check the flag contributes)
         let n = dirs.len() as u64;
         h.update(n.to_le_bytes()); // placeholder for file count
-        format!("{:x}", h.finalize())
+        h.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     };
 
     let with_gen = hash_for(true);

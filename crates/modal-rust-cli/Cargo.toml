@@ -27,8 +27,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Content-address the describe MANIFEST CACHE key (describe_cache.rs): a SHA-256 over the
 # closure source + Cargo.lock + the package/path decision keys the cached `--describe`
 # manifest under <target>/.modal-rust/. Already in the lockfile via the SDK upload path.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 # Used by the describe_latency integration test for the key-change proof.
-sha2 = "0.10"
+sha2 = "0.11"

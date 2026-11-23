@@ -3,7 +3,8 @@
 //! This is the project's downstream-consumer GPU proof and is the LAST step of
 //! the Burn-free-first ordering (nvidia-smi → rust nvidia-smi → cudarc → **Burn**).
 //! It runs an element-wise tensor add `c = a + b` on the Burn **CUDA backend**
-//! (`burn_cuda::Cuda<f32, i32>`), then verifies the GPU result against a CPU
+//! (selected by the tensor's device, `Device::cuda(..)`), then verifies the GPU
+//! result against a CPU
 //! reference.
 //!
 //! Unlike M12 (cudarc + a precompiled PTX kernel through the Driver API, Tier 0),
@@ -15,7 +16,7 @@
 //! `nvidia-cuda-runtime-cu12`).
 //!
 //! Pinned version set (pinned TOGETHER; recorded in Cargo.lock):
-//!   burn 0.21 + burn-cuda 0.21 → cubecl 0.10 (cuda) → cubecl-cuda 0.10
+//!   burn 0.22 (`cuda` feature) → cubecl 0.11 (cuda) → cubecl-cuda 0.11
 //!     → cudarc ^0.19 (fallback-dynamic-loading + fallback-latest).
 //!
 //! Because dynamic loading hides a missing lib until first use, a **hard startup
@@ -28,11 +29,7 @@
 // dependency is the `modal-rust` facade — no direct `modal-rust-runtime` / `inventory`.
 extern crate modal_rust_facade as modal_rust;
 
-use burn_cuda::{Cuda, CudaDevice};
 use serde::{Deserialize, Serialize};
-
-/// The Burn CUDA backend (CubeCL → cubecl-cuda → cudarc). f32 floats, i32 ints.
-type CudaBackend = Cuda<f32, i32>;
 
 /// Input for `burn_add` (M13). The runner argument is always a single named JSON
 /// object (boundaries.md §3); `n` is the number of elements in each 1-D tensor.
@@ -78,7 +75,7 @@ fn tier1_self_check() -> anyhow::Result<(String, String)> {
         for name in candidates {
             // SAFETY: we only open the library to prove it is loadable, and drop
             // the handle immediately; we never call into it here.
-            match unsafe { libloading::Library::new(name) } {
+            match unsafe { libloading::Library::new(*name) } {
                 Ok(_lib) => return Ok((*name).to_string()),
                 Err(e) => errors.push(format!("{name}: {e}")),
             }
@@ -136,7 +133,7 @@ fn tier1_self_check() -> anyhow::Result<(String, String)> {
     image = Image(base = "nvidia/cuda:12.6.3-devel-ubuntu22.04", install_rust = true)
 )]
 pub fn burn_add(input: BurnAddInput) -> anyhow::Result<BurnAddOutput> {
-    use burn::tensor::{Tensor, TensorData};
+    use burn::tensor::{Device, DeviceIndex, Tensor, TensorData};
 
     let n = input.n;
     if n == 0 {
@@ -151,19 +148,20 @@ pub fn burn_add(input: BurnAddInput) -> anyhow::Result<BurnAddOutput> {
     let b_host: Vec<f32> = (0..n).map(|i| (i as f32) * 2.0).collect();
     let cpu_ref: Vec<f32> = a_host.iter().zip(&b_host).map(|(x, y)| x + y).collect();
 
-    // Initialize the CUDA backend device. `CudaDevice::default()` is device 0 and
-    // triggers CubeCL's runtime init (which dlopens cudarc/NVRTC under the hood).
-    let device = CudaDevice::default();
+    // Select the CUDA device (CubeCL → cubecl-cuda → cudarc). The default index is
+    // device 0; creating the first tensor on it triggers CubeCL's runtime init
+    // (which dlopens cudarc/NVRTC under the hood).
+    let device = Device::cuda(DeviceIndex::Default);
 
     // Build the two GPU tensors and add them ON THE GPU.
-    let a = Tensor::<CudaBackend, 1>::from_data(TensorData::from(a_host.as_slice()), &device);
-    let b = Tensor::<CudaBackend, 1>::from_data(TensorData::from(b_host.as_slice()), &device);
+    let a = Tensor::<1>::from_data(TensorData::from(a_host.as_slice()), &device);
+    let b = Tensor::<1>::from_data(TensorData::from(b_host.as_slice()), &device);
     let c = a + b; // element-wise add, dispatched to a CubeCL CUDA kernel.
 
     // Pull the GPU result back to the host as f32.
     let c_data = c.into_data();
     let c_host: Vec<f32> = c_data
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .map_err(|e| anyhow::anyhow!("failed to read GPU tensor data back to host: {e:?}"))?;
 
     // Element-wise verification vs the CPU reference.

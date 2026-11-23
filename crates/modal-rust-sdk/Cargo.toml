@@ -22,18 +22,18 @@ live = []
 # /etc/ssl/certs, so the in-container client (Dict/Queue handles inside a
 # `#[function]` body) needs the bundled Mozilla roots to reach api.modal.com —
 # the Python client gets this for free via certifi.
-tonic = { version = "0.14.3", default-features = false, features = ["channel", "transport", "tls-native-roots", "tls-webpki-roots", "tls-ring", "codegen"] }
-tonic-prost = "0.14.3"
-prost = "0.14.3"
-prost-types = "0.14.3"
+tonic = { version = "0.14.9", default-features = false, features = ["channel", "transport", "tls-native-roots", "tls-webpki-roots", "tls-ring", "codegen"] }
+tonic-prost = "0.14.9"
+prost = "0.14.6"
+prost-types = "0.14.6"
 # Runtime + serialization
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_cbor = "0.11"            # MATCH modal-rs cbor.rs codec
 serde-pickle = "1.2"           # Dict/Queue value codec: Python-pickle interop (src/pickle.rs)
-toml = "0.9"                   # parse ~/.modal.toml
+toml = "1.2"                   # parse ~/.modal.toml
 base64 = "0.22"               # bake wrapper source into dockerfile_commands
-sha2 = "0.10"                 # content hashing for mounts/images
+sha2 = "0.11"                 # content hashing for mounts/images
 anyhow = "1"                  # ops-level error context (NOT the public error type — see error.rs)
 walkdir = "2"                 # recursive local-dir walk with early directory pruning (mount upload)
 ignore = "0.4"                # ripgrep's gitignore engine: .modalignore/.gitignore/defaults resolution (mount upload)
@@ -47,11 +47,11 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
-tonic-prost-build = "0.14.3"
+tonic-prost-build = "0.14.9"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
-tokio = { version = "1.49", features = ["full", "test-util"] }
+tokio = { version = "1.54", features = ["full", "test-util"] }
 serde_json = "1"
 # In-process Modal gRPC mock backend (dev/test-only; never shipped). Used by
 # tests/mock_ops.rs to round-trip the SDK client against the mock offline. This is
