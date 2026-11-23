@@ -239,9 +239,15 @@ macro_rules! typed {
                     // in scope for the fallback; the inherent method needs no import.
                     // When the handler's error is `Serialize`, the inherent method is
                     // chosen and this import is (expectedly) unused.
+                    //
+                    // The error is wrapped BY REFERENCE. An uninhabited error type
+                    // (`Infallible`, i.e. `!`) passed by value coerces to an unconstrained
+                    // type at the call, which defeats the bound-driven selection; a
+                    // reference does not coerce, and `&E` is `Display`/`Serialize`
+                    // exactly when `E` is, with identical output.
                     #[allow(unused_imports)]
                     use $crate::__macro_support::FunctionErrorOpaque as _;
-                    ::core::result::Result::Err($crate::__macro_support::Wrap(e).to_runner_error())
+                    ::core::result::Result::Err($crate::__macro_support::Wrap(&e).to_runner_error())
                 }
             }
         }
