@@ -1,7 +1,7 @@
 //! Live, best-effort `.remote()` proof — the payoff for the RUN path.
 //!
 //! Drives the facade end-to-end against REAL Modal: `App::connect` →
-//! `app.function("add").remote(AddInput{a:40,b:2})` → `AddOutput{sum:42}`, built
+//! `app.function("add").remote(add::Input{a:40,b:2})` → `42`, built
 //! from the user's REAL Rust `add` (NOT an echo) via `cargo build` IN THE FUNCTION
 //! BODY (the run boundary). NO modal CLI, NO per-project `.py`.
 //!
@@ -20,10 +20,14 @@
 
 use std::time::Duration;
 
-use example_add::{modal_registry, AddInput, AddOutput};
+use example_add_macro::add;
 use modal_rust::{App, Error};
 
 const APP_NAME: &str = "modal-rust-live-remote";
+/// The cargo package the facade uploads and builds in the function body. `add` is
+/// registered by `example-add-macro`; the facade's default package ships no
+/// `modal_runner`, so the package must be named.
+const PACKAGE: &str = "example-add-macro";
 
 /// Treat transport blips and known transient gRPC messages as retryable. Delegates
 /// to the SDK's own classifier (which inspects the tonic `Code` + message) so the
@@ -45,7 +49,7 @@ async fn remote_real_add_returns_42() {
         match round_trip().await {
             Ok(out) => {
                 println!("LIVE OK: add(40,2).remote() = {out:?}");
-                assert_eq!(out.sum, 42, "real Rust add must compute 42, not echo");
+                assert_eq!(out, 42, "real Rust add must compute 42, not echo");
                 return;
             }
             Err(err) => {
@@ -65,9 +69,8 @@ async fn remote_real_add_returns_42() {
     );
 }
 
-async fn round_trip() -> Result<AddOutput, Error> {
-    // Use the explicit registry so the test is self-contained (example-add is a
-    // dev-dependency; inventory would also work but this is unambiguous).
-    let app = App::connect_with_registry(APP_NAME, modal_registry()).await?;
-    app.function("add").remote(AddInput { a: 40, b: 2 }).await
+async fn round_trip() -> Result<i64, Error> {
+    std::env::set_var("MODAL_RUST_PACKAGE", PACKAGE);
+    let app = App::connect(APP_NAME).await?;
+    app.function("add").remote(add::Input { a: 40, b: 2 }).await
 }

@@ -10,7 +10,7 @@
 //!   2. WARM: a SECOND fresh ephemeral app (=> a fresh container, so warm-container
 //!      `_MARKER` reuse can't mask the test) finds + UNPACKS the archive
 //!      (`[cache] WARM`), so cargo sees a warm CARGO_HOME and the build is faster.
-//!   3. Both runs return the CORRECT result (`{sum:42}`) — a cache miss only costs
+//!   3. Both runs return the CORRECT result (`42`) — a cache miss only costs
 //!      time, NEVER changes the result.
 //!
 //! Client-side wall-clock of each `.remote()` round-trip is the headline timing
@@ -35,7 +35,7 @@
 
 use std::time::{Duration, Instant};
 
-use example_add::{modal_registry, AddInput, AddOutput};
+use example_add_macro::add;
 use modal_rust::{App, Error};
 
 /// COLD app: first run after a volume reset (no archive => packs one).
@@ -43,6 +43,10 @@ const COLD_APP: &str = "modal-rust-live-cache-cold";
 /// WARM app: a SEPARATE ephemeral app => a fresh container that unpacks the archive
 /// the COLD run packed (so warm-container `_MARKER` reuse can't mask the win).
 const WARM_APP: &str = "modal-rust-live-cache-warm";
+/// The cargo package the facade uploads and builds in the function body. `add` is
+/// registered by `example-add-macro`; the facade's default package ships no
+/// `modal_runner`, so the package must be named.
+const PACKAGE: &str = "example-add-macro";
 
 fn is_transient(err: &Error) -> bool {
     match err {
@@ -52,14 +56,15 @@ fn is_transient(err: &Error) -> bool {
 }
 
 /// One timed `.remote()` round-trip on `app_name`, retrying only transient errors.
-async fn timed_remote(label: &str, app_name: &str) -> (AddOutput, Duration) {
+async fn timed_remote(label: &str, app_name: &str) -> (i64, Duration) {
+    std::env::set_var("MODAL_RUST_PACKAGE", PACKAGE);
     let attempts = 4u32;
     let mut last: Option<Error> = None;
     for attempt in 1..=attempts {
         let started = Instant::now();
         let res = async {
-            let app = App::connect_with_registry(app_name, modal_registry()).await?;
-            app.function("add").remote(AddInput { a: 40, b: 2 }).await
+            let app = App::connect(app_name).await?;
+            app.function("add").remote(add::Input { a: 40, b: 2 }).await
         }
         .await;
         match res {
@@ -95,7 +100,7 @@ async fn timed_remote(label: &str, app_name: &str) -> (AddOutput, Duration) {
 async fn cache_cold_run_builds_and_packs() {
     let (out, elapsed) = timed_remote("COLD", COLD_APP).await;
     assert_eq!(
-        out.sum, 42,
+        out, 42,
         "cold run must compute the correct result (42), not depend on cache"
     );
     println!("COLD_SECONDS={:.1}", elapsed.as_secs_f64());
@@ -108,7 +113,7 @@ async fn cache_cold_run_builds_and_packs() {
 #[ignore = "live P6 cache WARM run; run AFTER the cold test; run with --features live -- --ignored"]
 async fn cache_warm_run_reuses_archive() {
     let (out, elapsed) = timed_remote("WARM", WARM_APP).await;
-    assert_eq!(out.sum, 42, "warm run must compute the correct result (42)");
+    assert_eq!(out, 42, "warm run must compute the correct result (42)");
     println!("WARM_SECONDS={:.1}", elapsed.as_secs_f64());
 }
 
@@ -125,7 +130,7 @@ async fn cache_opt_out_attaches_no_volume() {
     );
     let (out, elapsed) = timed_remote("OPTOUT", "modal-rust-live-cache-optout").await;
     assert_eq!(
-        out.sum, 42,
+        out, 42,
         "opt-out run must still compute the correct result (42)"
     );
     println!("OPTOUT_SECONDS={:.1}", elapsed.as_secs_f64());

@@ -4,7 +4,7 @@
 //! the `.remote()` path proves.
 //!
 //! - `spawn` enqueues ONE input and returns a `FunctionCall` handle IMMEDIATELY;
-//!   `get` polls that call's single output later → `AddOutput{sum:42}`.
+//!   `get` polls that call's single output later → `42`.
 //! - `map` fans out N inputs under one map call and collects the N outputs in INPUT
 //!   ORDER (the idx reassembly), running across containers in parallel.
 //!
@@ -23,11 +23,15 @@
 
 use std::time::Duration;
 
-use example_add::{modal_registry, AddInput, AddOutput};
+use example_add_macro::add;
 use modal_rust::{App, Error};
 
 const SPAWN_APP: &str = "modal-rust-live-spawn";
 const MAP_APP: &str = "modal-rust-live-map";
+/// The cargo package the facade uploads and builds in the function body. `add` is
+/// registered by `example-add-macro`; the facade's default package ships no
+/// `modal_runner`, so the package must be named.
+const PACKAGE: &str = "example-add-macro";
 
 /// Treat transport blips and known transient gRPC messages as retryable. Delegates
 /// to the SDK's own classifier so the test and the SDK agree on what is transient.
@@ -68,14 +72,18 @@ where
 #[tokio::test]
 #[ignore = "live Modal .spawn()/.get() round-trip; run with --features live -- --ignored"]
 async fn spawn_then_get_returns_42() {
-    let out: AddOutput = retry("spawn->get", 4, spawn_get_round_trip).await;
+    let out: i64 = retry("spawn->get", 4, spawn_get_round_trip).await;
     println!("LIVE OK: add(40,2).spawn().get() = {out:?}");
-    assert_eq!(out.sum, 42, "real Rust add must compute 42, not echo");
+    assert_eq!(out, 42, "real Rust add must compute 42, not echo");
 }
 
-async fn spawn_get_round_trip() -> Result<AddOutput, Error> {
-    let app = App::connect_with_registry(SPAWN_APP, modal_registry()).await?;
-    let fc = app.function("add").spawn(AddInput { a: 40, b: 2 }).await?;
+async fn spawn_get_round_trip() -> Result<i64, Error> {
+    std::env::set_var("MODAL_RUST_PACKAGE", PACKAGE);
+    let app = App::connect(SPAWN_APP).await?;
+    let fc = app
+        .function("add")
+        .spawn(add::Input { a: 40, b: 2 })
+        .await?;
     println!("[spawn->get] function_call_id = {}", fc.function_call_id());
     // The spawned input pays the cold in-body `cargo build`; the default `get`
     // deadline (wrapper timeout + buffer) covers it.
@@ -85,8 +93,7 @@ async fn spawn_get_round_trip() -> Result<AddOutput, Error> {
 #[tokio::test]
 #[ignore = "live Modal .map() fan-out (ordered); run with --features live -- --ignored"]
 async fn map_returns_outputs_in_input_order() {
-    let outs: Vec<AddOutput> = retry("map", 4, map_round_trip).await;
-    let sums: Vec<i64> = outs.iter().map(|o| o.sum).collect();
+    let sums: Vec<i64> = retry("map", 4, map_round_trip).await;
     println!("LIVE OK: add.map([1+1, 2+2, 3+3, 40+2]) = {sums:?}");
     // Proves INPUT ORDER (not completion order) — the idx reassembly. The last
     // input's much larger sum (42) is a distinct value, so a misordered collect
@@ -94,13 +101,14 @@ async fn map_returns_outputs_in_input_order() {
     assert_eq!(sums, vec![2, 4, 6, 42], "map must preserve input order");
 }
 
-async fn map_round_trip() -> Result<Vec<AddOutput>, Error> {
-    let app = App::connect_with_registry(MAP_APP, modal_registry()).await?;
+async fn map_round_trip() -> Result<Vec<i64>, Error> {
+    std::env::set_var("MODAL_RUST_PACKAGE", PACKAGE);
+    let app = App::connect(MAP_APP).await?;
     let inputs = vec![
-        AddInput { a: 1, b: 1 },
-        AddInput { a: 2, b: 2 },
-        AddInput { a: 3, b: 3 },
-        AddInput { a: 40, b: 2 },
+        add::Input { a: 1, b: 1 },
+        add::Input { a: 2, b: 2 },
+        add::Input { a: 3, b: 3 },
+        add::Input { a: 40, b: 2 },
     ];
     app.function("add").map(inputs).await
 }

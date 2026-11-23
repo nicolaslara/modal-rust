@@ -3,7 +3,7 @@
 //! Drives the facade end-to-end against REAL Modal:
 //!   `App::connect` → `app.deploy()` (source COPYed into an image LAYER; `cargo
 //!   build --release` runs AT IMAGE-BUILD time) → `app.call("modal-rust-add-deploy",
-//!   "add", AddInput{40,2})` → `AddOutput{sum:42}` — the deployed runtime execs ONLY
+//!   "add", add::Input{40,2})` → `42` — the deployed runtime execs ONLY
 //!   the prebuilt `/app/modal_runner` (NO cargo, NO source mount, NO build at call
 //!   time). Built from the user's REAL Rust `add` (NOT an echo).
 //!
@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use example_add::{modal_registry, AddInput, AddOutput};
+use example_add_macro::add;
 use modal_rust::{App, DeployConfig, Error};
 
 /// STABLE deploy app name: re-runs REPLACE this deploy (no accumulation), and the
@@ -34,6 +34,10 @@ const DEPLOY_APP: &str = "modal-rust-add-deploy";
 /// A separate ephemeral connect name for the client (the deploy publishes under
 /// `DEPLOY_APP` regardless; this is just the connection's throwaway app).
 const CONNECT_APP: &str = "modal-rust-live-deploy-driver";
+/// The cargo package the facade uploads and builds in the function body. `add` is
+/// registered by `example-add-macro`; the facade's default package ships no
+/// `modal_runner`, so the package must be named.
+const PACKAGE: &str = "example-add-macro";
 
 /// Treat transport blips and known transient gRPC messages as retryable.
 fn is_transient(err: &Error) -> bool {
@@ -53,7 +57,7 @@ async fn deploy_then_call_real_add_returns_42() {
         match deploy_and_call().await {
             Ok(out) => {
                 println!("LIVE OK: deploy + call('add', 40, 2) = {out:?}");
-                assert_eq!(out.sum, 42, "real Rust add must compute 42, not echo");
+                assert_eq!(out, 42, "real Rust add must compute 42, not echo");
                 return;
             }
             Err(err) => {
@@ -73,8 +77,9 @@ async fn deploy_then_call_real_add_returns_42() {
     );
 }
 
-async fn deploy_and_call() -> Result<AddOutput, Error> {
-    let app = App::connect_with_registry(CONNECT_APP, modal_registry()).await?;
+async fn deploy_and_call() -> Result<i64, Error> {
+    std::env::set_var("MODAL_RUST_PACKAGE", PACKAGE);
+    let app = App::connect(CONNECT_APP).await?;
 
     // 1. DEPLOY (persistent): build the deploy image (cargo build AT image-build
     //    time — the build logs stream the `Compiling`/`cargo build --release`
@@ -89,6 +94,6 @@ async fn deploy_and_call() -> Result<AddOutput, Error> {
 
     // 2. CALL (no upload, no build): resolve from_name + invoke. The deployed
     //    runtime execs the prebuilt /app/modal_runner; cargo never runs here.
-    app.call::<_, AddOutput>(DEPLOY_APP, "add", AddInput { a: 40, b: 2 })
+    app.call::<_, i64>(DEPLOY_APP, "add", add::Input { a: 40, b: 2 })
         .await
 }
