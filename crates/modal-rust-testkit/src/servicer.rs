@@ -349,6 +349,24 @@ impl ModalClient for MockServicer {
         Ok(Response::new(gen::FunctionPutInputsResponse { inputs }))
     }
 
+    /// A client-driven retry of a SYNC call's inputs: record the request and hand
+    /// back one fresh JWT per retried input, as the real server does.
+    async fn function_retry_inputs(
+        &self,
+        request: Request<gen::FunctionRetryInputsRequest>,
+    ) -> Result<Response<gen::FunctionRetryInputsResponse>, Status> {
+        let req = request.into_inner();
+        let input_jwts = req
+            .inputs
+            .iter()
+            .map(|item| format!("{}-retried", item.input_jwt))
+            .collect();
+        self.log.push(RecordedRequest::FunctionRetryInputs(req));
+        Ok(Response::new(gen::FunctionRetryInputsResponse {
+            input_jwts,
+        }))
+    }
+
     /// Invoke step 3: return ONE terminal SUCCESS output whose data is the CBOR of
     /// the runner ENVELOPE STRING (`R = String`) — exactly what `.remote()` decodes.
     /// The envelope content comes from the configured [`Responses`] (echo the input
@@ -824,7 +842,6 @@ impl ModalClient for MockServicer {
     unary function_get_time_range_stats(gen::FunctionGetTimeRangeStatsRequest) -> gen::FunctionGetTimeRangeStatsResponse;
     unary function_list_variants(gen::FunctionListVariantsRequest) -> gen::FunctionListVariantsResponse;
     unary function_put_outputs(gen::FunctionPutOutputsRequest) -> ();
-    unary function_retry_inputs(gen::FunctionRetryInputsRequest) -> gen::FunctionRetryInputsResponse;
     unary function_start_pty_shell(()) -> ();
     unary function_update_scheduling_params(gen::FunctionUpdateSchedulingParamsRequest) -> gen::FunctionUpdateSchedulingParamsResponse;
     unary image_build_chain_get(gen::ImageBuildChainGetRequest) -> gen::ImageBuildChainGetResponse;

@@ -19,6 +19,7 @@ use std::future::Future;
 
 use crate::client::{ModalClient, ModalClientStub};
 use crate::error::{Error, Result};
+use crate::ops::input_retry::ClientRetries;
 use crate::ops::invoke::{
     build_function_get_outputs_request, build_function_map_request,
     build_function_put_inputs_request,
@@ -27,6 +28,13 @@ use crate::proto::api::{
     FunctionCallInvocationType, FunctionCallType, FunctionGetOutputsResponse, FunctionPutInputsItem,
 };
 use crate::retry::retry_unary;
+
+/// A call the server accepted, with one input enqueued.
+pub(crate) struct EnqueuedCall {
+    pub function_call_id: String,
+    /// Set when the server delegates this call's retries to the client.
+    pub client_retries: Option<ClientRetries>,
+}
 
 impl ModalClient {
     /// Issue ONE unary control-plane RPC with the standard transient-retry wrapping.
@@ -61,7 +69,8 @@ impl ModalClient {
 
     /// Open a UNARY `FunctionMap` with `item` pipelined, then — fix #3 — fall back to
     /// `FunctionPutInputs` when the server did NOT echo the input back (it was not
-    /// enqueued). Returns the call's `function_call_id`. Shared by `.remote()`
+    /// enqueued). Returns the call's `function_call_id` and, when the server
+    /// delegates retries to the client, the context to retry with. Shared by `.remote()`
     /// ([`invoke_raw`](ModalClient::invoke_raw)) and `.spawn()`
     /// ([`spawn_raw`](ModalClient::spawn_raw)); `invocation_type` distinguishes them
     /// (`Sync` vs `Async`).
@@ -77,7 +86,7 @@ impl ModalClient {
         function_id: &str,
         invocation_type: FunctionCallInvocationType,
         item: FunctionPutInputsItem,
-    ) -> Result<String> {
+    ) -> Result<EnqueuedCall> {
         // Step 1 — FunctionMap (UNARY) with the input pipelined.
         let map_req = build_function_map_request(
             function_id,
@@ -100,22 +109,36 @@ impl ModalClient {
 
         // Step 2 — fix #3: if the input was NOT pipelined (echoed back), enqueue it.
         // The item carries idx/function_call_id so the server can dedup within a call.
-        if map.pipelined_inputs.is_empty() {
-            let put_req =
-                build_function_put_inputs_request(function_id, &function_call_id, vec![item]);
-            let put = self
-                .retry_rpc("function_put_inputs", put_req, |mut stub, req| async move {
-                    stub.function_put_inputs(req).await
-                })
-                .await?;
-            if put.inputs.is_empty() {
-                return Err(Error::build(
-                    "FunctionPutInputs accepted no inputs (input queue full?)".to_string(),
-                ));
+        let input = item.input.clone();
+        let accepted = match map.pipelined_inputs.into_iter().next() {
+            Some(accepted) => accepted,
+            None => {
+                let put_req =
+                    build_function_put_inputs_request(function_id, &function_call_id, vec![item]);
+                let put = self
+                    .retry_rpc("function_put_inputs", put_req, |mut stub, req| async move {
+                        stub.function_put_inputs(req).await
+                    })
+                    .await?;
+                put.inputs.into_iter().next().ok_or_else(|| {
+                    Error::build(
+                        "FunctionPutInputs accepted no inputs (input queue full?)".to_string(),
+                    )
+                })?
             }
-        }
+        };
 
-        Ok(function_call_id)
+        let client_retries = ClientRetries::for_call(
+            map.sync_client_retries_enabled,
+            map.retry_policy,
+            map.function_call_jwt,
+            accepted.input_jwt,
+            input,
+        );
+        Ok(EnqueuedCall {
+            function_call_id,
+            client_retries,
+        })
     }
 
     /// Long-poll ONE `FunctionGetOutputs` window for `function_call_id`, advancing
@@ -126,6 +149,8 @@ impl ModalClient {
     /// `max_values` bounds the batch (1 for a single `.remote()`/indexed get, N for a
     /// `map` collect); `index` filters to a specific output ordinal
     /// (`start_idx == end_idx == index`) or `None` for the next unfiltered output.
+    /// `input_jwts` names the inputs the client expects the server to be running
+    /// (client-retried SYNC calls only; empty otherwise).
     /// The caller owns the deadline loop and the per-output decode; this isolates the
     /// shared cursor + window + retry mechanics common to
     /// [`poll_outputs_indexed`](ModalClient::poll_outputs_indexed) and
@@ -136,13 +161,15 @@ impl ModalClient {
         max_values: i32,
         last_entry_id: &mut String,
         index: Option<i32>,
+        input_jwts: &[String],
     ) -> Result<FunctionGetOutputsResponse> {
-        let req = build_function_get_outputs_request(
+        let mut req = build_function_get_outputs_request(
             function_call_id,
             max_values,
             last_entry_id.clone(),
             index,
         );
+        req.input_jwts = input_jwts.to_vec();
         let resp = self
             .retry_rpc("function_get_outputs", req, |mut stub, req| async move {
                 stub.function_get_outputs(req).await

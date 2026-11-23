@@ -24,12 +24,14 @@ use serde::Serialize;
 use crate::client::ModalClient;
 use crate::codec;
 use crate::error::{Error, Result};
+use crate::ops::input_retry::{build_function_retry_inputs_request, ClientRetries, RetryDelays};
 use crate::ops::{describe_failure, result_status, ResultState};
 use crate::proto::api::function_input::ArgsOneof;
-use crate::proto::api::generic_result::DataOneof;
+use crate::proto::api::generic_result::{DataOneof, GenericStatus};
 use crate::proto::api::{
     DataFormat, FunctionCallInvocationType, FunctionCallType, FunctionGetOutputsRequest,
     FunctionInput, FunctionMapRequest, FunctionPutInputsItem, FunctionPutInputsRequest,
+    GenericResult,
 };
 
 /// Per-poll timeout (seconds) for `FunctionGetOutputs` long-poll reconnects.
@@ -222,13 +224,23 @@ impl ModalClient {
         // FunctionPutInputs fallback when the server did not enqueue it. See
         // [`ModalClient::enqueue_pipelined`] for the shared sequence + the
         // double-enqueue caveat (idempotent `add`; poll reads exactly ONE output).
-        let function_call_id = self
+        let call = self
             .enqueue_pipelined(function_id, FunctionCallInvocationType::Sync, item)
             .await?;
 
-        // Step 3 — poll FunctionGetOutputs until the result arrives.
-        self.poll_outputs_indexed(&function_call_id, None, deadline)
-            .await
+        // Step 3 — poll FunctionGetOutputs until the result arrives. When the server
+        // delegated this call's retries to the client, failed attempts are retried
+        // here first.
+        match call.client_retries {
+            None => {
+                self.poll_outputs_indexed(&call.function_call_id, None, deadline)
+                    .await
+            }
+            Some(retries) => {
+                self.poll_with_client_retries(&call.function_call_id, &retries, deadline)
+                    .await
+            }
+        }
     }
 
     /// Long-poll `FunctionGetOutputs` (api.proto:4247), advancing `last_entry_id`,
@@ -249,7 +261,88 @@ impl ModalClient {
     ) -> Result<Invocation> {
         let started = std::time::Instant::now();
         let mut last_entry_id = LAST_ENTRY_ID_INITIAL.to_string();
+        let (result, data_format) = self
+            .next_output(
+                function_call_id,
+                index,
+                &[],
+                started,
+                deadline,
+                &mut last_entry_id,
+            )
+            .await?;
+        into_invocation(result, data_format)
+    }
 
+    /// Wait for a SYNC call's result, retrying its input the way the official client
+    /// does when the server delegates retries (`_Invocation.run_function`):
+    ///
+    /// - `SUCCESS` and `TERMINATED` end the call.
+    /// - `INTERNAL_FAILURE` (the server lost the input, or its worker was preempted)
+    ///   is retried at once and does not use up the policy's retries.
+    /// - Any other failure waits out the policy's next delay and is retried, until
+    ///   the policy's retries are used up; then that failure is the call's result.
+    ///
+    /// `deadline` bounds the whole call, every attempt and wait included.
+    async fn poll_with_client_retries(
+        &mut self,
+        function_call_id: &str,
+        retries: &ClientRetries,
+        deadline: Duration,
+    ) -> Result<Invocation> {
+        let started = std::time::Instant::now();
+        let mut last_entry_id = LAST_ENTRY_ID_INITIAL.to_string();
+        let expected = [retries.input_jwt.clone()];
+        let mut delays = RetryDelays::new(retries.policy);
+
+        loop {
+            let (result, data_format) = self
+                .next_output(
+                    function_call_id,
+                    Some(0),
+                    &expected,
+                    started,
+                    deadline,
+                    &mut last_entry_id,
+                )
+                .await?;
+
+            let status = GenericStatus::try_from(result.status).unwrap_or(GenericStatus::Failure);
+            if matches!(status, GenericStatus::Success | GenericStatus::Terminated) {
+                return into_invocation(result, data_format);
+            }
+            if status != GenericStatus::InternalFailure {
+                match delays.next_delay() {
+                    // A retry that could not start before the deadline is not worth
+                    // waiting for: the failure in hand is the call's result.
+                    Some(delay) if started.elapsed() + delay <= deadline => {
+                        tokio::time::sleep(delay).await;
+                    }
+                    _ => return into_invocation(result, data_format),
+                }
+            }
+
+            let req = build_function_retry_inputs_request(retries);
+            self.retry_rpc("function_retry_inputs", req, |mut stub, req| async move {
+                stub.function_retry_inputs(req).await
+            })
+            .await?;
+        }
+    }
+
+    /// Long-poll until the call has an output whose result is finished, and return
+    /// that result undecoded. `input_jwts` is passed through to the poll (see
+    /// [`ModalClient::poll_one_output`]). Gives up once `deadline` has passed since
+    /// `started`.
+    async fn next_output(
+        &mut self,
+        function_call_id: &str,
+        index: Option<i32>,
+        input_jwts: &[String],
+        started: std::time::Instant,
+        deadline: Duration,
+        last_entry_id: &mut String,
+    ) -> Result<(GenericResult, DataFormat)> {
         loop {
             if started.elapsed() > deadline {
                 return Err(Error::deadline(format!(
@@ -262,7 +355,7 @@ impl ModalClient {
             // single poll window rather than failing the whole invoke (analogous to
             // the image-build poll reconnect). The shared helper advances the cursor.
             let resp = self
-                .poll_one_output(function_call_id, 1, &mut last_entry_id, index)
+                .poll_one_output(function_call_id, 1, last_entry_id, index, input_jwts)
                 .await?;
 
             if let Some(item) = resp.outputs.into_iter().next() {
@@ -279,32 +372,10 @@ impl ModalClient {
                 let result = item.result.ok_or_else(|| {
                     Error::build("FunctionGetOutputs item had no result".to_string())
                 })?;
-
-                match result_status(Some(&result)) {
-                    ResultState::Success => {
-                        let data = match result.data_oneof {
-                            Some(DataOneof::Data(bytes)) => bytes,
-                            Some(DataOneof::DataBlobId(_)) => {
-                                return Err(Error::build(
-                                    "function returned a blob result; blob fetch is not yet \
-                                     implemented (inline results only for now)"
-                                        .to_string(),
-                                ));
-                            }
-                            None => Vec::new(),
-                        };
-                        return Ok(Invocation { data, data_format });
-                    }
-                    ResultState::Failure(status) => {
-                        return Err(Error::build(describe_failure(
-                            "function call",
-                            status,
-                            &result,
-                        )));
-                    }
-                    // A finished output with UNSPECIFIED status is unexpected; treat
-                    // as pending and keep polling rather than mis-decoding.
-                    ResultState::Pending => {}
+                // A finished output with UNSPECIFIED status is unexpected; treat as
+                // pending and keep polling rather than mis-decoding.
+                if result_status(Some(&result)) != ResultState::Pending {
+                    return Ok((result, data_format));
                 }
             }
             // No output this window (and num_unfinished_inputs > 0) — keep polling.
@@ -364,7 +435,8 @@ impl ModalClient {
         // [`ModalClient::enqueue_pipelined`] for the double-enqueue caveat.
         let function_call_id = self
             .enqueue_pipelined(function_id, FunctionCallInvocationType::Async, item)
-            .await?;
+            .await?
+            .function_call_id;
 
         // Step 3 — return the call id. Do NOT poll (fire-and-forget).
         Ok(function_call_id)
@@ -448,7 +520,7 @@ impl ModalClient {
             // Same long-poll window + cursor advance + transient retry as
             // `poll_outputs_indexed`, but batched (max_values = N) and unfiltered.
             let resp = self
-                .poll_one_output(&function_call_id, n as i32, &mut last_entry_id, None)
+                .poll_one_output(&function_call_id, n as i32, &mut last_entry_id, None, &[])
                 .await?;
 
             for item in resp.outputs {
@@ -603,6 +675,35 @@ impl ModalClient {
 ///
 /// Returns an error (rather than panicking) if any index in `0..n` is missing — a
 /// defensive guard; `map_cbor` only calls this once `got.len() == n`.
+/// Turn a finished result into the call's [`Invocation`], or the error a failed
+/// result stands for.
+fn into_invocation(result: GenericResult, data_format: DataFormat) -> Result<Invocation> {
+    match result_status(Some(&result)) {
+        ResultState::Success => {
+            let data = match result.data_oneof {
+                Some(DataOneof::Data(bytes)) => bytes,
+                Some(DataOneof::DataBlobId(_)) => {
+                    return Err(Error::build(
+                        "function returned a blob result; blob fetch is not yet \
+                         implemented (inline results only for now)"
+                            .to_string(),
+                    ));
+                }
+                None => Vec::new(),
+            };
+            Ok(Invocation { data, data_format })
+        }
+        ResultState::Failure(status) => Err(Error::build(describe_failure(
+            "function call",
+            status,
+            &result,
+        ))),
+        ResultState::Pending => Err(Error::build(
+            "function call output had no finished result".to_string(),
+        )),
+    }
+}
+
 fn reassemble_in_order<R>(mut got: std::collections::BTreeMap<i32, R>, n: usize) -> Result<Vec<R>> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
