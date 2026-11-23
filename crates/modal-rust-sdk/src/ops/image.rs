@@ -16,8 +16,9 @@
 //!    the client mount — NO apt, NO build step. It is attached as the image build
 //!    CONTEXT (`Image.context_mount_id`); the rendered Dockerfile then emits the
 //!    client-blessed `_registry_setup_commands` add_python branch
-//!    (_image.py:2041-2059): `COPY /python/. /usr/local`, an auto
-//!    `RUN ln -s /usr/local/bin/python3 /usr/local/bin/python` for series < 3.13
+//!    (_image.py): `COPY /python/. /usr/local`, an auto
+//!    `RUN ln -s /usr/local/bin/python3 /usr/local/bin/python` when the standalone
+//!    release the image builder version installs ships no `python` binary
 //!    (the client-equivalent of `python-is-python3`, but a symlink against the
 //!    standalone install — NOT an apt package), and `ENV TERMINFO_DIRS=…`. A
 //!    standalone interpreter is relocatable and is NOT PEP-668 externally-managed,
@@ -122,6 +123,34 @@ mod tests {
             !cmds.iter().any(|c| c.contains("--break-system-packages")),
             "no --break-system-packages"
         );
+    }
+
+    #[test]
+    fn add_python_symlink_follows_the_builder_versions_standalone_release() {
+        let spec = ImageSpec::from_registry("rust:1-slim")
+            .with_add_python("3.12")
+            .with_python_standalone_mount_id("mo-py");
+        let has_symlink = |builder: &str| {
+            spec.dockerfile_commands_for(builder)
+                .iter()
+                .any(|c| c == "RUN ln -s /usr/local/bin/python3 /usr/local/bin/python")
+        };
+        // 2025.06 installs 3.12.1 (release 20240107), which ships only `python3`.
+        assert!(has_symlink("2025.06"));
+        // 2026.10 installs 3.12.15 (release 20261021), which ships `python`.
+        assert!(!has_symlink("2026.10"));
+        // The builder version reaches the request's image through the same path.
+        let req = build_image_get_or_create_request(&spec, "ap-1", "2026.10".to_string());
+        let image = req.image.expect("image");
+        assert_eq!(req.builder_version, "2026.10");
+        assert!(!image
+            .dockerfile_commands
+            .iter()
+            .any(|c| c.contains("ln -s /usr/local/bin/python3")));
+        assert!(image
+            .dockerfile_commands
+            .iter()
+            .any(|c| c == "COPY /python/. /usr/local"));
     }
 
     #[test]

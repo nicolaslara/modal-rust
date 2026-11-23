@@ -46,29 +46,78 @@ pub fn client_mount_name(version: &str) -> String {
     format!("modal-client-mount-{version}")
 }
 
-/// Supported python-build-standalone series → `(release, full_version)`, mirroring
-/// `PYTHON_STANDALONE_VERSIONS` (mount.py:44-52). These are the HOSTED, name-resolved
-/// python-standalone mounts Modal publishes for `add_python`; the pair encodes which
-/// python-build-standalone distribution release supplies the interpreter.
-const PYTHON_STANDALONE_VERSIONS: &[(&str, (&str, &str))] = &[
+/// One python-build-standalone series → `(release, full_version)`.
+type StandaloneVersions = &'static [(&'static str, (&'static str, &'static str))];
+
+/// Series published for image builder versions up to and including `2025.06`,
+/// mirroring `_PYTHON_STANDALONE_VERSIONS_2025_06` (mount.py).
+const PYTHON_STANDALONE_VERSIONS_2025_06: StandaloneVersions = &[
     ("3.10", ("20230826", "3.10.13")),
     ("3.11", ("20230826", "3.11.5")),
     ("3.12", ("20240107", "3.12.1")),
     ("3.13", ("20241008", "3.13.0")),
+    ("3.14", ("20251205", "3.14.2")),
+    ("3.14t", ("20251209", "3.14.2t")),
+    ("3.15", ("20261009", "3.15.0")),
+    ("3.15t", ("20261009", "3.15.0t")),
 ];
 
-/// Hosted python-standalone mount deployment name for a python `series`
-/// (`python_standalone_mount_name()`, mount.py:72-86). Only the glibc (`gnu`) libc
-/// is supported (matching the Python client). Returns
-/// `python-build-standalone.{release}.{full_version}-gnu`, e.g.
-/// `python-build-standalone.20240107.3.12.1-gnu` for `"3.12"`.
-///
-/// Returns `None` for an unsupported series (mirrors the client's `InvalidError`).
-pub fn python_standalone_mount_name(series: &str) -> Option<String> {
-    let (release, full) = PYTHON_STANDALONE_VERSIONS
+/// Series published for image builder versions `2026.10` and `PREVIEW`, mirroring
+/// `PYTHON_STANDALONE_VERSIONS["2026.10"]` (mount.py).
+const PYTHON_STANDALONE_VERSIONS_2026_10: StandaloneVersions = &[
+    ("3.11", ("20261021", "3.11.17")),
+    ("3.12", ("20261021", "3.12.15")),
+    ("3.13", ("20261021", "3.13.17")),
+    ("3.14", ("20261021", "3.14.9")),
+    ("3.14t", ("20261021", "3.14.9t")),
+    ("3.15", ("20261021", "3.15.1")),
+    ("3.15t", ("20261021", "3.15.1t")),
+];
+
+/// First python-build-standalone release whose tree ships a `python` binary;
+/// earlier releases ship only `python3` (`_registry_setup_commands`, _image.py).
+const FIRST_RELEASE_WITH_PYTHON_BINARY: &str = "20241008";
+
+/// The standalone table for an image builder version, mirroring
+/// `PYTHON_STANDALONE_VERSIONS[builder_version]` (mount.py). A version this SDK
+/// does not name (including the empty "let the server choose") gets the `2025.06`
+/// table, whose mounts every builder version can consume.
+fn standalone_versions(builder_version: &str) -> StandaloneVersions {
+    match builder_version {
+        "2026.10" | "PREVIEW" => PYTHON_STANDALONE_VERSIONS_2026_10,
+        _ => PYTHON_STANDALONE_VERSIONS_2025_06,
+    }
+}
+
+/// The `(release, full_version)` python-build-standalone distribution that supplies
+/// a python `series` under `builder_version`, or `None` for an unsupported series.
+pub(crate) fn python_standalone_release(
+    series: &str,
+    builder_version: &str,
+) -> Option<(&'static str, &'static str)> {
+    standalone_versions(builder_version)
         .iter()
         .find(|(s, _)| *s == series)
-        .map(|(_, pair)| *pair)?;
+        .map(|(_, pair)| *pair)
+}
+
+/// Whether the standalone tree for `series` under `builder_version` lacks a `python`
+/// binary, so the image must symlink `python` → `python3` (the bare `python` the
+/// container entrypoint execs). `false` for an unsupported series.
+pub(crate) fn python_standalone_needs_python_symlink(series: &str, builder_version: &str) -> bool {
+    python_standalone_release(series, builder_version)
+        .is_some_and(|(release, _)| release < FIRST_RELEASE_WITH_PYTHON_BINARY)
+}
+
+/// Hosted python-standalone mount deployment name for a python `series` under an
+/// image `builder_version` (`python_standalone_mount_name()`, mount.py). Only the
+/// glibc (`gnu`) libc on x86_64 is supported. Returns
+/// `python-build-standalone.{release}.{full_version}-gnu`, e.g.
+/// `python-build-standalone.20261021.3.12.15-gnu` for `"3.12"` under `"2026.10"`.
+///
+/// Returns `None` for an unsupported series (mirrors the client's `InvalidError`).
+pub fn python_standalone_mount_name(series: &str, builder_version: &str) -> Option<String> {
+    let (release, full) = python_standalone_release(series, builder_version)?;
     Some(format!("python-build-standalone.{release}.{full}-gnu"))
 }
 
@@ -117,22 +166,28 @@ impl ModalClient {
     /// step (mount.py:72-86; `_registry_setup_commands` add_python branch,
     /// _image.py:2041-2059).
     ///
+    /// The distribution is the one the resolved image builder version uses (the same
+    /// version [`ModalClient::image_get_or_create`] sends), so the mount and the
+    /// image's dockerfile commands agree on which standalone release is installed.
+    ///
     /// `environment` defaults to the configured environment (or `"main"`).
     pub async fn python_standalone_mount_id(
         &mut self,
         series: &str,
         environment: Option<&str>,
     ) -> Result<String> {
-        let deployment_name = python_standalone_mount_name(series).ok_or_else(|| {
-            Error::build(format!(
-                "unsupported standalone python series {series:?}; supported series: \
-                 {:?}",
-                PYTHON_STANDALONE_VERSIONS
-                    .iter()
-                    .map(|(s, _)| *s)
-                    .collect::<Vec<_>>()
-            ))
-        })?;
+        let builder_version = self.resolved_image_builder_version().await;
+        let deployment_name =
+            python_standalone_mount_name(series, &builder_version).ok_or_else(|| {
+                Error::build(format!(
+                    "unsupported standalone python series {series:?} for image builder \
+                     version {builder_version:?}; supported series: {:?}",
+                    standalone_versions(&builder_version)
+                        .iter()
+                        .map(|(s, _)| *s)
+                        .collect::<Vec<_>>()
+                ))
+            })?;
         self.global_mount_id(&deployment_name, environment)
             .await?
             .ok_or_else(|| {
@@ -174,34 +229,55 @@ mod tests {
 
     #[test]
     fn mount_name_is_version_keyed() {
-        assert_eq!(client_mount_name("1.3.2"), "modal-client-mount-1.3.2");
+        assert_eq!(client_mount_name("1.6.4"), "modal-client-mount-1.6.4");
     }
 
     #[test]
     fn python_standalone_mount_name_matches_client() {
-        // mount.py:72-86 → python-build-standalone.{release}.{full}-gnu.
+        // mount.py → python-build-standalone.{release}.{full}-gnu, per builder version.
+        for legacy in ["2023.12", "2024.04", "2024.10", "2025.06", ""] {
+            assert_eq!(
+                python_standalone_mount_name("3.12", legacy).as_deref(),
+                Some("python-build-standalone.20240107.3.12.1-gnu"),
+                "builder {legacy:?}"
+            );
+        }
         assert_eq!(
-            python_standalone_mount_name("3.12").as_deref(),
-            Some("python-build-standalone.20240107.3.12.1-gnu")
-        );
-        assert_eq!(
-            python_standalone_mount_name("3.13").as_deref(),
+            python_standalone_mount_name("3.13", "2025.06").as_deref(),
             Some("python-build-standalone.20241008.3.13.0-gnu")
         );
+        for modern in ["2026.10", "PREVIEW"] {
+            assert_eq!(
+                python_standalone_mount_name("3.12", modern).as_deref(),
+                Some("python-build-standalone.20261021.3.12.15-gnu"),
+                "builder {modern:?}"
+            );
+        }
     }
 
     #[test]
     fn python_standalone_mount_name_rejects_unsupported_series() {
-        assert_eq!(python_standalone_mount_name("3.99"), None);
+        assert_eq!(python_standalone_mount_name("3.99", "2025.06"), None);
+        // 3.10 left the table with builder 2026.10.
+        assert!(python_standalone_mount_name("3.10", "2025.06").is_some());
+        assert_eq!(python_standalone_mount_name("3.10", "2026.10"), None);
+    }
+
+    #[test]
+    fn python_symlink_is_needed_only_for_releases_without_a_python_binary() {
+        assert!(python_standalone_needs_python_symlink("3.12", "2025.06"));
+        assert!(!python_standalone_needs_python_symlink("3.13", "2025.06"));
+        assert!(!python_standalone_needs_python_symlink("3.12", "2026.10"));
+        assert!(!python_standalone_needs_python_symlink("3.99", "2025.06"));
     }
 
     #[test]
     fn build_mount_get_or_create_global_is_pure_lookup() {
         let req = build_mount_get_or_create_global_request(
-            "modal-client-mount-1.3.2",
+            "modal-client-mount-1.6.4",
             "main".to_string(),
         );
-        assert_eq!(req.deployment_name, "modal-client-mount-1.3.2");
+        assert_eq!(req.deployment_name, "modal-client-mount-1.6.4");
         assert_eq!(req.environment_name, "main");
         // GLOBAL namespace, UNSPECIFIED creation (pure lookup, never creates).
         assert_eq!(req.namespace, DeploymentNamespace::Global as i32);

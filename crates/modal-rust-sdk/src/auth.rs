@@ -14,10 +14,13 @@ use tonic::{Request, Status};
 
 use crate::error::{Error, Result};
 
-/// Our SDK client version (bumped from modal-rs's "1.3.1"; matches the verified
-/// Modal 1.3.2 facts). Sent as `x-modal-client-version` and used to key the
-/// hosted client mount (`modal-client-mount-{version}`) in later phases.
-pub const CLIENT_VERSION: &str = "1.3.2";
+/// The Modal Python client release this SDK identifies as. Sent as
+/// `x-modal-client-version` and used to key the hosted client mount
+/// (`modal-client-mount-{version}`), which is the `modal` package the in-container
+/// Python adapter imports. It must name a published release (the mount exists only
+/// for those) that is not past its retirement date, and the vendored `api.proto`
+/// must be at least as new as that release's.
+pub const CLIENT_VERSION: &str = "1.6.4";
 
 /// `ClientType::CLIENT_TYPE_CLIENT` (api.proto:84) as its enum-int string. We
 /// replicate the Python FILE-mode path, not the libmodal JS/Go identities.

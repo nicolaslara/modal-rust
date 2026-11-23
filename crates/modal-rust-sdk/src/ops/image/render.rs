@@ -5,6 +5,7 @@
 
 use base64::Engine;
 
+use crate::ops::mount::python_standalone_needs_python_symlink;
 use crate::ops::DEFAULT_BASE_IMAGE;
 use crate::proto::api::{BaseImage, Image, ImageContextFile};
 
@@ -56,8 +57,9 @@ pub struct ImageSpec {
     pub context_files: Vec<(String, Vec<u8>)>,
     /// PRIMARY Python provisioning: the python-build-standalone series to add (e.g.
     /// `"3.12"`). When `Some`, the rendered Dockerfile emits the client's add_python
-    /// branch (`COPY /python/. /usr/local`, the `ln -s python3 python` for series <
-    /// 3.13, and the `TERMINFO_DIRS` ENV) and SUPPRESSES the apt/pip fallback lines.
+    /// branch (`COPY /python/. /usr/local`, the `ln -s python3 python` when the
+    /// standalone release ships no `python` binary, and the `TERMINFO_DIRS` ENV) and
+    /// SUPPRESSES the apt/pip fallback lines.
     /// See [`ImageSpec::with_add_python`] and the module docs. `None` ⇒ the apt+pip
     /// fallback render branch.
     pub add_python: Option<String>,
@@ -235,7 +237,8 @@ impl ImageSpec {
 
     /// PRIMARY Python provisioning: add the python-build-standalone `series` (e.g.
     /// `"3.12"`) the way the official client does. Renders the add_python branch
-    /// (`COPY /python/. /usr/local` + `ln -s` for series < 3.13 + `TERMINFO_DIRS`)
+    /// (`COPY /python/. /usr/local` + `ln -s` when the standalone release ships no
+    /// `python` binary + `TERMINFO_DIRS`)
     /// and suppresses the apt/pip fallback. Pair with
     /// [`ImageSpec::with_python_standalone_mount_id`] (supplies `/python` as the
     /// build context) and, on the function, `mount_client_dependencies = true` (the
@@ -294,15 +297,25 @@ impl ImageSpec {
     /// _image.py:725-727) or `FROM <base_image>` for a registry base.
     ///
     /// PRIMARY ([`add_python`] set): emit the client's add_python branch
-    /// (`COPY /python/. /usr/local`, the `ln -s python3 python` for series < 3.13,
-    /// `ENV TERMINFO_DIRS=…`; _image.py:2041-2059) and SUPPRESS the apt/pip fallback.
+    /// (`COPY /python/. /usr/local`, the `ln -s python3 python` when the standalone
+    /// release ships no `python` binary, `ENV TERMINFO_DIRS=…`;
+    /// `_registry_setup_commands`, _image.py) and SUPPRESS the apt/pip fallback.
     /// FALLBACK ([`add_python`] unset): the apt pre-bake commands then the optional
     /// pip line (order is load-bearing — both provision the runtime the bake invokes).
     /// Then the wrapper bakes, then the extra commands.
     ///
     /// [`base_image_id`]: ImageSpec::base_image_id
     /// [`add_python`]: ImageSpec::add_python
+    #[cfg(test)]
     pub(super) fn dockerfile_commands(&self) -> Vec<String> {
+        self.dockerfile_commands_for(TEST_BUILDER_VERSION)
+    }
+
+    /// [`dockerfile_commands`](ImageSpec::dockerfile_commands) for the image builder
+    /// version the image is built under. The version selects which
+    /// python-build-standalone release `add_python` installs, and that release
+    /// decides whether the `python` symlink is emitted.
+    pub(super) fn dockerfile_commands_for(&self, builder_version: &str) -> Vec<String> {
         let from_line = if self.base_image_id.is_some() {
             // Layered build: reference the prior layer by the conventional tag.
             "FROM base".to_string()
@@ -312,13 +325,14 @@ impl ImageSpec {
         let mut cmds = vec![from_line];
 
         if let Some(series) = &self.add_python {
-            // Replicate `_registry_setup_commands` add_python branch
-            // (_image.py:2041-2059): COPY the standalone tree onto PATH, symlink
-            // `python` for series < 3.13 (the client-equivalent of python-is-python3
-            // — a symlink, not an apt package), then the TERMINFO ENV. The standalone
+            // Replicate `_registry_setup_commands` add_python branch (_image.py):
+            // COPY the standalone tree onto PATH, symlink `python` when the release
+            // the builder version installs ships only `python3` (the
+            // client-equivalent of python-is-python3 — a symlink, not an apt
+            // package), then the TERMINFO ENV. The standalone
             // mount supplies `/python` via this layer's `context_mount_id`.
             cmds.push("COPY /python/. /usr/local".to_string());
-            if python_series_lt_13(series) {
+            if python_standalone_needs_python_symlink(series, builder_version) {
                 cmds.push("RUN ln -s /usr/local/bin/python3 /usr/local/bin/python".to_string());
             }
             cmds.push(
@@ -425,7 +439,14 @@ impl ImageSpec {
     /// python-standalone mount when `add_python` is set with no source context (RUN
     /// path / DEPLOY base layer). `context_files` (field 7) carries any inline files;
     /// it defaults empty so RUN images stay byte-identical when unused.
+    #[cfg(test)]
     pub(super) fn to_proto(&self) -> Image {
+        self.to_proto_for(TEST_BUILDER_VERSION)
+    }
+
+    /// [`to_proto`](ImageSpec::to_proto) for the image builder version the image is
+    /// built under (see [`dockerfile_commands_for`](ImageSpec::dockerfile_commands_for)).
+    pub(super) fn to_proto_for(&self, builder_version: &str) -> Image {
         let base_images = match &self.base_image_id {
             Some(id) => vec![BaseImage {
                 docker_tag: "base".to_string(),
@@ -435,7 +456,7 @@ impl ImageSpec {
         };
         Image {
             base_images,
-            dockerfile_commands: self.dockerfile_commands(),
+            dockerfile_commands: self.dockerfile_commands_for(builder_version),
             context_mount_id: self.resolved_context_mount_id().unwrap_or_default(),
             context_files: self
                 .context_files
@@ -450,20 +471,9 @@ impl ImageSpec {
     }
 }
 
-/// True when a python-standalone `series` (e.g. `"3.12"`, `"3.14t"`) has minor < 13.
-/// Mirrors the client's check (_image.py:2052-2059): the `python` binary symlink is
-/// only needed for older standalone dists. A malformed series defaults to `false`
-/// (no symlink) — the supported-series guard lives in
-/// [`crate::ops::mount::python_standalone_mount_name`].
-pub(super) fn python_series_lt_13(series: &str) -> bool {
-    series
-        .split('.')
-        .nth(1)
-        .map(|minor| minor.trim_end_matches('t'))
-        .and_then(|minor| minor.parse::<u32>().ok())
-        .map(|minor| minor < 13)
-        .unwrap_or(false)
-}
+/// Image builder version the builder-agnostic unit tests render under.
+#[cfg(test)]
+pub(super) const TEST_BUILDER_VERSION: &str = "2025.06";
 
 /// A `RUN` command that base64-decodes `source` into `/root/<module_name>.py`.
 ///

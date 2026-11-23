@@ -28,7 +28,7 @@ pub(crate) fn build_image_get_or_create_request(
     builder_version: String,
 ) -> ImageGetOrCreateRequest {
     ImageGetOrCreateRequest {
-        image: Some(spec.to_proto()),
+        image: Some(spec.to_proto_for(&builder_version)),
         app_id: app_id.to_string(),
         builder_version,
         ..Default::default()

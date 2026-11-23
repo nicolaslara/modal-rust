@@ -103,8 +103,9 @@ pub(crate) const REMOTE_SRC: &str = "/src";
 /// Rust version tag of the default base image (`rust:{ver}-slim`).
 pub(crate) const RUST_VER: &str = modal_rust_sdk::RUST_TOOLCHAIN_VERSION;
 /// Python series to provision via `add_python` (the hosted python-build-standalone
-/// mount). `< 3.13`, so the image gets the auto `ln -s python3 python` the bare
-/// `python` entrypoint needs. Shared by the RUN and DEPLOY images.
+/// mount). Published for every image builder version; the SDK adds the
+/// `ln -s python3 python` the bare `python` entrypoint needs when the release it
+/// resolves to ships none. Shared by the RUN and DEPLOY images.
 pub(crate) const PYTHON_SERIES: &str = "3.12";
 /// In-body `cargo build` needs far longer than the SDK's 300s invoke default.
 pub(crate) const REMOTE_TIMEOUT_SECS: u32 = 1800;
