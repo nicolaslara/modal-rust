@@ -1397,3 +1397,54 @@ async fn run_errors_on_out_of_workspace_path_dep() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// The provision + invoke path must fit a thread stack well under the 2 MiB default
+/// of spawned threads and tokio workers, in an unoptimized build: a caller awaiting
+/// `.remote()` on such a thread aborts the whole process when it does not. An
+/// overflow here kills the test binary rather than failing an assertion.
+#[test]
+fn remote_fits_a_one_mebibyte_thread_stack() {
+    const STACK_BYTES: usize = 1024 * 1024;
+
+    let function_creates = std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let mock = MockModal::start().await.expect("mock up");
+                    let tmp = std::env::temp_dir()
+                        .join(format!("modal-rust-mock-stack-{}", std::process::id()));
+                    let mut rc = tiny_source_config(&tmp);
+                    rc.cache = false;
+                    let app = App::connect_at_with_configs(
+                        "stack-app",
+                        modal_registry(),
+                        configs_for_add(FunctionConfig {
+                            cache: Some(false),
+                            ..FunctionConfig::default()
+                        }),
+                        mock.url(),
+                        rc,
+                    )
+                    .await
+                    .expect("connect");
+
+                    let _: serde_json::Value = app
+                        .function("add")
+                        .remote(serde_json::json!({ "a": 1, "b": 2 }))
+                        .await
+                        .expect("remote");
+
+                    let _ = fs::remove_dir_all(&tmp);
+                    mock.took::<FunctionCreateRequest>()
+                })
+        })
+        .expect("spawn")
+        .join()
+        .expect("remote() completed on a 1 MiB stack");
+
+    assert_eq!(function_creates, 1, "the provisioning path ran");
+}

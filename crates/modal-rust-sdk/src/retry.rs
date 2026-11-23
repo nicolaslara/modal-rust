@@ -78,7 +78,11 @@ where
     let mut delay = policy.base_delay;
     let mut attempt = 1u32;
     loop {
-        match op().await {
+        // Each attempt's future is heap-allocated. A tonic call future is tens of
+        // KiB, and awaiting it inline would embed it in every caller's future up the
+        // async call chain; unoptimized builds then spend that size again in each
+        // poll frame, which overflows a 2 MiB thread stack on the provisioning path.
+        match Box::pin(op()).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let last_attempt = attempt >= policy.max_attempts;
