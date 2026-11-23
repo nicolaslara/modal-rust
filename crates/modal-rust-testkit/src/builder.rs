@@ -244,8 +244,8 @@ impl MockModalBuilder {
         self
     }
 
-    /// Bind a loopback port, start the in-process server task, and return the live
-    /// [`MockModal`] handle. The handle owns the task (aborted on `Drop`).
+    /// Bind a loopback port, start the in-process server thread, and return the live
+    /// [`MockModal`] handle. The handle owns the thread (stopped on `Drop`).
     pub async fn start(self) -> std::io::Result<MockModal> {
         MockModal::start_with_responses(self.responses).await
     }

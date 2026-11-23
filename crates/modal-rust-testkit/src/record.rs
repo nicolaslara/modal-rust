@@ -61,7 +61,7 @@ pub enum RecordedRequest {
 }
 
 /// The shared, cloneable request log. A cheap `Arc<Mutex<..>>` clone shared
-/// between the running server task and the test handle, so the test sees every
+/// between the running server thread and the test handle, so the test sees every
 /// request the mock recorded.
 #[derive(Clone, Default)]
 pub struct RequestLog {

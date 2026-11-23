@@ -1,11 +1,11 @@
 //! [`MockModal`] — the live mock handle.
 //!
-//! Owns the running tonic server task + the shared [`RequestLog`]. Built by
+//! Owns the running tonic server thread + the shared [`RequestLog`]. Built by
 //! [`MockModal::builder`] / [`MockModal::start`]; exposes the mock's loopback
 //! [`url`](MockModal::url), a ready-made [`modal_config`](MockModal::modal_config)
 //! for the SDK, and the typed request-query surface
 //! ([`last`](MockModal::last) / [`requests`](MockModal::requests) /
-//! [`took`](MockModal::took)). Tears down (aborts the task) on `Drop`.
+//! [`took`](MockModal::took)). Tears down (stops the server thread) on `Drop`.
 
 use std::net::SocketAddr;
 
@@ -15,15 +15,24 @@ use crate::record::{FromRecorded, RecordedRequest, RequestLog};
 use crate::responder::Responses;
 use crate::servicer::MockServicer;
 
+/// Stack size of the dedicated server thread.
+///
+/// The generated `ModalClientServer::call` dispatch keeps one stack slot per RPC arm
+/// in unoptimized builds (about 1 MiB at 286 RPCs). Serving on the caller's runtime
+/// would put that frame on the test thread, whose default stack is 2 MiB, so the
+/// server gets its own thread with room for the dispatch to grow with the proto.
+const SERVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// A live, in-process Modal gRPC mock on a loopback port.
 ///
 /// Cheap to obtain ([`MockModal::start`] / [`MockModal::builder`]); the handle owns
-/// the server task and aborts it on `Drop`, so a per-test (or per-table-case) mock
+/// the server thread and stops it on `Drop`, so a per-test (or per-table-case) mock
 /// tears down cleanly with no shared global state.
 pub struct MockModal {
     addr: SocketAddr,
     log: RequestLog,
-    task: tokio::task::JoinHandle<()>,
+    /// Dropping the sender ends the server thread's serve loop.
+    _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 impl MockModal {
@@ -39,29 +48,55 @@ impl MockModal {
         MockModalBuilder::default()
     }
 
-    /// Bind a loopback port, spawn the server task with the configured responses,
+    /// Bind a loopback port, spawn the server thread with the configured responses,
     /// and return the handle. Used by [`MockModalBuilder::start`].
     pub(crate) async fn start_with_responses(responses: Responses) -> std::io::Result<MockModal> {
         let log = RequestLog::default();
         let servicer = MockServicer::new(log.clone(), responses);
 
-        // Kernel-assigned loopback port; capture the concrete addr for `url()`.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        // Kernel-assigned loopback port; capture the concrete addr for `url()`. The
+        // socket is bound here so the address is known (and dialable) on return.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        let incoming =
-            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
 
-        let task = tokio::spawn(async move {
-            // The server runs until the task is aborted on `Drop`. A bind/serve error
-            // would surface to a test as a failed dial, so it is intentionally
-            // swallowed here (the handle is already returned).
-            let _ = tonic::transport::Server::builder()
-                .add_service(ModalClientServer::new(servicer))
-                .serve_with_incoming(incoming)
-                .await;
-        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("mock-modal-server".into())
+            .stack_size(SERVER_STACK_BYTES)
+            .spawn(move || {
+                // A runtime/serve error would surface to a test as a failed dial, so
+                // it is intentionally swallowed here (the handle is already returned).
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async move {
+                    let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                        return;
+                    };
+                    let incoming = tonic::transport::server::TcpIncoming::from(listener)
+                        .with_nodelay(Some(true));
+                    let serve = tonic::transport::Server::builder()
+                        .add_service(ModalClientServer::new(servicer))
+                        .serve_with_incoming(incoming);
+                    // The server runs until the handle is dropped. Dropping the serve
+                    // future closes every connection at once; a graceful shutdown would
+                    // wait on connections the test still holds open.
+                    tokio::select! {
+                        _ = serve => {}
+                        _ = stopped => {}
+                    }
+                });
+            })?;
 
-        Ok(MockModal { addr, log, task })
+        Ok(MockModal {
+            addr,
+            log,
+            _shutdown: shutdown,
+        })
     }
 
     /// The mock's base URL, e.g. `http://127.0.0.1:54321`. Feed this to the SDK /
@@ -123,11 +158,5 @@ impl MockModal {
     /// independently of the handle.
     pub fn log(&self) -> RequestLog {
         self.log.clone()
-    }
-}
-
-impl Drop for MockModal {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }

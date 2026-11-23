@@ -32,7 +32,7 @@ use crate::store::ObjectStore;
 const QUEUE_GET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The in-process mock backend's gRPC servicer. Cheap to clone (everything shared
-/// is behind an `Arc`), so the running server task and the test handle observe the
+/// is behind an `Arc`), so the running server thread and the test handle observe the
 /// same [`RequestLog`].
 #[derive(Clone)]
 pub(crate) struct MockServicer {
