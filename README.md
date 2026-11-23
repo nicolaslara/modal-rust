@@ -5,12 +5,14 @@ calling API.
 
 > [!WARNING]
 > **Work in progress.** `modal-rust` is early and the public API is still moving.
-> A broad surface is implemented and live-proven — `.local()` / `.remote()` /
+> The implemented surface includes `.local()` / `.remote()` /
 > `.spawn()` / `.map()`, `deploy` + `call`, GPU (cudarc + Burn on a T4), the full
 > decorator config, `#[cls]` (load-once-serve-many + memory snapshot),
 > `#[endpoint]` web endpoints, and `Dict` / `Queue` — but this is not ready to treat
-> as stable infrastructure yet. See [`docs/PARITY.md`](docs/PARITY.md) for an honest,
-> code-verified Have/Partial/Missing inventory vs the Modal Python client.
+> as stable infrastructure yet. See the SDK's
+> [known invocation limits](crates/modal-rust-sdk/README.md#known-invocation-limits)
+> and the [roadmap](docs/ROADMAP.md) for open correctness work.
+> [`docs/PARITY.md`](docs/PARITY.md) tracks broader feature coverage.
 
 `modal-rust` lets you write normal Rust functions, register them as Modal
 entrypoints, and call them three ways:
@@ -22,8 +24,10 @@ entrypoints, and call them three ways:
   prebuilt runner without rebuilding.
 
 The default command-line path is the `modal-rust` CLI. The library API also
-includes a first-party Rust client for Modal's control plane, so Rust code can
-drive local, remote, and deployed calls directly.
+includes a third-party Rust client for Modal's control plane, so Rust code can
+drive local, remote, and deployed calls directly. Inside Modal, a Python adapter
+forwards requests to a persistent Rust runner. You do not need to write Python
+application code or install Modal's Python CLI locally.
 
 ## Quickstart
 
@@ -45,9 +49,10 @@ pub fn add(a: i64, b: i64) -> anyhow::Result<i64> {
 ```
 
 That is the entire authoring surface — no `src/bin/modal_runner.rs`, no
-`__private`, no environment variable. Run it three ways via the typed
+`__private`, no environment variable. Call it locally or remotely via the typed
 `app.add(2, 3)` method (brought into scope with one `use` of the generated
-`AddCall` trait):
+`AddCall` trait). The remote library call requires the
+[`client` feature](#the-client-feature-talking-to-modal-vs-authoring):
 
 ```rust
 use modal_rust::App;
@@ -104,11 +109,11 @@ directly — just like `serde_derive` routes through `serde`.
 
 ### The `client` feature (talking to Modal vs. authoring)
 
-The default `modal-rust` dependency is **light**: it pulls in only ~9 crates and
-compiles in a couple of seconds. That is everything you need to author
-`#[function]`s, call `.local()`, and let the `modal-rust` CLI run/deploy your crate.
+The default `modal-rust` dependency excludes the gRPC client stack. It is enough
+to author `#[function]`s, call `.local()`, and let the `modal-rust` CLI run/deploy
+your crate.
 
-The gRPC control-plane client (tonic/hyper/prost/reqwest — ~150 crates) lives behind
+The gRPC control-plane client (tonic/hyper/prost/reqwest) lives behind
 a **non-default `client` feature**. You only need it when your *own code* talks to
 Modal directly — `App::connect(..)`, `.remote()`/`.spawn()`/`.map()`, `deploy`/`call`,
 or the offline `dry_run`/`dump_deploy_manifest` dump:
@@ -149,12 +154,13 @@ cargo install --git https://github.com/nicolaslara/modal-rust --package modal-ru
 cargo install --path crates/modal-rust-cli
 ```
 
-The CLI drives the first-party SDK directly — it builds your crate, generates the
+The CLI drives the Rust SDK directly: it builds your crate, generates the
 `modal_runner` binary for it (or uses one you ship), reads its `--describe`
-manifest, and creates/invokes the function over gRPC. There is no generated Python
-and no dependency on the `modal` CLI; just configure Modal credentials.
-(For platform-dependent dependencies, see §11 Troubleshooting in the getting-started
-guide — the cudarc pattern keeps the describe build working everywhere.)
+manifest, and creates/invokes the function over gRPC. It provisions the Python
+container adapters for you; the local CLI does not require the `modal` CLI.
+For crates that cannot compile locally, `--remote-describe` builds and reads the
+manifest on Modal. `--manifest` and `--no-local-build` also bypass the local build.
+See Troubleshooting in the [getting-started guide](docs/getting-started.md).
 
 Your crate stays a **pure library** — a single `modal-rust` dependency and your
 `#[function]`s, no runner binary. The examples below drive
@@ -391,7 +397,7 @@ pub struct TrainOutput {
     cpu = 2.0,                      // CPU cores (float); -> milli_cpu = int(1000 * cpu)
     memory = 4096,                  // requested RAM in MiB
     timeout = 1800,                 // wall-clock seconds
-    retries = 3,                    // auto-retry N times (fixed interval); or the struct
+    retries = 3,                    // retry-policy configuration; or the struct
                                     // form Retries(max_retries = 5, backoff_coefficient = 2.0,
                                     // initial_delay = 0.5, max_delay = 30.0) for custom backoff
     schedule = Cron("0 9 * * 1"),   // run on a cron cadence after deploy (or Period(days = 1))
@@ -414,6 +420,11 @@ pub fn train(input: TrainInput) -> anyhow::Result<TrainOutput> {
     Ok(TrainOutput { ok: true })
 }
 ```
+
+The `retries` field configures Modal's policy, but the Python adapters currently
+return ordinary Rust handler errors as successful string results. Those errors
+do not trigger the policy. See the
+[known invocation limits](crates/modal-rust-sdk/README.md#known-invocation-limits).
 
 `image = Image(..)` is the per-function analogue of Python's
 `app.function(image=..)`: it makes *this* entrypoint build on the declared base.
@@ -864,11 +875,10 @@ moves where the build happens:
   a prebuilt `/app/modal_runner` into a persistent image. There is no per-cold-
   container rebuild and no source upload at call time — the right choice for a
   heavy crate or a hot production endpoint.
-- **The `client` feature shrinks the build massively.** Keeping the gRPC client
+- **The `client` feature keeps the gRPC stack optional.** Keeping the gRPC client
   behind the non-default `client` feature (see [Install](#the-client-feature-talking-to-modal-vs-authoring))
-  collapses a ~150-crate tree to ~9, so the in-container `run` build stays small
-  and fast. A normal `#[function]` library that you `modal-rust run`/`deploy` never
-  compiles tonic at all.
+  avoids compiling that stack in a function-only crate. A `#[function]` library
+  using default features can be run or deployed by the CLI without linking tonic.
 - **`--serve` keeps one runner warm.** With `modal_runner --serve` (used by the
   `#[cls]` path) the process stays warm across inputs, so a `#[cls]` `#[enter]`
   runs **once per warm container** rather than once per call — load-once,
@@ -913,9 +923,9 @@ builds once at image-build time, so the cache applies to the `run` path only.)
 The default `modal-rust` build is **light**: the gRPC client (tonic/hyper/prost/
 reqwest) is behind the non-default `client` feature (see [Install](#the-client-feature-talking-to-modal-vs-authoring)),
 so authoring a `#[function]` crate, `.local()`, and the in-container `modal_runner`
-build never compile it — that collapses a ~150-crate tree down to ~9 and a ~30s cold
-build to ~2-3s. A `rust-toolchain.toml` pins the channel so Cargo's fingerprints (and
-any shared cache) stay stable across runs.
+build do not compile it unless the feature is enabled. A `rust-toolchain.toml`
+pins the channel so Cargo's fingerprints (and any shared cache) stay stable
+across runs.
 
 For teams that want even faster cold builds across machines, point Cargo at a shared
 [`sccache`](https://github.com/mozilla/sccache):
@@ -1080,7 +1090,8 @@ cargo test -p modal-rust --features live --test live_deploy -- --ignored
 
 ## Examples
 
-The `examples/` directory holds runnable, live-proven crates:
+The `examples/` directory holds runnable crates covering authoring, configuration,
+and calls:
 
 | Example | What it shows |
 | --- | --- |
@@ -1104,7 +1115,7 @@ The `examples/` directory holds runnable, live-proven crates:
 | `examples/spawn-map-foreach` | **(call shapes)** The rest of the map family: `.spawn_map()` (fire-and-forget fan-out) and `.for_each()` (side-effect map that waits and discards results). `notify` sends a per-recipient notification. |
 | `examples/cpu-memory` | **(decorator config)** Right-size plain compute with `#[function(cpu = 2.0, memory = 4096)]` (2.0 cores -> 2000 milli-cores, 4096 MiB -> 4 GiB). `crunch` folds a batch of records into a deterministic checksum. |
 | `examples/timeout-and-cache` | **(decorator config)** Operational knobs: a function `timeout` plus the on-by-default cargo build cache (`#[function(timeout = 1800, cache = true)]`). `spin` runs N checksum-fold iterations. |
-| `examples/retries` | **(decorator config)** Self-healing with an automatic retry policy (`#[function(retries = 5)]`): `fetch` fails the first two attempts and succeeds on the third, with no retry loop in your code. |
+| `examples/retries` | **(decorator config)** Retry-policy configuration (`#[function(retries = 5)]`). Tests check the policy metadata and explicitly supplied attempt values. Automatic recovery from Rust handler errors remains open in the [roadmap](docs/ROADMAP.md). |
 | `examples/secrets` | **(decorator config)** Attach a named Modal secret (`#[function(secrets = ["my-api-key"])]`) and read it as an env var inside the function. `check_secret` reports whether `MY_API_KEY` was injected and its length — never the value. |
 | `examples/volumes` | **(decorator config)** Mount a Volume (`#[function(volumes = ["/data=my-vol"])]`), write a file, and read it back on the next call — persistent storage across invocations. `record_visit` appends to a log and returns the running count. |
 | `examples/autoscaling` | **(decorator config)** Control warm capacity and scale-to-zero (`min`/`max`/`buffer_containers`, `scaledown_window`) for the latency-vs-cost tradeoff. `embed` turns a document into an L2-normalized feature vector — a believable unit of work to scale out. |

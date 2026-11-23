@@ -3,6 +3,97 @@
 Living backlog. Source for the ergonomics/docs items: `docs/local/ergonomics-and-docs-review.md`
 (prioritized table + 7 sub-30-min quick wins). Update this file as items land.
 
+## Open: invocation correctness (Go SDK comparison, 2026-10-21)
+
+These four findings come from comparing this checkout with the official Go SDK
+in the adjacent `../modal/client/go` checkout. All four remain open. Evidence is
+source inspection, plus one offline check of the deployed Python adapter with
+an in-memory fake runner for item 2. No live Modal tests or performance
+benchmarks were run. Duplicate-execution and deadline risks are inferred from
+the code, not reproduced production failures.
+
+### 1. Allow concurrent calls through one `App`
+
+The shared client mutex is held throughout `.remote()`, result polling, and
+`.map()` collection. Concurrent calls through the same `App` wait for the active
+operation to finish before submitting work. A waiting `get()` can also block a
+new spawn. One `.map()` still submits multiple inputs for remote parallel
+execution. Go keeps invocation state per call without an equivalent execution
+lock. See [`app.rs`](../crates/modal-rust/src/app.rs), especially
+`remote_invoke`, `remote_get`, and `remote_map`.
+
+Acceptance criteria:
+
+- Two calls through one `App` can both reach the mock backend before either
+  result is released. A pending `get()` does not prevent another spawn.
+- Keep function provisioning single-flight and cumulative app publication
+  consistent. Narrow shared locks to that state; use independent client handles
+  for invocation and polling.
+
+### 2. Propagate Rust handler failures into Modal failure handling
+
+Both Python adapters return a nonempty `{"ok":false,...}` runner envelope as a
+normal string. The facade converts it into a Rust error only after the Modal
+call succeeds. The offline deployed-adapter check confirmed that a
+`function_error` envelope returns without raising. Consequently, setting
+`#[function(retries = N)]` alone does not let Modal recognize and retry these
+handler failures. See the [run adapter](../crates/modal-rust/src/remote/wrapper.py),
+[deploy adapter](../crates/modal-rust/src/deploy/wrapper.py), and
+[`Function::remote`](../crates/modal-rust/src/function.rs).
+
+Acceptance criteria:
+
+- Define how handler failures reach Modal's failure handling while retaining
+  structured Rust error details and the runner's envelope contract. Cover both
+  run and deploy paths, including persistent and one-shot runners.
+- Prove recovery through the invocation interface using a handler that fails
+  initially and then succeeds with the same input. Verify exhaustion and attempt
+  counts. Keep user-error retries distinct from transport and infrastructure
+  retries.
+- Correct the [retries example](../examples/retries/tests/manifest.rs): its current
+  tests check configuration and manually change the attempt input from 1 to 3.
+  They do not prove automatic recovery. Verify that mapped handler failures are
+  surfaced according to the documented map error semantics.
+
+### 3. Support large function arguments and results
+
+Invocation arguments are always sent inline, and blob-backed outputs are
+explicitly rejected. Source and Volume upload support does not cover function
+payloads. Go uploads arguments using size thresholds from function metadata and
+downloads blob-backed results. See
+[`ops/invoke.rs`](../crates/modal-rust-sdk/src/ops/invoke.rs).
+
+Acceptance criteria:
+
+- Select inline or blob transport using function metadata and appropriate
+  synchronous/asynchronous defaults. Apply it to remote, spawn, and map calls.
+- Download and decode blob-backed results through the same typed result path as
+  inline results. Test payloads below, at, and above the threshold, plus upload
+  and download failures, through the public invocation interface.
+
+### 4. Make retries safe and cancellation and deadlines explicit
+
+Transport retries lack the stable idempotency key Go retains across attempts.
+A lost response after a successful enqueue can therefore create duplicate work.
+There is no public remote-call cancellation operation. Retry and invocation
+deadlines are checked between awaited operations; an in-flight request can
+outlive the advertised limit. See
+[`ops/transport.rs`](../crates/modal-rust-sdk/src/ops/transport.rs),
+[`retry.rs`](../crates/modal-rust-sdk/src/retry.rs), and
+[`ops/invoke.rs`](../crates/modal-rust-sdk/src/ops/invoke.rs).
+
+Acceptance criteria:
+
+- Generate one idempotency key per logical remote procedure call (RPC), preserve
+  it across transport retries, and use distinct keys for independent calls.
+  Test a server that accepts an enqueue and loses the response before retry.
+- Expose explicit remote call cancellation, including the container-termination
+  option. Document the difference between stopping a local wait and cancelling
+  remote execution; dropping a future must not imply remote cancellation.
+- Enforce the remaining deadline across requests, polling, and backoff. Test a
+  stalled request and a timeout shorter than the usual 55-second output poll.
+  Report wait expiry separately from function execution failure.
+
 ---
 
 ## DONE: newcomer ergonomics + real README examples (the P0s)
@@ -49,7 +140,8 @@ deploy/call-vs-connect naming — one edge: a deployed `.call()` loses the typed
   image builders (`pip_install`/`apt_install`/`run_commands`) + a per-function custom
   `image = Image(base/install_rust/apt/pip/run)` decorator field, `schedule` (Cron/Period),
   inline `env={..}` secrets-from-dict + `required_keys`, autoscaling, `starmap`. Each
-  shipped with mock tests.
+  shipped with mock tests. Retry configuration is implemented; recovery from
+  Rust handler errors remains open in item 2 above.
 - Still cheap & open: `Secret.from_dotenv()` / `.env` file parsing; `cpu`/`memory` as a
   `(request, limit)` tuple.
 

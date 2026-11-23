@@ -1,10 +1,15 @@
 # modal-rust-cli
 
-The `modal-rust` command-line tool — `run`, `deploy`, and `call` Rust functions on
-[Modal](https://modal.com), no Python and no codegen.
+The `modal-rust` command-line tool runs, deploys, and calls Rust functions on
+[Modal](https://modal.com).
 
 This crate provides the **binary**. The library you depend on to author functions is
 [`modal-rust`](https://crates.io/crates/modal-rust).
+
+The CLI generates a Rust runner when your crate does not provide one and
+provisions the Python adapters used inside Modal. You do not need to write
+Python application code or install Modal's Python CLI locally. See the SDK's
+[known invocation limits](../modal-rust-sdk/README.md#known-invocation-limits).
 
 ## Install
 

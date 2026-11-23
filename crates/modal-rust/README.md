@@ -1,11 +1,17 @@
 # modal-rust
 
-Deploy and run Rust functions on [Modal](https://modal.com) — no Python.
+Deploy and run Rust functions on [Modal](https://modal.com) with a Rust authoring API.
 
 `modal-rust` is the user-facing **library**: author `#[modal_rust::function]`s, run them
-in-process with `.local()`, or call the locked `.remote()` / `.spawn()` / `.map()` async
+in-process with `.local()`, or use the `.remote()` / `.spawn()` / `.map()` async
 surface. The gRPC control-plane client is re-exported as `modal_rust::sdk` behind the
-non-default `client` feature, so a function-authoring crate stays light (~9 crates).
+non-default `client` feature, so a function-authoring crate can exclude the gRPC stack.
+
+Remote execution uses a Python adapter inside Modal to communicate with the Rust
+runner. You do not need to write Python application code or install Modal's
+Python CLI locally. See the SDK's
+[known invocation limits](../modal-rust-sdk/README.md#known-invocation-limits)
+for concurrency, handler errors, payload sizes, and retry/cancellation behavior.
 
 ## Install
 

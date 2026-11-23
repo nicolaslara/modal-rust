@@ -1,173 +1,138 @@
 # modal-rust-sdk
 
-A lean, **first-party** Rust gRPC client for Modal's control plane. This crate
-talks to Modal directly over its `modal.client.ModalClient` gRPC service — there
-is **no dependency on the `modal` Python CLI, on `modal-rs`, or on any
-per-project Python**. It is the durable transport foundation under the
-higher-level `modal-rust` facade (decorator, `.local()` / `.remote()`, deploy +
-`from_name` call).
+A third-party Rust client for Modal's control plane, used by the
+[`modal-rust` facade](../modal-rust/README.md). It connects directly to the
+`modal.client.ModalClient` gRPC service. Local client operations do not require
+the `modal` Python CLI or the separate `modal-rs` crate.
 
-## What's in the box
+This README describes the current source checkout. The crate is pre-release;
+see [`Cargo.toml`](Cargo.toml) for its version and
+[the roadmap](../../docs/ROADMAP.md) for open work.
 
-- **Lean dependency set, no SDK deps.** `tonic` (client-only; `axum`/server
-  features dropped) + `prost`, `serde` + `serde_cbor`, `toml`, `reqwest`
-  (rustls only — no system OpenSSL), `sha2`, `walkdir`, `ignore`. The vendored
-  proto (`proto/api.proto`) is copied verbatim from the official Modal Python
-  SDK — see [`proto/SOURCE.toml`](proto/SOURCE.toml) for the exact upstream
-  revision and the re-vendoring steps; the auth/channel/codec *structure*
-  follows the unofficial `modal-rs`, but
-  **neither is a build- or run-time dependency** (both are read-only references;
-  see `NOTICE`).
-- **Auth + channel.** Credentials/endpoint resolve from the environment or
-  `~/.modal.toml` (`config.rs`); an `AuthInterceptor` attaches the `x-modal-*`
-  headers (`token-id`/`token-secret`/`client-type=1`/`client-version`/`platform`)
-  to every RPC over a hardened TLS channel (`tls-native-roots`, ring). `connect()`
-  performs a `ClientHello` handshake to fail fast on bad credentials.
-- **CBOR codec.** Function payloads are the 2-tuple `(args, kwargs)`
-  CBOR-encoded with `DATA_FORMAT_CBOR` end-to-end (`codec.rs`) — Modal's
-  non-Python wire format. `PICKLE` outputs are surfaced as opaque bytes (no
-  unpickling).
-- **`retry_transient` / `retry_unary`.** Every control-plane unary call is
-  wrapped in a transient-only retry (`retry.rs`): 8 attempts, exponential
-  backoff with full jitter, bounded by a total deadline. Only errors classified
-  `Error::is_transient` (e.g. UNAVAILABLE / connection reset) retry; auth,
-  invalid-argument, and in-band build failures surface immediately. The blob
-  object-store `PUT` has its own matching backoff.
-- **FILE-mode recipe.** The `ops/*` surface is a native Rust port of the proven
-  FILE-mode flow: a precreated function is identified purely by
-  `module_name` + `function_name` (empty `function_serialized`, `allow_sparse_base`),
-  the crate source is uploaded as an ephemeral Mount, and the wrapper boots via
-  `python -m modal._container_entrypoint`. **SERIALIZED-mode (pickled bytecode)
-  is not used.**
-- **The three spike fixes** (why `modal-rs`'s flow failed; baked into `ops/*`):
-  1. `FunctionCreate` sends **exactly one** of `function` / `function_data`
-     (XOR) and **always** sets `resources` (`ops/function.rs`).
-  2. Deploy uses `AppPublish` **only** — never the server-broken `AppSetObjects`
-     (`ops/app.rs`).
-  3. Invoke falls back to `FunctionPutInputs` when `FunctionMap` does not
-     pipeline the input, then polls `FunctionGetOutputs` (`ops/invoke.rs`).
+## Role in the Rust execution path
 
-## Coverage matrix (control plane)
+This crate owns authentication, transport, codecs, and control-plane operations.
+The facade adds typed function calls, macros, source packaging, and the
+run/deploy workflow. Its `client` feature enables this SDK; authoring functions
+and calling `.local()` do not require it.
 
-Scope: this crate currently calls **18 distinct RPCs** out of the ~240 in the
-vendored `proto/api.proto`. The matrix below is grouped by object/area. Status:
-**Implemented** = we call this RPC in `ops/*` or `client.rs`; **Partial** = the
-RPC is called but only a subset of its semantics/fields is exercised;
-**Not yet** = the object family is otherwise covered but this capability is
-absent. Every "Implemented" row was verified against the actual call sites.
+The remote execution path still uses Python inside Modal. Functions are created
+in FILE mode, with an importable Python module and callable rather than pickled
+function bytecode. The facade's adapters forward JSON requests to a persistent
+Rust `modal_runner --serve` process and return its JSON result envelopes.
+Users do not need to write those adapters or install the Python CLI locally.
 
-### App
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Get-or-create (idempotent) | Implemented | `AppGetOrCreate` | Run + deploy entry; also the cheap live auth probe. |
-| Create ephemeral app | Implemented | `AppCreate` | One-shot throwaway apps (GC'd on disconnect). |
-| Publish (make functions invokable / deploy) | Implemented | `AppPublish` | Fix #2; `Ephemeral` (run) vs `Deployed` (deploy) state. |
-| Stop / list / logs / rollback / heartbeat / tags / layout | Not yet | `AppStop`, `AppList`, `AppGetLogs`, `AppRollback`, `AppHeartbeat`, `AppSetTags`, `AppGetLayout`, … | App lifecycle/observability beyond create+publish not wired. |
+For `run`, the Rust build happens inside the function container, with cached
+binaries/build artifacts available for reuse. For `deploy`, the binary is built
+during image creation and the deployed adapter executes the prebuilt runner.
+See the [run adapter](../modal-rust/src/remote/wrapper.py) and
+[deploy adapter](../modal-rust/src/deploy/wrapper.py).
 
-### Environment
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Resolve environment + image-builder version | Implemented | `EnvironmentGetOrCreate` | Idempotent lookup; reads `image_builder_version` from settings. |
-| Create / update / delete / list / roles | Not yet | `EnvironmentCreate`, `EnvironmentUpdate`, `EnvironmentDelete`, `EnvironmentList`, … | Environment management is out of scope. |
+## Implemented surface
 
-### Image
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Build image (`from_registry` + add_python + wrapper bake) | Implemented | `ImageGetOrCreate` | Renders `dockerfile_commands`; `add_python` via a python-standalone context mount, matching the official client. |
-| Poll build to completion | Implemented | `ImageJoinStreaming` | Streams build status until terminal. |
-| Delete / from-id | Not yet | `ImageDelete`, `ImageFromId` | Not wired. Image-builder breadth (full `Image` DSL) is out of scope. |
+The table describes the typed operations in this crate. A vendored protocol
+definition or generated method alone does not imply a supported high-level API.
 
-### Function — authoring
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Precreate (reserve id, sparse base) | Implemented | `FunctionPrecreate` | Sets `allow_sparse_base`, making empty `function_serialized` legal (FILE mode). |
-| Create (FILE mode) | Implemented | `FunctionCreate` | Fix #1 (XOR `function`/`function_data`, always `resources`); GPU/timeout/secret_ids/volume_mounts/mount_ids wired. |
-| Resolve deployed function (`from_name`) | Implemented | `FunctionGet` | App name + object tag → invokable `function_id`. |
-| Get serialized / bind params / call graph / scheduling | Not yet | `FunctionGetSerialized`, `FunctionBindParams`, `FunctionGetCallGraph`, `FunctionUpdateSchedulingParams`, … | Not wired. |
+| Area | Implemented | Boundary |
+| --- | --- | --- |
+| Connection | Token credentials from the environment or `~/.modal.toml`, explicit credentials, `ClientHello`, HTTPS, and worker Unix-socket connections inside containers | No OAuth integration or refresh-token manager |
+| Apps | `AppGetOrCreate`, `AppCreate`, and `AppPublish`; ephemeral run apps and persistent deployments | No stop, list, logs, rollback, heartbeat, or tag API |
+| Environments | Resolve the configured environment and its image-builder version through `EnvironmentGetOrCreate` | No environment administration API |
+| Images | `ImageGetOrCreate` and `ImageJoinStreaming`; registry bases, Python provisioning, wrapper modules, build contexts, apt/pip installation, shell commands, and Rust toolchain installation | A subset of Modal's image-building API; no image lookup-by-ID or deletion wrapper |
+| Function definitions | `FunctionPrecreate`, `FunctionCreate`, and `FunctionGet`; resource, timeout, retry-policy, schedule, autoscaler, checkpoint, webhook, and input-concurrency fields | Configuration support does not imply full runtime semantics; see the limits below |
+| Invocation | Synchronous calls, spawn, ordered map collection, spawn-map, and result polling through `FunctionMap`, `FunctionPutInputs`, and `FunctionGetOutputs` | Control-plane path only; no input-plane attempt routing or remote cancellation |
+| Mounts | Hosted client/Python mounts and local source uploads through `MountGetOrCreate` and `MountPutFile`; Cargo dependency-closure uploads and ignore rules | Large mount files use single-part blob upload |
+| Volumes | Named resolution, function mounts, and local file/directory uploads using `VolumePutFiles2` with 8 MiB blocks | No download, listing, commit/reload, rename, copy, or deletion wrapper |
+| Secrets | Named lookup with required keys and creation from an environment map through `SecretGetOrCreate` | No update, delete, or list wrapper |
+| Dicts | Named lookup/create, get, put, put-if-absent, pop, contains, length, clear, and delete | No iteration, ephemeral lifecycle, or high-level batch update |
+| Queues | Named lookup/create, put/put-many, get/get-many, blocking polling, length, clear, and delete | Default partition only; no exposed partition or time-to-live settings, iteration, ephemeral lifecycle, or block-on-full put retry |
+| Blobs | `BlobCreate` plus single-part HTTP upload for large mount files | Multipart upload is rejected; blob download and function-payload offloading are not implemented |
+| Offline planning | Image and function request projections used by the facade's dry-run/dump tools | Request inspection does not execute or validate a deployment |
 
-### Function — invocation
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| `.remote()` (sync call + wait) | Implemented | `FunctionMap` → `FunctionPutInputs` → `FunctionGetOutputs` | Fix #3 enqueue fallback; CBOR `(args, kwargs)`; deadline-bounded output long-poll (`0-0` cursor). |
-| `.map()` (fan-out over many inputs) | Implemented | `FunctionMap` / `FunctionPutInputs` / `FunctionGetOutputs` | Same unary path, multiple inputs. |
-| `.spawn()` (fire-and-forget) | Implemented | `FunctionMap` (ASYNC) (+ `FunctionPutInputs` fallback) | Returns `function_call_id`; result fetched later. |
-| `FunctionCall::get` (poll a spawned call) | Implemented | `FunctionGetOutputs` | Polls by `function_call_id`. |
-| Cancel / retry / async-invoke / current-stats / dynamic-concurrency | Not yet | `FunctionCallCancel`, `FunctionRetryInputs`, `FunctionAsyncInvoke`, `FunctionGetCurrentStats`, `FunctionGetDynamicConcurrency` | Invocation lifecycle/observability beyond call+poll not wired. |
+Implementation references: [client](src/client.rs),
+[images](src/ops/image/render.rs), [function definitions](src/ops/function/spec.rs),
+[invocation](src/ops/invoke.rs), [mount uploads](src/ops/local_dir.rs),
+[Volumes](src/ops/volume.rs), [Secrets](src/ops/secret.rs),
+[Dicts](src/ops/dict.rs), [Queues](src/ops/queue.rs), and
+[planning](src/ops/planning.rs).
 
-### Mount
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Resolve hosted client mount (GLOBAL) | Implemented | `MountGetOrCreate` | `modal-client-mount-{version}` + python-standalone mounts; pure GLOBAL lookup. |
-| Upload local dir → ephemeral mount | Implemented | `MountGetOrCreate` + `MountPutFile` | Walks the cargo dep closure, hashes files, pushes inline (`MountPutFile.data`). `.modalignore` > `.gitignore` > defaults. |
-| Large-file blob branch | Implemented | `BlobCreate` + object-store HTTPS `PUT` | Files ≥ 4 MiB go via presigned URL → `MountPutFile.data_blob_id`. Single-part only (multipart rejected). |
+The facade exposes `#[cls]` through a Rust singleton and separate function
+entrypoints for its methods. This does not implement native parameterized Modal
+class binding. Its `#[endpoint]` and `#[web_server]` features use the function
+webhook configuration on deployment. Schedules and static autoscaler settings
+also travel through function creation; live autoscaler updates are not wrapped.
 
-### Volume
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Get-or-create (V1/V2) + attach as mount | Implemented | `VolumeGetOrCreate` | Powers the cargo build cache (V2, background commits) and user `volumes=["/m=name"]`; mount attached via `Function.volume_mounts`. |
-| Commit / reload / list / get-file / put-files / copy / rename / delete | Not yet | `VolumeCommit`, `VolumeReload`, `VolumeListFiles`, `VolumeGetFile`, `VolumePutFiles`, `VolumeCopyFiles`, `VolumeRename`, `VolumeDelete`, … | Direct file I/O against a volume from the client is not wired (the container commits the archive itself). |
+## Serialization
 
-### Secret
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| `from_name` lookup (+ `required_keys` assert) | Implemented | `SecretGetOrCreate` | Pure lookup; powers `#[function(secrets=[…])]`. |
-| `from_dict` create (idempotent) | Implemented | `SecretGetOrCreate` | `CREATE_IF_MISSING` + `env_dict`; values never logged. |
-| Update / delete / list | Not yet | `SecretUpdate`, `SecretDelete`, `SecretList` | Not wired. |
+Function arguments use Concise Binary Object Representation (CBOR) to encode
+`(args, kwargs)`. The low-level `invoke_cbor` API accepts these values directly.
+The facade uses that transport to carry `(entrypoint, input_json)` and receives
+a JSON envelope as a CBOR string.
 
-### Blob
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Single-part upload | Implemented | `BlobCreate` (+ HTTPS `PUT`) | See Mount large-file branch above. |
-| Multipart upload | Not yet | `BlobCreate` (multipart plan) | Detected and rejected — single-part only. |
-| Download | Not yet | `BlobGet` | Not wired. |
+Raw function results retain their format and bytes. Typed CBOR decoding rejects
+other formats; function results in Python's pickle format are not automatically
+unpickled.
 
-### Connect / handshake
-| Capability | Status | RPC(s) | Note |
-|---|---|---|---|
-| Client handshake / auth probe | Implemented | `ClientHello` | Run on `connect()`; bad credentials surface here. |
+Dict and Queue operations carry opaque bytes at the SDK operation layer. The
+facade uses the [restricted pickle codec](src/pickle.rs) for Python-compatible
+plain data: strings, numbers, booleans, bytes, lists, dictionaries, and Rust
+structs represented as dictionaries. Dict string keys use Python-compatible
+protocol-4 bytes. Arbitrary pickled Python classes and functions are unsupported.
 
-## Not covered (honest surface boundary)
+## Known invocation limits
 
-The crate is intentionally scoped to the run / deploy / call path. The following
-proto areas are **not implemented** today (the object families exist in the
-vendored proto but we issue none of their RPCs):
+These are open issues, not completed guarantees. The
+[roadmap's invocation section](../../docs/ROADMAP.md#open-invocation-correctness-go-sdk-comparison-2026-10-21)
+tracks the acceptance criteria.
 
-- **Sandbox** (the entire `Sandbox*` family — ~27 RPCs: create, exec, snapshot,
-  fs, tunnels, terminate, …).
-- **Dict** (`Dict*` — distributed dict).
-- **Queue** (`Queue*` — distributed queue).
-- **Cls / Class** (`ClassCreate` / `ClassGet` — Modal classes / parameterized
-  `Cls`).
-- **Web endpoints** (`EndpointCreate`/`List`/`Stop`, `TunnelStart`/`Stop`,
-  `DomainCreate`, web/ASGI/WSGI endpoints — no web-serving functions).
-- **Schedules / cron** — no schedule wiring (and no
-  `FunctionUpdateSchedulingParams`).
-- **NFS / shared volumes** (`SharedVolume*`) and **CloudBucket** mounts.
-- **Proxy** (`Proxy*`), **Cluster** (`Cluster*`), **Flash** (`Flash*`),
-  container exec/filesystem RPCs (`Container*`), and the
-  **autoscaler / scaling / current-stats** RPCs
-  (`FunctionGetCurrentStats`, `FunctionGetDynamicConcurrency`,
-  `FunctionUpdateSchedulingParams`, …).
-- **App lifecycle/observability** beyond create + publish (stop, logs, list,
-  rollback, history, heartbeat, tags).
-- **Volume / Secret / Environment management** RPCs (file I/O, update, delete,
-  list) beyond the get-or-create paths above.
-- **Token-flow auth** (`TokenFlow*`), workspace/billing RPCs, and the
-  **map/attempt** server-driven invocation RPCs
-  (`MapStartOrContinue`, `MapAwait`, `AttemptStart`/`Await`/`Retry`) — our
-  invocation uses the `FunctionMap`/`PutInputs`/`GetOutputs` path instead.
-- **SERIALIZED mode** (pickled function bytecode) — FILE mode only.
-- **Image-builder breadth** — only `from_registry` + `add_python` + the wrapper
-  bake are rendered; the full `Image` DSL (apt/pip/run/copy chains as a
-  first-class API) is not exposed.
+1. **Calls through one facade `App` serialize.** Its client mutex stays locked
+   throughout invocation and output polling. A pending `get()` can block another
+   spawn. One `.map()` still submits multiple inputs for remote parallel
+   execution. The low-level `ModalClient` is cloneable; the lock is in the facade.
+2. **Rust handler errors do not reach Modal as failed calls.** The Python adapters
+   return `{"ok":false,...}` as normal response data. The facade raises a Rust
+   error after receiving that successful transport result. Configuring
+   `#[function(retries = N)]` alone therefore does not cause Modal to retry
+   ordinary Rust handler failures. Wrapper exceptions and infrastructure failures
+   are separate cases.
+3. **Function payloads are inline-only.** Arguments are not uploaded to blobs,
+   and blob-backed outputs are rejected. Mount and Volume upload support does
+   not provide large-payload support for function calls.
+4. **Retries lack complete safety and cancellation semantics.** Transport retries
+   do not retain an idempotency key, so a lost enqueue response can lead to
+   duplicate work. There is no public remote call cancellation API. Deadline
+   checks happen between awaited operations, so they do not enforce a hard cap
+   on an in-flight request.
 
-## Stability
+The unary retry helper permits up to eight attempts with exponential backoff and
+jitter. It retries errors classified as transient and returns other errors
+immediately. This transport retry loop does not implement user-function retry
+semantics. See [retry policy](src/retry.rs) and
+[enqueue handling](src/ops/transport.rs).
 
-This crate is **pre-1.0 (`0.1.0`) and internal-leaning** — its public surface is
-shaped by what the `modal-rust` facade needs, and the `ModalClient::inner_mut()`
-escape hatch exists precisely so callers can issue any other control-plane RPC
-the typed surface does not yet wrap. It is, however, **designed to grow toward
-fuller Modal client-SDK compatibility**: the auth/channel/codec/retry foundation
-and the vendored full proto are already in place, so adding a new object family
-(Dict, Queue, Sandbox, …) is a matter of adding an `ops/*` module — not
-re-plumbing the transport.
+Map calls currently materialize all inputs and send them in one enqueue request.
+Partial acceptance returns an error. This is not a streaming map implementation
+with bounded buffering and backpressure.
+
+## Remaining platform gaps
+
+The typed surface does not yet cover Sandboxes, native parameterized class
+binding, network file systems, cloud-bucket mounts, proxies, tunnels, or clustered
+functions. General function/app logs, metrics, statistics, call graphs, and live
+autoscaler updates are also absent.
+
+`ModalClient::inner_mut()` exposes the generated stub for operations outside the
+typed surface. Callers using it own their request construction, retry behavior,
+and compatibility with the server.
+
+## Protocol provenance and verification
+
+The client uses `tonic`/`prost`, `reqwest` with Rustls, Serde, CBOR, and the
+restricted pickle codec. The vendored protocol comes from Modal's official
+client repository; [`proto/SOURCE.toml`](proto/SOURCE.toml) records its revision
+and update procedure. See [`NOTICE`](NOTICE) for attribution, including the
+`modal-rs` transport and codec references.
+
+Offline tests cover request construction, codecs, and operations against the
+in-process mock backend. Live tests are opt-in. A passing mock test establishes
+the tested client behavior, not full compatibility with production Modal.
