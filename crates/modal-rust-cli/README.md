@@ -16,7 +16,7 @@ Python application code or install Modal's Python CLI locally. See the SDK's
 Pre-release, so pin the version (`cargo install` skips pre-releases by default):
 
 ```bash
-cargo install modal-rust-cli --version 0.1.0-alpha.3
+cargo install modal-rust-cli --version 0.1.0-alpha.4
 ```
 
 Then, from a crate that authors `#[modal_rust::function]`s:

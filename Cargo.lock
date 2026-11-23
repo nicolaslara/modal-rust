@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "modal-rust"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "modal-rust-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3233,7 +3233,7 @@ dependencies = [
 
 [[package]]
 name = "modal-rust-macros"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "modal-rust-runtime"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "anyhow",
  "inventory",
@@ -3253,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "modal-rust-sdk"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "base64 0.22.1",
  "hyper-util",

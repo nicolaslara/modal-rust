@@ -20,7 +20,7 @@ pre-releases by default:
 
 ```toml
 [dependencies]
-modal-rust = "0.1.0-alpha.3"
+modal-rust = "0.1.0-alpha.4"
 ```
 
 ## The CLI
@@ -30,7 +30,7 @@ The `modal-rust` **binary** (`run` / `deploy` / `call`) ships in a separate crat
 does **not** work (this crate is the library; same split as `wasmtime` / `wasmtime-cli`):
 
 ```bash
-cargo install modal-rust-cli --version 0.1.0-alpha.3
+cargo install modal-rust-cli --version 0.1.0-alpha.4
 ```
 
 Full documentation: <https://github.com/nicolaslara/modal-rust>

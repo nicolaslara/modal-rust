@@ -92,7 +92,7 @@ One dependency covers both the macro and the manual authoring paths:
 
 ```toml
 [dependencies]
-modal-rust = "0.1.0-alpha.3"
+modal-rust = "0.1.0-alpha.4"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 ```
@@ -120,10 +120,10 @@ or the offline `dry_run`/`dump_deploy_manifest` dump:
 
 ```toml
 # Function-only crate (authoring + .local() + `modal-rust run`/`deploy`): nothing to add.
-modal-rust = "0.1.0-alpha.3"
+modal-rust = "0.1.0-alpha.4"
 
 # Orchestration code (your binary/tests call .remote()/deploy/connect): add the feature.
-modal-rust = { version = "0.1.0-alpha.3", features = ["client"] }
+modal-rust = { version = "0.1.0-alpha.4", features = ["client"] }
 ```
 
 If you forget the feature, the talk-to-Modal methods still compile — they return a
@@ -144,7 +144,7 @@ split as `wasmtime` / `wasmtime-cli`). Install the CLI from crates.io (explicit
 version while it is a pre-release):
 
 ```bash
-cargo install modal-rust-cli --version 0.1.0-alpha.3
+cargo install modal-rust-cli --version 0.1.0-alpha.4
 ```
 
 Or from GitHub, or a local checkout you are editing:
