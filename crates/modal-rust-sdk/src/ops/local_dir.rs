@@ -136,6 +136,8 @@ pub(crate) fn build_mount_get_or_create_source_request(
         // rejects EPHEMERAL for use in Function.mount_ids, switch to
         // ANONYMOUS_OWNED_BY_APP (=4) with app_id set by the facade.
         app_id: String::new(),
+        // Telemetry only; the server accepts it unset.
+        earliest_checked_at: None,
     }
 }
 

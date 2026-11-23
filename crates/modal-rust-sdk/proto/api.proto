@@ -65,8 +65,15 @@ enum AppState {
 enum AppStopSource {
   APP_STOP_SOURCE_UNSPECIFIED = 0;
   APP_STOP_SOURCE_CLI = 1;
-  APP_STOP_SOURCE_PYTHON_CLIENT = 2;
+  APP_STOP_SOURCE_PYTHON_CLIENT = 2;  // Now also used by JS and Go SDKs
   APP_STOP_SOURCE_WEB = 3;
+}
+
+// CPU architecture an image is built for and must run on.
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_X86_64 = 1;
+  ARCH_AARCH64 = 2;
 }
 
 enum CertificateStatus {
@@ -126,6 +133,15 @@ enum DeploymentNamespace {
   DEPLOYMENT_NAMESPACE_GLOBAL = 3;
 }
 
+enum DeploymentType {
+  DEPLOYMENT_TYPE_UNSPECIFIED = 0;
+  DEPLOYMENT_TYPE_STANDARD = 1;
+  DEPLOYMENT_TYPE_ROLLBACK = 2;
+  DEPLOYMENT_TYPE_ROLLOVER = 3;
+  DEPLOYMENT_TYPE_PROMOTION = 4;
+  DEPLOYMENT_TYPE_STAGED = 5;
+}
+
 enum EndpointApiSurface {
   ENDPOINT_API_SURFACE_UNSPECIFIED = 0;
   ENDPOINT_API_SURFACE_OPENAI_CHAT_COMPLETIONS = 1;
@@ -168,19 +184,40 @@ enum EndpointStopSource {
   ENDPOINT_STOP_SOURCE_WEB = 2;
 }
 
+enum EndpointTaskType {
+  ENDPOINT_TASK_TYPE_UNSPECIFIED = 0;
+  ENDPOINT_TASK_TYPE_GENERATION = 1;
+  ENDPOINT_TASK_TYPE_EMBEDDING = 2;
+}
+
+// Partial-update signal for EnvironmentUpdateRequest. Omitted means no-op.
+// INHERIT clears the environment override so the workspace default applies.
+enum EnvironmentBlockUnauthenticatedResources {
+  ENVIRONMENT_BLOCK_UNAUTHENTICATED_RESOURCES_UNSPECIFIED = 0;
+  ENVIRONMENT_BLOCK_UNAUTHENTICATED_RESOURCES_INHERIT = 1;
+  ENVIRONMENT_BLOCK_UNAUTHENTICATED_RESOURCES_BLOCK = 2;
+  ENVIRONMENT_BLOCK_UNAUTHENTICATED_RESOURCES_ALLOW = 3;
+}
+
 enum EnvironmentRole {
   ENVIRONMENT_ROLE_UNSPECIFIED = 0;
   ENVIRONMENT_ROLE_VIEWER = 1;
   ENVIRONMENT_ROLE_CONTRIBUTOR = 2;
   ENVIRONMENT_ROLE_NO_ACCESS = 3;
+  ENVIRONMENT_ROLE_MODAL_ADMINISTERED_OBSERVER = 4;
+  // Assignment uses a workspace role definition (`rd-`), not a built-in role.
+  ENVIRONMENT_ROLE_CUSTOM = 5;
 }
 
 // Creation-time environment classification. Captures whether an environment
-// is public. is_managed and machine_generated may be folded in as future
-// values.
+// is public or administered by Modal. is_managed and machine_generated may be
+// folded in as future values.
 enum EnvironmentType {
   ENVIRONMENT_TYPE_UNSPECIFIED = 0;
   ENVIRONMENT_TYPE_PUBLIC = 1;
+  // Restricted environment whose roles are administered by Modal admins rather
+  // than the workspace's own managers.
+  ENVIRONMENT_TYPE_MODAL_ADMINISTERED = 2;
 }
 
 enum ExecOutputOption {
@@ -195,6 +232,22 @@ enum FileDescriptor {
   FILE_DESCRIPTOR_STDOUT = 1;
   FILE_DESCRIPTOR_STDERR = 2;
   FILE_DESCRIPTOR_INFO = 3;
+}
+
+enum FunctionCallInputStatus {
+  FUNCTION_CALL_INPUT_STATUS_UNSPECIFIED = 0;
+  FUNCTION_CALL_INPUT_STATUS_PENDING = 1;
+  FUNCTION_CALL_INPUT_STATUS_RUNNING = 2;
+  FUNCTION_CALL_INPUT_STATUS_SUCCESS = 3;
+  FUNCTION_CALL_INPUT_STATUS_FAILURE = 4;
+  FUNCTION_CALL_INPUT_STATUS_TIMEOUT = 5;
+  FUNCTION_CALL_INPUT_STATUS_TERMINATED = 6;
+  FUNCTION_CALL_INPUT_STATUS_INIT_FAILURE = 7;
+  FUNCTION_CALL_INPUT_STATUS_INTERNAL_FAILURE = 8;
+  FUNCTION_CALL_INPUT_STATUS_IDLE_TIMEOUT = 9;
+  FUNCTION_CALL_INPUT_STATUS_MEMORY_MANAGER_EVICTION = 10;
+  FUNCTION_CALL_INPUT_STATUS_MEMORY_THRASHING_EVICTION = 11;
+  FUNCTION_CALL_INPUT_STATUS_KERNEL_OOM_KILL = 12;
 }
 
 enum FunctionCallInvocationType {
@@ -229,8 +282,14 @@ enum GPUType {
 enum IdentityProviderType {
   IDENTITY_PROVIDER_TYPE_UNSPECIFIED = 0;
   IDENTITY_PROVIDER_TYPE_GITHUB = 1;
-  IDENTITY_PROVIDER_TYPE_OKTA = 2;
+  IDENTITY_PROVIDER_TYPE_SAML = 2;
   IDENTITY_PROVIDER_TYPE_GOOGLE_OAUTH = 3;
+}
+
+enum LLMEngine {
+  LLM_ENGINE_UNSPECIFIED = 0;
+  LLM_ENGINE_SGLANG = 1;
+  LLM_ENGINE_VLLM = 2;
 }
 
 enum MemberRole {
@@ -275,12 +334,6 @@ enum ProxyIpStatus {
   PROXY_IP_STATUS_UNHEALTHY = 4;
 }
 
-enum ProxyType {
-  PROXY_TYPE_UNSPECIFIED = 0;
-  PROXY_TYPE_LEGACY = 1;
-  PROXY_TYPE_VPROX = 2;
-}
-
 enum RateLimitInterval {
   RATE_LIMIT_INTERVAL_UNSPECIFIED = 0;
   RATE_LIMIT_INTERVAL_SECOND = 1;
@@ -301,21 +354,11 @@ enum SeekWhence {
   SEEK_END = 2;
 }
 
-enum SystemErrorCode {
-  SYSTEM_ERROR_CODE_UNSPECIFIED = 0;
-  SYSTEM_ERROR_CODE_PERM = 1;           // EPERM: Operation not permitted
-  SYSTEM_ERROR_CODE_NOENT = 2;          // ENOENT: No such file or directory
-  SYSTEM_ERROR_CODE_IO = 5;             // EIO: Input/output error
-  SYSTEM_ERROR_CODE_NXIO = 6;           // ENXIO: No such device or address
-  SYSTEM_ERROR_CODE_NOMEM = 12;         // ENOMEM: Out of memory
-  SYSTEM_ERROR_CODE_ACCES = 13;         // EACCES: Permission denied
-  SYSTEM_ERROR_CODE_EXIST = 17;         // EEXIST: File exists
-  SYSTEM_ERROR_CODE_NOTDIR = 20;        // ENOTDIR: Not a directory
-  SYSTEM_ERROR_CODE_ISDIR = 21;         // EISDIR: Is a directory
-  SYSTEM_ERROR_CODE_INVAL = 22;         // EINVAL: Invalid argument
-  SYSTEM_ERROR_CODE_MFILE = 24;         // EMFILE: Too many open files
-  SYSTEM_ERROR_CODE_FBIG = 27;          // EFBIG: File too large
-  SYSTEM_ERROR_CODE_NOSPC = 28;         // ENOSPC: No space left on device
+enum ServerInferenceStatsStatus {
+  SERVER_INFERENCE_STATS_STATUS_UNSPECIFIED = 0;
+  SERVER_INFERENCE_STATS_STATUS_AVAILABLE = 1;
+  SERVER_INFERENCE_STATS_STATUS_NO_DATA = 2;
+  SERVER_INFERENCE_STATS_STATUS_UNAVAILABLE = 3;
 }
 
 enum TaskSnapshotBehavior {
@@ -338,6 +381,51 @@ enum TaskState {
   TASK_STATE_PREEMPTIBLE = 9;
   TASK_STATE_PREEMPTED = 10;
   TASK_STATE_LOADING_CHECKPOINT_IMAGE = 11;
+}
+
+enum TaskTerminationReason {
+  // Our internal taxonomy for why a task stopped running. Reported alongside
+  // GenericResult, which stays the coarse outcome. This should not be exposed
+  // directly to clients; instead, public-facing statuses should derive from it.
+  // Values 1-11 match the integers historically stored for V1 tasks (tasks.termination_reason).
+  TASK_TERMINATION_REASON_UNSPECIFIED = 0;
+
+  // Control-plane initiated.
+  TASK_TERMINATION_REASON_PREEMPTED_BY_SCHEDULER = 1;
+  TASK_TERMINATION_REASON_USER_CANCELLED = 2;
+  TASK_TERMINATION_REASON_WORKER_PREEMPTED = 3;
+  TASK_TERMINATION_REASON_INPUT_CANCELLED = 4;
+  TASK_TERMINATION_REASON_WORKSPACE_FROZEN = 5;
+  TASK_TERMINATION_REASON_BILLING_LIMIT_REACHED = 6;
+  TASK_TERMINATION_REASON_CLUSTER_FAILURE = 7;
+  // 8-10 were the NOTEBOOK_KERNEL_{DISAPPEARED,IDLE,STOPPED} reasons of the retired Notebooks product.
+  reserved 8, 9, 10;
+  TASK_TERMINATION_REASON_LOW_PRIORITY_PREEMPTED_FOR_WORKER_SHUTDOWN = 11;
+  TASK_TERMINATION_REASON_APP_STOPPED = 12;
+  TASK_TERMINATION_REASON_APP_DISABLED = 13;
+  TASK_TERMINATION_REASON_APP_NOT_FOUND = 14;
+  TASK_TERMINATION_REASON_NAME_LOST = 15;
+  TASK_TERMINATION_REASON_SECURITY_EVENT = 16;
+  // The worker lost contact with the control plane for too long.
+  TASK_TERMINATION_REASON_WORKER_HEARTBEAT_TIMEOUT = 17;
+  TASK_TERMINATION_REASON_FUNCTION_NOT_FOUND = 18;
+  // A sandbox was not scheduled onto a worker before its deadline.
+  TASK_TERMINATION_REASON_SCHEDULING_TIMEOUT = 19;
+
+  // Worker initiated.
+  TASK_TERMINATION_REASON_TIMEOUT = 20;
+  TASK_TERMINATION_REASON_IDLE_TIMEOUT = 21;
+  TASK_TERMINATION_REASON_STARTUP_TIMEOUT = 22;
+  TASK_TERMINATION_REASON_MEMORY_MANAGER_EVICTION = 23;
+  TASK_TERMINATION_REASON_MEMORY_THRASHING_EVICTION = 24;
+  TASK_TERMINATION_REASON_KERNEL_OOM_KILL = 25;
+  TASK_TERMINATION_REASON_CONTAINER_HEARTBEAT_TIMEOUT = 26;
+  TASK_TERMINATION_REASON_RUNTIME_ERROR = 27;
+
+  // Not a termination: the process ended on its own.
+  TASK_TERMINATION_REASON_EXITED = 30;
+  TASK_TERMINATION_REASON_PROCESS_FAILED = 31;
+  TASK_TERMINATION_REASON_INIT_FAILURE = 32;
 }
 
 enum TunnelType {
@@ -367,10 +455,23 @@ enum WebhookType {
   WEBHOOK_TYPE_WEB_SERVER = 4;
 }
 
+message AppCallCounts {
+  uint64 total = 1;
+  uint64 succeeded = 2;
+  uint64 failed = 3;  // All non-success outcomes, including timeouts.
+}
+
 message AppClientDisconnectRequest {
   string app_id = 1;
   AppDisconnectReason reason = 2;
   string exception = 3;
+}
+
+message AppContainerCounts {
+  // Containers that finished with an error in [since, until).
+  uint64 container_errors = 1;
+  // Distinct containers that published heartbeats in [since, until).
+  uint64 container_active_count = 2;
 }
 
 message AppCountLogsRequest {
@@ -384,6 +485,8 @@ message AppCountLogsRequest {
   google.protobuf.Timestamp until = 8;
   uint32 bucket_secs = 9;
   FileDescriptor source = 10;
+  // Restrict logs to this exact Function ID, including when it is the base Function.
+  string parametrized_function_id = 11;
 }
 
 message AppCountLogsResponse {
@@ -435,6 +538,7 @@ message AppDeploymentHistory {
   uint32 rollback_version = 7;
   bool rollback_allowed = 8;
   optional CommitInfo commit_info = 10;
+  DeploymentType deployment_type = 11;
 }
 
 message AppDeploymentHistoryRequest {
@@ -457,10 +561,29 @@ message AppFetchLogsRequest {
   string task_id = 8;
   string sandbox_id = 9;
   string search_text = 10;
+  // Restrict logs to this exact Function ID, including when it is the base Function.
+  string parametrized_function_id = 11;
 }
 
 message AppFetchLogsResponse {
   repeated TaskLogsBatch batches = 1;
+}
+
+message AppFunctionCounts {
+  AppCallCounts calls = 1;
+  AppContainerCounts containers = 2;
+}
+
+message AppFunctionStats {
+  string object_id = 1;  // Root Function ID
+  AppFunctionCounts counts = 2;
+}
+
+message AppFunctionStatsGroup {
+  // Counts summed across current Functions.
+  AppFunctionCounts total = 1;
+  // Current Functions keyed by name.
+  map<string, AppFunctionStats> by_name = 2;
 }
 
 message AppGetByDeploymentNameRequest {
@@ -474,6 +597,25 @@ message AppGetByDeploymentNameResponse {
   string previous_app_id = 2;  // Populated if App with requested name was recently stopped
   string environment_name = 3;  // Populated because server may resolve default environment
   AppLifecycle lifecycle = 4;  // Lifecycle of current App or recently stopped App
+}
+
+message AppGetInfoRequest {
+  string app_id = 1;
+}
+
+message AppGetInfoResponse {
+  message FunctionInfoSummary {
+    repeated GPUConfig gpu_config = 1;
+    Schedule schedule = 2;
+    // True for Web Functions and classes with web methods; false for Servers.
+    bool web_function = 3;
+    optional bool requires_proxy_auth = 4;
+    // True for Sessioned Servers.
+    bool is_sessioned = 5;
+  }
+
+  AppHandleMetadata info = 1;
+  map<string, FunctionInfoSummary> function_info_summaries = 2;
 }
 
 message AppGetLayoutRequest {
@@ -529,6 +671,7 @@ message AppGetOrCreateRequest {
 
 message AppGetOrCreateResponse {
   string app_id = 1;
+  AppHandleMetadata handle_metadata = 2;
 }
 
 message AppGetTagsRequest {
@@ -537,6 +680,32 @@ message AppGetTagsRequest {
 
 message AppGetTagsResponse {
   map<string, string> tags = 1;
+}
+
+message AppGetTimeRangeStatsRequest {
+  string app_id = 1;
+  google.protobuf.Timestamp since = 2;  // Required, inclusive.
+  google.protobuf.Timestamp until = 3;  // Required, exclusive; at most seven days after since.
+}
+
+message AppGetTimeRangeStatsResponse {
+  google.protobuf.Timestamp since = 1;  // Inclusive.
+  google.protobuf.Timestamp until = 2;  // Exclusive.
+  AppFunctionStatsGroup functions = 3;
+  AppServerStatsGroup servers = 4;
+  AppSandboxCounts sandboxes = 7;
+  AppLifecycle lifecycle = 8;  // Current App metadata at query time.
+  // Live publishes in [since, until); absent for ephemeral and detached run Apps.
+  optional uint64 deployment_count = 9;
+}
+
+message AppHandleMetadata {
+  string description = 1;
+  string app_id = 2;
+  string environment_name = 3;
+  AppLifecycle lifecycle = 4;
+  map<string, string> functions = 5;  // tag -> function id
+  map<string, string> servers = 6;  // tag -> function id
 }
 
 message AppHeartbeatRequest {
@@ -573,6 +742,7 @@ message AppListResponse {
     double stopped_at = 6;
     int32 n_running_tasks = 8;
     string name = 10;
+    AppHandleMetadata metadata = 11;
   }
   repeated AppListItem apps = 1;
 }
@@ -584,6 +754,17 @@ message AppLookupRequest {
 
 message AppLookupResponse {
   string app_id = 1;
+}
+
+message AppPromoteRequest {
+  string app_id = 1;
+  int32 version = 2;
+}
+
+message AppPromoteResponse {
+  string url = 1;
+  repeated Warning server_warnings = 2;
+  double deployed_at = 3;
 }
 
 message AppPublishRequest {
@@ -602,12 +783,20 @@ message AppPublishRequest {
   // If true, create a version pinned deployment but don't update the production deployment
   // definition on publish
   bool staged = 12;
+  DeploymentType deployment_type = 13;
+
 }
 
 message AppPublishResponse {
   string url = 1;
   repeated Warning server_warnings = 3;
   double deployed_at = 4;
+}
+
+message AppRequestCounts {
+  uint64 total = 1;
+  uint64 ok = 2;
+  uint64 failed = 3;  // All non-1xx, non-2xx, and non-3xx responses, including status zero.
 }
 
 message AppRollbackRequest {
@@ -629,6 +818,29 @@ message AppRolloverResponse {
   string url = 1;
   repeated Warning server_warnings = 3;
   double deployed_at = 4;
+}
+
+message AppSandboxCounts {
+  uint64 total = 1;  // finished + live; not the number created during the window.
+  uint64 finished = 2;  // Finished in [since, until), regardless of terminal outcome.
+  uint64 live = 3;  // Pending, starting, or running at the exclusive until cutoff.
+}
+
+message AppServerCounts {
+  AppRequestCounts requests = 1;
+  AppContainerCounts containers = 2;
+}
+
+message AppServerStats {
+  string object_id = 1;
+  AppServerCounts counts = 2;
+}
+
+message AppServerStatsGroup {
+  // Counts summed across current Servers.
+  AppServerCounts total = 1;
+  // Current Servers keyed by name.
+  map<string, AppServerStats> by_name = 2;
 }
 
 message AppSetObjectsRequest {
@@ -803,6 +1015,96 @@ message AttemptStartResponse {
   FunctionRetryPolicy retry_policy = 2;
 }
 
+message AuditLogActor {
+  string type = 1;  // "user", "service_user", "oauth_grant" or "system"
+  string id = 2;
+  string name = 3;   // Display or service user name; OAuth authorizing user's name. Empty if unresolved.
+  string email = 4;  // User or OAuth authorizing user's email. Empty if unresolved.
+}
+
+message AuditLogBucketsRequest {
+  string q = 1;            // Search query in the audit log search syntax
+  int64 oldest_ms = 2;     // Oldest time bound in Unix milliseconds, inclusive
+  int64 newest_ms = 3;     // Newest time bound in Unix milliseconds, exclusive
+  uint32 bucket_size = 4;  // Approximate entries per bucket; 0 selects the default
+}
+
+message AuditLogContext {
+  string workspace_id = 1;
+  string environment_id = 2;
+  string source = 3;  // "sdk", "web" or "unknown"
+  string ip_address = 4;
+  bool is_modal_admin = 5;
+  string environment_name = 6;  // Empty if unresolved.
+}
+
+message AuditLogCountRequest {
+  string q = 1;         // Search query in the audit log search syntax
+  int64 oldest_ms = 2;  // Oldest time bound in Unix milliseconds, inclusive
+  int64 newest_ms = 3;  // Newest time bound in Unix milliseconds, exclusive
+}
+
+message AuditLogCountResponse {
+  int64 count = 1;
+}
+
+// A position in the results. Pass it back unchanged.
+message AuditLogCursor {
+  int64 event_at_desc = 1;
+  string id = 2;
+}
+
+message AuditLogEntry {
+  string id = 1;
+  AuditLogActor actor = 2;
+  string action = 3;
+  repeated AuditLogTarget targets = 4;
+  AuditLogContext context = 5;
+  string event_at = 6;       // ISO 8601 timestamp
+  string status = 7;         // "success" or "error"
+  string metadata_json = 8;  // JSON-encoded string
+  google.protobuf.Timestamp event_at_timestamp = 9;
+}
+
+// Entries are read newest to oldest. The newest bound is exclusive and the oldest bound is inclusive, for time and cursors.
+message AuditLogListRequest {
+  string q = 1;                      // Search query in the audit log search syntax
+  int64 oldest_ms = 2;               // Oldest time bound in Unix milliseconds, inclusive
+  int64 newest_ms = 3;               // Newest time bound in Unix milliseconds, exclusive
+  uint32 limit = 4;                  // Maximum entries to return; 0 selects the default
+  AuditLogCursor oldest_cursor = 5;  // Oldest cursor bound, inclusive; omit to read to oldest_ms
+  AuditLogCursor newest_cursor = 6;  // Newest cursor bound, exclusive; omit to start at newest_ms
+}
+
+message AuditLogListResponse {
+  repeated AuditLogEntry items = 1;   // Newest first
+  AuditLogCursor next_cursor = 2;     // Set when more entries may follow
+}
+
+message AuditLogPlanResponse {
+  // Bucket cut points, newest first. Cursor i is the last entry of bucket i, and bucket i+1 starts after it.
+  // Bucket 0 starts at the newest entry, and the last bucket is the remainder.
+  repeated AuditLogCursor cursors = 1;
+}
+
+message AuditLogSettingsGetRequest {
+}
+
+message AuditLogSettingsGetResponse {
+  uint32 bucket_size = 1;
+  uint32 page_size = 2;
+  uint32 max_concurrent_requests = 3;
+  uint32 max_buffered_buckets = 4;
+  reserved 5, 6, 7, 10;
+  float request_timeout_secs = 8;
+  float plan_timeout_secs = 9;
+}
+
+message AuditLogTarget {
+  string type = 1;  // For example "app", "function" or "secret"
+  string id = 2;
+}
+
 message AuthTokenGetRequest {
 }
 
@@ -840,10 +1142,13 @@ message AutoscalerSettings {
   // Maximum amount of time a container can be idle before being scaled down, in seconds; pka "container_idle_timeout"
   optional uint32 scaledown_window = 5;
   reserved 6;
-  // Target concurrent inputs per replica for Flash autoscaling.
-  optional uint32 target_concurrency = 7;
+  // Integer-valued target concurrent requests per replica for Flash autoscaling.
+  // Superseded by `target_concurrency_float`, which allows non-integer targets.
+  optional uint32 target_concurrency = 7; // Deprecated
   // Maximum number of containers that can be scaled down per minute for Flash autoscaling.
   optional uint32 scaledown_rate_limit = 8;
+  // Target concurrent requests per replica for Flash autoscaling; may be fractional.
+  optional double target_concurrency_float = 9;
 }
 
 // Used for flash autoscaling
@@ -883,10 +1188,23 @@ message BlobCreateResponse {
 
 message BlobGetRequest {
   string blob_id = 1;
+  string function_id = 2;
 }
 
 message BlobGetResponse {
   string download_url = 1;
+}
+
+message BlobUploadResult {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_SUCCESS = 1;
+    OUTCOME_FAILURE = 2;
+  }
+
+  string blob_id = 1; // The blob id (from BlobCreateResponse) that this upload attempt targeted.
+  Outcome outcome = 2;
+  uint64 throughput_bytes_s = 3;
 }
 
 message BuildFunction {
@@ -911,6 +1229,8 @@ message CheckpointInfo {
   string original_task_id = 7;
   reserved 8;
   string runsc_runtime_version = 9;
+  optional string gvisor_platform = 10;
+  bool encrypted = 11;
 }
 
 message ClassCreateRequest {
@@ -1006,6 +1326,22 @@ message ClassParameterValue {  // TODO: rename into NamedPayloadValue
   }
 }
 
+// Suggest guidance for an unknown static CLI command using its syntax and client version.
+// The client version is supplied in request metadata.
+message CliCommandSuggestRequest {
+  // Successfully parsed parent commands, excluding "modal".
+  repeated string parent_path = 1;
+  // The command token that could not be resolved. No arguments or option values.
+  string unknown_command = 2;
+}
+
+message CliCommandSuggestResponse {
+  // Complete guidance text; empty when local CLI suggestions should be used.
+  string message = 1;
+  // Append the original invocation locally, preserving its arguments and flags.
+  bool append_original_command = 2;
+}
+
 message ClientHelloResponse {
   string warning = 1;
   string image_builder_version = 2;  // Deprecated, no longer used in client
@@ -1058,6 +1394,32 @@ message ClusterListResponse {
   repeated ClusterStats clusters = 1;
 }
 
+message ClusterReservation {
+  // A container running on a worker reserved for this reservation.
+  message Task {
+    string task_id = 1;
+    int32 cluster_rank = 2;
+    string app_id = 3;
+    string function_id = 4;
+  }
+
+  string name = 1;  // reservation name, as configured by Modal
+  string gpu_type = 2;  // e.g. "B300"
+  string region = 3;
+  int32 min_reserved_workers = 4;  // workers Modal has committed to keep reserved
+  int32 reserved_workers = 5;  // healthy reserved workers currently present (active + idle)
+  int32 active_workers = 6;  // reserved workers running this workspace's containers
+  int32 idle_workers = 7;  // reserved workers available for new clusters
+  int32 unfulfilled_workers = 8;  // max(0, min_reserved_workers - reserved_workers)
+  repeated Task tasks = 9;  // containers on reserved workers, ordered by cluster then rank
+}
+
+message ClusterReservationListRequest {}
+
+message ClusterReservationListResponse {
+  repeated ClusterReservation reservations = 1;
+}
+
 message ClusterStats {
   string app_id = 1;
   repeated string task_ids = 2;
@@ -1086,7 +1448,6 @@ message ContainerArguments {  // This is used to pass data from the worker to th
   string function_id = 2;
   string app_id = 4;
   Function function_def = 7;
-  ProxyInfo proxy_info = 8;
   map<string, string> tracing_context = 9;
   bytes serialized_params = 10;
   string runtime = 11;
@@ -1211,11 +1572,6 @@ message ContainerFileWriteReplaceBytesRequest {
 message ContainerFileWriteRequest {
   string file_descriptor = 1;
   bytes data = 2;
-}
-
-message ContainerFilesystemExecGetOutputRequest {
-  string exec_id = 1;
-  float timeout = 2;
 }
 
 message ContainerFilesystemExecRequest {
@@ -1487,12 +1843,20 @@ message EndpointCreateRequest {
   string environment_name = 8;
   bool unauthenticated = 9;
   EndpointServingMode serving_mode = 10;
+  bool shared_endpoint_notice_acknowledged = 11;
+  // Requires Modal admin access. Dedicated endpoints only; must match model.
+  optional string recipe_id = 12;
+  // Dedicated endpoints only. Fields that are set override the model's default autoscaling
+  // configuration. Target concurrency and scaledown rate limits are not supported.
+  optional AutoscalerSettings autoscaler_settings = 13;
 }
 
 message EndpointCreateResponse {
   string endpoint_id = 1;
   string endpoint_page_url = 2;
   string name = 3;
+  // Model name to send in requests to the endpoint.
+  string model_name = 4;
 }
 
 message EndpointCustomModelSource {
@@ -1511,6 +1875,54 @@ message EndpointGetByNameRequest {
 message EndpointGetByNameResponse {
   string endpoint_id = 1;
   string environment_name = 2;
+}
+
+message EndpointGetInfoRequest {
+  string endpoint_id = 1;
+}
+
+message EndpointGetInfoResponse {
+
+  enum EndpointStatus {
+    ENDPOINT_STATUS_UNSPECIFIED = 0;
+    ENDPOINT_STATUS_PROVISIONING = 1;
+    ENDPOINT_STATUS_LIVE = 2;
+    ENDPOINT_STATUS_FAILED = 3;
+    ENDPOINT_STATUS_CANCELLING = 4;
+    ENDPOINT_STATUS_CANCELLED = 5;
+    ENDPOINT_STATUS_STOPPED = 6;
+  }
+
+  message EndpointInfoSummary {
+    string name = 1;
+    string repo_id = 2;
+    string revision = 3;
+    string service_url = 4;
+    bool requires_proxy_auth = 5;
+    EndpointServingMode serving_mode = 6;
+    EndpointStatus status = 7;
+    EndpointLifecycle lifecycle = 8;
+    // set only when the model is served from a modal volume
+    string volume_id = 11;
+    string model_path = 12;
+    // Model name to send in requests to the endpoint.
+    string model_name = 13;
+  }
+
+  message EndpointHandleMetadata {
+    string app_id = 1;
+    string server_id = 2;
+    string environment_name = 3;
+  }
+
+  EndpointInfoSummary info = 1;
+  optional EndpointHandleMetadata metadata = 2;
+}
+
+message EndpointGetLibraryRequest {}
+
+message EndpointGetLibraryResponse {
+  repeated EndpointModel models = 1;
 }
 
 message EndpointGetLifecycleRequest {
@@ -1536,6 +1948,17 @@ message EndpointLifecycle {
   string environment_name = 6;
 }
 
+message EndpointListFilter {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;  // live or stopped
+    STATUS_LIVE = 1;  // not stopped with EndpointStop
+    STATUS_STOPPED = 2;  // stopped with EndpointStop
+  }
+  // Only Endpoints whose name contains this text, ignoring case; empty matches every name.
+  string name_contains = 1;
+  Status status = 2;
+}
+
 message EndpointListItem {
   string endpoint_id = 1;
   string name = 2;
@@ -1549,11 +1972,13 @@ message EndpointListItem {
   EndpointProvisioningStatus provisioning_status = 10;
   string status = 11;
   EndpointServingMode serving_mode = 12;
+  bool unauthenticated = 13;
 }
 
 message EndpointListRequest {
   string environment_name = 1;
   ListPagination pagination = 2;
+  EndpointListFilter filter = 3;
 }
 
 message EndpointListResponse {
@@ -1569,6 +1994,13 @@ message EndpointMetadata {
 message EndpointModalVolumeModelSource {
   string volume_id = 1;
   string model_path = 2;
+}
+
+message EndpointModel {
+  // Canonical model identifier used in Endpoint configuration.
+  string base_model_repo_id = 1;
+  repeated EndpointInputModality supported_input_modalities = 4;
+  repeated EndpointServingMode available_serving_modes = 5;
 }
 
 message EndpointModelSource {
@@ -1599,7 +2031,7 @@ message EnvironmentBillingSummaryResponse {
   // at the workspace level
   string metered_cost = 3;
 
-  // keyed by deployed, ephemeral, volume, notebook
+  // keyed by app type (deployed, ephemeral, notebook, endpoint, ...), volume, tokens, network egress
   map<string, string> metered_cost_breakdown = 4;
 }
 
@@ -1609,6 +2041,7 @@ message EnvironmentCreateRequest {
   EnvironmentSettings settings = 3;
   EnvironmentType environment_type = 4;
   optional EnvironmentRole default_member_role = 5;
+  string default_member_role_str = 6;  // String representation; parsed when the enum is unspecified.
 }
 
 message EnvironmentDeleteRequest {
@@ -1671,11 +2104,17 @@ message EnvironmentGetRolesResponse {
     string avatar_url = 4;
     string user_name = 5;
     string service_user_name = 6;
+    // Built-in role token or custom role name.
+    string role_str = 8;
     EnvironmentRole role = 7;
-    string role_str = 8;  // String representation for the CLI
+    EnvironmentRoleDefinition role_definition = 13;
+
     repeated EnvironmentRole choosable_roles = 9;
+    repeated EnvironmentRoleDefinition choosable_role_definitions = 14;
+
     MemberRole member_role = 10;
     optional bool inherits_default_member_role = 11;
+    optional bool has_role_assignment = 12;
   }
 
   string name = 1;
@@ -1701,6 +2140,12 @@ message EnvironmentListItem {
   bool spend_limit_reached = 14;
   EnvironmentType environment_type = 15;
   optional EnvironmentRole default_member_role = 16;
+  optional bool block_unauthenticated_resources = 17;
+  optional EnvironmentRole effective_role = 18;
+  optional string image_builder_version = 19;
+  optional bool can_manage = 20;
+  optional string created_by = 21;
+  optional string created_by_avatar_url = 22;
 }
 
 message EnvironmentListResponse {
@@ -1713,12 +2158,25 @@ message EnvironmentMetadata{
   EnvironmentType environment_type = 3;
 }
 
+// Workspace custom role. Built-in Viewer and Contributor are not represented here.
+message EnvironmentRoleDefinition {
+  string environment_role_definition_id = 1;
+  string name = 2;
+  string description = 3;
+  repeated string permissions = 4;
+  double created_at = 5;
+}
+
 message EnvironmentRoleSetRequest {
   string environment_id = 1;
   string user_id = 2;
   string service_user_id = 3;
   EnvironmentRole role = 4;
   string role_str = 5;  // String representation from the CLI; parsed when role is unspecified
+  string service_user_name = 6;
+  string environment_name = 7; // Sent by the client when an environment ID is unavailable
+  // Custom role (`rd-`).
+  string environment_role_definition_id = 8;
 }
 
 message EnvironmentSetBudgetRequest {
@@ -1746,6 +2204,10 @@ message EnvironmentSettings {
   string webhook_suffix = 2;
   optional int32 max_concurrent_gpus = 3;
   optional int32 max_concurrent_tasks = 4;
+  // When true, new unauthenticated web functions, Servers, tunnels, and
+  // Endpoints in this environment are rejected. Unset inherits the workspace
+  // default.
+  optional bool block_unauthenticated_resources = 5;
 }
 
 message EnvironmentUpdateRequest {
@@ -1754,6 +2216,33 @@ message EnvironmentUpdateRequest {
   google.protobuf.StringValue web_suffix = 3;
   optional int32 max_concurrent_tasks = 4;
   optional int32 max_concurrent_gpus = 5;
+  optional EnvironmentBlockUnauthenticatedResources block_unauthenticated_resources = 6;
+  optional string image_builder_version = 7;
+}
+
+// Experimental policy for outbound traffic from a sandbox: header
+// replacements.
+message ExperimentalOutboundPolicy {
+  // Replace headers in outbound HTTPS requests, potentially with secret values.
+  repeated HeaderReplacement header_replacements = 1;
+
+  message HeaderReplacement {
+    // Domain that the header replacements are scoped to. Supports wildcards in
+    // subdomain positions.
+    string domain = 1;
+    // Reference to a secret usable in the header value templates. Can be
+    // empty if no secret value is used.
+    string secret_id = 4;
+    // Header name -> header value.
+    //
+    // Values support templating with keys in the stanza's secret_id: a
+    // $-prefixed key name in the secret will be replaced with the secret
+    // value. Literal $ characters can be represented by two dollars: `$$`.
+    map<string, string> headers = 5;
+
+    reserved 2, 3;
+    reserved "header_name", "header_value";
+  }
 }
 
 // A file entry when listing files in a volume or network file system.
@@ -1770,13 +2259,6 @@ message FileEntry {
   FileType type = 2;
   uint64 mtime = 3;
   uint64 size = 4;
-}
-
-message FilesystemRuntimeOutputBatch {
-  repeated bytes output = 1;
-  optional SystemErrorMessage error = 2;
-  uint64 batch_index = 3;
-  bool eof = 4;
 }
 
 message FlashContainerDeregisterRequest {
@@ -1919,8 +2401,8 @@ message Function {
 
   bool is_class = 53;  // if "Function" is actually a class grouping multiple methods
 
-  string use_function_id = 54;  // for class methods use this function id instead for invocations - the *referenced* function should have is_class=True
-  string use_method_name = 55;  // for class methods - this method name needs to be included in the FunctionInput
+  reserved 54; // use_function_id, pre-0.67 class method placeholders
+  reserved 55; // use_method_name, pre-0.67 class method placeholders
 
   ClassParameterInfo class_parameter_info = 56;
 
@@ -1949,10 +2431,6 @@ message Function {
   bool untrusted = 68;
 
   uint32 _experimental_buffer_containers = 69;  // To be replaced by autoscaler_settings.buffer_containers
-
-  // _experimental_proxy_ip -> ProxyInfo
-  // TODO: deprecate.
-  optional string _experimental_proxy_ip = 70 [deprecated=true];
 
   bool runtime_perf_record = 71; // For internal debugging use only.
 
@@ -2001,6 +2479,12 @@ message Function {
   bool is_server = 92; // When True, the function is a server function
 
   string routing_region = 93; // Where inputs to a function should be routed through.
+
+  // True when the function is a Sessioned Server. Only valid together with is_server.
+  bool is_sessioned = 95;
+
+  // Outbound network access of the Function's containers. Takes precedence over block_network.
+  optional NetworkAccess network_access = 96;
 }
 
 message FunctionAsyncInvokeRequest {
@@ -2038,6 +2522,55 @@ message FunctionCallCancelRequest {
   string function_call_id = 1;
   bool terminate_containers = 2;
   optional string function_id = 3; // Only provided for sync input cancellation on the input plane. Async input cancellation does not provide this field this.
+}
+
+message FunctionCallCountRequest {
+  string function_id = 1;
+  google.protobuf.Timestamp since = 2;  // Inclusive, based on input enqueue time.
+  google.protobuf.Timestamp until = 3;  // Exclusive, based on input enqueue time.
+  uint32 bucket_secs = 4;
+  // Include the root Function and its eligible variants.
+  bool all_variants = 5;
+}
+
+message FunctionCallCountResponse {
+  message InputBucket {
+    google.protobuf.Timestamp bucket_start_at = 1;
+    // Number of unique inputs, matching FunctionCallFetch.
+    uint64 count = 2;
+  }
+
+  // Ordered by bucket start time, from oldest to newest.
+  // Counts include only inputs within the requested time range.
+  repeated InputBucket buckets = 1;
+}
+
+message FunctionCallFetchRequest {
+  message Range {
+    google.protobuf.Timestamp since = 1;  // Inclusive, based on input enqueue time.
+    google.protobuf.Timestamp until = 2;  // Exclusive, based on input enqueue time.
+    // Maximum number of inputs to return. Must be between 1 and 20000.
+    uint32 limit = 3;
+  }
+
+  message Tail {
+    // Number of most recent inputs to return. Must be between 1 and 1000.
+    uint32 count = 1;
+  }
+
+  string function_id = 1;
+  oneof query_oneof {
+    Tail tail = 3;
+    Range range = 5;
+  }
+  // Include the root Function and its eligible variants.
+  bool all_variants = 4;
+}
+
+message FunctionCallFetchResponse {
+  // Tail queries return the most recent inputs from the last seven days, ordered from newest to oldest.
+  // Range queries return inputs ordered from oldest to newest.
+  repeated FunctionCallInputInfo function_call_inputs = 1;
 }
 
 message FunctionCallFromIdRequest {
@@ -2090,6 +2623,17 @@ message FunctionCallInfo {
   int32 total_inputs = 17;
 }
 
+message FunctionCallInputInfo {
+  google.protobuf.Timestamp enqueued_at = 1;
+  optional google.protobuf.Timestamp started_at = 2;
+  optional string container_id = 3;
+  optional double startup_time_seconds = 4;
+  optional double execution_time_seconds = 5;
+  FunctionCallInputStatus status = 6;
+  string function_call_id = 7;
+  optional string service_method_name = 8;
+}
+
 message FunctionCallListRequest {
   string function_id = 1;
 }
@@ -2119,9 +2663,10 @@ message FunctionCreateRequest {
 message FunctionCreateResponse {
   string function_id = 1;
   string __deprecated_web_url = 2  [ deprecated = true];  // Used up until 0.62.212
-  Function function = 4;
+  Function function = 4; // deprecated soon
   FunctionHandleMetadata handle_metadata = 5;
   repeated Warning server_warnings = 6;
+  FunctionData function_data = 7;
 }
 
 message FunctionData {
@@ -2158,9 +2703,6 @@ message FunctionData {
   WebUrlInfo web_url_info = 10;
   WebhookConfig webhook_config = 11;
   repeated CustomDomainInfo custom_domain_info = 12;
-  // _experimental_proxy_ip -> ProxyInfo
-  // TODO: deprecate.
-  optional string _experimental_proxy_ip = 24 [deprecated=true];
   // Mapping of method names to method definitions, only non-empty for class service functions
   map<string, MethodDefinition> method_definitions = 25;
   bool method_definitions_set = 26;
@@ -2169,8 +2711,8 @@ message FunctionData {
   ClassParameterInfo class_parameter_info = 14;
 
   bool is_method = 15;
-  string use_function_id = 16; // used for methods
-  string use_method_name = 17; // used for methods
+  reserved 16; // use_function_id, pre-0.67 class method placeholders
+  reserved 17; // use_method_name, pre-0.67 class method placeholders
 
   message RankedFunction {
     uint32 rank = 1;
@@ -2206,6 +2748,9 @@ message FunctionData {
   bool is_server = 41; // When True, the function is a server function
 
   string routing_region = 42; // Where inputs to a function should be routed through.
+
+  // True when the function is a Sessioned Server. Only valid together with is_server.
+  bool is_sessioned = 44;
 }
 
 message FunctionExtended {
@@ -2226,6 +2771,14 @@ message FunctionFinishInputsRequest {
   uint32 num_inputs = 3;
 }
 
+message FunctionGetByIdRequest {
+  string function_id = 1;
+}
+
+message FunctionGetByIdResponse {
+  FunctionData function = 1;
+  FunctionHandleMetadata handle_metadata = 2;
+}
 
 message FunctionGetCallGraphRequest {
   string function_call_id = 2;
@@ -2234,6 +2787,8 @@ message FunctionGetCallGraphRequest {
 message FunctionGetCallGraphResponse {
   repeated InputCallGraphInfo inputs = 1;
   repeated FunctionCallCallGraphInfo function_calls = 2;
+  // Set by the server when the graph has more nodes than it will return, so `inputs` is a prefix of the graph.
+  bool truncated = 3;
 }
 
 message FunctionGetCurrentStatsRequest {
@@ -2248,6 +2803,14 @@ message FunctionGetDynamicConcurrencyRequest{
 
 message FunctionGetDynamicConcurrencyResponse {
   uint32 concurrency = 1;
+}
+
+message FunctionGetFlashAuthTokenRequest {
+  string function_id = 1;
+}
+
+message FunctionGetFlashAuthTokenResponse {
+  string token = 1;
 }
 
 message FunctionGetInputsItem {
@@ -2277,6 +2840,28 @@ message FunctionGetInputsRequest {
 message FunctionGetInputsResponse {
   repeated FunctionGetInputsItem inputs = 3;
   float rate_limit_sleep_duration = 4; // How long to sleep before requesting another input.
+}
+
+message FunctionGetMetricsRequest {
+  string function_id = 1;
+  google.protobuf.Timestamp since = 2; // Required; rounded down to a UTC bucket boundary.
+  google.protobuf.Timestamp until = 3; // Required; rounded down; at most 31 days after since.
+  // If omitted, choose a supported width targeting approximately 100 buckets.
+  // Allowed widths are documented in MetricsGetInfoRequest.bucket_secs.
+  // At most 500 points per series in the rounded interval.
+  optional uint32 bucket_secs = 4;
+  // Metric groups: containers, calls.
+  // Empty selects all applicable groups. Each group returns its standard series.
+  repeated string groups = 5;
+  // Restrict the root Function's metrics to one of its parametrized Functions.
+  bool rollup = 6;
+}
+
+message FunctionGetMetricsResponse {
+  google.protobuf.Timestamp since = 1; // Inclusive effective bound, rounded down.
+  google.protobuf.Timestamp until = 2; // Exclusive effective bound, rounded down.
+  uint32 bucket_secs = 3;
+  repeated FunctionMetricSeries series = 4;
 }
 
 message FunctionGetOutputsItem {
@@ -2323,6 +2908,15 @@ message FunctionGetResponse {
   string function_id = 1;
   FunctionHandleMetadata handle_metadata = 2;
   repeated Warning server_warnings = 4;
+  FunctionData function = 5;
+}
+
+message FunctionGetSchedulingParamsRequest {
+  string function_id = 1;
+}
+
+message FunctionGetSchedulingParamsResponse {
+  AutoscalerConfiguration autoscaler_configuration = 1;
 }
 
 message FunctionGetSerializedRequest {
@@ -2334,6 +2928,54 @@ message FunctionGetSerializedResponse {
   bytes class_serialized = 2;
 }
 
+message FunctionGetTimeRangeStatsRequest {
+  string function_id = 1;
+  google.protobuf.Timestamp since = 2;  // Inclusive.
+  google.protobuf.Timestamp until = 3;  // Exclusive.
+  // Aggregate the root Function pool and its non-version-pinned variant pools.
+  bool rollup = 4;
+  // Filter stats for a specific container
+  optional string container_id = 5; // ta-*
+}
+
+
+message FunctionGetTimeRangeStatsResponse {
+  google.protobuf.Timestamp since = 1;  // Inclusive.
+  google.protobuf.Timestamp until = 2;  // Exclusive.
+
+  // Counts of inputs that finish in the requested time range.
+  uint64 input_success_count = 3;
+  uint64 input_failure_count = 4;
+  uint64 input_timeout_count = 5;
+
+  // Number of inputs assigned but not finished at the exclusive end of the time range.
+  uint64 input_running_at_end_count = 6;
+
+  // Metrics include execution_time, end_to_end_latency, subject to change
+  // as requirements evolve
+  map<string, StatsPercentileDistribution> input_percentile_stats = 7;
+
+  // Container lifecycle counts. Started and errored containers are counted when
+  // the corresponding event occurs in the requested time range. Creating containers
+  // were enqueued but had not started or finished at the exclusive end of the range.
+  uint64 container_started_count = 8;
+  uint64 container_error_count = 9;
+  uint64 container_creating_at_end_count = 10;
+
+  // Metrics include cpu_usage, memory_usage, gpu_utilization subject to change
+  // as requirements evolve
+  map<string, StatsPercentileDistribution> container_percentile_stats = 11;
+
+
+  // Number of direct non-version-pinned variants included in the roll-up.
+  // Zero when roll-up is disabled or the base Function has no variants.
+  uint32 variant_count = 12;
+
+  // Number of containers that were active (published heartbeats) in the time range.
+  uint64 container_total_count = 13;
+}
+
+
 message FunctionHandleMetadata {
   // contains all the info about a function that is needed to trigger the right
   // behaviour when using a FunctionHandler. Notably excludes things purely
@@ -2344,7 +2986,7 @@ message FunctionHandleMetadata {
   Function.FunctionType function_type = 8;
   string web_url = 28;
   bool is_method = 39;
-  string use_function_id = 40; // used for methods
+  reserved 40; // use_function_id, pre-0.67 class method placeholders
   string use_method_name = 41; // used for methods
   string definition_id = 42;
   ClassParameterInfo class_parameter_info = 43;
@@ -2360,6 +3002,8 @@ message FunctionHandleMetadata {
   repeated DataFormat supported_input_formats = 50;
   repeated DataFormat supported_output_formats = 51;
   string app_id = 52;
+  // The base Function ID for a variant, or the Function's own ID otherwise.
+  string base_function_id = 54;
 }
 
 message FunctionInput {
@@ -2371,6 +3015,30 @@ message FunctionInput {
   bool final_input = 9;
   DataFormat data_format = 10; // For args_oneof.
   optional string method_name = 11; // specifies which method to call when calling a class/object function
+}
+
+message FunctionListVariantsRequest {
+  string function_id = 1;
+  FunctionVariantCursor cursor = 2;
+  uint32 limit = 3;
+}
+
+message FunctionListVariantsResponse {
+  repeated FunctionVariantInfo infos = 1;
+  // Pass back as cursor to fetch the next page. Unset once the listing is complete.
+  FunctionVariantCursor next_cursor = 2;
+  // Set by the server when it ordered the variants by how many tasks each is running, busiest first.
+  bool ordered_by_task_count = 3;
+}
+
+// Structured error detail attached to a failed FunctionGet lookup.
+message FunctionLookupError {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_CLASS_NAME_USED = 1;
+  }
+
+  Reason reason = 1;
 }
 
 message FunctionMapRequest {
@@ -2390,6 +3058,22 @@ message FunctionMapResponse {
   string function_call_jwt = 4;
   bool sync_client_retries_enabled = 5;
   uint32 max_inputs_outstanding = 6;
+}
+
+message FunctionMetricPoint {
+  // UTC-aligned bucket start within the response's effective [since, until).
+  google.protobuf.Timestamp timestamp = 1;
+  optional double value = 2;
+}
+
+message FunctionMetricSeries {
+  // Unique within the response; identifies one aggregate series for this metric.
+  // The metric name defines the aggregation semantics.
+  string name = 1;
+  // Public semantic unit, such as seconds, calls, containers, or requests.
+  string unit = 2;
+  repeated FunctionMetricPoint points = 3; // Ascending timestamps; absent points are gaps.
+  string description = 4;
 }
 
 // todo(ayush): update this to also use `autoscaler_settings`
@@ -2424,8 +3108,8 @@ message FunctionPrecreateRequest {
   string existing_function_id = 3;
   Function.FunctionType function_type = 4;
   WebhookConfig webhook_config = 5;
-  string use_function_id = 6;  // for class methods - use this function id instead for invocations - the *referenced* function should have is_class=True
-  string use_method_name = 7;  // for class methods - this method name needs to be included in the FunctionInput
+  reserved 6; // use_function_id, pre-0.67 class method placeholders
+  reserved 7; // use_method_name, pre-0.67 class method placeholders
   // Mapping of method names to method definitions, only non-empty for class service functions
   map<string, MethodDefinition> method_definitions = 8;
   FunctionSchema function_schema = 9;
@@ -2444,6 +3128,7 @@ message FunctionPutInputsItem {
   bool r2_failed = 3;
   reserved 4; // r2_latency_ms
   uint64 r2_throughput_bytes_s = 5;
+  repeated BlobUploadResult blob_upload_results = 6;
 }
 
 message FunctionPutInputsRequest {
@@ -2529,6 +3214,17 @@ message FunctionUpdateSchedulingParamsResponse {
   AutoscalerSettings current_settings = 1;
 }
 
+message FunctionVariantCursor {
+  double created_before = 1;
+  string function_id = 2;
+}
+
+message FunctionVariantInfo {
+  string function_id = 1;
+  bytes serialized_params = 2;
+  FunctionOptions function_options = 3;
+}
+
 message GPUConfig {
   GPUType type = 1;  // Deprecated, at some point
   uint32 count = 2;
@@ -2559,6 +3255,13 @@ message GenericResult {  // Used for both tasks and function outputs
     GENERIC_STATUS_INTERNAL_FAILURE = 6;
     // Used when sandboxes are terminated due to idle_timeout
     GENERIC_STATUS_IDLE_TIMEOUT = 7;
+    // Used when a task was killed because it was evicted by the memory manager when the worker was
+    // under memory pressure.
+    GENERIC_STATUS_MEMORY_MANAGER_EVICTION = 8;
+    // Used when a task was killed by the memory manager after thrashing at its own memory limit.
+    GENERIC_STATUS_MEMORY_THRASHING_EVICTION = 9;
+    // Used when the kernel OOM-killed a process in the task's container after it hit its own memory limit.
+    GENERIC_STATUS_KERNEL_OOM_KILL = 10;
   }
 
   GenericStatus status = 1; // Status of the task or function output.
@@ -2585,6 +3288,7 @@ message HTTPConfig {
   bool h2_enabled = 5;
   uint32 target_concurrency = 6;
   bool unauthenticated = 7;
+  optional LiftAndShiftConfig lift_and_shift_config = 8;
 }
 
 message Image {
@@ -2614,6 +3318,10 @@ message Image {
 
   // Volume mount for RUN commands
   repeated VolumeMount volume_mounts = 23;
+
+  // CPU architecture the image is built for. Images with an unspecified
+  // arch predate this field and are treated as x86_64.
+  Arch arch = 24;
 }
 
 message ImageBuildChainGetRequest {
@@ -2708,6 +3416,8 @@ message ImageListTagsItem {
   string revision_id = 3;
   double created_at = 4;
   double updated_at = 5;
+  // Display name of whoever published the image this tag points at.
+  string last_published_by = 6;
 }
 
 message ImageListTagsRequest {
@@ -2717,6 +3427,8 @@ message ImageListTagsRequest {
   // Defaults to 100. Values above 100 are rejected by the server.
   uint32 max_objects = 3;
   string page_token = 4;
+  // Returns only the tags that currently point at this image. Optional.
+  string image_id = 5;
 }
 
 message ImageListTagsResponse {
@@ -2745,6 +3457,18 @@ message ImageMetadata {
 
   // The builder version for/with which the image was created.
   optional string image_builder_version = 5;
+
+  // The image's ENTRYPOINT, including one inherited from a base image. Empty if unset.
+  repeated string entrypoint = 6;
+
+  // The image's CMD: the default arguments to the entrypoint when a container is
+  // started without any, including a CMD inherited from a base image. Empty if unset.
+  repeated string cmd = 7;
+}
+
+message ImageNameDeleteRequest {
+  // Named image reference: "[environment/]name[:tag]".
+  string tag = 1;
 }
 
 
@@ -2818,6 +3542,8 @@ message InputInfo {
   bool task_first_input = 7;
 }
 
+message LiftAndShiftConfig {}
+
 message ListPagination {
   int32 max_objects = 1;
   double created_before = 2;
@@ -2888,12 +3614,53 @@ message MethodDefinition {
   repeated DataFormat supported_output_formats = 9;
 }
 
+message MetricDefinition {
+  string name = 1; // Exact series name returned by the metrics RPC.
+  string unit = 2; // Matches FunctionMetricSeries.unit.
+  string description = 3; // Meaning and aggregation semantics of the series.
+}
+
+message MetricGroupDefinition {
+  // Group selector, such as "calls". Multiple catalogue rows can share this name.
+  string name = 1;
+  string description = 2; // Shared description of this catalogue row's series.
+  // Individual series represented by this row, ordered by name; all have the same unit.
+  repeated MetricDefinition metrics = 3;
+  string display_name = 4; // Display label, such as "execution_time_{p50,p90,p99}".
+}
+
+message MetricsGetInfoRequest {
+  enum MetricsTargetType {
+    METRICS_TARGET_TYPE_UNSPECIFIED = 0;
+    METRICS_TARGET_TYPE_FUNCTION = 1;
+    METRICS_TARGET_TYPE_SERVER = 2;
+  }
+
+  // Required; unspecified and unrecognized targets are rejected.
+  MetricsTargetType target_type = 1;
+  google.protobuf.Timestamp since = 2; // Required; rounded down to a UTC bucket boundary.
+  google.protobuf.Timestamp until = 3; // Required; rounded down; at most 31 days after since.
+  // If omitted, choose a supported width targeting approximately 100 buckets.
+  optional uint32 bucket_secs = 4;
+  repeated string groups = 5;
+}
+
+message MetricsGetInfoResponse {
+  // Catalogue rows for the requested target type, ordered by name then display_name.
+  // Rows sharing a name belong under the same group heading. Each series appears once per group.
+  // Describes the catalog; individual exports may omit unavailable series.
+  repeated MetricGroupDefinition groups = 1;
+  uint32 bucket_secs = 4; // Resolved bucket width.
+  uint32 bucket_count = 5; // Projected buckets per series, not observed sample count.
+}
+
 message MountBatchedCheckExistenceRequest {
   repeated string sha256_hex_hashes = 1;
 }
 
 message MountBatchedCheckExistenceResponse {
   repeated string missing_sha256_hex_hashes = 1;
+  google.protobuf.Timestamp checked_at = 2; // Server time of the check. Clients send the earliest one back as earliest_checked_at on the commit.
 }
 
 message MountFile {
@@ -2910,6 +3677,8 @@ message MountGetOrCreateRequest {
   ObjectCreationType object_creation_type = 4;
   repeated MountFile files = 5;
   string app_id = 6;  // only used with OBJECT_CREATION_TYPE_ANONYMOUS_OWNED_BY_APP
+  // Earliest checked_at the client received from the existence checks for these files. Telemetry only.
+  google.protobuf.Timestamp earliest_checked_at = 7;
 }
 
 message MountGetOrCreateResponse {
@@ -2932,6 +3701,7 @@ message MountPutFileRequest {
 
 message MountPutFileResponse {
   bool exists = 2;
+  google.protobuf.Timestamp checked_at = 3; // Server time of the check. Clients send the earliest one back as earliest_checked_at on the commit.
 }
 
 message MultiPartUpload {
@@ -2954,35 +3724,6 @@ message NetworkAccess {
   NetworkAccessType network_access_type = 1;
   repeated string allowed_cidrs = 2;
   repeated string allowed_domains = 3;
-}
-
-message NotebookKernelPublishResultsRequest {
-  // See kernelshim.py for the differences between this and `ExecuteResult`.
-  // https://jupyter-client.readthedocs.io/en/stable/messaging.html#execution-results
-  message ExecuteReply {
-    string status = 1;
-    uint32 execution_count = 2;
-    double duration = 3;
-  }
-
-  // IOPub message or reply received from the kernel for a cell.
-  message CellResult {
-    string cell_id = 1;
-
-    oneof result_type {
-      // Persistent output that is saved in the notebook.
-      NotebookOutput output = 2;
-
-      // Clear all previous outputs of the cell.
-      bool clear_output = 3;
-
-      // Cell has finished executing, return the kernel's execute_reply.
-      ExecuteReply execute_reply = 4;
-    }
-  }
-
-  string notebook_id = 1;
-  repeated CellResult results = 2;
 }
 
 // A single output from a notebook. When you execute a cell, it produces an
@@ -3042,6 +3783,155 @@ message ObjectDependency {
   string object_id = 1;
 }
 
+// Optional name suggestions for CLI error paths. Only objects visible to the
+// caller in the selected environment are considered; no object is modified.
+message ObjectSuggestRequest {
+  enum ObjectSuggestKind {
+    OBJECT_SUGGEST_KIND_UNSPECIFIED = 0;
+    OBJECT_SUGGEST_KIND_APP = 1;
+    OBJECT_SUGGEST_KIND_FUNCTION = 2;
+    OBJECT_SUGGEST_KIND_SERVER = 3;
+  }
+
+  // Empty selects the workspace's default environment.
+  string environment_name = 1;
+  // Required; UNSPECIFIED is invalid.
+  ObjectSuggestKind kind = 2;
+  // The reference exactly as typed. For Functions and Servers this may be an
+  // APP_NAME/OBJECT_NAME reference or a reference with an incorrect separator.
+  string query = 3;
+  // Maximum number of suggestions. Zero defaults to 3; values above 10 are
+  // capped at 10.
+  uint32 limit = 4;
+}
+
+message ObjectSuggestResponse {
+  // Distinct suggestions, best match first. Empty if no suitable match exists.
+  repeated ObjectSuggestion suggestions = 1;
+}
+
+message ObjectSuggestion {
+  // Set for Functions and Servers; empty for Apps.
+  string app_name = 1;
+  // The object's name or tag, including any class method suffix. For Apps,
+  // this is the deployment name. Combine with app_name using '/' when set.
+  string object_name = 2;
+}
+
+// Route-based policy for outbound network traffic. A sandbox applies it to
+// its main container.
+//
+// Routes are evaluated in order and the first match decides what happens to
+// a connection or packet. The last route must be the policy's only
+// `any` route, which decides what happens to traffic no other route
+// matches. Traffic a route matches without a redirect goes to its original
+// destination.
+message OutboundPolicy {
+  enum Transport {
+    // The route type's default, described on each route's transport field.
+    TRANSPORT_UNSPECIFIED = 0;
+    TRANSPORT_ANY = 1;
+    TRANSPORT_TCP = 2;
+    TRANSPORT_UDP = 3;
+  }
+
+  // An inclusive range of ports. A single port has start == end.
+  message PortRange {
+    uint32 start = 1;
+    uint32 end = 2;
+  }
+
+  // Traffic to these CIDRs.
+  message IPRoute {
+    // Unspecified means any transport.
+    Transport transport = 1;
+    // Empty means every port.
+    repeated PortRange ports = 2;
+    repeated string cidrs = 3;
+
+    Redirect redirect = 20;
+  }
+
+  // Connections that carry TLS from the first byte to these domains. Never
+  // decrypted.
+  message TLSRoute {
+    // Unspecified means TCP.
+    Transport transport = 1;
+    // Empty means port 443.
+    repeated PortRange ports = 2;
+    // Supports `*.` wildcard prefixes and a bare `*`.
+    repeated string domains = 3;
+
+    Redirect redirect = 20;
+  }
+
+  // HTTPS connections to these domains. Always decrypted, which requires TLS
+  // decryption to be allowed.
+  message HTTPSRoute {
+    // Unspecified means TCP.
+    Transport transport = 1;
+    // Empty means port 443.
+    repeated PortRange ports = 2;
+    // Supports `*.` wildcard prefixes and a bare `*`.
+    repeated string domains = 3;
+
+    repeated HeaderReplacement header_replacements = 10;
+
+    Redirect redirect = 20;
+  }
+
+  // Everything earlier routes didn't match.
+  message AnyRoute {
+    Redirect redirect = 20;
+  }
+
+  message HeaderReplacement {
+    // Secret whose keys the header value templates may reference. Empty for
+    // static values.
+    string secret_id = 1;
+    // Header name -> value template. A $-prefixed key name in the secret is
+    // replaced with the secret value; `$$` is a literal `$`.
+    map<string, string> headers = 2;
+  }
+
+  message Redirect {
+    message Block {}
+
+    message ViaProxy {
+      string proxy_id = 1;
+    }
+
+    message ViaSidecar {
+      string sidecar_name = 1;
+    }
+
+    oneof redirect {
+      Block block = 1;
+      ViaProxy via_proxy = 2;
+      ViaSidecar via_sidecar = 3;
+    }
+  }
+
+  message Route {
+    oneof route {
+      IPRoute ip = 1;
+      TLSRoute tls = 2;
+      HTTPSRoute https = 3;
+      AnyRoute any = 4;
+    }
+  }
+
+  message TLSDecryption {
+    // Generate a certificate authority for the sandbox and attempt to make the
+    // sandbox trust it, so that routes that need to can decrypt its TLS traffic.
+    // Decrypts nothing on its own. Required by HTTPS routes. Fixed at creation.
+    bool allowed = 1;
+  }
+
+  TLSDecryption tls_decryption = 1;
+  repeated Route routes = 2;
+}
+
 message PTYInfo {
   bool enabled = 1;  // Soon deprecated
   uint32 winsz_rows = 2;
@@ -3056,6 +3946,58 @@ message PTYInfo {
   }
   PTYType pty_type = 7;
   bool no_terminate_on_idle_stdin = 8;
+}
+
+message PersistentSandboxCreateRequest {
+  string app_id = 1;
+  Sandbox definition = 2;
+}
+
+message PersistentSandboxCreateResponse {
+  string persistent_sandbox_id = 1;
+  string sandbox_id = 2;
+}
+
+message PersistentSandboxGetRequest {
+  oneof lookup {
+    string persistent_sandbox_id = 1;
+    PersistentSandboxNameLookup name = 2;
+  }
+}
+
+message PersistentSandboxGetResponse {
+  string persistent_sandbox_id = 1;
+  string sandbox_id = 2;
+  // Set once the persistent Sandbox is terminated; unset otherwise.
+  google.protobuf.Timestamp terminated_at = 3;
+}
+
+message PersistentSandboxNameLookup {
+  string app_name = 1;
+  string environment_name = 2;
+  string name = 3;
+}
+
+message PersistentSandboxResumeRequest {
+  string persistent_sandbox_id = 1;
+}
+
+message PersistentSandboxResumeResponse {
+  string sandbox_id = 1;
+}
+
+message PersistentSandboxTerminateRequest {
+  string persistent_sandbox_id = 1;
+}
+
+message PersistentSandboxTerminateResponse {}
+
+message PersistentSandboxTunnelsListRequest {
+  string persistent_sandbox_id = 1;
+}
+
+message PersistentSandboxTunnelsListResponse {
+  repeated TunnelData tunnels = 1;
 }
 
 message PortSpec {
@@ -3135,9 +4077,6 @@ message ProxyGetResponse {
 message ProxyInfo {
   string elastic_ip = 1;
   string proxy_key = 2;
-  string remote_addr = 3;
-  int32 remote_port = 4;
-  ProxyType proxy_type = 5;
   bool use_oidc = 6;
   string vprox_node_id = 7;
 }
@@ -3304,6 +4243,7 @@ message Resources {
   uint32 ephemeral_disk_mb = 6;  // MiB
   uint32 milli_cpu_max = 7; // milli CPU cores
   bool rdma = 8; // Whether to use RDMA interfaces
+  bool skip_num_threads_env_vars = 9; // Leave thread-count env vars (OMP_NUM_THREADS, ...) unset so libraries size themselves from the visible CPUs. Ignored on runc.
 }
 
 message RuntimeInputMessage {
@@ -3395,7 +4335,8 @@ message Sandbox {
   // Set by the backend at snapshot creation time.
   optional string runsc_runtime_version = 27;
 
-  // If set, overrides the runtime used by the function, either "runc" or "gvisor".
+  // Runtime the sandbox runs in: "vm" for a virtual machine, or a container
+  // runtime such as "gvisor". Leave it unset to let Modal pick.
   optional string runtime = 28;
 
   // If set, the sandbox will be created with verbose logging enabled.
@@ -3439,6 +4380,38 @@ message Sandbox {
   repeated string inbound_cidr_allowlist = 39;
 
   StringMap environment_variables = 40;
+
+  optional ExperimentalOutboundPolicy experimental_outbound_policy = 42;
+
+  // If set, the sandbox's main container is served an X.509-SVID over a
+  // SPIFFE Workload API socket, addressed by SPIFFE_ENDPOINT_SOCKET. The
+  // certificate federates into a cloud account (AWS IAM Roles Anywhere).
+  // Sidecars are not served one.
+  bool include_x509_svid = 43;
+
+  // Route-based outbound policy. Mutually exclusive with
+  // experimental_outbound_policy (superseded, experimental API) and with any
+  // network_access other than OPEN.
+  optional OutboundPolicy outbound_policy = 44;
+}
+
+message SandboxContainerCreateV2Request {
+  // Sandbox the container joins; it runs inside that sandbox's task.
+  string sandbox_id = 1;
+  // Logical container name, unique within the sandbox.
+  string container_name = 2;
+  // Same definition type as SandboxCreateV2. Fields a container cannot honor
+  // (resources, timeouts, scheduling constraints, ...) are rejected.
+  Sandbox definition = 3;
+  StringMap ephemeral_secrets = 4;
+  map<string, StringMap> cloud_bucket_mount_credentials = 5;
+  // Applied in order. Cannot be combined with ephemeral_secrets. If definition.secret_ids is set, it must match the secret_id entries here.
+  repeated SecretSource secret_sources = 6;
+}
+
+message SandboxContainerCreateV2Response {
+  string container_id = 1;
+  string container_name = 2;
 }
 
 message SandboxCreateConnectTokenRequest {
@@ -3471,6 +4444,8 @@ message SandboxCreateV2Request {
   StringMap ephemeral_secrets = 3;
   repeated SandboxTag tags = 4;
   map<string, StringMap> cloud_bucket_mount_credentials = 5;
+  // Applied in order. Cannot be combined with ephemeral_secrets. If definition.secret_ids is set, it must match the secret_id entries here.
+  repeated SecretSource secret_sources = 6;
 }
 
 message SandboxCreateV2Response {
@@ -3479,6 +4454,8 @@ message SandboxCreateV2Response {
   string task_id = 3;
   SandboxHandleMetadata metadata = 4;
   CommandRouterAccess command_router_access = 5;
+  // Signed app and workspace id of the sandbox. Sent as the x-modal-sandbox-token metadata header.
+  string sandbox_token = 6;
 }
 
 // Used by the sandbox controller to get command router access for V2 sandboxes.
@@ -3516,6 +4493,9 @@ message SandboxGetExitSnapshotResponse {
     ERROR_CODE_UNSPECIFIED = 0;
     ERROR_CODE_TIMEOUT = 1;
     ERROR_CODE_INTERNAL = 2;
+    // The sandbox exited without leaving a consistent filesystem (e.g. killed
+    // before it could flush) and recovery failed, so no exit snapshot exists.
+    ERROR_CODE_FILESYSTEM_INCONSISTENT = 3;
   }
 
   message Error {
@@ -3534,6 +4514,9 @@ message SandboxGetFromNameRequest {
   string sandbox_name = 1;
   string environment_name = 2;
   string app_name = 3;
+  // When set, the lookup also considers sandboxes that have already stopped and
+  // returns the most recently created sandbox with the given name.
+  bool include_terminated = 4;
 }
 
 message SandboxGetFromNameResponse {
@@ -3559,6 +4542,55 @@ message SandboxGetResourceUsageResponse {
   optional string gpu_type = 4;
 }
 
+message SandboxGetStatsRequest {
+  string sandbox_id = 1;
+  // Time range of the samples to include. Unset `since` means the sandbox's
+  // creation and unset `until` means now.
+  google.protobuf.Timestamp since = 2;  // Inclusive.
+  google.protobuf.Timestamp until = 3;  // Exclusive.
+}
+
+message SandboxGetStatsResponse {
+  // Estimated compute cost in USD at the workspace's current plan rates, without
+  // reservation discounts or network egress. Unset when no usage is available.
+  optional string cost = 1;
+  map<string, string> cost_by_resource = 2;
+
+  message ResourceStats {
+    // Exact, equally weighted sample percentiles: p50, p90, p99, and p99.9.
+    repeated StatsPercentile percentiles = 1;
+    double mean = 2;
+    double max = 3;
+  }
+
+  uint64 num_datapoints = 3;
+  // Superseded by `percentile_stats`; still populated for clients that read these fields.
+  ResourceStats cpu_cores = 4 [deprecated = true];
+  ResourceStats memory_gib = 5 [deprecated = true];
+  double duration_hours = 6;
+  // Billing-adjusted usage: the greater of measured and reserved resources per
+  // sample, less any resources bundled with a GPU.
+  double billed_cpu_core_seconds = 7;
+  double billed_memory_gib_seconds = 8;
+  // The time range covered, with the request's defaults applied. Every sample
+  // counted lies within it: with `since` unset, it starts before the sandbox's
+  // creation if clock skew stamped a sample earlier.
+  google.protobuf.Timestamp since = 9;
+  google.protobuf.Timestamp until = 10;
+  // Measured usage keyed like FunctionGetTimeRangeStatsResponse.container_percentile_stats:
+  // "CPU Usage (cores)" and "Memory Usage (GiB)". Each has exact, equally weighted sample
+  // percentiles p50, p90, and p99. Empty when no usage is available.
+  map<string, StatsPercentileDistribution> percentile_stats = 11;
+}
+
+message SandboxGetStatusRequest {
+  string sandbox_id = 1;
+}
+
+message SandboxGetStatusResponse {
+  SandboxStatus status = 1;
+}
+
 message SandboxGetTaskIdRequest {
   string sandbox_id = 1;
   optional float timeout = 2; // Legacy clients do not provide a timeout. New clients must always provide a timeout.
@@ -3568,6 +4600,20 @@ message SandboxGetTaskIdRequest {
 message SandboxGetTaskIdResponse {
   optional string task_id = 1; // This is None if the sandbox was terminated before a task could be scheduled.
   optional GenericResult task_result = 2; // If the task has already exited, this is the result.
+}
+
+message SandboxGetTimeRangeStatsRequest {
+  google.protobuf.Timestamp since = 1;
+  google.protobuf.Timestamp until = 2;
+  repeated string group_by_tags = 3;
+  map<string, string> tags = 4;
+  string app_id = 5;
+  string page_token = 6;
+}
+
+message SandboxGetTimeRangeStatsResponse {
+  repeated SandboxStatsGroup groups = 1;
+  string next_page_token = 2;
 }
 
 message SandboxGetTunnelsRequest {
@@ -3602,6 +4648,7 @@ message SandboxInfo {
   optional Probe readiness_probe = 14;
   repeated TunnelData tunnels = 15;
   SandboxHandleMetadata metadata = 16;
+  SandboxStatus status = 17;
 }
 
 
@@ -3658,6 +4705,14 @@ message SandboxSetNameRequest {
 
 message SandboxSetNameResponse {}
 
+message SandboxSetOutboundPolicyRequest {
+  string sandbox_id = 1;
+  // Replaces the Sandbox's route-based outbound policy.
+  OutboundPolicy outbound_policy = 2;
+}
+
+message SandboxSetOutboundPolicyResponse {}
+
 message SandboxSnapshotFsAsyncGetRequest {
   string image_id = 1;
   float timeout = 2;
@@ -3711,6 +4766,68 @@ message SandboxSnapshotWaitRequest {
 
 message SandboxSnapshotWaitResponse {
   GenericResult result = 1;
+}
+
+message SandboxStatsGroup {
+  message TagValue {
+    optional string value = 1;
+  }
+  map<string, TagValue> tags = 1;
+  double cost = 2 [deprecated = true];
+  map<string, double> cost_by_resource = 3 [deprecated = true];
+  string cost_str = 4;  // Supersedes cost
+  map<string, string> cost_by_resource_str = 5;  // Supersedes cost_by_resource
+}
+
+// The public-facing Sandbox Status taxonomy. Computed server-side from the
+// task's lifecycle timestamps and its TaskTerminationReason; clients should never
+// reconstruct it themselves. New states/reasons carry their older classification
+// in the *_fallbacks lists so older clients keep working.
+message SandboxStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_CREATED = 1;
+    STATE_SCHEDULED = 2;
+    STATE_STARTING = 3;
+    STATE_READY = 4;
+    STATE_TERMINATING = 5;
+    STATE_TERMINATED = 6;
+  }
+
+  enum TerminationReason {
+    TERMINATION_REASON_UNSPECIFIED = 0;
+    TERMINATION_REASON_EXITED = 1;
+    TERMINATION_REASON_FAILED = 2;
+    TERMINATION_REASON_START_FAILED = 3;
+    TERMINATION_REASON_USER_TERMINATED = 4;
+    TERMINATION_REASON_PREEMPTED = 5;
+    TERMINATION_REASON_MEMORY_CONTENTION = 6;
+    TERMINATION_REASON_MEMORY_THRASHING = 7;
+    TERMINATION_REASON_MEMORY_LIMIT = 8;
+    TERMINATION_REASON_TIMEOUT = 9;
+    TERMINATION_REASON_IDLE_TIMEOUT = 10;
+    TERMINATION_REASON_PLATFORM_ERROR = 11;
+    TERMINATION_REASON_SECURITY_POLICY = 12;
+    TERMINATION_REASON_SPEND_LIMIT = 13;
+    TERMINATION_REASON_APP_STOPPED = 14;
+    TERMINATION_REASON_SCHEDULING_TIMEOUT = 15;
+  }
+
+  State state = 1;
+  string state_str = 2; // the state as a string, for clients that predate the enum value
+  repeated State state_fallbacks = 3; // states older servers would have reported instead, most specific first
+
+  TerminationReason termination_reason = 4; // only set for TERMINATING / TERMINATED
+  string termination_reason_str = 5; // see state_str
+  repeated TerminationReason termination_reason_fallbacks = 6; // see state_fallbacks
+
+  optional int32 exit_code = 7; // the exit status returned from the process; unset if no exit status was returned; 137 if sigkilled
+  optional string message = 8; // user-facing explanation, when there is one
+  google.protobuf.Timestamp since = 9; // when the Sandbox entered its current state
+  optional google.protobuf.Timestamp deadline = 10; // for TERMINATING, when the Sandbox will be SIGKILLed
+  bool is_terminal = 11;
+  bool is_running = 12;
+  optional bool terminated_with_error = 13;
 }
 
 message SandboxStdinWriteRequest {
@@ -3815,6 +4932,14 @@ message SecretDeleteRequest {
   string secret_id = 1;
 }
 
+message SecretGetInfoRequest {
+  string secret_id = 1;
+}
+
+message SecretGetInfoResponse {
+  SecretMetadata metadata = 1;
+}
+
 message SecretGetOrCreateRequest {
   string deployment_name = 1;
   reserved 2; // removed namespace
@@ -3852,6 +4977,20 @@ message SecretListResponse {
 message SecretMetadata {
   string name = 1;
   CreationInfo creation_info = 2;
+  repeated string keys = 3;
+  string environment_name = 4;
+  double last_used_at = 5;
+  string template_type = 6;
+}
+
+// One source of environment variables for a Sandbox container or exec.
+message SecretSource {
+  oneof source {
+    // Server-side Secret, resolved on the worker.
+    string secret_id = 1;
+    // Plaintext values sent directly to the worker. Must not be persisted.
+    StringMap env = 2;
+  }
 }
 
 message SecretUpdateRequest {
@@ -3863,7 +5002,144 @@ message SecretUpdateRequest {
   repeated Update updates = 2;
 }
 
+message ServerCountRequestsRequest {
+  string function_id = 1;
+  google.protobuf.Timestamp since = 2;  // Inclusive, based on request timestamp.
+  google.protobuf.Timestamp until = 3;  // Exclusive, based on request timestamp.
+  uint32 bucket_secs = 4;
+}
+
+message ServerCountRequestsResponse {
+  message RequestBucket {
+    google.protobuf.Timestamp bucket_start_at = 1;
+    // Number of request records, matching ServerRequestFetch.
+    uint64 count = 2;
+  }
+
+  // Ordered by bucket start time, from oldest to newest.
+  // Counts include only requests within the requested time range.
+  repeated RequestBucket buckets = 1;
+}
+
+message ServerGetMetricsRequest {
+  string function_id = 1;
+  google.protobuf.Timestamp since = 2; // Required; rounded down to a UTC bucket boundary.
+  google.protobuf.Timestamp until = 3; // Required; rounded down; at most 31 days after since.
+  // If omitted, choose a supported width targeting approximately 100 buckets.
+  // At most 500 points per series in the rounded interval.
+  optional uint32 bucket_secs = 4;
+  // Metric groups: containers, requests, etc.
+  repeated string groups = 5;
+}
+
+message ServerGetMetricsResponse {
+  google.protobuf.Timestamp since = 1; // Inclusive effective bound, rounded down.
+  google.protobuf.Timestamp until = 2; // Exclusive effective bound, rounded down.
+  uint32 bucket_secs = 3;
+  repeated FunctionMetricSeries series = 4;
+}
+
+message ServerGetTimeRangeStatsRequest {
+  string function_id = 1;
+  google.protobuf.Timestamp since = 2;  // Inclusive.
+  google.protobuf.Timestamp until = 3;  // Exclusive.
+  // Filter stats for a specific container
+  optional string container_id = 4;
+}
+
+message ServerGetTimeRangeStatsResponse {
+  message ServerInferenceStats {
+    LLMEngine engine = 1;
+    ServerInferenceStatsStatus status = 2;
+
+    // Metrics include time_to_first_token, inter_token_latency, and
+    // end_to_end_latency, subject to change as requirements evolve.
+    map<string, StatsPercentileDistribution> percentile_stats = 3;
+
+    // Metrics include input_tokens_per_second, cached_input_tokens_per_second,
+    // and output_tokens_per_second, subject to change as requirements evolve.
+    map<string, double> scalar_stats = 4;
+  }
+
+  message ServerStatusCodeCount {
+    uint32 status_code = 1;
+    uint64 count = 2;
+  }
+
+  google.protobuf.Timestamp since = 1;  // Inclusive.
+  google.protobuf.Timestamp until = 2;  // Exclusive.
+
+  uint64 request_count = 3;
+  repeated ServerStatusCodeCount request_count_by_status_code = 4;
+  double request_rate_per_second = 5;
+
+  // Metrics include request_latency, subject to change as requirements evolve.
+  map<string, StatsPercentileDistribution> request_percentile_stats = 6;
+
+  // Metrics include startup_time, cpu_usage, memory_usage, and
+  // gpu_utilization, subject to change as requirements evolve.
+  map<string, StatsPercentileDistribution> container_percentile_stats = 7;
+
+  // Absent when the image does not contain a supported inference engine.
+  ServerInferenceStats inference = 8;
+
+  // Container lifecycle counts. Started and errored containers are counted when
+  // the corresponding event occurs in the requested time range. Creating containers
+  // were enqueued but had not started or finished at the exclusive end of the range.
+  uint64 container_started_count = 9;
+  uint64 container_error_count = 10;
+  uint64 container_creating_at_end_count = 11;
+
+  // Number of containers that were active (published heartbeats) in the time range.
+  uint64 container_total_count = 12;
+}
+
+message ServerRequestFetchRequest {
+  message Range {
+    google.protobuf.Timestamp since = 1;  // Inclusive, based on request timestamp.
+    google.protobuf.Timestamp until = 2;  // Exclusive, based on request timestamp.
+    // Maximum number of requests to return. Must be between 1 and 20000.
+    uint32 limit = 3;
+  }
+
+  message Tail {
+    // Number of most recent requests to return. Must be between 1 and 1000.
+    uint32 count = 1;
+  }
+
+  string function_id = 1;
+  oneof query_oneof {
+    Tail tail = 3;
+    Range range = 4;
+  }
+}
+
+message ServerRequestFetchResponse {
+  // Tail queries return the most recent requests from the last seven days, ordered from newest to oldest.
+  // Range queries return requests ordered from oldest to newest.
+  repeated ServerRequestInfo requests = 1;
+}
+
+message ServerRequestInfo {
+  string route = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  string container_id = 3;
+  double duration_seconds = 4;
+  int32 status = 5;
+}
+
 message ServiceUser {
+  message EnvironmentRoleEntry {
+    string environment_id = 1;
+    EnvironmentRole role = 2;
+    string environment_name = 3;
+    // Built-in token, or the custom definition's name.
+    string role_str = 4;
+    reserved 5; // environment_role_definition_id
+    // Set on reads when `role` is ENVIRONMENT_ROLE_CUSTOM.
+    EnvironmentRoleDefinition environment_role_definition = 6;
+  }
+
   string name = 1;
   string token_id = 2;
   string created_by = 3;
@@ -3871,6 +5147,32 @@ message ServiceUser {
   double last_used_at = 5;
   string created_by_avatar_url = 6;
   string service_user_id = 7;
+  string status = 8;
+  bool scoped = 9;
+  repeated EnvironmentRoleEntry environment_roles = 10;
+
+  // This should be a TImestamp type, but keeping as a double for compatibility with public_api.proto
+  optional double expires_at = 11;
+}
+
+message ServiceUserCreateRequest {
+  string name = 1;
+  bool scoped = 2;
+  uint32 expires_in_seconds = 3;
+  // Create the service user with no standing API token.
+  bool skip_token = 4;
+}
+
+message ServiceUserCreateResponse {
+  string token_id = 1;
+  string token_secret = 2;
+  string service_user_id = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message ServiceUserDeleteRequest {
+  string service_user_id = 1;
+  string service_user_name = 2;
 }
 
 message ServiceUserIdentity {
@@ -3879,9 +5181,18 @@ message ServiceUserIdentity {
   UserIdentity created_by = 3;
 }
 
+message ServiceUserInfoRequest {
+  string service_user_name = 1;
+}
+
+message ServiceUserInfoResponse {
+  ServiceUser service_user = 1;
+}
+
 message ServiceUserListResponse {
   repeated ServiceUser service_users = 1;
 }
+
 
 // SharedVolume in the backend corresponds to NetworkFileSystem in the current API
 
@@ -3970,13 +5281,20 @@ message SharedVolumeRemoveFileRequest {
   bool recursive = 3;
 }
 
-message StringMap {
-  map<string, string> contents = 1;
+message StatsPercentile {
+  // The percentile expressed in basis points: 5000 is p50 and 9990 is p99.9.
+  uint32 percentile_basis_points = 1;
+  double value = 2;
 }
 
-message SystemErrorMessage {
-  SystemErrorCode error_code = 1;
-  string error_message = 2;
+message StatsPercentileDistribution {
+  // Unit identifier such as "seconds", "cores", "gibibytes", or "fraction".
+  string unit = 1;
+  repeated StatsPercentile percentiles = 2;
+}
+
+message StringMap {
+  map<string, string> contents = 1;
 }
 
 message TaskClusterHelloRequest {
@@ -4069,6 +5387,7 @@ message TaskLogsBatch {
   string pty_exec_id = 15;  // Used for interactive functions
   string root_function_id = 16;
   uint32 ttl_days = 17;
+  string sandbox_id = 18;
 }
 
 message TaskProgress {
@@ -4080,6 +5399,7 @@ message TaskProgress {
 
 message TaskResultRequest {
   GenericResult result = 2;
+  TaskTerminationReason termination_reason = 3;
 }
 
 message TaskStats {
@@ -4120,12 +5440,27 @@ message TokenCreateResponse {
 
 message TokenDeleteRequest {
   string token_id = 2;
+  repeated string token_ids = 3;
+  bool allow_missing = 4;
+}
+
+message TokenDeleteResponse {
+  repeated string deleted_token_ids = 1;
+}
+
+message TokenDisableRequest {
+  repeated string token_ids = 1;
+}
+
+message TokenEnableRequest {
+  repeated string token_ids = 1;
 }
 
 message TokenFlowCreateRequest {
   string utm_source = 3;
   int32 localhost_port = 4;
   string next_url = 5;
+  uint32 expires_in_seconds = 6;
 }
 
 message TokenFlowCreateResponse {
@@ -4165,6 +5500,25 @@ message TokenInfoGetResponse {
   google.protobuf.Timestamp expires_at = 7;
 
   string token_name = 8;
+}
+
+message TokensListResponse {
+  message Token {
+    string token_id = 1;
+    double created_at = 2;
+    string workspace_id = 3;
+    string user_id = 4;
+    double last_used_at = 5;
+    string member_displayname = 6;
+    string member_id = 7;
+    IdentityProviderType identity_provider_type = 8;
+    string member_avatar_url = 9;
+    string name = 10;
+    optional double expires_at = 11;
+    bool disabled = 12;
+  }
+
+  repeated Token tokens = 1;
 }
 
 message TunnelData {
@@ -4207,6 +5561,14 @@ message UserActionInfo {
   double timestamp = 2;
   // Resolved display name, could be a user or service user.
   string requested_by = 3;
+}
+
+message UserGroupEnvironmentSetRequest {
+  string environment_id = 1;
+  string user_group_id = 2;
+  EnvironmentRole role = 3;
+  // Custom role (`rd-`).
+  string environment_role_definition_id = 4;
 }
 
 message UserIdentity {
@@ -4266,6 +5628,9 @@ message VolumeGetFile2Request {
   string path = 2;
   uint64 start = 3;
   uint64 len = 4; // 0 is interpreted as 'read to end'
+  // The client extends each block body it downloads with zero bytes up to the
+  // block's expected length, so responses may omit trailing zero bytes.
+  bool client_pads_blocks = 5;
 }
 
 message VolumeGetFile2Response {
@@ -4438,6 +5803,8 @@ message VolumePutFilesRequest {
   // If set to true, prevent overwriting existing files. (Note that we don't allow overwriting
   // existing directories with uploaded files regardless.)
   bool disallow_overwrite_existing_files = 3;
+  // Earliest checked_at the client received from the existence checks for these files. Telemetry only.
+  google.protobuf.Timestamp earliest_checked_at = 4;
 }
 
 message VolumeReloadRequest {
@@ -4497,10 +5864,13 @@ message WebhookToken {
   string token_id = 1;
   double created_at = 2;
   bool scoped = 3;
+  string name = 4;
+  UserIdentity created_by = 5;
 }
 
 message WebhookTokenCreateRequest {
   bool scoped = 1;
+  string name = 2;
 }
 
 message WebhookTokenEnvironmentAddRequest {
@@ -4527,6 +5897,21 @@ message WebhookTokenListForEnvironmentRequest {
 
 message WebhookTokenListResponse {
   repeated WebhookToken tokens = 1;
+}
+
+message WebhookTokenUpdateRequest {
+  string token_id = 1;
+  optional string name = 2;
+}
+
+message WorkspaceBillingRatesRequest {}
+
+message WorkspaceBillingRatesResponse {
+  // compute rates are per unit per hour, storage rate is per GiB-month
+  map<string, string> rates = 1;
+  map<string, string> deprecation_warnings = 2;
+  map<string, string> deprecation_errors = 3;
+  string formatted = 4;
 }
 
 message WorkspaceBillingReportItem {
@@ -4564,7 +5949,7 @@ message WorkspaceBillingSummaryResponse {
 
   // keyed by deployed, ephemeral, volume, notebook, tokens
   map<string, string> metered_cost_breakdown = 5;
-  // keyed by plan, credits, reservations, storage
+  // keyed by plan, credits, reservations, storage, network egress allowance
   map<string, string> adjustments = 6;
 }
 
@@ -4600,8 +5985,27 @@ message WorkspaceNameLookupResponse {
   string username = 2;
 }
 
+message WorkspaceRoleDefinition {
+  string workspace_role_definition_id = 1;
+  string name = 2;
+  string description = 3;
+  repeated string permissions = 4;
+  double created_at = 5;
+  bool is_builtin = 6;
+}
+
 message WorkspaceSetDefaultEnvironmentRequest {
   string environment_name = 1;
+}
+
+message WorkspaceSetDefaultEnvironmentSettingsRequest {
+  // Omitted = no-op. INHERIT clears the workspace default so environments
+  // with no override have no block. Rejects UNSPECIFIED.
+  optional EnvironmentBlockUnauthenticatedResources block_unauthenticated_resources = 1;
+}
+
+message WorkspaceSetDefaultEnvironmentSettingsResponse {
+  EnvironmentSettings default_environment_settings = 1;
 }
 
 message WorkspaceSetImageBuilderVersionRequest {
@@ -4627,15 +6031,18 @@ service ModalClient {
   rpc AppDeploymentHistory(AppDeploymentHistoryRequest) returns (AppDeploymentHistoryResponse);
   rpc AppFetchLogs(AppFetchLogsRequest) returns (AppFetchLogsResponse);
   rpc AppGetByDeploymentName(AppGetByDeploymentNameRequest) returns (AppGetByDeploymentNameResponse);
+  rpc AppGetInfo(AppGetInfoRequest) returns (AppGetInfoResponse);
   rpc AppGetLayout(AppGetLayoutRequest) returns (AppGetLayoutResponse);
   rpc AppGetLifecycle(AppGetLifecycleRequest) returns (AppGetLifecycleResponse);
   rpc AppGetLogs(AppGetLogsRequest) returns (stream TaskLogsBatch);
   rpc AppGetObjects(AppGetObjectsRequest) returns (AppGetObjectsResponse);
   rpc AppGetOrCreate(AppGetOrCreateRequest) returns (AppGetOrCreateResponse);
   rpc AppGetTags(AppGetTagsRequest) returns (AppGetTagsResponse);
+  rpc AppGetTimeRangeStats(AppGetTimeRangeStatsRequest) returns (AppGetTimeRangeStatsResponse);
   rpc AppHeartbeat(AppHeartbeatRequest) returns (google.protobuf.Empty);
   rpc AppList(AppListRequest) returns (AppListResponse);
   rpc AppLookup(AppLookupRequest) returns (AppLookupResponse);
+  rpc AppPromote(AppPromoteRequest) returns (AppPromoteResponse);
   rpc AppPublish(AppPublishRequest) returns (AppPublishResponse);
   rpc AppRollback(AppRollbackRequest) returns (AppRollbackResponse);
   rpc AppRollover(AppRolloverRequest) returns (AppRolloverResponse);
@@ -4648,6 +6055,12 @@ service ModalClient {
   rpc AttemptRetry(AttemptRetryRequest) returns (AttemptRetryResponse);
   rpc AttemptStart(AttemptStartRequest) returns (AttemptStartResponse);
 
+  // Audit logs
+  rpc AuditLogCount(AuditLogCountRequest) returns (AuditLogCountResponse);
+  rpc AuditLogList(AuditLogListRequest) returns (AuditLogListResponse);
+  rpc AuditLogPlan(AuditLogBucketsRequest) returns (AuditLogPlanResponse);
+  rpc AuditLogSettingsGet(AuditLogSettingsGetRequest) returns (AuditLogSettingsGetResponse);
+
   // Auth Token
   rpc AuthTokenGet(AuthTokenGetRequest) returns (AuthTokenGetResponse);
 
@@ -4659,12 +6072,16 @@ service ModalClient {
   rpc ClassCreate(ClassCreateRequest) returns (ClassCreateResponse);
   rpc ClassGet(ClassGetRequest) returns (ClassGetResponse);
 
+  // CLI guidance
+  rpc CliCommandSuggest(CliCommandSuggestRequest) returns (CliCommandSuggestResponse);
+
   // Clients
   rpc ClientHello(google.protobuf.Empty) returns (ClientHelloResponse);
 
   // Clusters
   rpc ClusterGet(ClusterGetRequest) returns (ClusterGetResponse);
   rpc ClusterList(ClusterListRequest) returns (ClusterListResponse);
+  rpc ClusterReservationList(ClusterReservationListRequest) returns (ClusterReservationListResponse);
 
   // Container
   rpc ContainerCheckpoint(ContainerCheckpointRequest) returns (google.protobuf.Empty);
@@ -4673,7 +6090,6 @@ service ModalClient {
   rpc ContainerExecPutInput(ContainerExecPutInputRequest) returns (google.protobuf.Empty);
   rpc ContainerExecWait(ContainerExecWaitRequest) returns (ContainerExecWaitResponse);
   rpc ContainerFilesystemExec(ContainerFilesystemExecRequest) returns (ContainerFilesystemExecResponse);
-  rpc ContainerFilesystemExecGetOutput(ContainerFilesystemExecGetOutputRequest) returns (stream FilesystemRuntimeOutputBatch);
   rpc ContainerHeartbeat(ContainerHeartbeatRequest) returns (ContainerHeartbeatResponse);
   rpc ContainerHello(google.protobuf.Empty) returns (google.protobuf.Empty);
   rpc ContainerLog(ContainerLogRequest) returns (google.protobuf.Empty);
@@ -4706,6 +6122,8 @@ service ModalClient {
   // Endpoints
   rpc EndpointCreate(EndpointCreateRequest) returns (EndpointCreateResponse);
   rpc EndpointGetByName(EndpointGetByNameRequest) returns (EndpointGetByNameResponse);
+  rpc EndpointGetInfo(EndpointGetInfoRequest) returns (EndpointGetInfoResponse);
+  rpc EndpointGetLibrary(EndpointGetLibraryRequest) returns (EndpointGetLibraryResponse);
   rpc EndpointGetLifecycle(EndpointGetLifecycleRequest) returns (EndpointGetLifecycleResponse);
   rpc EndpointList(EndpointListRequest) returns (EndpointListResponse);
   rpc EndpointStop(EndpointStopRequest) returns (EndpointStopResponse);
@@ -4734,7 +6152,10 @@ service ModalClient {
   // Functions
   rpc FunctionAsyncInvoke(FunctionAsyncInvokeRequest) returns (FunctionAsyncInvokeResponse);
   rpc FunctionBindParams(FunctionBindParamsRequest) returns (FunctionBindParamsResponse);
+  rpc FunctionBlobGet(BlobGetRequest) returns (BlobGetResponse);
   rpc FunctionCallCancel(FunctionCallCancelRequest) returns (google.protobuf.Empty);
+  rpc FunctionCallCount(FunctionCallCountRequest) returns (FunctionCallCountResponse);
+  rpc FunctionCallFetch(FunctionCallFetchRequest) returns (FunctionCallFetchResponse);
   rpc FunctionCallFromId(FunctionCallFromIdRequest) returns (FunctionCallFromIdResponse);
   rpc FunctionCallGetDataIn(FunctionCallGetDataRequest) returns (stream DataChunk);
   rpc FunctionCallGetDataOut(FunctionCallGetDataRequest) returns (stream DataChunk);
@@ -4744,12 +6165,18 @@ service ModalClient {
   rpc FunctionCreate(FunctionCreateRequest) returns (FunctionCreateResponse);
   rpc FunctionFinishInputs(FunctionFinishInputsRequest) returns (google.protobuf.Empty); // For map RPCs, to signal that all inputs have been sent
   rpc FunctionGet(FunctionGetRequest) returns (FunctionGetResponse);
+  rpc FunctionGetById(FunctionGetByIdRequest) returns (FunctionGetByIdResponse);
   rpc FunctionGetCallGraph(FunctionGetCallGraphRequest) returns (FunctionGetCallGraphResponse);
   rpc FunctionGetCurrentStats(FunctionGetCurrentStatsRequest) returns (FunctionStats);
   rpc FunctionGetDynamicConcurrency(FunctionGetDynamicConcurrencyRequest) returns (FunctionGetDynamicConcurrencyResponse);
+  rpc FunctionGetFlashAuthToken(FunctionGetFlashAuthTokenRequest) returns (FunctionGetFlashAuthTokenResponse);
   rpc FunctionGetInputs(FunctionGetInputsRequest) returns (FunctionGetInputsResponse);  // For containers to request next call
+  rpc FunctionGetMetrics(FunctionGetMetricsRequest) returns (FunctionGetMetricsResponse);
   rpc FunctionGetOutputs(FunctionGetOutputsRequest) returns (FunctionGetOutputsResponse);  // Returns the next result(s) for an entire function call (FunctionMap)
+  rpc FunctionGetSchedulingParams(FunctionGetSchedulingParamsRequest) returns (FunctionGetSchedulingParamsResponse);
   rpc FunctionGetSerialized(FunctionGetSerializedRequest) returns (FunctionGetSerializedResponse);
+  rpc FunctionGetTimeRangeStats(FunctionGetTimeRangeStatsRequest) returns (FunctionGetTimeRangeStatsResponse);
+  rpc FunctionListVariants(FunctionListVariantsRequest) returns (FunctionListVariantsResponse);
   rpc FunctionMap(FunctionMapRequest) returns (FunctionMapResponse);
   rpc FunctionPrecreate(FunctionPrecreateRequest) returns (FunctionPrecreateResponse);
   rpc FunctionPutInputs(FunctionPutInputsRequest) returns (FunctionPutInputsResponse);
@@ -4766,6 +6193,7 @@ service ModalClient {
   rpc ImageGetOrCreate(ImageGetOrCreateRequest) returns (ImageGetOrCreateResponse);
   rpc ImageJoinStreaming(ImageJoinStreamingRequest) returns (stream ImageJoinStreamingResponse);
   rpc ImageListTags(ImageListTagsRequest) returns (ImageListTagsResponse);
+  rpc ImageNameDelete(ImageNameDeleteRequest) returns (google.protobuf.Empty);
   rpc ImagePublish(ImagePublishRequest) returns (ImagePublishResponse);
   rpc ImageTagRevisions(ImageTagRevisionsRequest) returns (ImageTagRevisionsResponse);
 
@@ -4774,13 +6202,23 @@ service ModalClient {
   rpc MapCheckInputs(MapCheckInputsRequest) returns (MapCheckInputsResponse);
   rpc MapStartOrContinue(MapStartOrContinueRequest) returns (MapStartOrContinueResponse);
 
+  // Metrics discovery
+  rpc MetricsGetInfo(MetricsGetInfoRequest) returns (MetricsGetInfoResponse);
+
   // Mounts
   rpc MountBatchedCheckExistence(MountBatchedCheckExistenceRequest) returns (MountBatchedCheckExistenceResponse);
   rpc MountGetOrCreate(MountGetOrCreateRequest) returns (MountGetOrCreateResponse);
   rpc MountPutFile(MountPutFileRequest) returns (MountPutFileResponse);
 
-  // Notebooks
-  rpc NotebookKernelPublishResults(NotebookKernelPublishResultsRequest) returns (google.protobuf.Empty);
+  // Object name suggestions
+  rpc ObjectSuggest(ObjectSuggestRequest) returns (ObjectSuggestResponse);
+
+  // Persistent sandboxes
+  rpc PersistentSandboxCreate(PersistentSandboxCreateRequest) returns (PersistentSandboxCreateResponse);
+  rpc PersistentSandboxGet(PersistentSandboxGetRequest) returns (PersistentSandboxGetResponse);
+  rpc PersistentSandboxResume(PersistentSandboxResumeRequest) returns (PersistentSandboxResumeResponse);
+  rpc PersistentSandboxTerminate(PersistentSandboxTerminateRequest) returns (PersistentSandboxTerminateResponse);
+  rpc PersistentSandboxTunnelsList(PersistentSandboxTunnelsListRequest) returns (PersistentSandboxTunnelsListResponse);
 
   // Proxies
   rpc ProxyAddIp(ProxyAddIpRequest) returns (ProxyAddIpResponse);
@@ -4804,18 +6242,25 @@ service ModalClient {
   rpc QueuePut(QueuePutRequest) returns (google.protobuf.Empty);
 
   // Sandboxes
+  rpc SandboxContainerCreateV2(SandboxContainerCreateV2Request) returns (SandboxContainerCreateV2Response);
   rpc SandboxCreate(SandboxCreateRequest) returns (SandboxCreateResponse);
   rpc SandboxCreateConnectToken(SandboxCreateConnectTokenRequest) returns (SandboxCreateConnectTokenResponse);
   rpc SandboxCreateConnectTokenV2(SandboxCreateConnectTokenRequest) returns (SandboxCreateConnectTokenResponse);
   rpc SandboxCreateV2(SandboxCreateV2Request) returns (SandboxCreateV2Response);
   rpc SandboxGetCommandRouterAccess(SandboxGetCommandRouterAccessRequest) returns (SandboxGetCommandRouterAccessResponse);
   rpc SandboxGetExitSnapshot(SandboxGetExitSnapshotRequest) returns (SandboxGetExitSnapshotResponse);
+  rpc SandboxGetExitSnapshotV2(SandboxGetExitSnapshotRequest) returns (SandboxGetExitSnapshotResponse);
   rpc SandboxGetFromName(SandboxGetFromNameRequest) returns (SandboxGetFromNameResponse);
   rpc SandboxGetFromNameV2(SandboxGetFromNameRequest) returns (SandboxGetFromNameResponse);
   rpc SandboxGetLogs(SandboxGetLogsRequest) returns (stream TaskLogsBatch);
   rpc SandboxGetResourceUsage(SandboxGetResourceUsageRequest) returns (SandboxGetResourceUsageResponse);
+  // Statistics over available usage samples; ingestion can lag execution.
+  rpc SandboxGetStats(SandboxGetStatsRequest) returns (SandboxGetStatsResponse);
+  rpc SandboxGetStatsV2(SandboxGetStatsRequest) returns (SandboxGetStatsResponse);
+  rpc SandboxGetStatus(SandboxGetStatusRequest) returns (SandboxGetStatusResponse);
   rpc SandboxGetTaskId(SandboxGetTaskIdRequest) returns (SandboxGetTaskIdResponse); // needed for modal container exec
   rpc SandboxGetTaskIdV2(SandboxGetTaskIdRequest) returns (SandboxGetTaskIdResponse);
+  rpc SandboxGetTimeRangeStats(SandboxGetTimeRangeStatsRequest) returns (SandboxGetTimeRangeStatsResponse);
   rpc SandboxGetTunnels(SandboxGetTunnelsRequest) returns (SandboxGetTunnelsResponse);
   rpc SandboxGetTunnelsV2(SandboxGetTunnelsRequest) returns (SandboxGetTunnelsResponse);
   rpc SandboxList(SandboxListRequest) returns (SandboxListResponse);
@@ -4823,6 +6268,8 @@ service ModalClient {
   rpc SandboxRestore(SandboxRestoreRequest) returns (SandboxRestoreResponse);
   rpc SandboxRestoreV2(SandboxRestoreV2Request) returns (SandboxRestoreV2Response);
   rpc SandboxSetName(SandboxSetNameRequest) returns (SandboxSetNameResponse);
+  rpc SandboxSetOutboundPolicy(SandboxSetOutboundPolicyRequest) returns (SandboxSetOutboundPolicyResponse);
+  rpc SandboxSetOutboundPolicyV2(SandboxSetOutboundPolicyRequest) returns (SandboxSetOutboundPolicyResponse);
   rpc SandboxSnapshot(SandboxSnapshotRequest) returns (SandboxSnapshotResponse);
   rpc SandboxSnapshotFs(SandboxSnapshotFsRequest) returns (SandboxSnapshotFsResponse);
   rpc SandboxSnapshotFsAsync(SandboxSnapshotFsAsyncRequest) returns (SandboxSnapshotFsAsyncResponse);
@@ -4842,11 +6289,21 @@ service ModalClient {
 
   // Secrets
   rpc SecretDelete(SecretDeleteRequest) returns (google.protobuf.Empty);
+  rpc SecretGetInfo(SecretGetInfoRequest) returns (SecretGetInfoResponse);
   rpc SecretGetOrCreate(SecretGetOrCreateRequest) returns (SecretGetOrCreateResponse);
   rpc SecretList(SecretListRequest) returns (SecretListResponse);
   rpc SecretUpdate(SecretUpdateRequest) returns (google.protobuf.Empty);
 
+  // Servers
+  rpc ServerCountRequests(ServerCountRequestsRequest) returns (ServerCountRequestsResponse);
+  rpc ServerGetMetrics(ServerGetMetricsRequest) returns (ServerGetMetricsResponse);
+  rpc ServerGetTimeRangeStats(ServerGetTimeRangeStatsRequest) returns (ServerGetTimeRangeStatsResponse);
+  rpc ServerRequestFetch(ServerRequestFetchRequest) returns (ServerRequestFetchResponse);
+
   // Service users
+  rpc ServiceUserCreate(ServiceUserCreateRequest) returns (ServiceUserCreateResponse);
+  rpc ServiceUserDelete(ServiceUserDeleteRequest) returns (google.protobuf.Empty);
+  rpc ServiceUserInfo(ServiceUserInfoRequest) returns (ServiceUserInfoResponse);
   rpc ServiceUserList(google.protobuf.Empty) returns (ServiceUserListResponse);
 
   // SharedVolumes
@@ -4872,13 +6329,20 @@ service ModalClient {
   rpc TemplateList(TemplateListRequest) returns (TemplateListResponse);
 
   // Tokens (web auth flow)
+  rpc TokenDelete(TokenDeleteRequest) returns (TokenDeleteResponse);
+  rpc TokenDisable(TokenDisableRequest) returns (google.protobuf.Empty);
+  rpc TokenEnable(TokenEnableRequest) returns (google.protobuf.Empty);
   rpc TokenFlowCreate(TokenFlowCreateRequest) returns (TokenFlowCreateResponse);
   rpc TokenFlowWait(TokenFlowWaitRequest) returns (TokenFlowWaitResponse);
   rpc TokenInfoGet(TokenInfoGetRequest) returns (TokenInfoGetResponse);
+  rpc TokensList(google.protobuf.Empty) returns (TokensListResponse);
 
   // Tunnels
   rpc TunnelStart(TunnelStartRequest) returns (TunnelStartResponse);
   rpc TunnelStop(TunnelStopRequest) returns (TunnelStopResponse);
+
+  // User groups
+  rpc UserGroupEnvironmentSet(UserGroupEnvironmentSetRequest) returns (google.protobuf.Empty);
 
   // Volumes
   rpc VolumeCommit(VolumeCommitRequest) returns (VolumeCommitResponse);
@@ -4908,14 +6372,17 @@ service ModalClient {
   rpc WebhookTokenEnvironmentRemove(WebhookTokenEnvironmentRemoveRequest) returns (google.protobuf.Empty);
   rpc WebhookTokenList(google.protobuf.Empty) returns (WebhookTokenListResponse);
   rpc WebhookTokenListForEnvironment(WebhookTokenListForEnvironmentRequest) returns (WebhookTokenListResponse);
+  rpc WebhookTokenUpdate(WebhookTokenUpdateRequest) returns (WebhookToken);
 
   // Workspaces
+  rpc WorkspaceBillingRates(WorkspaceBillingRatesRequest) returns (WorkspaceBillingRatesResponse);
   rpc WorkspaceBillingReport(WorkspaceBillingReportRequest) returns (stream WorkspaceBillingReportItem);
   rpc WorkspaceBillingSummary(WorkspaceBillingSummaryRequest) returns (WorkspaceBillingSummaryResponse);
   rpc WorkspaceDashboardUrlGet(WorkspaceDashboardUrlRequest) returns (WorkspaceDashboardUrlResponse);
   rpc WorkspaceMembersList(google.protobuf.Empty) returns (WorkspaceMembersListResponse);
   rpc WorkspaceNameLookup(google.protobuf.Empty) returns (WorkspaceNameLookupResponse);
   rpc WorkspaceSetDefaultEnvironment(WorkspaceSetDefaultEnvironmentRequest) returns (google.protobuf.Empty);
+  rpc WorkspaceSetDefaultEnvironmentSettings(WorkspaceSetDefaultEnvironmentSettingsRequest) returns (WorkspaceSetDefaultEnvironmentSettingsResponse);
   rpc WorkspaceSetImageBuilderVersion(WorkspaceSetImageBuilderVersionRequest) returns (WorkspaceSetImageBuilderVersionResponse);
   rpc WorkspaceSettings(google.protobuf.Empty) returns (WorkspaceSettingsResponse);
 }

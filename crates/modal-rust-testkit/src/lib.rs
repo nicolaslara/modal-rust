@@ -14,9 +14,10 @@
 //! OVERRIDES via the [`MockModal::builder`] (canned function results + per-RPC
 //! closures).
 //!
-//! # The 201-method problem (Option A)
+//! # The hundreds-of-methods problem (Option A)
 //!
-//! The `ModalClient` service has 201 RPCs but the SDK only calls ~18. The testkit
+//! The `ModalClient` service has hundreds of RPCs (the count is recorded in the SDK's
+//! `proto/SOURCE.toml`) but the SDK only calls a few dozen. The testkit
 //! owns its OWN `build_server(true)` codegen on the same proto and hand-writes the
 //! handful the SDK calls; the rest are stubbed as `Status::unimplemented` via the
 //! [`mock_unimplemented!`](crate::macros) declarative macro. The testkit's generated

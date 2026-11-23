@@ -18,9 +18,9 @@ path = "modal_proto/api.proto"
 url = "https://raw.githubusercontent.com/modal-labs/modal-client/main/modal_proto/api.proto"
 
 # Upstream commit this copy was taken at.
-commit = "1d53eec296"
-commit_date = "2026-08-07"
-synced = "2026-08-07"
+commit = "85a1e5bfbb"
+commit_date = "2026-11-18"
+synced = "2026-11-19"
 
-# 236 RPCs on service ModalClient at this revision.
-rpc_count = 236
+# 286 RPCs on service ModalClient at this revision.
+rpc_count = 286
