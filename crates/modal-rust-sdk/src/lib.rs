@@ -73,7 +73,7 @@ pub use ops::image::ImageSpec;
 pub use ops::invoke::Invocation;
 pub use ops::local_dir::{WorkspaceClosureSpec, DEFAULT_IGNORE_PATTERNS, DEFAULT_MODALIGNORE_NAME};
 pub use ops::mount::{client_mount_name, python_standalone_mount_name};
-pub use ops::DEFAULT_BASE_IMAGE;
+pub use ops::{DEFAULT_BASE_IMAGE, RUST_TOOLCHAIN_VERSION};
 
 /// Typed, SDK-owned planning projections for the facade's offline dry-run/dump
 /// (`modal_rust::dump`): assemble the SAME control-plane requests the live path

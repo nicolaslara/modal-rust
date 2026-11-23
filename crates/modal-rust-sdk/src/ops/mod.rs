@@ -44,6 +44,15 @@ use crate::proto::api::GenericResult;
 /// sync with [`crate::auth::CLIENT_VERSION`].
 pub const CLIENT_VERSION: &str = crate::auth::CLIENT_VERSION;
 
+/// Rust toolchain version of the default remote build image (`rust:{version}-slim`)
+/// and of the rustup install [`ImageSpec::with_rust_toolchain`] renders. Equal to the
+/// workspace's `rust-toolchain.toml` channel, so the runner is built by one compiler
+/// version locally and on Modal, and an image build never depends on which `stable`
+/// a registry tag or rustup resolved to on the day it was first cached.
+///
+/// [`ImageSpec::with_rust_toolchain`]: crate::ops::image::ImageSpec::with_rust_toolchain
+pub const RUST_TOOLCHAIN_VERSION: &str = "1.100.0";
+
 /// Default base image used by [`image`]'s `from_registry` recipe. FILE mode carries
 /// no pickled bytecode, so the exact Python version is irrelevant to correctness;
 /// a small, fast-pulling stock tag is preferred.
@@ -125,6 +134,21 @@ pub(crate) fn describe_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The remote build image and the local toolchain pin name the same compiler.
+    #[test]
+    fn remote_rust_toolchain_matches_the_workspace_pin() {
+        let pin = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../rust-toolchain.toml"
+        ))
+        .expect("workspace rust-toolchain.toml");
+        assert!(
+            pin.contains(&format!("channel = \"{RUST_TOOLCHAIN_VERSION}\"")),
+            "RUST_TOOLCHAIN_VERSION ({RUST_TOOLCHAIN_VERSION}) must equal the \
+             rust-toolchain.toml channel:\n{pin}"
+        );
+    }
 
     fn result(status: GenericStatus, exception: &str, traceback: &str) -> GenericResult {
         GenericResult {

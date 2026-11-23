@@ -66,8 +66,11 @@ fn base_image_and_install_rust_ride_into_the_image_dockerfile() {
 
     // 2. `install_rust` renders the rustup install RUN...
     assert!(
-        cmds.iter()
-            .any(|c| c.contains("rustup.rs") && c.contains("--default-toolchain stable")),
+        cmds.iter().any(|c| c.contains("rustup.rs")
+            && c.contains(&format!(
+                "--default-toolchain {}",
+                modal_rust::sdk::RUST_TOOLCHAIN_VERSION
+            ))),
         "install_rust renders the rustup toolchain install (got {cmds:?})"
     );
     // ...and bakes cargo onto PATH so the in-body `cargo build` finds it.

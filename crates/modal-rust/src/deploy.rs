@@ -764,7 +764,10 @@ mod tests {
         std::env::remove_var("MODAL_RUST_INSTALL_RUST");
         let cfg = DeployConfig::default();
         assert_eq!(cfg.app_name, "modal-rust-add-deploy");
-        assert_eq!(cfg.base_image, "rust:1-slim");
+        assert_eq!(
+            cfg.base_image,
+            format!("rust:{}-slim", crate::remote::RUST_VER)
+        );
         // The deploy context upload reuses the RUN-path scoping/ignore defaults.
         assert!(cfg.use_cargo_scoping, "cargo scoping is the default");
         assert_eq!(cfg.modalignore_name, ".modalignore");

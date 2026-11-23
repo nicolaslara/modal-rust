@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-RUST_TOOLCHAIN="1.96.0" # keep in lockstep with ci.yml + rust-toolchain.toml
+RUST_TOOLCHAIN="1.100.0" # keep in lockstep with ci.yml + rust-toolchain.toml
 
 run() {
   echo "==> $*"

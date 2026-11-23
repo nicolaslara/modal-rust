@@ -215,8 +215,11 @@ mod tests {
             assert!(rustup_line.contains(pkg), "rustup apt prereq {pkg} present");
         }
         assert!(
-            rustup_line.contains("--default-toolchain stable --profile minimal"),
-            "rustup uses stable + minimal profile (gpu_app.py)"
+            rustup_line.contains(&format!(
+                "--default-toolchain {} --profile minimal",
+                crate::ops::RUST_TOOLCHAIN_VERSION
+            )),
+            "rustup installs the pinned toolchain with the minimal profile"
         );
 
         // (b) `/root/.cargo/bin` is on the baked PATH.

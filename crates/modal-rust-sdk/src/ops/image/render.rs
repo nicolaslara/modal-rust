@@ -362,14 +362,14 @@ impl ImageSpec {
             //
             // Single combined RUN (minimal layers): apt prereqs for rustup, then the
             // exact rustup one-liner from `gpu_app.py`.
-            cmds.push(
+            cmds.push(format!(
                 "RUN apt-get update && apt-get install -y --no-install-recommends \
                  curl ca-certificates build-essential pkg-config \
                  && rm -rf /var/lib/apt/lists/* \
                  && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                 | sh -s -- -y --default-toolchain stable --profile minimal"
-                    .to_string(),
-            );
+                 | sh -s -- -y --default-toolchain {} --profile minimal",
+                crate::ops::RUST_TOOLCHAIN_VERSION
+            ));
             // Bake PATH (cargo + the CUDA bin dir) and CUDA_PATH as image ENV so they
             // hold at BOTH image-build time (the DEPLOY top layer's `cargo build`) AND
             // runtime (the RUN-path in-body build + CubeCL's NVRTC include resolution).

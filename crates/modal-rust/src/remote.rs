@@ -100,8 +100,8 @@ pub(crate) fn web_server_attr(entrypoint: &str) -> String {
 }
 /// Where the uploaded source mount lands inside the container.
 pub(crate) const REMOTE_SRC: &str = "/src";
-/// Rust base image major version tag (`rust:{ver}-slim`).
-pub(crate) const RUST_VER: &str = "1";
+/// Rust version tag of the default base image (`rust:{ver}-slim`).
+pub(crate) const RUST_VER: &str = modal_rust_sdk::RUST_TOOLCHAIN_VERSION;
 /// Python series to provision via `add_python` (the hosted python-build-standalone
 /// mount). `< 3.13`, so the image gets the auto `ln -s python3 python` the bare
 /// `python` entrypoint needs. Shared by the RUN and DEPLOY images.
@@ -392,7 +392,7 @@ pub struct RemoteConfig {
     /// image. Set when [`base_image`](RemoteConfig::base_image) is a non-Rust base
     /// (e.g. a `nvidia/cuda:<ver>-devel` Tier-1 base; boundaries.md §9) so the
     /// in-body `cargo build` finds a toolchain on PATH. Default `false` (the
-    /// `rust:1-slim` base already carries Rust). Env override:
+    /// `rust:<version>-slim` base already carries Rust). Env override:
     /// `MODAL_RUST_INSTALL_RUST` (`1`/`true`/`yes`/`on`).
     pub install_rust: bool,
     /// Ordered image-builder steps ([`ImageStep`]: `apt_install` / `pip_install` /
@@ -1118,11 +1118,11 @@ mod tests {
         std::env::remove_var("MODAL_RUST_NO_CACHE");
         let cfg = RemoteConfig::default();
         assert_eq!(cfg.remote_src, "/src");
-        assert_eq!(cfg.base_image, "rust:1-slim");
+        assert_eq!(cfg.base_image, format!("rust:{RUST_VER}-slim"));
         assert_eq!(cfg.timeout_secs, 1800);
         assert!(cfg.use_cargo_scoping, "cargo scoping is the default");
         assert_eq!(cfg.modalignore_name, ".modalignore");
-        // The CUDA Tier-1 knob defaults OFF, so the default rust:1-slim path stays
+        // The CUDA Tier-1 knob defaults OFF, so the default rust:<version>-slim path stays
         // byte-identical (no rustup, no CUDA env).
         assert!(!cfg.install_rust, "install_rust defaults off");
         // P6: the cargo build cache is ON by default.
