@@ -28,6 +28,12 @@ cd "$(dirname "$0")/.."
 pass=0
 fail=0
 
+# `live` bounds each real Modal command with `timeout`, which stock macOS lacks.
+# perl's alarm survives the exec, so the command is killed by SIGALRM at the limit.
+if ! command -v timeout >/dev/null 2>&1; then
+  timeout() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+fi
+
 # ───────────────────────── Completeness check ──────────────────────────
 # Every example dir must appear in at least one tier (OFFLINE, LIVE, or GPU).
 # Add a new entry here when adding an example; the check below fails loudly
