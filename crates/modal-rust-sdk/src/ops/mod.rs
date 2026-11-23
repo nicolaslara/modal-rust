@@ -53,10 +53,13 @@ pub const DEFAULT_BASE_IMAGE: &str = "python:3.12-slim";
 ///
 /// A `None` result, or a result whose status is `UNSPECIFIED`, means the remote
 /// operation has not finished yet (keep polling). Any other status is terminal.
+///
+/// A status value the vendored proto does not name is reported as `FAILURE`: the
+/// server can add statuses at any time, and polling on one would never end.
 pub(crate) fn result_status(result: Option<&GenericResult>) -> ResultState {
     match result {
         None => ResultState::Pending,
-        Some(r) => match GenericStatus::try_from(r.status).unwrap_or(GenericStatus::Unspecified) {
+        Some(r) => match GenericStatus::try_from(r.status).unwrap_or(GenericStatus::Failure) {
             GenericStatus::Unspecified => ResultState::Pending,
             GenericStatus::Success => ResultState::Success,
             other => ResultState::Failure(other),
@@ -130,6 +133,26 @@ mod tests {
             traceback: traceback.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unnamed_status_is_a_terminal_failure() {
+        let unnamed = GenericResult {
+            status: i32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            result_status(Some(&unnamed)),
+            ResultState::Failure(GenericStatus::Failure)
+        );
+        // UNSPECIFIED stays pending; the memory-kill statuses are terminal by name.
+        let pending = result(GenericStatus::Unspecified, "", "");
+        assert_eq!(result_status(Some(&pending)), ResultState::Pending);
+        let oom = result(GenericStatus::KernelOomKill, "", "");
+        assert_eq!(
+            result_status(Some(&oom)),
+            ResultState::Failure(GenericStatus::KernelOomKill)
+        );
     }
 
     #[test]
