@@ -12,8 +12,11 @@ use crate::proto::api::{ImageGetOrCreateRequest, ImageJoinStreamingRequest};
 
 /// Per-stream timeout (seconds) for `ImageJoinStreaming` long-poll reconnects.
 const JOIN_STREAM_TIMEOUT_SECS: f32 = 55.0;
-/// Safety cap on total wall-clock time spent polling an image build.
-const BUILD_DEADLINE: Duration = Duration::from_secs(600);
+/// Safety cap on total wall-clock time spent polling an image build. A cold build
+/// that pulls a CUDA base, installs a toolchain and compiles a large dependency
+/// tree runs well past ten minutes; the build goes on server-side either way, so a
+/// cap shorter than the build only turns a slow build into a failed call.
+const BUILD_DEADLINE: Duration = Duration::from_secs(3600);
 
 /// Build the `ImageGetOrCreate` request (api.proto:4260) — pure, no I/O.
 ///
